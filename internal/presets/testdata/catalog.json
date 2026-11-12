@@ -1,0 +1,149 @@
+[
+	{
+		"name": "openai",
+		"protocol": "openai",
+		"base_url": "https://api.openai.com/v1",
+		"api_key_env": "OPENAI_API_KEY",
+		"billing": "pay_per_use",
+		"target_defaults": {
+			"output_cap_param": "max_completion_tokens"
+		}
+	},
+	{
+		"name": "anthropic",
+		"protocol": "anthropic",
+		"base_url": "https://api.anthropic.com",
+		"api_key_env": "ANTHROPIC_API_KEY",
+		"billing": "pay_per_use",
+		"gen_ai_provider": "anthropic",
+		"target_defaults": {
+			"dialect": "adaptive_effort"
+		}
+	},
+	{
+		"name": "openrouter",
+		"protocol": "openai",
+		"base_url": "https://openrouter.ai/api/v1",
+		"api_key_env": "OPENROUTER_API_KEY",
+		"billing": "pay_per_use",
+		"cost_report": {
+			"path": "usage.cost",
+			"usd_per_unit": 1
+		},
+		"stream_usage": "native",
+		"gen_ai_provider": "openrouter",
+		"target_defaults": {
+			"dialect": "reasoning_object",
+			"output_cap_param": "max_tokens"
+		}
+	},
+	{
+		"name": "deepinfra",
+		"protocol": "openai",
+		"base_url": "https://api.deepinfra.com/v1/openai",
+		"api_key_env": "DEEPINFRA_API_KEY",
+		"billing": "pay_per_use"
+	},
+	{
+		"name": "minimax",
+		"protocol": "openai",
+		"base_url": "https://api.minimax.io/v1",
+		"api_key_env": "MINIMAX_API_KEY",
+		"billing": "pay_per_use"
+	},
+	{
+		"name": "zai",
+		"protocol": "openai",
+		"base_url": "https://api.z.ai/api/paas/v4",
+		"api_key_env": "ZAI_API_KEY",
+		"billing": "pay_per_use"
+	},
+	{
+		"name": "moonshot",
+		"protocol": "openai",
+		"base_url": "https://api.moonshot.ai/v1",
+		"api_key_env": "MOONSHOT_API_KEY",
+		"billing": "pay_per_use"
+	},
+	{
+		"name": "dashscope",
+		"protocol": "openai",
+		"api_key_env": "DASHSCOPE_API_KEY",
+		"billing": "pay_per_use"
+	},
+	{
+		"name": "ollama",
+		"protocol": "openai",
+		"base_url": "http://localhost:11434/v1",
+		"billing": "none"
+	},
+	{
+		"name": "tei",
+		"protocol": "openai",
+		"billing": "none"
+	},
+	{
+		"name": "deepseek",
+		"untested": true,
+		"protocol": "openai",
+		"base_url": "https://api.deepseek.com",
+		"api_key_env": "DEEPSEEK_API_KEY",
+		"billing": "pay_per_use"
+	},
+	{
+		"name": "gemini",
+		"untested": true,
+		"protocol": "openai",
+		"base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+		"api_key_env": "GEMINI_API_KEY",
+		"billing": "pay_per_use"
+	},
+	{
+		"name": "xai",
+		"untested": true,
+		"protocol": "openai",
+		"base_url": "https://api.x.ai/v1",
+		"api_key_env": "XAI_API_KEY",
+		"billing": "pay_per_use"
+	},
+	{
+		"name": "mistral",
+		"untested": true,
+		"protocol": "openai",
+		"base_url": "https://api.mistral.ai/v1",
+		"api_key_env": "MISTRAL_API_KEY",
+		"billing": "pay_per_use"
+	},
+	{
+		"name": "groq",
+		"untested": true,
+		"protocol": "openai",
+		"base_url": "https://api.groq.com/openai/v1",
+		"api_key_env": "GROQ_API_KEY",
+		"billing": "pay_per_use"
+	},
+	{
+		"name": "together",
+		"untested": true,
+		"protocol": "openai",
+		"base_url": "https://api.together.ai/v1",
+		"api_key_env": "TOGETHER_API_KEY",
+		"billing": "pay_per_use"
+	},
+	{
+		"name": "fireworks",
+		"untested": true,
+		"protocol": "openai",
+		"base_url": "https://api.fireworks.ai/inference/v1",
+		"api_key_env": "FIREWORKS_API_KEY",
+		"billing": "pay_per_use"
+	},
+	{
+		"name": "cerebras",
+		"untested": true,
+		"protocol": "openai",
+		"base_url": "https://api.cerebras.ai/v1",
+		"api_key_env": "CEREBRAS_API_KEY",
+		"billing": "pay_per_use"
+	}
+]

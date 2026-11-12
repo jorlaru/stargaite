@@ -40,10 +40,12 @@ type input struct {
 type flagKind int
 
 const (
-	kindString     flagKind = iota // a value the command reads itself
-	kindBool                       // the same, given without a value
-	kindNumber                     // a JSON number at path
-	kindTypedPairs                 // name=value pairs under path, comma-separated or repeated: a JSON number, true or false is sent as that literal, anything else as a string
+	kindString      flagKind = iota // a value the command reads itself or, with a path, a JSON string at path
+	kindBool                        // the same, given without a value; with a path, true or false at path
+	kindNumber                      // a JSON number at path
+	kindTypedPairs                  // name=value pairs under path, comma-separated or repeated: a JSON number, true or false is sent as that literal, anything else as a string
+	kindStringPairs                 // the same, every value sent as a string
+	kindQuota                       // <window>:<unit>=<n>, repeated: appends {"window": window, unit: n} to the list at path, a top-level member
 )
 
 // flagSpec is one flag of a command. A one-letter name is the short form the
@@ -87,6 +89,33 @@ var settingsFlags = []flagSpec{
 	{"audit-months", kindNumber, "retention.audit_months", "months audit records are kept"},
 }
 
+// providerFlags are the fields of a provider (kick-off section 6).
+var providerFlags = []flagSpec{
+	{"protocol", kindString, "protocol", "openai or anthropic"},
+	{"base-url", kindString, "base_url", "the provider's base URL"},
+	{"api-key-env", kindString, "api_key_env", "the environment variable that holds the credential, never its value"},
+	{"billing", kindString, "billing", "pay_per_use, subscription or none"},
+	{"quota", kindQuota, "quota", "<window>:<requests|tokens>=<n>, repeated: a window of a subscription, such as 5h:requests=1500"},
+	{"cost-report", kindTypedPairs, "cost_report", "path=<dotted path>,usd_per_unit=<usd>: where a response reports its cost"},
+	{"stream-usage", kindString, "stream_usage", "request, native or none"},
+	{"rerank-url", kindString, "rerank_url", "where rerank requests go"},
+	{"gen-ai-provider", kindString, "gen_ai_provider", "the provider's well-known name for telemetry"},
+	{"target-defaults", kindStringPairs, "target_defaults", "dialect=<dialect>,output_cap_param=<name>: what a new target starts with"},
+	{"allow-private-network", kindBool, "allow_private_network", "allow plain HTTP, loopback and private addresses"},
+}
+
+// named is the request of a command on the resource its positional argument
+// names; a PATCH sends the body flags given as the merge patch.
+func named(method, collection string) func(input) (string, string, any) {
+	return func(in input) (string, string, any) {
+		var body any
+		if method == http.MethodPatch {
+			body = in.body
+		}
+		return method, collection + "/" + url.PathEscape(in.args[0]), body
+	}
+}
+
 var commands = []command{
 	{words: []string{"version"}, local: version},
 	{words: []string{"validate"}, local: validateFile, request: get("/validate"), flags: []flagSpec{
@@ -97,6 +126,17 @@ var commands = []command{
 	{words: []string{"settings", "set"}, flags: settingsFlags, request: func(in input) (string, string, any) {
 		return http.MethodPatch, "/settings", in.body
 	}},
+	{words: []string{"providers", "presets"}, request: get("/presets")},
+	{words: []string{"providers", "add"}, args: []string{"name"}, flags: append(slices.Clone(providerFlags),
+		flagSpec{"preset", kindString, "preset", "the preset to start from (default: the one named like the provider, if any)"}),
+		request: func(in input) (string, string, any) {
+			in.body["name"] = in.args[0]
+			return http.MethodPost, "/providers", in.body
+		}},
+	{words: []string{"providers", "list"}, request: get("/providers")},
+	{words: []string{"providers", "show"}, args: []string{"name"}, request: named(http.MethodGet, "/providers")},
+	{words: []string{"providers", "set"}, args: []string{"name"}, flags: providerFlags, request: named(http.MethodPatch, "/providers")},
+	{words: []string{"providers", "remove"}, args: []string{"name"}, needsYes: func(input) bool { return true }, request: named(http.MethodDelete, "/providers")},
 	{words: []string{"export"}, request: func(in input) (string, string, any) {
 		if in.json {
 			return http.MethodGet, "/export?format=json", nil
@@ -155,11 +195,13 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 		specs = append(specs, flagSpec{"yes", kindBool, "", "confirm that the command deletes or revokes"})
 	}
 	for _, f := range specs {
-		switch f.kind {
-		case kindString:
+		switch {
+		case f.kind == kindString && f.path == "":
 			in.flags[f.name] = fs.String(f.name, "", f.usage)
-		case kindBool:
+		case f.kind == kindBool && f.path == "":
 			in.bools[f.name] = fs.Bool(f.name, false, f.usage)
+		case f.kind == kindBool:
+			fs.BoolFunc(f.name, f.usage, func(v string) error { return fill(in.body, f, v) })
 		default:
 			fs.Func(f.name, f.usage, func(v string) error { return fill(in.body, f, v) })
 		}

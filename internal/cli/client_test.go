@@ -72,7 +72,10 @@ func oneJSONValue(out string) bool {
 // TestCommandWalk walks every row of the command table against the admin
 // listener, with standard input closed (AC-41): under --json each sample
 // prints one JSON value with its exit code; without it the same exit code;
-// and a sample that needs --yes exits 2 without it, before any call.
+// and a sample that needs --yes exits 2 without it, before any call. Each
+// sample runs twice on one server, so an "@" in an argument is "1" in the
+// --json run and "2" in the other: both runs create, read and remove a
+// resource of their own.
 func TestCommandWalk(t *testing.T) {
 	stdin := os.Stdin
 	r, w, err := os.Pipe()
@@ -90,11 +93,21 @@ func TestCommandWalk(t *testing.T) {
 		args []string
 		code int
 	}{
-		"version":       {{nil, 0}},
-		"validate":      {{nil, 0}, {[]string{"-f", example}, 0}, {[]string{"-f", invalid}, 1}},
-		"settings show": {{nil, 0}},
-		"settings set":  {{[]string{"--max-parallel-requests", "9", "--budget", "limit_usd=10,reset_interval=monthly"}, 0}, {[]string{"--max-parallel-requests", "-1"}, 1}},
-		"export":        {{nil, 0}},
+		"version":           {{nil, 0}},
+		"validate":          {{nil, 0}, {[]string{"-f", example}, 0}, {[]string{"-f", invalid}, 1}},
+		"settings show":     {{nil, 0}},
+		"settings set":      {{[]string{"--max-parallel-requests", "9", "--budget", "limit_usd=10,reset_interval=monthly"}, 0}, {[]string{"--max-parallel-requests", "-1"}, 1}},
+		"providers presets": {{nil, 0}},
+		"providers add": {
+			{[]string{"walk@", "--preset", "openrouter", "--billing", "subscription", "--quota", "5h:requests=10", "--target-defaults", "dialect=adaptive_effort"}, 0},
+			{[]string{"bare@", "--protocol", "openai", "--base-url", "http://127.0.0.1:8000/v1", "--allow-private-network", "--billing", "none"}, 0},
+			{[]string{"walk@"}, 1}, {[]string{"other@", "--preset", "nope"}, 1}, {[]string{"dashscope"}, 1},
+		},
+		"providers list":   {{nil, 0}},
+		"providers show":   {{[]string{"walk@"}, 0}, {[]string{"nope"}, 1}},
+		"providers set":    {{[]string{"walk@", "--stream-usage", "none", "--cost-report="}, 0}, {[]string{"walk@", "--billing", "monthly"}, 1}},
+		"providers remove": {{[]string{"bare@", "--yes"}, 0}, {[]string{"nope", "--yes"}, 1}},
+		"export":           {{nil, 0}},
 		"apply": {
 			{[]string{"-f", example, "--dry-run"}, 0}, {[]string{"-f", example}, 0}, {[]string{"-f", invalid}, 1},
 			{[]string{"-f", example, "--prune", "--yes"}, 0}, {[]string{"-f", example, "--prune", "--dry-run"}, 0},
@@ -108,12 +121,20 @@ func TestCommandWalk(t *testing.T) {
 		}
 		for _, s := range samples[name] {
 			args := append(slices.Clone(c.words), s.args...)
-			if r := runMain(vars, append(args, "--json")...); r.code != s.code || !oneJSONValue(r.stdout) {
+			run := func(n string) []string {
+				out := slices.Clone(args)
+				for i := range out {
+					out[i] = strings.ReplaceAll(out[i], "@", n)
+				}
+				return out
+			}
+			if r := runMain(vars, append(run("1"), "--json")...); r.code != s.code || !oneJSONValue(r.stdout) {
 				t.Errorf("%q --json: exit %d, want %d; stdout %q stderr %q", args, r.code, s.code, r.stdout, r.stderr)
 			}
-			if r := runMain(vars, args...); r.code != s.code || (r.code == 0 && r.stdout == "") {
+			if r := runMain(vars, run("2")...); r.code != s.code || (r.code == 0 && r.stdout == "") {
 				t.Errorf("%q: exit %d, want %d; stdout %q stderr %q", args, r.code, s.code, r.stdout, r.stderr)
 			}
+			args = run("1")
 			if i := slices.Index(args, "--yes"); i >= 0 {
 				if c.needsYes == nil {
 					t.Errorf("%q: --yes on a command that never needs it", args)
@@ -170,6 +191,29 @@ func TestRequests(t *testing.T) {
 		{[]string{"apply", "--prune", "-f", file, "--dry-run"}, "POST", "/admin/v1/apply?dry_run=true&prune=true", "version: 1\n"},
 		{[]string{"apply", "--prune", "-f", file, "--yes"}, "POST", "/admin/v1/apply?dry_run=false&prune=true", "version: 1\n"},
 		{[]string{"validate"}, "GET", "/admin/v1/validate", ""},
+		{[]string{"providers", "presets"}, "GET", "/admin/v1/presets", ""},
+		{[]string{"providers", "list"}, "GET", "/admin/v1/providers", ""},
+		{[]string{"providers", "add", "openrouter"}, "POST", "/admin/v1/providers", `{"name":"openrouter"}`},
+		{
+			[]string{"providers", "add", "minimax-plan", "--preset", "minimax", "--protocol", "anthropic", "--base-url", "https://api.minimax.io/anthropic",
+				"--api-key-env", "MINIMAX_PLAN_API_KEY", "--target-defaults", "dialect=adaptive_effort,n=1", "--billing", "subscription",
+				"--quota", "5h:requests=1500", "--quota", "7d:tokens=1e6"},
+			"POST", "/admin/v1/providers",
+			`{"api_key_env":"MINIMAX_PLAN_API_KEY","base_url":"https://api.minimax.io/anthropic","billing":"subscription","name":"minimax-plan","preset":"minimax",` +
+				`"protocol":"anthropic","quota":[{"requests":1500,"window":"5h"},{"tokens":1e6,"window":"7d"}],"target_defaults":{"dialect":"adaptive_effort","n":"1"}}`,
+		},
+		{
+			[]string{"providers", "add", "local", "--allow-private-network", "--cost-report", "path=usage.cost,usd_per_unit=1"},
+			"POST", "/admin/v1/providers", `{"allow_private_network":true,"cost_report":{"path":"usage.cost","usd_per_unit":1},"name":"local"}`,
+		},
+		{[]string{"providers", "show", "a.b"}, "GET", "/admin/v1/providers/a.b", ""},
+		{
+			[]string{"providers", "set", "local", "--allow-private-network=false", "--quota=", "--rerank-url=", "--gen-ai-provider", "x", "--stream-usage", "native"},
+			"PATCH", "/admin/v1/providers/local", `{"allow_private_network":false,"gen_ai_provider":"x","quota":null,"rerank_url":null,"stream_usage":"native"}`,
+		},
+		{[]string{"providers", "set", "local", "--quota=", "--quota", "1d:requests=5"}, "PATCH", "/admin/v1/providers/local", `{"quota":[{"requests":5,"window":"1d"}]}`},
+		{[]string{"providers", "set", "local", "--allow-private-network="}, "PATCH", "/admin/v1/providers/local", `{"allow_private_network":null}`},
+		{[]string{"providers", "remove", "local", "--yes"}, "DELETE", "/admin/v1/providers/local", ""},
 	} {
 		*got = recorded{}
 		if r := runMain(vars, tc.args...); r.code != 0 {
@@ -177,7 +221,7 @@ func TestRequests(t *testing.T) {
 		}
 		contentType := ""
 		switch {
-		case tc.method == http.MethodPost:
+		case tc.method == http.MethodPost && tc.args[0] == "apply":
 			contentType = "application/yaml"
 		case tc.body != "":
 			contentType = "application/json"
@@ -210,6 +254,20 @@ func TestUsage(t *testing.T) {
 		{"export", "--admin-url", "127.0.0.1:4001"},
 		{"validate", "--env-file", file},
 		{"validate", "-f", ""},
+		{"providers", "add"},
+		{"providers", "add", "a", "b"},
+		{"providers", "add", "a", "--quota", "5h"},
+		{"providers", "add", "a", "--quota", "5h:requests"},
+		{"providers", "add", "a", "--quota", "5h:requests=x"},
+		{"providers", "add", "a", "--quota", ":requests=1"},
+		{"providers", "add", "a", "--quota", "5h:=1"},
+		{"providers", "add", "a", "--allow-private-network=maybe"},
+		{"providers", "add", "a", "--target-defaults", "dialect"},
+		{"providers", "add", "a", "--protocol"},
+		{"providers", "set", "a", "--preset", "openai"},
+		{"providers", "show"},
+		{"providers", "remove", "a"},
+		{"providers", "remove", "a", "--json"},
 	} {
 		*got = recorded{}
 		r := runMain(vars, args...)

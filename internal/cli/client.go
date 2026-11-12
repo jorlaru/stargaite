@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -49,25 +50,46 @@ func fill(body map[string]any, f flagSpec, v string) error {
 		return nil
 	}
 	switch f.kind {
+	case kindString:
+		put(body, path, v)
+	case kindBool:
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("%q is not true or false", v)
+		}
+		put(body, path, b)
 	case kindNumber:
-		if raw := jsontext.Value(v); !raw.IsValid() || raw.Kind() != '0' {
+		if !number(v) {
 			return fmt.Errorf("%q is not a number", v)
 		}
 		put(body, path, jsontext.Value(v))
-	case kindTypedPairs:
+	case kindTypedPairs, kindStringPairs:
 		for _, pair := range strings.Split(v, ",") {
 			name, value, ok := strings.Cut(pair, "=")
 			if !ok || name == "" {
 				return fmt.Errorf("%q is not name=value", pair)
 			}
 			var typed any = value
-			if raw := jsontext.Value(value); raw.IsValid() && strings.ContainsRune("0tf", rune(raw.Kind())) {
+			if raw := jsontext.Value(value); f.kind == kindTypedPairs && raw.IsValid() && strings.ContainsRune("0tf", rune(raw.Kind())) {
 				typed = raw
 			}
 			put(body, append(path, name), typed)
 		}
+	case kindQuota:
+		window, limit, _ := strings.Cut(v, ":")
+		unit, n, ok := strings.Cut(limit, "=")
+		if !ok || window == "" || unit == "" || !number(n) {
+			return fmt.Errorf("%q is not <window>:<unit>=<number>", v)
+		}
+		list, _ := body[f.path].([]any) // null after "--quota=", which this entry replaces
+		body[f.path] = append(list, map[string]any{"window": window, unit: jsontext.Value(n)})
 	}
 	return nil
+}
+
+func number(v string) bool {
+	raw := jsontext.Value(v)
+	return raw.IsValid() && raw.Kind() == '0'
 }
 
 // put sets the member at path, making the objects on the way.

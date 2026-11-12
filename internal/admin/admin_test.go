@@ -43,12 +43,18 @@ var exampleEnv = map[string]string{
 }
 
 // resolve answers every lookup without the network: localhost is loopback,
-// any other name a public address.
+// the names of the set-time tests what they stand for, and any other name a
+// public address.
 func resolve(_ context.Context, host string) ([]netip.Addr, error) {
-	if host == "localhost" {
-		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	addr, ok := map[string]string{
+		"localhost":         "127.0.0.1",
+		"llm.internal.test": "10.0.0.5",
+		"metadata.test":     "169.254.169.254",
+	}[host]
+	if !ok {
+		addr = "93.184.216.34"
 	}
-	return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+	return []netip.Addr{netip.MustParseAddr(addr)}, nil
 }
 
 type fixture struct {
@@ -62,14 +68,19 @@ type fixture struct {
 // ServeHTTP in the test's goroutine, so the log buffer needs no lock.
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
+	return newFixtureEnv(t, func() config.Env {
+		return config.Env{Lookup: func(n string) (string, bool) { v, ok := exampleEnv[n]; return v, ok }, Resolve: resolve}
+	})
+}
+
+// newFixtureEnv is newFixture with its own Env.
+func newFixtureEnv(t *testing.T, env func() config.Env) *fixture {
+	t.Helper()
 	st, err := store.Open(context.Background(), t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	env := func() config.Env {
-		return config.Env{Lookup: func(n string) (string, bool) { v, ok := exampleEnv[n]; return v, ok }, Resolve: resolve}
-	}
 	cfg, err := config.Open(context.Background(), st, env, func() time.Time { return time.UnixMilli(testNow) })
 	if err != nil {
 		t.Fatal(err)

@@ -60,6 +60,12 @@ var routes = []route{
 	{"GET /admin/v1/export", (*server).export},
 	{"POST /admin/v1/apply", (*server).apply},
 	{"GET /admin/v1/validate", (*server).validate},
+	{"GET /admin/v1/presets", (*server).listPresets},
+	{"GET /admin/v1/providers", (*server).listProviders},
+	{"POST /admin/v1/providers", (*server).addProvider},
+	{"GET /admin/v1/providers/{name}", (*server).showProvider},
+	{"PATCH /admin/v1/providers/{name}", (*server).setProvider},
+	{"DELETE /admin/v1/providers/{name}", (*server).removeProvider},
 }
 
 // Handler returns the admin listener's handler. keyHash is the SHA-256 of the
@@ -81,9 +87,12 @@ func Handler(cfg *config.Service, keyHash [32]byte, log *slog.Logger) http.Handl
 			write(w, http.StatusUnauthorized, envelope{domain.NewError(domain.CodeInvalidAPIKey, "a valid admin key is required: Authorization: Bearer <admin key>")})
 			return
 		}
-		h, pattern := mux.Handler(r)
+		// The pattern only tells whether a route matched; the request goes
+		// through mux.ServeHTTP, which gives the route its wildcards
+		// (r.PathValue) and r.Pattern.
+		_, pattern := mux.Handler(r)
 		rec := &recorder{ResponseWriter: w, mux: pattern == ""}
-		h.ServeHTTP(rec, r)
+		mux.ServeHTTP(rec, r)
 		switch {
 		case rec.mux && rec.status == http.StatusNotFound:
 			write(w, rec.status, envelope{domain.NewError(domain.CodeNotFound, "no such route")})
@@ -274,14 +283,22 @@ func (s *server) getSettings(w http.ResponseWriter, _ *http.Request) {
 	write(w, http.StatusOK, s.cfg.Snapshot().Settings)
 }
 
-func (s *server) patchSettings(w http.ResponseWriter, r *http.Request) {
+// patchBody reads the merge patch of a PATCH request: one JSON value with no
+// repeated member. What it may hold is decided when it is merged.
+func patchBody(w http.ResponseWriter, r *http.Request) (jsontext.Value, error) {
 	data, err := body(w, r, maxBody)
-	var patch jsontext.Value
-	if err == nil {
-		if err = config.Decode(data, &patch); err != nil {
-			err = invalid("%v", err)
-		}
+	if err != nil {
+		return nil, err
 	}
+	var patch jsontext.Value
+	if err := config.Decode(data, &patch); err != nil {
+		return nil, invalid("%v", err)
+	}
+	return patch, nil
+}
+
+func (s *server) patchSettings(w http.ResponseWriter, r *http.Request) {
+	patch, err := patchBody(w, r)
 	if err != nil {
 		s.fail(w, err)
 		return

@@ -1,0 +1,256 @@
+{
+  "version": 1,
+  "settings": {
+    "budget": {
+      "limit_usd": 2000,
+      "reset_interval": "monthly"
+    },
+    "max_parallel_requests": 500,
+    "max_body_bytes": 10485760,
+    "max_response_bytes": 33554432,
+    "timeouts": {
+      "connect_ms": 5000,
+      "first_byte_ms": 30000,
+      "stream_idle_ms": 120000,
+      "total_ms": 180000
+    },
+    "retention": {
+      "usage_days": 90,
+      "usage_daily_months": 36,
+      "audit_months": 24
+    },
+    "telemetry": {
+      "otlp_endpoint": "https://langfuse.example.com/api/public/otel",
+      "basic_auth_env": [
+        "LANGFUSE_PUBLIC_KEY",
+        "LANGFUSE_SECRET_KEY"
+      ],
+      "headers": {
+        "x-langfuse-ingestion-version": "4"
+      },
+      "trust_traceparent": true,
+      "content_max_bytes": 32768
+    }
+  },
+  "providers": {
+    "openrouter": {
+      "protocol": "openai",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "billing": "pay_per_use",
+      "cost_report": {
+        "path": "usage.cost",
+        "usd_per_unit": 1
+      },
+      "stream_usage": "native",
+      "gen_ai_provider": "openrouter",
+      "target_defaults": {
+        "dialect": "reasoning_object",
+        "output_cap_param": "max_tokens"
+      }
+    },
+    "anthropic": {
+      "protocol": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "api_key_env": "ANTHROPIC_API_KEY",
+      "billing": "pay_per_use",
+      "gen_ai_provider": "anthropic",
+      "target_defaults": {
+        "dialect": "adaptive_effort"
+      }
+    },
+    "minimax-plan": {
+      "protocol": "anthropic",
+      "base_url": "https://api.minimax.io/anthropic",
+      "api_key_env": "MINIMAX_PLAN_API_KEY",
+      "billing": "subscription",
+      "quota": [
+        {
+          "window": "5h",
+          "requests": 1500
+        },
+        {
+          "window": "7d",
+          "requests": 15000
+        }
+      ],
+      "target_defaults": {
+        "dialect": "adaptive_effort"
+      }
+    },
+    "tei-embed": {
+      "protocol": "openai",
+      "base_url": "http://localhost:8080/v1",
+      "billing": "none",
+      "allow_private_network": true
+    },
+    "tei-rerank": {
+      "protocol": "openai",
+      "base_url": "http://localhost:8081/v1",
+      "rerank_url": "http://localhost:8081/rerank",
+      "billing": "none",
+      "allow_private_network": true
+    }
+  },
+  "targets": {
+    "minimax-plan/MiniMax-M3.1-Flash": {
+      "kind": "chat",
+      "capabilities": {
+        "tools": true,
+        "structured_output": true
+      },
+      "max_output_tokens": 64000,
+      "reasoning": {
+        "dialect": "adaptive_effort",
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "can_disable": false
+      }
+    },
+    "openrouter/qwen/qwen-3.6-flash": {
+      "kind": "chat",
+      "capabilities": {
+        "tools": true,
+        "structured_output": true,
+        "strict_schema": true
+      },
+      "max_output_tokens": 32000,
+      "reasoning": {
+        "dialect": "reasoning_object",
+        "levels": [
+          "minimal",
+          "low",
+          "medium",
+          "high"
+        ],
+        "can_disable": true
+      },
+      "pricing": {
+        "input_per_million": 0.15,
+        "output_per_million": 0.6,
+        "cache_read_per_million": 0.05,
+        "as_of": "2026-11-01"
+      }
+    },
+    "anthropic/claude-sonnet-5-5": {
+      "kind": "chat",
+      "capabilities": {
+        "tools": true,
+        "structured_output": true,
+        "strict_schema": true,
+        "vision": true
+      },
+      "max_output_tokens": 64000,
+      "reasoning": {
+        "dialect": "adaptive_effort",
+        "levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "can_disable": false
+      },
+      "pricing": {
+        "input_per_million": 3.0,
+        "output_per_million": 15.0,
+        "cache_read_per_million": 0.3,
+        "cache_write_per_million": 3.75,
+        "as_of": "2026-11-01"
+      }
+    },
+    "tei-embed/bge-m3": {
+      "kind": "embeddings"
+    },
+    "tei-rerank/bge-reranker-v2-m3": {
+      "kind": "rerank"
+    }
+  },
+  "models": {
+    "fast": {
+      "targets": [
+        "minimax-plan/MiniMax-M3.1-Flash",
+        "openrouter/qwen/qwen-3.6-flash"
+      ],
+      "requires": [
+        "tools",
+        "structured_output"
+      ],
+      "reasoning": {
+        "effort": "medium",
+        "mode": "default"
+      },
+      "max_output_tokens": 32000,
+      "params": {
+        "enable_search": "drop"
+      }
+    },
+    "deep": {
+      "targets": [
+        "anthropic/claude-sonnet-5-5"
+      ],
+      "requires": [
+        "tools",
+        "structured_output",
+        "strict_schema"
+      ],
+      "reasoning": {
+        "effort": "high",
+        "mode": "forced"
+      },
+      "max_output_tokens": 32000,
+      "budget": {
+        "limit_usd": 500,
+        "reset_interval": "monthly"
+      }
+    },
+    "embed": {
+      "targets": [
+        "tei-embed/bge-m3"
+      ],
+      "trace_sample_rate": 0
+    },
+    "rerank": {
+      "targets": [
+        "tei-rerank/bge-reranker-v2-m3"
+      ],
+      "trace_sample_rate": 0
+    }
+  },
+  "keys": {
+    "invoice-agent": {
+      "models": [
+        "fast",
+        "deep"
+      ],
+      "budget": {
+        "limit_usd": 100,
+        "reset_interval": "monthly"
+      },
+      "rpm_limit": 60,
+      "max_parallel_requests": 5,
+      "quota_share": {
+        "minimax-plan": 0.4
+      }
+    },
+    "classifier-flow": {
+      "models": [
+        "fast",
+        "embed",
+        "rerank"
+      ],
+      "budget": {
+        "limit_usd": 30,
+        "reset_interval": "monthly"
+      },
+      "max_parallel_requests": 10,
+      "trace_sample_rate": 0.1
+    }
+  }
+}

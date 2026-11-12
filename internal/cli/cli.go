@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -23,21 +24,39 @@ const (
 )
 
 type input struct {
-	json bool
+	json   bool
+	flags  map[string]*string // the value of each flag of the row, by name
+	getenv func(string) string
+}
+
+// flagSpec is one flag of a command. Every flag is a string until a command
+// needs another kind. A one-letter name is the short form the kick-off
+// writes ("-f"); the flag package also accepts it with two dashes.
+type flagSpec struct {
+	name, usage string
 }
 
 type command struct {
 	words []string // leading words: {"providers", "add"}
 	args  []string // positional arguments, all required
-	local func(in input, stdout io.Writer) error
+	flags []flagSpec
+	local func(ctx context.Context, in input, stdout io.Writer) error
 }
 
 var commands = []command{
 	{words: []string{"version"}, local: version},
+	{words: []string{"validate"}, local: validateFile, flags: []flagSpec{
+		{"f", "the YAML file to check, with no server running"},
+		{"env-file", "a file of NAME=value lines that credential references also resolve from"},
+	}},
 }
 
-// Main runs one command and returns the exit code of the process.
-func Main(args []string, _ func(string) string, stdout, stderr io.Writer) int {
+// errUsage marks a wrong usage found by a command itself: exit 2.
+var errUsage = errors.New("wrong usage")
+
+// Main runs one command and returns the exit code of the process. getenv is
+// the only way a command reads the process environment.
+func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) int {
 	if len(args) > 0 && (args[0] == "-h" || args[0] == "-help" || args[0] == "--help") {
 		usage(stdout)
 		return exitOK
@@ -57,8 +76,11 @@ func Main(args []string, _ func(string) string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.Usage = func() {}
-	var in input
+	in := input{flags: map[string]*string{}, getenv: getenv}
 	fs.BoolVar(&in.json, "json", false, "print JSON")
+	for _, f := range cmd.flags {
+		in.flags[f.name] = fs.String(f.name, "", f.usage)
+	}
 
 	pos, err := parse(fs, rest)
 	switch {
@@ -75,8 +97,11 @@ func Main(args []string, _ func(string) string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
-	if err := cmd.local(in, stdout); err != nil {
+	if err := cmd.local(context.Background(), in, stdout); err != nil {
 		say(stderr, "%s: %v\n", name, err)
+		if errors.Is(err, errUsage) {
+			return exitUsage
+		}
 		return exitFailure
 	}
 	return exitOK
@@ -113,7 +138,7 @@ func parse(fs *flag.FlagSet, args []string) ([]string, error) {
 	return append(pos, tail...), nil
 }
 
-func version(in input, stdout io.Writer) error {
+func version(_ context.Context, in input, stdout io.Writer) error {
 	if in.json {
 		return json.NewEncoder(stdout).Encode(map[string]string{"version": Version})
 	}

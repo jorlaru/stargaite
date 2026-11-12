@@ -81,10 +81,24 @@ func fill(body map[string]any, f flagSpec, v string) error {
 		if !ok || window == "" || unit == "" || !number(n) {
 			return fmt.Errorf("%q is not <window>:<unit>=<number>", v)
 		}
-		list, _ := body[f.path].([]any) // null after "--quota=", which this entry replaces
-		body[f.path] = append(list, map[string]any{"window": window, unit: jsontext.Value(n)})
+		appendTo(body, path, map[string]any{"window": window, unit: jsontext.Value(n)})
+	case kindList:
+		appendTo(body, path, v)
+	case kindRaw:
+		if !jsontext.Value(v).IsValid() {
+			return fmt.Errorf("%q is not one JSON value", v)
+		}
+		put(body, path, jsontext.Value(v))
 	}
 	return nil
+}
+
+// appendTo appends v to the list at path. The first value given starts a new
+// list, so a list is replaced whole, and one given after "--flag=" replaces
+// that null.
+func appendTo(body map[string]any, path []string, v any) {
+	list, _ := parent(body, path)[path[len(path)-1]].([]any)
+	put(body, path, append(list, v))
 }
 
 func number(v string) bool {
@@ -94,6 +108,12 @@ func number(v string) bool {
 
 // put sets the member at path, making the objects on the way.
 func put(body map[string]any, path []string, v any) {
+	parent(body, path)[path[len(path)-1]] = v
+}
+
+// parent returns the object that holds the member at path, making the
+// objects on the way.
+func parent(body map[string]any, path []string) map[string]any {
 	for _, name := range path[:len(path)-1] {
 		next, ok := body[name].(map[string]any)
 		if !ok {
@@ -102,7 +122,7 @@ func put(body map[string]any, path []string, v any) {
 		}
 		body = next
 	}
-	body[path[len(path)-1]] = v
+	return body
 }
 
 // call sends the one request of a command and prints the answer.

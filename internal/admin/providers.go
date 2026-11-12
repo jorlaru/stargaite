@@ -87,29 +87,8 @@ func (s *server) changed(w http.ResponseWriter, status int, res config.Result, n
 // explicit members are merged over it; only the result is stored, so from
 // then on the preset no longer counts.
 func (s *server) addProvider(w http.ResponseWriter, r *http.Request) {
-	data, err := body(w, r, maxBody)
-	var members map[string]jsontext.Value
-	if err == nil {
-		if err = config.Decode(data, &members); err != nil {
-			err = invalid("%v", err)
-		}
-	}
 	var name, preset string
-	for member, v := range map[string]*string{"name": &name, "preset": &preset} {
-		if raw, ok := members[member]; ok && err == nil {
-			if config.Decode(raw, v) != nil {
-				err = invalid("%s must be a string", member)
-			}
-			delete(members, member)
-		}
-	}
-	if err == nil && name == "" {
-		err = invalid("name is required")
-	}
-	var patch []byte
-	if err == nil {
-		patch, err = config.Encode(members)
-	}
+	patch, err := addBody(w, r, "name", &name, map[string]*string{"preset": &preset})
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -137,6 +116,37 @@ func (s *server) addProvider(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.changed(w, http.StatusCreated, res, name)
+}
+
+// addBody reads the body of a POST that creates a resource: a JSON object of
+// the declaration's members plus request members, each a string. It takes the
+// member key, which names the resource and is required, into *name and each
+// member of extra into its destination, and returns the other members encoded,
+// the merge patch the handler applies to its starting point. What it refuses
+// is refused before the pipeline, so it is not audited.
+func addBody(w http.ResponseWriter, r *http.Request, key string, name *string, extra map[string]*string) ([]byte, error) {
+	data, err := body(w, r, maxBody)
+	if err != nil {
+		return nil, err
+	}
+	var members map[string]jsontext.Value
+	if err := config.Decode(data, &members); err != nil {
+		return nil, invalid("%v", err)
+	}
+	strs := map[string]*string{key: name}
+	maps.Copy(strs, extra)
+	for member, v := range strs {
+		if raw, ok := members[member]; ok {
+			if config.Decode(raw, v) != nil {
+				return nil, invalid("%s must be a string", member)
+			}
+			delete(members, member)
+		}
+	}
+	if *name == "" {
+		return nil, invalid("%s is required", key)
+	}
+	return config.Encode(members)
 }
 
 // setProvider merges the patch into the stored declaration.

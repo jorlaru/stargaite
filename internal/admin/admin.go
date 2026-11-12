@@ -66,6 +66,19 @@ var routes = []route{
 	{"GET /admin/v1/providers/{name}", (*server).showProvider},
 	{"PATCH /admin/v1/providers/{name}", (*server).setProvider},
 	{"DELETE /admin/v1/providers/{name}", (*server).removeProvider},
+	// A target id holds "/": the trailing wildcard takes the rest of the
+	// path, unescaped, so the CLI escapes the whole id and "." or ".."
+	// segments of an upstream id are never cleaned away.
+	{"GET /admin/v1/targets", (*server).listTargets},
+	{"POST /admin/v1/targets", (*server).addTarget},
+	{"GET /admin/v1/targets/{id...}", (*server).showTarget},
+	{"PATCH /admin/v1/targets/{id...}", (*server).setTarget},
+	{"DELETE /admin/v1/targets/{id...}", (*server).removeTarget},
+	{"GET /admin/v1/models", (*server).listModels},
+	{"POST /admin/v1/models", (*server).addModel},
+	{"GET /admin/v1/models/{name}", (*server).showModel},
+	{"PATCH /admin/v1/models/{name}", (*server).setModel},
+	{"DELETE /admin/v1/models/{name}", (*server).removeModel},
 }
 
 // Handler returns the admin listener's handler. keyHash is the SHA-256 of the

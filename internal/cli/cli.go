@@ -45,7 +45,9 @@ const (
 	kindNumber                      // a JSON number at path
 	kindTypedPairs                  // name=value pairs under path, comma-separated or repeated: a JSON number, true or false is sent as that literal, anything else as a string
 	kindStringPairs                 // the same, every value sent as a string
-	kindQuota                       // <window>:<unit>=<n>, repeated: appends {"window": window, unit: n} to the list at path, a top-level member
+	kindQuota                       // <window>:<unit>=<n>, repeated: appends {"window": window, unit: n} to the list at path
+	kindList                        // repeated: appends the value, a JSON string, to the list at path, in order
+	kindRaw                         // one JSON value, sent verbatim at path
 )
 
 // flagSpec is one flag of a command. A one-letter name is the short form the
@@ -104,8 +106,54 @@ var providerFlags = []flagSpec{
 	{"allow-private-network", kindBool, "allow_private_network", "allow plain HTTP, loopback and private addresses"},
 }
 
+// targetFlags are the fields of a target (kick-off section 6), with the
+// flags of its reasoning block (kick-off section 13.3).
+var targetFlags = []flagSpec{
+	{"kind", kindString, "kind", "chat, embeddings or rerank"},
+	{"capabilities", kindTypedPairs, "capabilities", "tools=<true|false>,structured_output=...,strict_schema=...,vision=..."},
+	{"max-output-tokens", kindNumber, "max_output_tokens", "the model's own output limit"},
+	{"output-cap-param", kindString, "output_cap_param", "the parameter an alias cap is sent as toward an openai target"},
+	{"dialect", kindString, "reasoning.dialect", "the reasoning dialect"},
+	{"level", kindList, "reasoning.levels", "a level the provider accepts, repeated in scale order"},
+	{"can-disable", kindBool, "reasoning.can_disable", "whether reasoning can be turned off"},
+	{"thinking-budget", kindTypedPairs, "reasoning.budgets", "<level>=<tokens>: the budget of a level, for thinking_budget"},
+	{"effort-map", kindStringPairs, "reasoning.map", "<level>=<level>: the level sent for a canonical level"},
+	{"reasoning-on", kindRaw, "reasoning.on", "the exact JSON fragment that turns reasoning on"},
+	{"reasoning-off", kindRaw, "reasoning.off", "the exact JSON fragment that turns reasoning off"},
+	{"pricing", kindTypedPairs, "pricing", "input_per_million=<usd>,output_per_million=<usd>,cache_read_per_million=...,cache_write_per_million=...,as_of=<date>"},
+	{"unsupported-param", kindList, "unsupported_params", "a parameter the target does not accept, repeated"},
+	{"response-model", kindList, "response_models", "a model name the provider may answer with, repeated"},
+	{"inline-think-tags", kindBool, "inline_think_tags", "remove <think> blocks from the visible content"},
+}
+
+// modelFlags are the fields of a model alias (kick-off section 6).
+var modelFlags = []flagSpec{
+	{"target", kindList, "targets", "a target id, repeated: the primary first, then the fallbacks"},
+	{"require", kindList, "requires", "a capability every target must declare true, repeated"},
+	{"effort", kindString, "reasoning.effort", "the alias's reasoning effort, or provider_default"},
+	{"effort-mode", kindString, "reasoning.mode", "default (the client's effort wins) or forced"},
+	{"max-output-tokens", kindNumber, "max_output_tokens", "the alias's output cap"},
+	{"param", kindStringPairs, "params", "<parameter>=<forward|drop>: a rule for a parameter"},
+	{"budget", kindTypedPairs, "budget", "limit_usd=<usd>,reset_interval=<daily|monthly|never>"},
+	{"rpm-limit", kindNumber, "rpm_limit", "requests per minute"},
+	{"tpm-limit", kindNumber, "tpm_limit", "tokens per minute"},
+	{"max-parallel-requests", kindNumber, "max_parallel_requests", "requests in flight"},
+	{"trace-sample-rate", kindNumber, "trace_sample_rate", "the share of requests traced, 0 to 1"},
+}
+
+// add is the request of a command that creates the resource its positional
+// argument names: the body flags given, plus that argument as member key.
+func add(collection, key string) func(input) (string, string, any) {
+	return func(in input) (string, string, any) {
+		in.body[key] = in.args[0]
+		return http.MethodPost, collection, in.body
+	}
+}
+
 // named is the request of a command on the resource its positional argument
-// names; a PATCH sends the body flags given as the merge patch.
+// names; a PATCH sends the body flags given as the merge patch. The argument
+// is escaped whole, so each "/" of a target id travels as %2F and no segment
+// of an upstream id is cleaned away on the server.
 func named(method, collection string) func(input) (string, string, any) {
 	return func(in input) (string, string, any) {
 		var body any
@@ -129,14 +177,21 @@ var commands = []command{
 	{words: []string{"providers", "presets"}, request: get("/presets")},
 	{words: []string{"providers", "add"}, args: []string{"name"}, flags: append(slices.Clone(providerFlags),
 		flagSpec{"preset", kindString, "preset", "the preset to start from (default: the one named like the provider, if any)"}),
-		request: func(in input) (string, string, any) {
-			in.body["name"] = in.args[0]
-			return http.MethodPost, "/providers", in.body
-		}},
+		request: add("/providers", "name")},
 	{words: []string{"providers", "list"}, request: get("/providers")},
 	{words: []string{"providers", "show"}, args: []string{"name"}, request: named(http.MethodGet, "/providers")},
 	{words: []string{"providers", "set"}, args: []string{"name"}, flags: providerFlags, request: named(http.MethodPatch, "/providers")},
 	{words: []string{"providers", "remove"}, args: []string{"name"}, needsYes: func(input) bool { return true }, request: named(http.MethodDelete, "/providers")},
+	{words: []string{"targets", "add"}, args: []string{"id"}, flags: targetFlags, request: add("/targets", "id")},
+	{words: []string{"targets", "list"}, request: get("/targets")},
+	{words: []string{"targets", "show"}, args: []string{"id"}, request: named(http.MethodGet, "/targets")},
+	{words: []string{"targets", "set"}, args: []string{"id"}, flags: targetFlags, request: named(http.MethodPatch, "/targets")},
+	{words: []string{"targets", "remove"}, args: []string{"id"}, needsYes: func(input) bool { return true }, request: named(http.MethodDelete, "/targets")},
+	{words: []string{"models", "add"}, args: []string{"name"}, flags: modelFlags, request: add("/models", "name")},
+	{words: []string{"models", "list"}, request: get("/models")},
+	{words: []string{"models", "show"}, args: []string{"name"}, request: named(http.MethodGet, "/models")},
+	{words: []string{"models", "set"}, args: []string{"name"}, flags: modelFlags, request: named(http.MethodPatch, "/models")},
+	{words: []string{"models", "remove"}, args: []string{"name"}, needsYes: func(input) bool { return true }, request: named(http.MethodDelete, "/models")},
 	{words: []string{"export"}, request: func(in input) (string, string, any) {
 		if in.json {
 			return http.MethodGet, "/export?format=json", nil

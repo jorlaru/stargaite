@@ -107,7 +107,24 @@ func TestCommandWalk(t *testing.T) {
 		"providers show":   {{[]string{"walk@"}, 0}, {[]string{"nope"}, 1}},
 		"providers set":    {{[]string{"walk@", "--stream-usage", "none", "--cost-report="}, 0}, {[]string{"walk@", "--billing", "monthly"}, 1}},
 		"providers remove": {{[]string{"bare@", "--yes"}, 0}, {[]string{"nope", "--yes"}, 1}},
-		"export":           {{nil, 0}},
+		"targets add": {
+			{[]string{"walk@/up/model-1.5", "--kind", "chat", "--capabilities", "tools=true", "--max-output-tokens", "1000", "--level", "low", "--level", "high", "--can-disable"}, 0},
+			{[]string{"walk@/up/model-1.5", "--kind", "chat"}, 1}, {[]string{"nope/x", "--kind", "chat"}, 1},
+		},
+		"targets list":   {{nil, 0}},
+		"targets show":   {{[]string{"walk@/up/model-1.5"}, 0}, {[]string{"walk@/nope"}, 1}},
+		"targets set":    {{[]string{"walk@/up/model-1.5", "--reasoning-on", `{"thinking":{"type":"enabled"}}`, "--level="}, 0}, {[]string{"walk@/up/model-1.5", "--kind", "image"}, 1}},
+		"targets remove": {{[]string{"walk@/up/model-1.5", "--yes"}, 0}, {[]string{"walk@/nope", "--yes"}, 1}},
+		"models add": {
+			{[]string{"m@", "--target", "walk@/created", "--effort", "low", "--effort-mode", "forced", "--max-output-tokens", "100"}, 0},
+			{[]string{"m@", "--target", "walk@/created"}, 1},
+			{[]string{"x", "--target", "walk@/a", "--target", "walk@/b", "--target", "walk@/c", "--target", "walk@/d"}, 1},
+		},
+		"models list":   {{nil, 0}},
+		"models show":   {{[]string{"m@"}, 0}, {[]string{"nope"}, 1}},
+		"models set":    {{[]string{"m@", "--param", "enable_search=drop", "--trace-sample-rate", "0"}, 0}, {[]string{"m@", "--target", "nope/x"}, 1}},
+		"models remove": {{[]string{"m@", "--yes"}, 0}, {[]string{"nope", "--yes"}, 1}},
+		"export":        {{nil, 0}},
 		"apply": {
 			{[]string{"-f", example, "--dry-run"}, 0}, {[]string{"-f", example}, 0}, {[]string{"-f", invalid}, 1},
 			{[]string{"-f", example, "--prune", "--yes"}, 0}, {[]string{"-f", example, "--prune", "--dry-run"}, 0},
@@ -214,6 +231,33 @@ func TestRequests(t *testing.T) {
 		{[]string{"providers", "set", "local", "--quota=", "--quota", "1d:requests=5"}, "PATCH", "/admin/v1/providers/local", `{"quota":[{"requests":5,"window":"1d"}]}`},
 		{[]string{"providers", "set", "local", "--allow-private-network="}, "PATCH", "/admin/v1/providers/local", `{"allow_private_network":null}`},
 		{[]string{"providers", "remove", "local", "--yes"}, "DELETE", "/admin/v1/providers/local", ""},
+		{[]string{"targets", "list"}, "GET", "/admin/v1/targets", ""},
+		{
+			[]string{"targets", "add", "openrouter/qwen/qwen-3.6-flash", "--kind", "chat", "--capabilities", "tools=true,vision=false", "--level", "low", "--level", "high",
+				"--can-disable=false", "--thinking-budget", "low=1024", "--effort-map", "max=high", "--reasoning-on", ` {"thinking": {"type":"enabled"}} `, "--reasoning-off", "{}",
+				"--pricing", "input_per_million=0.15,as_of=2026-11-01", "--unsupported-param", "a", "--unsupported-param", "b", "--response-model", "4",
+				"--inline-think-tags", "--max-output-tokens", "4", "--output-cap-param=", "--dialect", "thinking_budget"},
+			"POST", "/admin/v1/targets",
+			`{"capabilities":{"tools":true,"vision":false},"id":"openrouter/qwen/qwen-3.6-flash","inline_think_tags":true,"kind":"chat","max_output_tokens":4,` +
+				`"output_cap_param":null,"pricing":{"as_of":"2026-11-01","input_per_million":0.15},"reasoning":{"budgets":{"low":1024},"can_disable":false,` +
+				`"dialect":"thinking_budget","levels":["low","high"],"map":{"max":"high"},"off":{},"on":{"thinking":{"type":"enabled"}}},"response_models":["4"],"unsupported_params":["a","b"]}`,
+		},
+		{[]string{"targets", "show", "openrouter/qwen/qwen-3.6-flash"}, "GET", "/admin/v1/targets/openrouter%2Fqwen%2Fqwen-3.6-flash", ""},
+		{[]string{"targets", "set", "p/a b%c/./d", "--level="}, "PATCH", "/admin/v1/targets/p%2Fa%20b%25c%2F.%2Fd", `{"reasoning":{"levels":null}}`},
+		{[]string{"targets", "set", "p/m", "--level", "x", "--level=", "--level", "y", "--reasoning-on="}, "PATCH", "/admin/v1/targets/p%2Fm", `{"reasoning":{"levels":["y"],"on":null}}`},
+		{[]string{"targets", "remove", "p/m", "--yes"}, "DELETE", "/admin/v1/targets/p%2Fm", ""},
+		{[]string{"models", "list"}, "GET", "/admin/v1/models", ""},
+		{
+			[]string{"models", "add", "fast", "--target", "a/b", "--target", "c/d", "--require", "tools", "--effort", "medium", "--effort-mode", "default",
+				"--max-output-tokens", "32000", "--param", "enable_search=drop", "--budget", "limit_usd=500,reset_interval=monthly", "--trace-sample-rate", "0",
+				"--rpm-limit", "5", "--tpm-limit", "6", "--max-parallel-requests", "7"},
+			"POST", "/admin/v1/models",
+			`{"budget":{"limit_usd":500,"reset_interval":"monthly"},"max_output_tokens":32000,"max_parallel_requests":7,"name":"fast","params":{"enable_search":"drop"},` +
+				`"reasoning":{"effort":"medium","mode":"default"},"requires":["tools"],"rpm_limit":5,"targets":["a/b","c/d"],"tpm_limit":6,"trace_sample_rate":0}`,
+		},
+		{[]string{"models", "show", "fast"}, "GET", "/admin/v1/models/fast", ""},
+		{[]string{"models", "set", "fast", "--target", "4", "--effort="}, "PATCH", "/admin/v1/models/fast", `{"reasoning":{"effort":null},"targets":["4"]}`},
+		{[]string{"models", "remove", "fast", "--yes"}, "DELETE", "/admin/v1/models/fast", ""},
 	} {
 		*got = recorded{}
 		if r := runMain(vars, tc.args...); r.code != 0 {
@@ -268,6 +312,19 @@ func TestUsage(t *testing.T) {
 		{"providers", "show"},
 		{"providers", "remove", "a"},
 		{"providers", "remove", "a", "--json"},
+		{"targets", "add"},
+		{"targets", "add", "p/m", "--reasoning-on", "{"},
+		{"targets", "add", "p/m", "--reasoning-off", "{} {}"},
+		{"targets", "add", "p/m", "--can-disable=maybe"},
+		{"targets", "add", "p/m", "--max-output-tokens", "4k"},
+		{"targets", "add", "p/m", "--thinking-budget", "low"},
+		{"targets", "set", "p/m", "--effort", "low"},
+		{"targets", "remove", "p/m"},
+		{"models", "add", "m", "--max-output-tokens", "x"},
+		{"models", "add", "m", "--param", "x"},
+		{"models", "add", "m", "--level", "low"},
+		{"models", "show", "m", "n"},
+		{"models", "remove", "m"},
 	} {
 		*got = recorded{}
 		r := runMain(vars, args...)
@@ -367,4 +424,67 @@ secrets.a: sk-x
 	if r.code != 0 || r.stdout != want {
 		t.Errorf("exit %d, stderr %q, stdout\n%s\nwant\n%s", r.code, r.stderr, r.stdout, want)
 	}
+}
+
+// TestAnnexBByCommand: the providers, targets and aliases of annex B built
+// one command at a time equal those of the applied file (AC-39 over annex B).
+// Two targets are created by models add and completed by targets set.
+func TestAnnexBByCommand(t *testing.T) {
+	built := adminServer(t)
+	levels := []string{"--level", "low", "--level", "medium", "--level", "high", "--level", "xhigh", "--level", "max"}
+	for _, args := range [][]string{
+		{"providers", "add", "openrouter"},
+		{"providers", "add", "anthropic"},
+		{"providers", "add", "minimax-plan", "--preset", "minimax", "--protocol", "anthropic", "--base-url", "https://api.minimax.io/anthropic",
+			"--api-key-env", "MINIMAX_PLAN_API_KEY", "--target-defaults", "dialect=adaptive_effort", "--billing", "subscription",
+			"--quota", "5h:requests=1500", "--quota", "7d:requests=15000"},
+		{"providers", "add", "tei-embed", "--protocol", "openai", "--base-url", "http://localhost:8080/v1", "--billing", "none", "--allow-private-network"},
+		{"providers", "add", "tei-rerank", "--protocol", "openai", "--base-url", "http://localhost:8081/v1", "--rerank-url", "http://localhost:8081/rerank",
+			"--billing", "none", "--allow-private-network"},
+		append([]string{"targets", "add", "minimax-plan/MiniMax-M3.1-Flash", "--kind", "chat", "--capabilities", "tools=true,structured_output=true",
+			"--max-output-tokens", "64000", "--can-disable=false"}, levels...),
+		{"targets", "add", "openrouter/qwen/qwen-3.6-flash", "--kind", "chat", "--capabilities", "tools=true,structured_output=true,strict_schema=true",
+			"--max-output-tokens", "32000", "--output-cap-param=", "--level", "minimal", "--level", "low", "--level", "medium", "--level", "high", "--can-disable",
+			"--pricing", "input_per_million=0.15,output_per_million=0.60,cache_read_per_million=0.05,as_of=2026-11-01"},
+		append([]string{"targets", "add", "anthropic/claude-sonnet-5-5", "--kind", "chat", "--capabilities", "tools=true,structured_output=true,strict_schema=true,vision=true",
+			"--max-output-tokens", "64000", "--can-disable=false",
+			"--pricing", "input_per_million=3.00,output_per_million=15.00,cache_read_per_million=0.30,cache_write_per_million=3.75,as_of=2026-11-01"}, levels...),
+		{"models", "add", "fast", "--target", "minimax-plan/MiniMax-M3.1-Flash", "--target", "openrouter/qwen/qwen-3.6-flash", "--require", "tools",
+			"--require", "structured_output", "--effort", "medium", "--effort-mode", "default", "--max-output-tokens", "32000", "--param", "enable_search=drop"},
+		{"models", "add", "deep", "--target", "anthropic/claude-sonnet-5-5", "--require", "tools", "--require", "structured_output", "--require", "strict_schema",
+			"--effort", "high", "--effort-mode", "forced", "--max-output-tokens", "32000", "--budget", "limit_usd=500,reset_interval=monthly"},
+		{"models", "add", "embed", "--target", "tei-embed/bge-m3", "--trace-sample-rate", "0"},
+		{"targets", "set", "tei-embed/bge-m3", "--kind", "embeddings"},
+		{"models", "add", "rerank", "--target", "tei-rerank/bge-reranker-v2-m3", "--trace-sample-rate", "0"},
+		{"targets", "set", "tei-rerank/bge-reranker-v2-m3", "--kind", "rerank"},
+	} {
+		r := runMain(built, append(args, "--json")...)
+		if r.code != 0 {
+			t.Fatalf("%q: exit %d, stdout %s", args, r.code, r.stdout)
+		}
+		if args[1] == "add" && args[0] == "models" && strings.HasPrefix(args[4], "tei-") && !strings.Contains(r.stdout, `{"kind":"target","name":"`+args[4]+`","action":"created"`) {
+			t.Errorf("%q: the created target is not in the diff: %s", args, r.stdout)
+		}
+	}
+	applied := adminServer(t)
+	if r := runMain(applied, "apply", "-f", "../../config.example.yaml"); r.code != 0 {
+		t.Fatalf("apply: exit %d, stderr %s", r.code, r.stderr)
+	}
+	got, want := exported(t, built), exported(t, applied)
+	for _, kind := range []string{"providers", "targets", "models"} {
+		if g, w := got[kind], want[kind]; !bytes.Equal(g, w) || len(w) < 100 {
+			t.Errorf("%s built by command:\n%s\napplied:\n%s", kind, g, w)
+		}
+	}
+}
+
+// exported is the canonical export of the instance at vars, by member.
+func exported(t *testing.T, vars map[string]string) map[string]json.RawMessage {
+	t.Helper()
+	r := runMain(vars, "export", "--json")
+	var doc map[string]json.RawMessage
+	if r.code != 0 || json.Unmarshal([]byte(r.stdout), &doc) != nil {
+		t.Fatalf("export: exit %d, stdout %s", r.code, r.stdout)
+	}
+	return doc
 }

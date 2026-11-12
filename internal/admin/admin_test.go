@@ -443,6 +443,12 @@ func TestApplyExportFixedPoint(t *testing.T) {
 			var res written
 			decode(t, f.do(t, http.MethodPatch, "/admin/v1/settings", []byte(`{"timeouts":{"total_ms":1000}}`)), http.StatusOK, &res)
 		}},
+		{"built through the provider, target and alias routes", func(t *testing.T, f *fixture) {
+			f.addProvider(t, `{"name":"anthropic"}`)
+			f.addTarget(t, `{"id":"anthropic/a/b.c","kind":"chat","reasoning":{"dialect":"thinking_budget","levels":["low"],"budgets":{"low":1024},`+
+				`"on":{"thinking":{"type":"enabled","budget_tokens":12345678901234567890}},"off":{}},"pricing":{"input_per_million":0,"output_per_million":1.50,"as_of":"2026-11-01"}}`)
+			f.addModel(t, `{"name":"m","targets":["anthropic/a/b.c","anthropic/created"],"max_output_tokens":10,"trace_sample_rate":0}`)
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t)

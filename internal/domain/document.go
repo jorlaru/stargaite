@@ -12,7 +12,8 @@
 //     read alike only for strings, lists and maps.
 //   - A field whose zero value is itself a declaration (a capability set to
 //     false, a sample rate or a price of 0) is a pointer: nil is undeclared.
-//   - A block is a pointer when its presence carries meaning or when it holds
+//   - A block is a pointer when its presence carries meaning (every member of
+//     settings: apply replaces a declared one, even empty) or when it holds
 //     lists or maps; nil is undeclared. The other blocks are plain values.
 package domain
 
@@ -37,8 +38,8 @@ type Settings struct {
 	MaxParallelRequests int64      `json:"max_parallel_requests,omitzero"`
 	MaxBodyBytes        int64      `json:"max_body_bytes,omitzero"`
 	MaxResponseBytes    int64      `json:"max_response_bytes,omitzero"`
-	Timeouts            Timeouts   `json:"timeouts,omitzero"`
-	Retention           Retention  `json:"retention,omitzero"`
+	Timeouts            *Timeouts  `json:"timeouts,omitzero"`
+	Retention           *Retention `json:"retention,omitzero"`
 	Telemetry           *Telemetry `json:"telemetry,omitzero"`
 }
 

@@ -62,11 +62,14 @@ image:
 	test "$$(docker run --rm $(IMAGE) version)" = "$$VERSION"
 
 # A read-only root and a volume on /data: the ready line proves that the non-root
-# user writes the data directory, and SIGTERM must stop the proxy with exit 0.
+# user writes the data directory; the CLI inside the container proves that the
+# admin key was bootstrapped there and the admin API answers; and SIGTERM must
+# stop the proxy with exit 0.
 image-test: image
 	@id=$$(docker run -d --read-only -v /data $(IMAGE)) || exit 1; \
 	for i in $$(seq 40); do docker logs $$id 2>&1 | grep -q '"msg":"ready"' && break; sleep 0.25; done; \
+	shown=$$(docker exec $$id /stargaite settings show --json); shown_code=$$?; \
 	docker stop -t 35 $$id >/dev/null; \
 	code=$$(docker inspect -f '{{.State.ExitCode}}' $$id); logs=$$(docker logs $$id 2>&1); \
-	docker container rm --volumes $$id >/dev/null; echo "$$logs"; \
-	echo "$$logs" | grep -q '"msg":"ready","data_dir":"/data"' && echo "$$logs" | grep -q '"msg":"stopped"' && test "$$code" = 0
+	docker container rm --volumes $$id >/dev/null; echo "$$logs"; echo "settings show: exit $$shown_code: $$shown"; \
+	echo "$$logs" | grep -q '"msg":"ready","data_dir":"/data"' && echo "$$logs" | grep -q '"msg":"stopped"' && test "$$code" = 0 && test "$$shown_code" = 0

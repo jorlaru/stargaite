@@ -30,8 +30,13 @@ const lookupTimeout = 30 * time.Second
 // file, with the verdict apply would give on an empty instance (OPS-5).
 func validateFile(ctx context.Context, in input, stdout io.Writer) error {
 	path := *in.flags["f"]
-	if path == "" {
-		return fmt.Errorf("%w: -f <file> is required; validate without -f asks a server, which this version cannot do yet", errUsage)
+	switch {
+	case !in.set["f"] && in.set["env-file"]:
+		return fmt.Errorf("%w: --env-file goes with -f; a server reads its own", errUsage)
+	case !in.set["f"]:
+		return errRemote // validate the published configuration
+	case path == "":
+		return fmt.Errorf("%w: -f needs a file", errUsage)
 	}
 	ctx, cancel := context.WithTimeout(ctx, lookupTimeout)
 	defer cancel()
@@ -54,11 +59,7 @@ func validateFile(ctx context.Context, in input, stdout io.Writer) error {
 			say(stdout, "no findings\n")
 		}
 		for _, f := range findings {
-			field := ""
-			if f.Field != "" {
-				field = " " + printable(f.Field)
-			}
-			if _, err := fmt.Fprintf(stdout, "%s %s %s%s: %s\n", f.Severity, f.Rule, printable(f.Resource), field, printable(f.Message)); err != nil {
+			if _, err := fmt.Fprintln(stdout, findingLine(f)); err != nil {
 				return err
 			}
 		}
@@ -67,6 +68,15 @@ func validateFile(ctx context.Context, in input, stdout io.Writer) error {
 		return fmt.Errorf("%d of %d findings are errors", errs, len(findings))
 	}
 	return nil
+}
+
+// findingLine is one finding on one line, for a person.
+func findingLine(f domain.Finding) string {
+	field := ""
+	if f.Field != "" {
+		field = " " + printable(f.Field)
+	}
+	return fmt.Sprintf("%s %s %s%s: %s", printable(f.Severity), printable(f.Rule), printable(f.Resource), field, printable(f.Message))
 }
 
 // printable quotes s when it holds a line break, an escape or another

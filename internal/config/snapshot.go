@@ -67,7 +67,7 @@ func build(st *State, env Env, findings []domain.Finding) *Snapshot {
 	s := &Snapshot{
 		Revision:  st.Revision,
 		Doc:       d,
-		Settings:  withDefaults(d.Settings),
+		Settings:  WithDefaults(d.Settings),
 		Providers: make(map[string]*Provider, len(d.Providers)),
 		Targets:   make(map[string]*Target, len(d.Targets)),
 		Models:    make(map[string]*Model, len(d.Models)),
@@ -115,19 +115,25 @@ func build(st *State, env Env, findings []domain.Finding) *Snapshot {
 	return s
 }
 
-// withDefaults gives every undeclared setting that has a default its default
+// WithDefaults gives every undeclared setting that has a default its default
 // (design section 13, point 15). A declaration is never changed: export
 // reads Doc.
-func withDefaults(s domain.Settings) domain.Settings {
+func WithDefaults(s domain.Settings) domain.Settings {
 	s.MaxBodyBytes = cmp.Or(s.MaxBodyBytes, domain.DefaultMaxBodyBytes)
 	s.MaxResponseBytes = cmp.Or(s.MaxResponseBytes, domain.DefaultMaxResponseBytes)
-	s.Timeouts.ConnectMS = cmp.Or(s.Timeouts.ConnectMS, domain.DefaultConnectMS)
-	s.Timeouts.FirstByteMS = cmp.Or(s.Timeouts.FirstByteMS, domain.DefaultFirstByteMS)
-	s.Timeouts.StreamIdleMS = cmp.Or(s.Timeouts.StreamIdleMS, domain.DefaultStreamIdleMS)
-	s.Timeouts.TotalMS = cmp.Or(s.Timeouts.TotalMS, domain.DefaultTotalMS)
-	s.Retention.UsageDays = cmp.Or(s.Retention.UsageDays, domain.DefaultUsageDays)
-	s.Retention.UsageDailyMonths = cmp.Or(s.Retention.UsageDailyMonths, domain.DefaultUsageDailyMonths)
-	s.Retention.AuditMonths = cmp.Or(s.Retention.AuditMonths, domain.DefaultAuditMonths)
+	t := cmp.Or(s.Timeouts, &domain.Timeouts{})
+	s.Timeouts = &domain.Timeouts{
+		ConnectMS:    cmp.Or(t.ConnectMS, domain.DefaultConnectMS),
+		FirstByteMS:  cmp.Or(t.FirstByteMS, domain.DefaultFirstByteMS),
+		StreamIdleMS: cmp.Or(t.StreamIdleMS, domain.DefaultStreamIdleMS),
+		TotalMS:      cmp.Or(t.TotalMS, domain.DefaultTotalMS),
+	}
+	r := cmp.Or(s.Retention, &domain.Retention{})
+	s.Retention = &domain.Retention{
+		UsageDays:        cmp.Or(r.UsageDays, domain.DefaultUsageDays),
+		UsageDailyMonths: cmp.Or(r.UsageDailyMonths, domain.DefaultUsageDailyMonths),
+		AuditMonths:      cmp.Or(r.AuditMonths, domain.DefaultAuditMonths),
+	}
 	if s.Telemetry != nil {
 		t := *s.Telemetry
 		if t.TrustTraceparent == nil {

@@ -221,6 +221,12 @@ func validateSettings(r *report, s domain.Settings) {
 	r.nonNegative("LIM-5", res, "max_parallel_requests", s.MaxParallelRequests)
 	r.nonNegative("LIM-6", res, "max_body_bytes", s.MaxBodyBytes)
 	r.nonNegative("RES-4", res, "max_response_bytes", s.MaxResponseBytes)
+	if s.Timeouts == nil {
+		s.Timeouts = &domain.Timeouts{}
+	}
+	if s.Retention == nil {
+		s.Retention = &domain.Retention{}
+	}
 	r.nonNegative("RES-3", res, "timeouts.connect_ms", s.Timeouts.ConnectMS)
 	r.nonNegative("RES-3", res, "timeouts.first_byte_ms", s.Timeouts.FirstByteMS)
 	r.nonNegative("RES-3", res, "timeouts.stream_idle_ms", s.Timeouts.StreamIdleMS)

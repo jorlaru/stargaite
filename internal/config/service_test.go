@@ -282,7 +282,7 @@ func TestCommitRows(t *testing.T) {
 		edit(st.Doc.Keys, "k", func(k *domain.Key) { k.RPMLimit = 10 })
 		st.Secrets[0].ValidUntil = testNow + 3_600_000
 		st.Secrets = append(st.Secrets, KeySecret{PublicID: "bbbbbbbbbbbb", KeyName: "k", Hash: hash2, CreatedAt: testNow})
-		st.Doc.Settings.Timeouts.TotalMS = 60_000
+		st.Doc.Settings.Timeouts = &domain.Timeouts{TotalMS: 60_000}
 	}))
 	wantRows(t, "diff of the update", entries(res.Diff), []string{
 		`provider p updated {"protocol":"openai","base_url":"https://api.example.com/v1","api_key_env":"P_API_KEY","billing":"none"} {"protocol":"openai","base_url":"https://api.example.com/v1","api_key_env":"P_API_KEY","billing":"subscription"}`,
@@ -303,7 +303,7 @@ func TestCommitRows(t *testing.T) {
 		delete(st.Doc.Models, "fast")
 		delete(st.Doc.Targets, "p/m")
 		delete(st.Doc.Providers, "p")
-		st.Doc.Settings.Timeouts = domain.Timeouts{}
+		st.Doc.Settings.Timeouts = nil
 	}))
 	wantRows(t, "diff of the prune", entries(res.Diff), []string{
 		`provider p removed {"protocol":"openai","base_url":"https://api.example.com/v1","api_key_env":"P_API_KEY","billing":"subscription"} `,
@@ -740,8 +740,8 @@ func TestSnapshotBuild(t *testing.T) {
 	}
 	empty := build(&State{}, Env{}, nil).Settings
 	if empty.MaxBodyBytes != domain.DefaultMaxBodyBytes || empty.MaxResponseBytes != domain.DefaultMaxResponseBytes ||
-		empty.Timeouts != (domain.Timeouts{ConnectMS: domain.DefaultConnectMS, FirstByteMS: domain.DefaultFirstByteMS, StreamIdleMS: domain.DefaultStreamIdleMS, TotalMS: domain.DefaultTotalMS}) ||
-		empty.Retention != (domain.Retention{UsageDays: domain.DefaultUsageDays, UsageDailyMonths: domain.DefaultUsageDailyMonths, AuditMonths: domain.DefaultAuditMonths}) || empty.Telemetry != nil {
+		*empty.Timeouts != (domain.Timeouts{ConnectMS: domain.DefaultConnectMS, FirstByteMS: domain.DefaultFirstByteMS, StreamIdleMS: domain.DefaultStreamIdleMS, TotalMS: domain.DefaultTotalMS}) ||
+		*empty.Retention != (domain.Retention{UsageDays: domain.DefaultUsageDays, UsageDailyMonths: domain.DefaultUsageDailyMonths, AuditMonths: domain.DefaultAuditMonths}) || empty.Telemetry != nil {
 		t.Errorf("defaults %+v", empty)
 	}
 	withTelemetry := &State{Doc: domain.Document{Settings: domain.Settings{Telemetry: &domain.Telemetry{OTLPEndpoint: "https://otel.example.com"}}}}

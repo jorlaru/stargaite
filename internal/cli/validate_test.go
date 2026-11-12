@@ -107,7 +107,7 @@ func TestValidateFileExitCodes(t *testing.T) {
 		{"standard input is never read", nil, []string{"-f", "/dev/stdin"}, 1},
 		{"invalid YAML", nil, []string{"-f", writeFile(t, "version: [\n")}, 1},
 		{"an unknown member", nil, []string{"-f", writeFile(t, "version: 1\nsetting: {}\n")}, 1},
-		{"no -f", nil, nil, 2},
+		{"--env-file without -f", nil, []string{"--env-file", "x"}, 2}, // without -f, validate asks the server
 		{"an empty -f", nil, []string{"-f", ""}, 2},
 		{"-f without its value", nil, []string{"-f"}, 2},
 		{"a positional", nil, []string{"-f", example, "extra"}, 2},

@@ -70,7 +70,7 @@ Versions are stated only where the survey verified them.
 | `internal/auth` | Token format: issue, parse, hash, constant-time compare | — |
 | `internal/presets` | The provider catalog as a Go literal | `domain` |
 | `internal/config` | Strict codec, YAML conversion, `Validate`, `CheckResolved`, `State`, `Service`, diff, configuration SQL, audit rows, `Snapshot`, `Env` and the env file parser | `domain`, `store`, `transport`, `auth` |
-| `internal/admin` | Admin listener: key bootstrap, authentication, envelope, handlers | `domain`, `config`, `presets` |
+| `internal/admin` | Admin listener: key bootstrap, authentication, envelope, handlers | `domain`, `config`, `auth`, `presets` |
 | `internal/api` | Data listener: health probes, `GET /v1/models` | `domain`, `config` |
 | `internal/cli` | Command table, flag parsing, admin client, output, offline `validate -f` | `domain`, `config` |
 | `tests/mockprovider` | Scriptable provider handler, package `mockprovider`; its `main` is the single file of `tests/mockprovider/cmd/mockprovider` | — |
@@ -83,7 +83,7 @@ Differences from annex C:
 - Only the packages above are created. `params`, `reasoning`, `plan`, `adapters`, `routing`, `admission`, `usage` and `telemetry` arrive with their features.
 - `store` holds no configuration SQL and imports no internal package, so phase 3 usage brings its own SQL through the same `Write`. Backup and retention join it in phase 4 as annex C says.
 - Audit rows are written by `config`, not `admin`: SEC-7 and AC-40 need them in the change's transaction.
-- `auth` holds only the token format; the allow-list is a method on the snapshot's key, which avoids a cycle with `config`.
+- `auth` holds only the token format; the allow-list is a method on the snapshot's key, which avoids a cycle with `config`. Settled in C5: `admin` imports `auth` for the admin key's alphabet (`auth.Secret`), the client-key prefix it refuses and the constant-time comparison (`auth.Equal`).
 - `transport` has no SSE code yet. `serve` wiring lives in `cmd/stargaite` so `cli` never imports `store`. `tests/e2e` is new.
 
 ## 4. Configuration: store, validation, snapshot
@@ -203,14 +203,15 @@ func CheckResolved(ctx context.Context, doc *domain.Document, urls []OutboundURL
 **Export and apply (OPS-3).**
 
 - `export` emits `Doc`: no secrets, no revoked keys, no derived fields; maps sorted by name. Comments and flow style of a hand-written file do not survive, and date-like strings are emitted quoted. The golden file is "export after applying `config.example.yaml`".
-- `apply` replaces each named resource by the file's declaration as a whole; each top-level member of `settings` counts as one resource. Presets and `target_defaults` are not consulted: the file is the declaration.
+- `apply` replaces each named resource by the file's declaration as a whole; each top-level member of `settings` counts as one resource, and one declared empty (`timeouts: {}`) is named, so its fields return to their defaults (settled in C5: every member of `domain.Settings` is a pointer). Presets and `target_defaults` are not consulted: the file is the declaration.
 - A key not present is created with a new secret, returned once in `Result.Secrets`; an existing key keeps its secrets; a key named in `Revoked` is `409 conflict`.
-- `--prune` removes absent providers, targets and aliases, revokes absent keys and clears absent settings. `--dry-run` goes no further than step 6 and writes nothing. `version` must be `1`.
+- `--prune` removes absent providers, targets and aliases, revokes absent keys and clears absent settings. `--dry-run` goes no further than step 6 and writes nothing. `version` must be `1`: settled in C5, the file's `version` goes into the checked document, so `Validate` refuses any other value as a finding (`unsupported_version`) and the refusal is audited like any other.
+- Settled in C5: `apply` is `Service.Apply(ctx, file, prune, dryRun)`, which builds the `Change` (summary `apply` or `apply --prune`, kind `configuration`) and calls `Commit`; `GET /validate` is `Service.Check(ctx)`. A file that does not decode (YAML, unknown member) is `400` before `Commit` and is not audited.
 - Property tests: `apply(export(S))` on S gives an empty diff; on an empty instance it gives a document equal to S (AC-39).
 
 **Start-up order of `serve`.** (1) Flags, then `STARGAITE_<FLAG>` variables. (2) The listener rule for both listeners (§5). (3) `store.Open`: directory `0700`, lock, SQLite; a held lock exits `1` (OPS-10, AC-42). The lock file stays open for the life of the process and is never deleted. (4) `config.Open`: load, validate, build, publish; it runs `CheckResolved` with no URLs, so start-up resolves credentials but no host name, and `serve` logs every finding of the published configuration (§13 point 13), then names its revision in the `ready` line. A row the strict decoder refuses stops the start with exit `1`. (5) Admin key. (6) Bind the admin listener, then the data listener; `/health/ready` answers `200` from here, and one `ready` log line names both bound addresses. On `SIGTERM`: `Shutdown` on both servers with a 30 s bound, then `store.Close`.
 
-**Admin key bootstrap (SEC-3).** `STARGAITE_ADMIN_KEY` wins. Otherwise `<data-dir>/admin.key` is read; when missing, 32 random bytes in lowercase base32 are written to a temporary file opened `O_EXCL` with mode `0600`, then `fsync`, `rename`, and `fsync` of the directory, all before the admin listener binds and under the lock. Only the SHA-256 of the key is kept in memory. `serve` exits `1` if the key has fewer than 32 characters or starts with `sk-stargaite-` (§13 point 17).
+**Admin key bootstrap (SEC-3).** `STARGAITE_ADMIN_KEY` wins. Otherwise `<data-dir>/admin.key` is read; when missing, 32 random bytes in lowercase base32 are written to a temporary file opened `O_EXCL` with mode `0600`, then `fsync`, `rename`, and `fsync` of the directory, all before the admin listener binds and under the lock. Only the SHA-256 of the key is kept in memory. `serve` exits `1` if the key has fewer than 32 characters, has leading or trailing whitespace (HTTP trims a header value, so no client could present it; settled in C5) or starts with `sk-stargaite-` (§13 point 17).
 
 **Credential resolution (SEC-5, OPS-6).**
 
@@ -248,12 +249,13 @@ Listens on `127.0.0.1:4001` under `/admin/v1`. Every CLI command that talks to a
 
 Rules of the listener:
 
-- **Authentication.** `Authorization: Bearer <admin key>`; SHA-256 of the presented token compared in constant time. Failure is `401 invalid_api_key` and a rate-limited log line. A client key fails the same way (SEC-2). One wrapper around the admin mux enforces it for every route.
+- **Authentication.** `Authorization: Bearer <admin key>`; SHA-256 of the presented token compared in constant time. Failure is `401 invalid_api_key` and a rate-limited log line (settled in C5: at most one line per 10 s, with the request id, the remote address and the count of failures since the previous line; never the presented token). The scheme is matched in any letter case. An authenticated request logs one `admin request` line: request id, method, path, status. A client key fails the same way (SEC-2). One wrapper around the admin mux enforces it for every route.
 - **Metrics token.** Out of phase 1: no metrics route is registered and `STARGAITE_METRICS_TOKEN` is not read; SEC-5 already forbids that name as a credential reference.
 - **Bodies.** JSON through the strict decoder; a repeated or unknown member is `400 invalid_request` naming it. Cap of 1 MiB, 16 MiB on `/apply` (sized for §18); above it `413 request_too_large`.
 - **Create and update.** `POST` on an existing or revoked name is `409 conflict`. `PATCH` merges, so `null` removes a member and lists are replaced whole, and the result goes through the pipeline. `preset` and `grace` are request members, never stored.
 - **Reads** come from the snapshot and add derived, read-only members: a provider's `credential` (`resolved`, `unresolved` or `none`), a key's `secrets` (public ids and `valid_until`). A credential value is never accepted or returned.
-- **Envelope.** Every response carries `x-stargaite-request-id`. The mux's plain-text 404 and 405 are rewritten into the JSON envelope.
+- **Envelope.** Every response carries `x-stargaite-request-id`. The mux's plain-text 404 and 405 are rewritten into the JSON envelope. Settled in C5: §15 has no row for `405`, so it answers status `405` with `invalid_request_error` and `invalid_request`, keeping the mux's `Allow` header. A `500` answers a fixed message naming the request id; its cause goes only to the log under that id (OPS-9). A route that takes query parameters (`/export`, `/apply`) refuses an unknown or repeated one, and a flag is `true` or `false`: absent is `false`, a flag without a value is refused, so neither a misspelt nor a bare `dry_run` ever applies for real.
+- **Settings (settled in C5).** `GET /settings` answers the effective values (§13 point 15); `PATCH /settings` merges into the stored declaration inside `Mutate`, so a member the strict decoder refuses is an audited refusal, and answers the `Result` plus `resource`, the effective settings after the change. `GET /validate` answers `200` with `{"findings":[…]}` whatever their severity.
 - **Listener rule (SEC-6, AC-45).** Evaluated per listener before binding: a host other than a loopback literal or `localhost` needs the certificate pair or `--behind-tls-proxy`; an empty host (`:4000`) is not loopback. Both servers set `ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, `IdleTimeout` and `MaxHeaderBytes`. No listener ever runs without a write timeout (§13 point 22).
 
 ```text
@@ -334,6 +336,7 @@ var commands = []command{ /* one row per shipped command of §13.3 */ }
 func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) int
 ```
 
+- **Settled in C5.** Kinds shipped so far: string and boolean (read by the row itself, no `path`), number and typed pairs; the others arrive with the commands that need them. A row may have both `local` and `request`: `local` returns a sentinel to hand over to the request, which is how `validate` without `-f` asks the server. A request body of the `yamlFile` type is read by `Main` (regular files only) and sent as `application/yaml`. Rows with a request get `--admin-url` and `--data-dir`; rows with `needsYes` get `--yes`. A `2xx` answer that holds an error finding exits `1`, so `validate` exits as `validate -f` does. A missing admin key and an unreachable API are both the local `admin_unreachable` envelope; an `-f` file that cannot be read is exit `1` with a local `invalid_request` envelope. The client never follows a redirect.
 - **Registration.** A command is one row. `Main` matches the leading words, builds one `FlagSet` from the row, parses, and either calls `local` or sends the one request. There is no per-command handler code and no rule: presets, "name equals a preset name", defaults and validation are the server's.
 - **Flags after positionals.** Standard `flag` stops at the first positional (verified), and the kick-off writes positionals first. `Main` therefore parses in a loop: parse, take one positional, parse the rest, until the arguments are exhausted; `--` ends flag parsing. Tested with flags before, after and between positionals.
 - **Flag convention (§13.3)**, written out as table rows, not derived by reflection:
@@ -352,7 +355,7 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 
 ## 7. Keys and authentication
 
-- **Format (SEC-1, ADR-011).** `sk-stargaite-<public id>-<secret>`, 79 characters. The public id is 12 characters and the secret 52 (32 random bytes), both in base32 with the lowercase alphabet `a-z2-7` and no padding, from `crypto/rand`. The standard encoding is upper case, so the alphabet is set explicitly and tested.
+- **Format (SEC-1, ADR-011).** `sk-stargaite-<public id>-<secret>`, 78 characters (corrected in C5: 13 + 12 + 1 + 52). The public id is 12 characters and the secret 52 (32 random bytes), both in base32 with the lowercase alphabet `a-z2-7` and no padding, from `crypto/rand`. The standard encoding is upper case, so the alphabet is set explicitly and tested.
 - **Storage.** `key_secrets` holds the public id and the SHA-256 of the full token. The token leaves the server once, in `Result.Secrets`.
 
 ```go
@@ -529,7 +532,7 @@ The end-to-end test builds the binary, starts it, runs the quick start by CLI ag
 
 **Fork-safe CI (AC-03).** Tests dial loopback only and DNS is injected, so no test needs the network or a secret. The hosted workflow only calls `make ci-container` and `make image-test` (which runs `make image` first), on `pull_request` and on pushes to the default branch, with read-only permissions, no secret reference and third-party steps pinned by commit. The host is GitHub Actions (OQ-4), so the file is `.github/workflows/ci.yml`. No PUB-2 search ships in the repository: its patterns would be the very names PUB-2 forbids, so maintainers run the search with their own patterns before publishing.
 
-**Container image (SEC-10).** A multi-stage Dockerfile: the builder compiles with `CGO_ENABLED=0 -trimpath` and creates an empty `/data`; the final stage is the pinned distroless image with the binary, `/data` copied with the non-root owner, `STARGAITE_DATA_DIR=/data`, `ENTRYPOINT ["/stargaite"]` and `CMD ["serve"]`. The image never bakes in `--behind-tls-proxy` or a non-loopback listener (§13 point 21). `make image-test` runs it with a read-only root and a volume on `/data` and waits for the ready line in the log, which proves the non-root user can write the data directory; then `docker stop` must end it with exit `0` and the stop line (confirmed in C3). From C10 it also runs `stargaite settings show --json` inside the container: exit `0` proves the key was bootstrapped and the admin API answers. Confirmed by hand in C1: the image runs as uid 65532 and `--chown=65532:65532` gives it `/data`, created with mode `0700`.
+**Container image (SEC-10).** A multi-stage Dockerfile: the builder compiles with `CGO_ENABLED=0 -trimpath` and creates an empty `/data`; the final stage is the pinned distroless image with the binary, `/data` copied with the non-root owner, `STARGAITE_DATA_DIR=/data`, `ENTRYPOINT ["/stargaite"]` and `CMD ["serve"]`. The image never bakes in `--behind-tls-proxy` or a non-loopback listener (§13 point 21). `make image-test` runs it with a read-only root and a volume on `/data` and waits for the ready line in the log, which proves the non-root user can write the data directory; then `docker stop` must end it with exit `0` and the stop line (confirmed in C3). From C5 (planned for C10, brought forward because it was cheap) it also runs `stargaite settings show --json` inside the container: exit `0` proves the key was bootstrapped and the admin API answers. Confirmed by hand in C1: the image runs as uid 65532 and `--chown=65532:65532` gives it `/data`, created with mode `0700`.
 
 ## 11. Ordered changes
 
@@ -546,7 +549,7 @@ Each row is one pull request that leaves `make ci` green.
 | C7 | `transport.NewClient` with its injected resolver (two clients); `tests/mockprovider` | Rebinding through the injected resolver; `302`; metadata address; exact bytes recorded | AC-43 (dial time, redirect) | C2 |
 | C8 | Target and alias routes and commands; `models add` creating targets; reasoning flags | Rules through the API; the providers, targets and aliases of annex B built command by command equal those of the applied file | AC-39 over annex B | C6 |
 | C9 | Key routes and commands; rotate; `Snapshot.Authenticate`; `GET /v1/models` | The other tests of §7; the keys of annex B created by command equal those of the applied file, secrets aside | AC-06, AC-07 | C5, C8 |
-| C10 | Quick-start guide; `tests/e2e`; extends `make image-test` with `settings show --json` | End-to-end flow; image smoke test | PUB-3 as far as phase 1 reaches; AC-41 complete | C7, C9 |
+| C10 | Quick-start guide; `tests/e2e` (the `make image-test` check of `settings show --json` landed in C5) | End-to-end flow; image smoke test | PUB-3 as far as phase 1 reaches; AC-41 complete | C7, C9 |
 
 ## 12. Risks of phase 1 and how each step retires them
 

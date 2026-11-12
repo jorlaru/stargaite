@@ -1,5 +1,6 @@
 // Package cli is the command line: a command table, one flag set per command
-// and deterministic exit codes. No command ever reads standard input.
+// and deterministic exit codes. Every command but version and validate -f is
+// one call to the admin API. No command ever reads standard input (PRI-8).
 package cli
 
 import (
@@ -9,14 +10,17 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 )
 
 // Version is the version string. Release builds set it at link time.
 var Version = "dev"
 
-// Exit codes: success, failure, wrong usage.
+// Exit codes: success, failure, wrong usage (OPS-2).
 const (
 	exitOK      = 0
 	exitFailure = 1
@@ -25,34 +29,97 @@ const (
 
 type input struct {
 	json   bool
-	flags  map[string]*string // the value of each flag of the row, by name
+	args   []string           // the positional arguments
+	flags  map[string]*string // the string flags of the row, by name
+	bools  map[string]*bool   // the boolean flags of the row, by name
+	set    map[string]bool    // the flags given, by name
+	body   map[string]any     // what the body flags given fill, by path
 	getenv func(string) string
 }
 
-// flagSpec is one flag of a command. Every flag is a string until a command
-// needs another kind. A one-letter name is the short form the kick-off
-// writes ("-f"); the flag package also accepts it with two dashes.
+type flagKind int
+
+const (
+	kindString     flagKind = iota // a value the command reads itself
+	kindBool                       // the same, given without a value
+	kindNumber                     // a JSON number at path
+	kindTypedPairs                 // name=value pairs under path, comma-separated or repeated: a JSON number, true or false is sent as that literal, anything else as a string
+)
+
+// flagSpec is one flag of a command. A one-letter name is the short form the
+// kick-off writes ("-f"); the flag package also accepts it with two dashes.
 type flagSpec struct {
-	name, usage string
+	name  string
+	kind  flagKind
+	path  string // the member of the request body a body flag fills: "timeouts.connect_ms"
+	usage string
 }
 
 type command struct {
-	words []string // leading words: {"providers", "add"}
-	args  []string // positional arguments, all required
-	flags []flagSpec
-	local func(ctx context.Context, in input, stdout io.Writer) error
+	words    []string // leading words: {"settings", "set"}
+	args     []string // positional arguments, all required
+	flags    []flagSpec
+	needsYes func(in input) bool                                      // nil is never; without --yes, exit 2 (OPS-2)
+	request  func(in input) (method, path string, body any)           // the one admin call
+	local    func(ctx context.Context, in input, out io.Writer) error // runs without a server; errRemote hands over to request
+}
+
+// yamlFile is a request body: the file at that path, sent as YAML.
+type yamlFile string
+
+func get(path string) func(input) (string, string, any) {
+	return func(input) (string, string, any) { return http.MethodGet, path, nil }
+}
+
+// settingsFlags are the scalar and structured settings; telemetry has its own
+// command from phase 3.
+var settingsFlags = []flagSpec{
+	{"budget", kindTypedPairs, "budget", "limit_usd=<usd>,reset_interval=<daily|monthly|never>"},
+	{"max-parallel-requests", kindNumber, "max_parallel_requests", "requests in flight on the instance"},
+	{"max-body-bytes", kindNumber, "max_body_bytes", "the largest request body"},
+	{"max-response-bytes", kindNumber, "max_response_bytes", "the largest provider response"},
+	{"connect-ms", kindNumber, "timeouts.connect_ms", "provider connection timeout"},
+	{"first-byte-ms", kindNumber, "timeouts.first_byte_ms", "time to the first byte of a provider response"},
+	{"stream-idle-ms", kindNumber, "timeouts.stream_idle_ms", "longest pause inside a stream"},
+	{"total-ms", kindNumber, "timeouts.total_ms", "longest provider call"},
+	{"usage-days", kindNumber, "retention.usage_days", "days usage records are kept"},
+	{"usage-daily-months", kindNumber, "retention.usage_daily_months", "months daily aggregates are kept"},
+	{"audit-months", kindNumber, "retention.audit_months", "months audit records are kept"},
 }
 
 var commands = []command{
 	{words: []string{"version"}, local: version},
-	{words: []string{"validate"}, local: validateFile, flags: []flagSpec{
-		{"f", "the YAML file to check, with no server running"},
-		{"env-file", "a file of NAME=value lines that credential references also resolve from"},
+	{words: []string{"validate"}, local: validateFile, request: get("/validate"), flags: []flagSpec{
+		{"f", kindString, "", "the YAML file to check, with no server running; without it, the server checks its configuration"},
+		{"env-file", kindString, "", "with -f: a file of NAME=value lines that credential references also resolve from"},
 	}},
+	{words: []string{"settings", "show"}, request: get("/settings")},
+	{words: []string{"settings", "set"}, flags: settingsFlags, request: func(in input) (string, string, any) {
+		return http.MethodPatch, "/settings", in.body
+	}},
+	{words: []string{"export"}, request: func(in input) (string, string, any) {
+		if in.json {
+			return http.MethodGet, "/export?format=json", nil
+		}
+		return http.MethodGet, "/export", nil
+	}},
+	{words: []string{"apply"}, flags: []flagSpec{
+		{"f", kindString, "", "the YAML file to apply"},
+		{"dry-run", kindBool, "", "validate and show the difference, and publish nothing"},
+		{"prune", kindBool, "", "remove absent providers, targets and aliases, revoke absent keys and clear absent settings"},
+	}, needsYes: func(in input) bool { return *in.bools["prune"] && !*in.bools["dry-run"] },
+		request: func(in input) (string, string, any) {
+			q := url.Values{"dry_run": {strconv.FormatBool(*in.bools["dry-run"])}, "prune": {strconv.FormatBool(*in.bools["prune"])}}
+			return http.MethodPost, "/apply?" + q.Encode(), yamlFile(*in.flags["f"])
+		}},
 }
 
-// errUsage marks a wrong usage found by a command itself: exit 2.
-var errUsage = errors.New("wrong usage")
+var (
+	// errUsage marks a wrong usage found by a command itself: exit 2.
+	errUsage = errors.New("wrong usage")
+	// errRemote is what a local function returns to send the request instead.
+	errRemote = errors.New("ask the server")
+)
 
 // Main runs one command and returns the exit code of the process. getenv is
 // the only way a command reads the process environment.
@@ -76,10 +143,26 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.Usage = func() {}
-	in := input{flags: map[string]*string{}, getenv: getenv}
+	in := input{flags: map[string]*string{}, bools: map[string]*bool{}, set: map[string]bool{}, body: map[string]any{}, getenv: getenv}
 	fs.BoolVar(&in.json, "json", false, "print JSON")
-	for _, f := range cmd.flags {
-		in.flags[f.name] = fs.String(f.name, "", f.usage)
+	specs := slices.Clone(cmd.flags)
+	if cmd.request != nil {
+		specs = append(specs,
+			flagSpec{"admin-url", kindString, "", "the admin API (default $STARGAITE_ADMIN_URL, else " + defaultAdminURL + ")"},
+			flagSpec{"data-dir", kindString, "", "where admin.key is when STARGAITE_ADMIN_KEY is unset (default $STARGAITE_DATA_DIR, else ./data)"})
+	}
+	if cmd.needsYes != nil {
+		specs = append(specs, flagSpec{"yes", kindBool, "", "confirm that the command deletes or revokes"})
+	}
+	for _, f := range specs {
+		switch f.kind {
+		case kindString:
+			in.flags[f.name] = fs.String(f.name, "", f.usage)
+		case kindBool:
+			in.bools[f.name] = fs.Bool(f.name, false, f.usage)
+		default:
+			fs.Func(f.name, f.usage, func(v string) error { return fill(in.body, f, v) })
+		}
 	}
 
 	pos, err := parse(fs, rest)
@@ -96,15 +179,30 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 		say(stderr, "%s: takes %d positional argument(s), got %d\n", name, len(cmd.args), len(pos))
 		return exitUsage
 	}
+	in.args = pos
+	fs.Visit(func(f *flag.Flag) { in.set[f.Name] = true })
 
-	if err := cmd.local(context.Background(), in, stdout); err != nil {
-		say(stderr, "%s: %v\n", name, err)
-		if errors.Is(err, errUsage) {
+	ctx := context.Background()
+	if cmd.local != nil {
+		err := cmd.local(ctx, in, stdout)
+		switch {
+		case errors.Is(err, errRemote):
+		case errors.Is(err, errUsage):
+			say(stderr, "%s: %v\n", name, err)
 			return exitUsage
+		case err != nil:
+			say(stderr, "%s: %v\n", name, err)
+			return exitFailure
+		default:
+			return exitOK
 		}
-		return exitFailure
 	}
-	return exitOK
+	if cmd.needsYes != nil && cmd.needsYes(in) && !*in.bools["yes"] {
+		say(stderr, "%s: this deletes or revokes; give --yes to confirm\n", name)
+		return exitUsage
+	}
+	method, path, body := cmd.request(in)
+	return call(ctx, name, in, method, path, body, stdout, stderr)
 }
 
 // match returns the command whose words lead args, and the arguments after them.

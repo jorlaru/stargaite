@@ -25,8 +25,8 @@ var annexB = Document{
 		MaxParallelRequests: 500,
 		MaxBodyBytes:        10485760,
 		MaxResponseBytes:    33554432,
-		Timeouts:            Timeouts{ConnectMS: 5000, FirstByteMS: 30000, StreamIdleMS: 120000, TotalMS: 180000},
-		Retention:           Retention{UsageDays: 90, UsageDailyMonths: 36, AuditMonths: 24},
+		Timeouts:            &Timeouts{ConnectMS: 5000, FirstByteMS: 30000, StreamIdleMS: 120000, TotalMS: 180000},
+		Retention:           &Retention{UsageDays: 90, UsageDailyMonths: 36, AuditMonths: 24},
 		Telemetry: &Telemetry{
 			OTLPEndpoint:     "https://langfuse.example.com/api/public/otel",
 			BasicAuthEnv:     []string{"LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"},

@@ -29,6 +29,9 @@ import (
 	"github.com/jorlaru/stargaite/internal/store"
 )
 
+// adminKey is an admin key given through STARGAITE_ADMIN_KEY.
+const adminKey = "test-admin-key-of-at-least-32-characters"
+
 func env(vars map[string]string) func(string) string {
 	return func(name string) string { return vars[name] }
 }
@@ -133,16 +136,21 @@ func TestServe(t *testing.T) {
 		{data + "/health/live", "", http.StatusOK},
 		{data + "/health/ready", "", http.StatusOK},
 		{data + "/health/ready", strings.Repeat("x", 128<<10), http.StatusRequestHeaderFieldsTooLarge},
-		{"http://" + ready.AdminAddr + "/admin/v1/settings", "", http.StatusNotFound}, // bound, no route yet
+		{"http://" + ready.AdminAddr + "/admin/v1/settings", "", http.StatusUnauthorized},
 	} {
 		if code, err := get(t, client, tc.url, tc.header); err != nil || code != tc.status {
 			t.Errorf("GET %s: status %d, error %v; want %d", tc.url, code, err, tc.status)
 		}
 	}
-	for _, name := range []string{"lock", "stargaite.db"} {
+	for _, name := range []string{"lock", "stargaite.db", "admin.key"} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
 			t.Errorf("data directory: %v", err)
 		}
+	}
+	// The CLI finds the generated key in the data directory (SEC-3).
+	var stdout bytes.Buffer
+	if code := cli.Main([]string{"settings", "show", "--json", "--admin-url", "http://" + ready.AdminAddr}, env(map[string]string{"STARGAITE_DATA_DIR": dir}), &stdout, io.Discard); code != 0 || !json.Valid(stdout.Bytes()) {
+		t.Errorf("settings show: exit %d, stdout %q", code, &stdout)
 	}
 
 	var stderr bytes.Buffer
@@ -194,7 +202,9 @@ func TestServeLoadsTheConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ready, stop := start(t, env(map[string]string{"STARGAITE_ENV_FILE": envFile}), "--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0")
+	// The admin key from the environment: no file is created, so the
+	// finding is the only line before the ready line.
+	ready, stop := start(t, env(map[string]string{"STARGAITE_ENV_FILE": envFile, "STARGAITE_ADMIN_KEY": adminKey}), "--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0")
 	var finding struct{ Level, Msg, Severity, Rule, Code, Resource, Field string }
 	if err := json.Unmarshal([]byte(ready.before), &finding); err != nil || ready.Revision != 1 || finding != (struct{ Level, Msg, Severity, Rule, Code, Resource, Field string }{
 		"WARN", "configuration finding", "warning", "OPS-6", "credential_unresolved", "providers/q", "api_key_env",
@@ -202,8 +212,11 @@ func TestServeLoadsTheConfiguration(t *testing.T) {
 		t.Errorf("ready line %+v; finding %+v, error %v", ready, finding, err)
 	}
 	code, rest := stop()
-	if code != 0 || strings.Contains(ready.before+rest, "PLANTED") {
+	if code != 0 || strings.Contains(ready.before+rest, "PLANTED") || strings.Contains(ready.before+rest, adminKey) {
 		t.Errorf("exit %d; log %q %q", code, ready.before, rest)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "admin.key")); !os.IsNotExist(err) {
+		t.Errorf("admin.key was written although STARGAITE_ADMIN_KEY is set: %v", err)
 	}
 
 	// A row this binary cannot decode stops the start, and the lock is released.
@@ -245,7 +258,7 @@ func TestServeTLS(t *testing.T) {
 	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots}}}
 	for url, want := range map[string]int{
 		"https://" + ready.DataAddr + "/health/ready":       http.StatusOK,
-		"https://" + ready.AdminAddr + "/admin/v1/settings": http.StatusNotFound,
+		"https://" + ready.AdminAddr + "/admin/v1/settings": http.StatusUnauthorized,
 		"http://" + ready.DataAddr + "/health/ready":        http.StatusBadRequest, // plain HTTP to a TLS listener
 		"http://" + ready.AdminAddr + "/admin/v1/settings":  http.StatusBadRequest,
 	} {
@@ -324,7 +337,9 @@ func TestServeExitCodes(t *testing.T) {
 		{name: "default admin address with a public data address", args: []string{"--listen", "192.0.2.1:4000"}, code: 1, msg: "listener refused"},
 		{name: "address without port", args: []string{"--listen", "127.0.0.1", "--admin-listen", "127.0.0.1:0"}, code: 1, msg: "listener refused"},
 		{name: "unreadable certificate", args: append([]string{"--tls-cert", "missing.pem", "--tls-key", "missing.pem"}, loopback...), code: 1, msg: "tls certificate refused"},
-		{name: "address in use", args: []string{"--json", "--listen", taken.Addr().String(), "--admin-listen", "127.0.0.1:0"}, code: 1, msg: "server failed", created: true},
+		{name: "address in use", vars: map[string]string{"STARGAITE_ADMIN_KEY": adminKey}, args: []string{"--json", "--listen", taken.Addr().String(), "--admin-listen", "127.0.0.1:0"}, code: 1, msg: "server failed", created: true},
+		{name: "short admin key", vars: map[string]string{"STARGAITE_ADMIN_KEY": adminKey[:31]}, args: loopback, code: 1, msg: "admin key refused", created: true},
+		{name: "admin key with the client key prefix", vars: map[string]string{"STARGAITE_ADMIN_KEY": "sk-stargaite-" + adminKey}, args: loopback, code: 1, msg: "admin key refused", created: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "data")

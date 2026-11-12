@@ -12,10 +12,12 @@ import (
 	"net/http"
 	"net/netip"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/jorlaru/stargaite/internal/admin"
 	"github.com/jorlaru/stargaite/internal/api"
 	"github.com/jorlaru/stargaite/internal/cli"
 	"github.com/jorlaru/stargaite/internal/config"
@@ -124,15 +126,24 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 	}
 
 	code := 0
-	// The admin listener has no route before the admin API arrives; it is
-	// bound so that its address, its TLS and the listener rule are real.
-	ready := []any{"data_dir", *dataDir, "tls", tlsConfig != nil, "version", cli.Version, "revision", snap.Revision}
-	if err := runServers(ctx, log, tlsConfig, ready, []listener{
-		{"admin", *adminAddr, http.NewServeMux()},
-		{"data", *dataAddr, api.Handler()},
-	}); err != nil {
-		log.Error("server failed", "error", err.Error())
+	// The admin key, under the lock and before the admin listener binds (SEC-3).
+	keyHash, created, err := admin.Key(*dataDir, getenv)
+	switch {
+	case err != nil:
+		log.Error("admin key refused", "rule", "SEC-3", "error", err.Error())
 		code = 1
+	case created:
+		log.Info("admin key created", "path", filepath.Join(*dataDir, admin.KeyFile))
+	}
+	ready := []any{"data_dir", *dataDir, "tls", tlsConfig != nil, "version", cli.Version, "revision", snap.Revision}
+	if code == 0 {
+		if err := runServers(ctx, log, tlsConfig, ready, []listener{
+			{"admin", *adminAddr, admin.Handler(cfg, keyHash, log)},
+			{"data", *dataAddr, api.Handler()},
+		}); err != nil {
+			log.Error("server failed", "error", err.Error())
+			code = 1
+		}
 	}
 	if err := st.Close(); err != nil {
 		log.Error("store close failed", "error", err.Error())

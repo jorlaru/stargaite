@@ -34,10 +34,18 @@ const (
 	codeUnreachable = "admin_unreachable"
 )
 
-// client does not follow redirects: the admin key goes to the admin URL only.
+// client follows no redirect and ignores the proxy variables (design section
+// 13, point 23): the admin key goes to the admin URL only.
 var client = &http.Client{
 	Timeout:       requestTimeout,
+	Transport:     direct(),
 	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
+
+func direct() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = nil
+	return t
 }
 
 // fill puts the value of a body flag at its path. "--flag=" sends null, which

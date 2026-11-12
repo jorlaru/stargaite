@@ -428,6 +428,15 @@ func TestFailures(t *testing.T) {
 	}
 }
 
+// TestClientIgnoresProxyVariables: the admin key never goes to a proxy
+// (design section 13, point 23). Checked on the field, as in transport:
+// http.ProxyFromEnvironment reads the variables once per process.
+func TestClientIgnoresProxyVariables(t *testing.T) {
+	if tr, ok := client.Transport.(*http.Transport); !ok || tr.Proxy != nil {
+		t.Error("the admin client has a proxy function")
+	}
+}
+
 // TestAdminKeyFile: without STARGAITE_ADMIN_KEY the key is read from the data
 // directory: --data-dir, else STARGAITE_DATA_DIR.
 func TestAdminKeyFile(t *testing.T) {

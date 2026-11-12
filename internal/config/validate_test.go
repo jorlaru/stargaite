@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"maps"
 	"math/rand/v2"
+	"net"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"slices"
@@ -14,6 +16,8 @@ import (
 	"testing"
 
 	"github.com/jorlaru/stargaite/internal/domain"
+	"github.com/jorlaru/stargaite/internal/transport"
+	"github.com/jorlaru/stargaite/tests/mockprovider"
 )
 
 // Target ids of annex B, the document every row starts from.
@@ -684,6 +688,44 @@ func TestCheckResolvedURLs(t *testing.T) {
 				t.Errorf("findings %q, want %q", s, want)
 			}
 		})
+	}
+}
+
+// SEC-4, AC-43: one resolver serves set time and dial time. A name that
+// resolves to a public address when it is set and to a private one when it
+// is dialled passes CheckResolved and is refused by the client, before any
+// byte reaches the provider.
+func TestRebindingRefusedAtDialTime(t *testing.T) {
+	m := mockprovider.New()
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	_, port, err := net.SplitHostPort(srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const host = "rebind.example"
+	answers := []string{"8.8.8.8", "127.0.0.1"} // set time, then dial time
+	lookups := 0
+	resolve := func(_ context.Context, h string) ([]netip.Addr, error) {
+		if h != host || lookups == len(answers) {
+			t.Errorf("unexpected lookup of %q", h)
+			return nil, errors.New("unexpected lookup")
+		}
+		lookups++
+		return []netip.Addr{netip.MustParseAddr(answers[lookups-1])}, nil
+	}
+	url := "https://" + host + ":" + port + "/chat/completions"
+	urls := []OutboundURL{{Resource: "providers/p", Field: "base_url", URL: url}}
+	env := Env{Lookup: func(string) (string, bool) { return "", false }, Resolve: resolve}
+	if got := CheckResolved(context.Background(), &domain.Document{Version: 1}, urls, env); len(got) != 0 {
+		t.Fatalf("set time: %q", summary(got))
+	}
+	resp, err := transport.NewClient(false, env.Resolve).Get(url)
+	if err == nil {
+		_ = resp.Body.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), host+": address 127.0.0.1 is private") || lookups != 2 || len(m.Calls()) != 0 {
+		t.Errorf("dial time: err %v, %d lookups, %d calls", err, lookups, len(m.Calls()))
 	}
 }
 

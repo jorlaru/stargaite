@@ -406,6 +406,7 @@ Corrected in C4: `fmt` calls no method on an unexported struct field, and none o
 - `CheckURL`, called by `Validate`: scheme `http` or `https` only; no userinfo; a host is required; HTTPS unless `allowPrivate`; a literal address is classified; `localhost` counts as loopback.
 - `CheckResolved` (§4) applies `Classify` to the addresses a name resolves to when the URL is set.
 - `NewClient` resolves the host through `resolve` in its `DialContext`, applies `Classify` to every address, refuses the dial when any address is `Forbidden`, or `Private` while `allowPrivate` is false, and otherwise dials an address literal; `net.Dialer.Control` applies the same verdict to the address actually connected to, so a name that later resolves elsewhere is refused. `Proxy` is nil, so proxy variables are ignored (§13 point 23). `CheckRedirect` returns `http.ErrUseLastResponse`. Certificates are always verified. The two clients have separate connection pools.
+  Settled in C7: a host with several addresses is refused when any one is refused, before anything is dialled; then the addresses are dialled in the resolver's order until one connects. `NewClient` panics on a nil resolver. It sets no timeout: phase 2 bounds each call with the request's context (RES-3, RES-5), and the connection timeout, a setting, reaches the client then. A custom `DialContext` turns HTTP/2 off unless phase 2 asks for it. Nothing calls `NewClient` in phase 1, so `serve` builds neither client yet; phase 2 passes them `systemResolver`, the function `serve` already gives `config.NewEnv`, which keeps the resolver single.
 - The telemetry block that `apply` stores gets the same treatment in phase 1: `otlp_endpoint` under its own `allow_private_network`, `basic_auth_env` and header references as credential references, and static headers named `Authorization`, `Proxy-Authorization`, `Cookie` or `x-api-key` refused (TEL-2).
 
 **Credential references (SEC-5).** A reference is a variable name: letters in either case, digits and `_`, not starting with a digit, and not starting with `STARGAITE_` in any letter case (`strings.EqualFold` on its first ten characters), so `stargaite_admin_key` is refused too (§13 point 18). Resolution is in §4. The resolved value lives in a `Secret` (the block above): the value is readable only inside `transport`, and no exported method returns it.
@@ -510,6 +511,8 @@ func (s *Server) Calls() []Call
 ```
 
 A `main` of about fifteen lines, in `tests/mockprovider/cmd/mockprovider` because one directory holds one package and `tests/e2e` imports the library, serves it on a loopback port for the quick start (`go run ./tests/mockprovider/cmd/mockprovider`). Phase 2 adds fields to `Step` (SSE chunks, delay, hang, cut); none exists now because nothing in phase 1 streams.
+
+Settled in C7: every request is recorded, whatever its route. A route other than the three, or a method other than `POST`, gets `404` or `405` and takes no scripted reply, so a request sent to the wrong path cannot pass on a scripted answer. A scripted `Step` answers any of the three routes; its zero `Status` is `200`. The defaults are constant bodies with `"model":"mock"`. The `main` listens on `127.0.0.1:4010` unless `-listen` says otherwise and logs a JSON `ready` line with the bound address.
 
 ## 10. Testing and CI
 

@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"database/sql"
 	"encoding/json"
 	"encoding/pem"
 	"io"
@@ -22,6 +24,9 @@ import (
 	"time"
 
 	"github.com/jorlaru/stargaite/internal/cli"
+	"github.com/jorlaru/stargaite/internal/config"
+	"github.com/jorlaru/stargaite/internal/domain"
+	"github.com/jorlaru/stargaite/internal/store"
 )
 
 func env(vars map[string]string) func(string) string {
@@ -34,6 +39,8 @@ type readyLine struct {
 	DataAddr     string `json:"data_addr"`
 	AdminAddr    string `json:"admin_addr"`
 	TLS          bool
+	Revision     int64
+	before       string // the log lines before the ready line
 }
 
 // start runs serve as the process does and returns its ready line. stop
@@ -49,12 +56,22 @@ func start(t *testing.T, getenv func(string) string, args ...string) (ready read
 	}()
 
 	lines := bufio.NewScanner(logs)
-	if !lines.Scan() {
-		t.Fatal("no log line")
+	var before strings.Builder
+	for ready.Msg != "ready" {
+		if !lines.Scan() {
+			t.Fatalf("no ready line; log %q", &before)
+		}
+		var line struct{ Level, Msg string }
+		if err := json.Unmarshal(lines.Bytes(), &line); err != nil || line.Level == "ERROR" {
+			t.Fatalf("log line %q: %+v, error %v", lines.Text(), line, err)
+		}
+		if line.Msg != "ready" {
+			before.WriteString(lines.Text() + "\n")
+		} else if err := json.Unmarshal(lines.Bytes(), &ready); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if err := json.Unmarshal(lines.Bytes(), &ready); err != nil || ready.Msg != "ready" {
-		t.Fatalf("first log line %q: %+v, error %v", lines.Text(), ready, err)
-	}
+	ready.before = before.String()
 	rest := make(chan string, 1)
 	go func() {
 		var b strings.Builder
@@ -143,6 +160,77 @@ func TestServe(t *testing.T) {
 	}
 	if _, err := get(t, client, data+"/health/live", ""); err == nil {
 		t.Error("the data listener still answers after the stop")
+	}
+}
+
+// TestServeLoadsTheConfiguration: serve publishes the stored configuration
+// before it is ready, under the stored revision, resolves credentials from
+// --env-file and logs the findings, never a credential value.
+func TestServeLoadsTheConfiguration(t *testing.T) {
+	const planted = "sk-PLANTED-credential"
+	dir := t.TempDir()
+	st, err := store.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Open(context.Background(), st, func() config.Env { return config.Env{Lookup: func(string) (string, bool) { return "", false }} }, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.Commit(context.Background(), config.Change{Summary: "apply", Mutate: func(s *config.State) (map[string]string, error) {
+		for _, name := range []string{"p", "q"} {
+			// A literal address: a change resolves host names, and no test does.
+			s.Doc.Providers[name] = domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: "https://93.184.216.34/v1", Billing: domain.BillingNone, APIKeyEnv: strings.ToUpper(name) + "_KEY"}
+		}
+		return nil, nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	envFile := filepath.Join(t.TempDir(), "env")
+	if err := os.WriteFile(envFile, []byte("P_KEY="+planted+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ready, stop := start(t, env(map[string]string{"STARGAITE_ENV_FILE": envFile}), "--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0")
+	var finding struct{ Level, Msg, Severity, Rule, Code, Resource, Field string }
+	if err := json.Unmarshal([]byte(ready.before), &finding); err != nil || ready.Revision != 1 || finding != (struct{ Level, Msg, Severity, Rule, Code, Resource, Field string }{
+		"WARN", "configuration finding", "warning", "OPS-6", "credential_unresolved", "providers/q", "api_key_env",
+	}) {
+		t.Errorf("ready line %+v; finding %+v, error %v", ready, finding, err)
+	}
+	code, rest := stop()
+	if code != 0 || strings.Contains(ready.before+rest, "PLANTED") {
+		t.Errorf("exit %d; log %q %q", code, ready.before, rest)
+	}
+
+	// A row this binary cannot decode stops the start, and the lock is released.
+	if st, err = store.Open(context.Background(), dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`UPDATE providers SET spec = '{"colour":"blue"}' WHERE name = 'q'`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if code := serve([]string{"--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0"}, env(nil), io.Discard, &stderr); code != 1 {
+		t.Errorf("undecodable configuration: exit %d", code)
+	}
+	var line struct{ Level, Msg, Error string }
+	if err := json.Unmarshal(stderr.Bytes(), &line); err != nil || line.Msg != "configuration failed" || !strings.Contains(line.Error, `provider q: unknown member "/colour"`) {
+		t.Errorf("log %q: %+v, error %v", &stderr, line, err)
+	}
+	if st, err = store.Open(context.Background(), dir); err != nil {
+		t.Errorf("the lock was not released: %v", err)
+	} else {
+		_ = st.Close()
 	}
 }
 

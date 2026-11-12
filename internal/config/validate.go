@@ -511,8 +511,12 @@ func validateKey(r *report, doc *domain.Document, name string) {
 	case slices.Contains(k.Models, "*") && len(k.Models) > 1:
 		r.fail("OPS-5", "invalid_value", res, "models", `"*" stands for every alias and is listed alone`)
 	}
-	for _, alias := range k.Models {
-		if _, ok := doc.Models[alias]; !ok && alias != "*" {
+	for i, alias := range k.Models {
+		// key_models has one row per alias, so a repeat could not be stored.
+		switch _, ok := doc.Models[alias]; {
+		case slices.Index(k.Models, alias) < i:
+			r.fail("OPS-5", "duplicate_alias", res, "models", "alias %.64q is listed twice", alias)
+		case !ok && alias != "*":
 			r.warn("OPS-5", "unknown_alias", res, "models", "alias %.64q does not exist", alias)
 		}
 	}

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -17,6 +18,8 @@ import (
 
 	"github.com/jorlaru/stargaite/internal/api"
 	"github.com/jorlaru/stargaite/internal/cli"
+	"github.com/jorlaru/stargaite/internal/config"
+	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/store"
 )
 
@@ -34,6 +37,7 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 	certFile := fs.String("tls-cert", "", "PEM certificate chain: both listeners serve TLS")
 	keyFile := fs.String("tls-key", "", "PEM private key of --tls-cert")
 	behindProxy := fs.Bool("behind-tls-proxy", false, "a trusted front end terminates TLS for a listener outside loopback")
+	envFile := fs.String("env-file", "", "a file of NAME=value lines that credential references also resolve from, read again on every change")
 	fs.Bool("json", false, "accepted like on every command: the logs are always JSON")
 
 	var err error
@@ -93,10 +97,37 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 		log.Error("store failed", "data_dir", *dataDir, "error", err.Error())
 		return 1
 	}
+	// The process environment cannot tell an empty variable from an unset
+	// one through getenv; an empty one does not resolve anyway.
+	environ := func(name string) (string, bool) {
+		v := getenv(name)
+		return v, v != ""
+	}
+	cfg, err := config.Open(ctx, st, func() config.Env { return config.NewEnv(environ, *envFile, systemResolver) }, time.Now)
+	if err != nil {
+		log.Error("configuration failed", "error", err.Error())
+		if err := st.Close(); err != nil {
+			log.Error("store close failed", "error", err.Error())
+		}
+		return 1
+	}
+	snap := cfg.Snapshot()
+	// A stored configuration with findings is still published (design
+	// section 13, point 13). A finding never carries a credential value.
+	for _, f := range snap.Findings {
+		level := slog.LevelWarn
+		if f.Severity == domain.SeverityError {
+			level = slog.LevelError
+		}
+		log.Log(ctx, level, "configuration finding", "severity", f.Severity, "rule", f.Rule, "code", f.Code,
+			"resource", f.Resource, "field", f.Field, "message", f.Message)
+	}
+
 	code := 0
 	// The admin listener has no route before the admin API arrives; it is
 	// bound so that its address, its TLS and the listener rule are real.
-	if err := runServers(ctx, log, tlsConfig, *dataDir, []listener{
+	ready := []any{"data_dir", *dataDir, "tls", tlsConfig != nil, "version", cli.Version, "revision", snap.Revision}
+	if err := runServers(ctx, log, tlsConfig, ready, []listener{
 		{"admin", *adminAddr, http.NewServeMux()},
 		{"data", *dataAddr, api.Handler()},
 	}); err != nil {
@@ -111,6 +142,12 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 		log.Info("stopped")
 	}
 	return code
+}
+
+// systemResolver is the resolver of set time (CheckResolved) and, from phase
+// 2, of dial time: both ask the same source.
+func systemResolver(ctx context.Context, host string) ([]netip.Addr, error) {
+	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 }
 
 // checkListener applies SEC-6 to one address: a host other than a loopback
@@ -132,17 +169,16 @@ type listener struct {
 	handler    http.Handler
 }
 
-// runServers binds the listeners in order, logs the ready line and serves
-// until ctx is done or a server fails; then it shuts every server down
-// within shutdownGrace.
-func runServers(ctx context.Context, log *slog.Logger, tlsConfig *tls.Config, dataDir string, ls []listener) error {
+// runServers binds the listeners in order, logs the ready line with the
+// attributes of ready and the bound addresses, and serves until ctx is done or
+// a server fails; then it shuts every server down within shutdownGrace.
+func runServers(ctx context.Context, log *slog.Logger, tlsConfig *tls.Config, ready []any, ls []listener) error {
 	lns := make([]net.Listener, 0, len(ls))
 	defer func() {
 		for _, ln := range lns {
 			_ = ln.Close() // already closed by Shutdown, except on a failed bind
 		}
 	}()
-	ready := []any{"data_dir", dataDir, "tls", tlsConfig != nil, "version", cli.Version}
 	for _, l := range ls {
 		ln, err := net.Listen("tcp", l.addr)
 		if err != nil {

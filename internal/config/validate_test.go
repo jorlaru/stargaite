@@ -513,6 +513,8 @@ func TestValidate(t *testing.T) {
 		{"OPS-5 key with every alias", func(d *domain.Document) { d.Keys["new"] = domain.Key{Models: []string{"*"}} }, nil},
 		{"OPS-5 every alias is listed alone", func(d *domain.Document) { d.Keys["new"] = domain.Key{Models: []string{"*", "fast"}} },
 			[]string{"error OPS-5 invalid_value keys/new models"}},
+		{"OPS-5 an alias is listed once", func(d *domain.Document) { d.Keys["new"] = domain.Key{Models: []string{"fast", "rerank", "fast"}} },
+			[]string{"error OPS-5 duplicate_alias keys/new models"}},
 		{"OPS-5 warning for a key naming an unknown alias", func(d *domain.Document) { delete(d.Models, "rerank") },
 			[]string{"warning OPS-5 unknown_alias keys/classifier-flow models"}},
 		{"LIM-2 key budget with a wrong interval", func(d *domain.Document) {

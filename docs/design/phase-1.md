@@ -138,7 +138,7 @@ type Result struct {
 	Secrets  map[string]string // shown once (OPS-3, SEC-8); empty on a dry run
 }
 
-func Open(st *store.Store, env func() Env, now func() time.Time) (*Service, error) // load, validate, publish
+func Open(ctx context.Context, st *store.Store, env func() Env, now func() time.Time) (*Service, error) // load, validate, publish
 func (s *Service) Commit(ctx context.Context, ch Change) (Result, error)           // error is *domain.Error
 func (s *Service) Snapshot() *Snapshot                                             // atomic.Pointer load; once per request
 ```
@@ -146,8 +146,8 @@ func (s *Service) Snapshot() *Snapshot                                          
 **The change pipeline.** `Commit` is the only way configuration changes, for single commands and `apply` alike. Under one mutex:
 
 1. Deep-copy the committed `State` (encode and decode with the canonical codec).
-2. Run `Mutate`. A `404 not_found` or `409 conflict` ends here; unless `DryRun`, it first writes one audit row for `Kind` and `Name` with `result=refused:<code>` (`refused:not_found` or `refused:conflict`), no revision.
-3. Compute the resource-level diff against the committed `State`.
+2. Run `Mutate`. A `404 not_found` or `409 conflict` ends here; unless `DryRun`, it first writes one audit row for `Kind` and `Name` with `result=refused:<code>` (`refused:not_found` or `refused:conflict`), no revision. Settled in C4: any `*domain.Error` below `500` that `Mutate` returns is such a refusal, audited with its own code; any other error is a `500` with no audit row, because nothing was decided.
+3. Compute the resource-level diff against the committed `State`. Added in C4: a key that leaves `Doc` without entering `Revoked`, a revoked name that is declared again, leaves `Revoked` or changes its `revoked_at`, a `Mutate` that sets `State.Revision`, a revocation of a key that did not exist, a secret of an undeclared key, and a public id whose key, hash or creation time changes are refused here with `500`: no command may do them, so only a faulty `Mutate` can.
 4. Call `env()` once, which re-reads the env file; run `Validate` on the whole resulting document, then `CheckResolved` with that `Env` on every credential reference and on the outbound URLs this diff sets.
 5. On any finding of severity `error`: return `400` with the findings; unless `DryRun`, first write one audit row for `Kind` and `Name` with `result=refused:invalid_request`, no revision. The pointer is untouched (OPS-5, AC-39).
 6. On `DryRun` without errors: return diff and findings. A dry run never writes or publishes anything, an audit row included.
@@ -170,7 +170,7 @@ type Snapshot struct {
 	Targets   map[string]*Target
 	Models    map[string]*Model
 	Keys      map[string]*Key  // by name; revoked keys are absent
-	Findings  []domain.Finding // warnings of the published configuration
+	Findings  []domain.Finding // findings of the published configuration: warnings after a change; at start, errors too (§13 point 13)
 	secrets   map[string]secret // by public id: hash, valid_until, *Key
 }
 type Provider struct { Name string; Spec domain.Provider; Credential transport.Secret; Disabled bool }
@@ -193,7 +193,7 @@ func CheckResolved(ctx context.Context, doc *domain.Document, urls []OutboundURL
 // every credential reference through env.Lookup (warning); every host in urls through env.Resolve
 ```
 
-- Errors landed in phase 1 (§13 point 5): unknown providers and targets; aliases with no target or more than three; resource-name syntax; RSN-9 (no key name starts with `_`); PAR-5; PAR-6 and PAR-7 on alias caps; the PAR-2 collision check: a `forward` rule is refused when its name is, for any target of the alias, a top-level key that the dialect table writes for that target's dialect, a top-level key of that target's own `on` or `off` fragment (RSN-3), that target's `output_cap_param` (its default included), or `stream_options`; adapter fields remain §13 point 6; RSN-3; RSN-7, naming the alias and the target; USE-12; SEC-4 on `base_url`, `rerank_url` and `settings.telemetry.otlp_endpoint`; SEC-5 on every credential reference; the reserved header names of TEL-2.
+- Errors landed in phase 1 (§13 point 5): unknown providers and targets; aliases with no target or more than three; resource-name syntax; RSN-9 (no key name starts with `_`); an alias listed twice in a key's `models` (added in C4: `key_models` holds one row per alias, so the repeat could not be stored and reloaded); PAR-5; PAR-6 and PAR-7 on alias caps; the PAR-2 collision check: a `forward` rule is refused when its name is, for any target of the alias, a top-level key that the dialect table writes for that target's dialect, a top-level key of that target's own `on` or `off` fragment (RSN-3), that target's `output_cap_param` (its default included), or `stream_options`; adapter fields remain §13 point 6; RSN-3; RSN-7, naming the alias and the target; USE-12; SEC-4 on `base_url`, `rerank_url` and `settings.telemetry.otlp_endpoint`; SEC-5 on every credential reference; the reserved header names of TEL-2.
 - Warnings landed in phase 1: undeclared `levels` or `can_disable` (RSN-3), an effort toward a `none` dialect (RSN-5), no prices to fall back on (USE-12), a key naming an unknown alias. Warnings tied to later features ("never verified", "cannot serve an endpoint") arrive with them; adding a warning never invalidates a stored configuration.
 - `CheckResolved` holds the two checks that need the environment, so a real change, a dry run, `validate` and `validate -f` report the same findings (OPS-5). It looks every credential reference of the document up through `env.Lookup`: one that does not resolve, or resolves to an empty value, is the `credential_unresolved` warning. It resolves each host in `urls` through `env.Resolve` and classifies every address (§8): an address that is `Forbidden`, or `Private` while that URL's `AllowPrivate` is false, is an error; a failed lookup, or an answer with no address, is a warning. `Commit` passes the URLs the diff sets; `validate` and `validate -f` pass every URL of the document, so a file gets the verdict `apply` would give on an empty instance (§13 point 14).
 - At start, findings on the stored configuration are logged and shown by `validate`; the configuration is still published (§13 point 13).
@@ -208,7 +208,7 @@ func CheckResolved(ctx context.Context, doc *domain.Document, urls []OutboundURL
 - `--prune` removes absent providers, targets and aliases, revokes absent keys and clears absent settings. `--dry-run` goes no further than step 6 and writes nothing. `version` must be `1`.
 - Property tests: `apply(export(S))` on S gives an empty diff; on an empty instance it gives a document equal to S (AC-39).
 
-**Start-up order of `serve`.** (1) Flags, then `STARGAITE_<FLAG>` variables. (2) The listener rule for both listeners (§5). (3) `store.Open`: directory `0700`, lock, SQLite; a held lock exits `1` (OPS-10, AC-42). The lock file stays open for the life of the process and is never deleted. (4) `config.Open`: load, validate, build, publish. (5) Admin key. (6) Bind the admin listener, then the data listener; `/health/ready` answers `200` from here, and one `ready` log line names both bound addresses. On `SIGTERM`: `Shutdown` on both servers with a 30 s bound, then `store.Close`.
+**Start-up order of `serve`.** (1) Flags, then `STARGAITE_<FLAG>` variables. (2) The listener rule for both listeners (§5). (3) `store.Open`: directory `0700`, lock, SQLite; a held lock exits `1` (OPS-10, AC-42). The lock file stays open for the life of the process and is never deleted. (4) `config.Open`: load, validate, build, publish; it runs `CheckResolved` with no URLs, so start-up resolves credentials but no host name, and `serve` logs every finding of the published configuration (§13 point 13), then names its revision in the `ready` line. A row the strict decoder refuses stops the start with exit `1`. (5) Admin key. (6) Bind the admin listener, then the data listener; `/health/ready` answers `200` from here, and one `ready` log line names both bound addresses. On `SIGTERM`: `Shutdown` on both servers with a 30 s bound, then `store.Close`.
 
 **Admin key bootstrap (SEC-3).** `STARGAITE_ADMIN_KEY` wins. Otherwise `<data-dir>/admin.key` is read; when missing, 32 random bytes in lowercase base32 are written to a temporary file opened `O_EXCL` with mode `0600`, then `fsync`, `rename`, and `fsync` of the directory, all before the admin listener binds and under the lock. Only the SHA-256 of the key is kept in memory. `serve` exits `1` if the key has fewer than 32 characters or starts with `sk-stargaite-` (§13 point 17).
 
@@ -393,7 +393,7 @@ type Secret struct{ /* unexported value */ } // Format (fmt.Formatter, so every 
 func NewSecret(value string) Secret         // called only by config, when a reference resolves
 ```
 
-A `Secret` is held only in exported struct fields, because `fmt` calls no method on an unexported one.
+Corrected in C4: `fmt` calls no method on an unexported struct field, and none on any field while it reports a wrong verb (`%s` on a pointer to a struct that holds a `Secret` prints that struct with its methods off), so a value held as a plain string leaks through both paths. The value is therefore held behind a pointer, which `fmt` prints below the top level only as an address; exported fields are no longer what keeps it out.
 
 - `Classify`: always `Forbidden`, checked first: unspecified, multicast, broadcast, link-local (`169.254.0.0/16`, `fe80::/10`), and the cloud metadata addresses that sit outside link-local, kept in one explicit list of prefixes that starts with `fd00:ec2::/32`, `100.100.100.200/32` and `168.63.129.16/32` (the last one is in public address space, so only the list refuses it). Then `Private`: loopback, RFC 1918, carrier-grade NAT and unique-local. Everything else is `Public`. An address in the NAT64 prefix `64:ff9b::/96` is classified by the IPv4 address in its last four bytes, because a translating gateway delivers it there. A table test fixes every range and every listed prefix, IPv4-mapped IPv6 included, and `64:ff9b::` followed by a loopback, an RFC 1918 and a link-local IPv4 address, and checks that each `Forbidden` entry stays refused with `allow_private_network` set.
 - `CheckURL`, called by `Validate`: scheme `http` or `https` only; no userinfo; a host is required; HTTPS unless `allowPrivate`; a literal address is classified; `localhost` counts as loopback.
@@ -525,7 +525,7 @@ The end-to-end test builds the binary, starts it, runs the quick start by CLI ag
 3. `CGO_ENABLED=0 go build -trimpath ./...` for linux and darwin, amd64 and arm64.
 4. `go test -race ./...`, which includes `tests/e2e`.
 
-`make ci` requires Go 1.27 or later and says so in one line when it is missing. `make ci-container` runs the same target inside `golang:1.27.4-trixie`, for machines without Go 1.27. Confirmed in C1: `-race` needs cgo and a C compiler at test time; the builder image has both, and `make ci-container` passes.
+`make ci` requires Go 1.27 or later and says so in one line when it is missing. `make ci-container` runs the same target inside `golang:1.27.4-trixie`, for machines without Go 1.27. Confirmed in C1: `-race` needs cgo and a C compiler at test time; the builder image has both, and `make ci-container` passes. Measured in C4 (`BenchmarkCommitScale18`, AMD Ryzen 5 5500): at §18 scale, with a secret per key, one change publishes in about 72 ms and the first apply of the whole configuration in about 0.4 s, so the encode-and-decode deep copy stays.
 
 **Fork-safe CI (AC-03).** Tests dial loopback only and DNS is injected, so no test needs the network or a secret. The hosted workflow only calls `make ci-container` and `make image-test` (which runs `make image` first), on `pull_request` and on pushes to the default branch, with read-only permissions, no secret reference and third-party steps pinned by commit. The host is GitHub Actions (OQ-4), so the file is `.github/workflows/ci.yml`. No PUB-2 search ships in the repository: its patterns would be the very names PUB-2 forbids, so maintainers run the search with their own patterns before publishing.
 

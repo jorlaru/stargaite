@@ -9,8 +9,10 @@ import (
 // Handler returns the routes of the data-plane listener.
 func Handler() http.Handler {
 	mux := http.NewServeMux()
-	// serve binds this listener only once the store is open, so whatever
-	// answers is ready; on a stop the listener closes before the store does.
+	// serve binds this listener only once the store is open and the stored
+	// configuration is published (config.Open returned), so whatever answers
+	// is ready (kick-off section 13.1); on a stop the listener closes before
+	// the store does.
 	mux.HandleFunc("GET /health/live", ok)
 	mux.HandleFunc("GET /health/ready", ok)
 	return mux

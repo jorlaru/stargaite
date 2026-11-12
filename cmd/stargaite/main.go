@@ -15,7 +15,7 @@ func main() {
 // run starts the proxy for `serve` and hands every other command to the CLI.
 func run(args []string, getenv func(string) string, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "serve" {
-		return serve(args[1:], dataAddr, stdout, stderr)
+		return serve(args[1:], getenv, stdout, stderr)
 	}
 	return cli.Main(args, getenv, stdout, stderr)
 }

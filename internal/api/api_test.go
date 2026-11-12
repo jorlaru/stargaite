@@ -7,13 +7,15 @@ import (
 	"testing"
 )
 
-func TestHealthLive(t *testing.T) {
+func TestHealth(t *testing.T) {
 	for _, tc := range []struct {
 		method, path string
 		status       int
 	}{
 		{http.MethodGet, "/health/live", http.StatusOK},
+		{http.MethodGet, "/health/ready", http.StatusOK},
 		{http.MethodPost, "/health/live", http.StatusMethodNotAllowed},
+		{http.MethodPost, "/health/ready", http.StatusMethodNotAllowed},
 		{http.MethodGet, "/health/other", http.StatusNotFound},
 	} {
 		rec := httptest.NewRecorder()

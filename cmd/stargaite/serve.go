@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,25 +11,44 @@ import (
 	"net"
 	"net/http"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jorlaru/stargaite/internal/api"
 	"github.com/jorlaru/stargaite/internal/cli"
+	"github.com/jorlaru/stargaite/internal/store"
 )
-
-// dataAddr is the default address of the data-plane listener: loopback only.
-const dataAddr = "127.0.0.1:4000"
 
 // shutdownGrace bounds how long in-flight requests may take to finish on a stop signal.
 const shutdownGrace = 30 * time.Second
 
-// serve runs the proxy until SIGINT or SIGTERM. Logs are JSON lines on stderr.
-func serve(args []string, addr string, stdout, stderr io.Writer) int {
+// serve runs the proxy until SIGINT or SIGTERM. Each flag falls back to its
+// STARGAITE_<FLAG> variable; the flag wins. Logs are JSON lines on stderr.
+func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("stargaite serve", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	dataDir := fs.String("data-dir", "./data", "the data directory: the store and its lock")
+	dataAddr := fs.String("listen", "127.0.0.1:4000", "address of the data-plane listener")
+	adminAddr := fs.String("admin-listen", "127.0.0.1:4001", "address of the admin listener")
+	certFile := fs.String("tls-cert", "", "PEM certificate chain: both listeners serve TLS")
+	keyFile := fs.String("tls-key", "", "PEM private key of --tls-cert")
+	behindProxy := fs.Bool("behind-tls-proxy", false, "a trusted front end terminates TLS for a listener outside loopback")
 	fs.Bool("json", false, "accepted like on every command: the logs are always JSON")
-	switch err := fs.Parse(args); {
+
+	var err error
+	fs.VisitAll(func(f *flag.Flag) {
+		name := "STARGAITE_" + strings.ToUpper(strings.ReplaceAll(f.Name, "-", "_"))
+		if v := getenv(name); v != "" && err == nil {
+			if err = fs.Set(f.Name, v); err != nil {
+				err = fmt.Errorf("%s: %w", name, err)
+			}
+		}
+	})
+	if err == nil {
+		err = fs.Parse(args)
+	}
+	switch {
 	case errors.Is(err, flag.ErrHelp):
 		fs.SetOutput(stdout)
 		fs.Usage()
@@ -39,50 +59,137 @@ func serve(args []string, addr string, stdout, stderr io.Writer) int {
 	case fs.NArg() > 0:
 		_, _ = fmt.Fprintf(stderr, "stargaite serve: unexpected argument %q\n", fs.Arg(0))
 		return 2
+	case *dataDir == "":
+		_, _ = fmt.Fprintln(stderr, "stargaite serve: --data-dir is empty")
+		return 2
+	case (*certFile == "") != (*keyFile == ""):
+		_, _ = fmt.Fprintln(stderr, "stargaite serve: --tls-cert and --tls-key go together")
+		return 2
 	}
 
 	log := slog.New(slog.NewJSONHandler(stderr, nil))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	ln, err := net.Listen("tcp", addr)
+	// The listener rule (SEC-6), for both listeners, before anything opens.
+	for _, l := range []struct{ name, addr string }{{"admin", *adminAddr}, {"data", *dataAddr}} {
+		if err := checkListener(l.addr, *certFile != "" || *behindProxy); err != nil {
+			log.Error("listener refused", "listener", l.name, "rule", "SEC-6", "error", err.Error())
+			return 1
+		}
+	}
+	var tlsConfig *tls.Config
+	if *certFile != "" {
+		cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+		if err != nil {
+			log.Error("tls certificate refused", "error", err.Error())
+			return 1
+		}
+		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
+	}
+
+	st, err := store.Open(ctx, *dataDir)
 	if err != nil {
-		log.Error("listen failed", "listener", "data", "error", err.Error())
+		log.Error("store failed", "data_dir", *dataDir, "error", err.Error())
 		return 1
 	}
-	if err := runServer(ctx, ln, log); err != nil {
-		log.Error("server failed", "listener", "data", "error", err.Error())
-		return 1
+	code := 0
+	// The admin listener has no route before the admin API arrives; it is
+	// bound so that its address, its TLS and the listener rule are real.
+	if err := runServers(ctx, log, tlsConfig, *dataDir, []listener{
+		{"admin", *adminAddr, http.NewServeMux()},
+		{"data", *dataAddr, api.Handler()},
+	}); err != nil {
+		log.Error("server failed", "error", err.Error())
+		code = 1
 	}
-	return 0
+	if err := st.Close(); err != nil {
+		log.Error("store close failed", "error", err.Error())
+		code = 1
+	}
+	if code == 0 {
+		log.Info("stopped")
+	}
+	return code
 }
 
-// runServer serves the data plane on ln until ctx is done, then shuts down gracefully.
-func runServer(ctx context.Context, ln net.Listener, log *slog.Logger) error {
-	srv := &http.Server{
-		Handler:           api.Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      60 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    64 << 10,
-		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
-	}
-	log.Info("listening", "listener", "data", "addr", ln.Addr().String(), "version", cli.Version)
-
-	failed := make(chan error, 1)
-	go func() { failed <- srv.Serve(ln) }()
-	select {
-	case err := <-failed:
+// checkListener applies SEC-6 to one address: a host other than a loopback
+// literal or localhost needs TLS, from the certificate pair or a trusted front
+// end. An empty host listens everywhere, so it is not loopback.
+func checkListener(addr string, secured bool) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
 		return err
+	}
+	if ip := net.ParseIP(host); secured || host == "localhost" || ip != nil && ip.IsLoopback() {
+		return nil
+	}
+	return fmt.Errorf("%s is outside loopback: it needs --tls-cert and --tls-key, or --behind-tls-proxy", addr)
+}
+
+type listener struct {
+	name, addr string
+	handler    http.Handler
+}
+
+// runServers binds the listeners in order, logs the ready line and serves
+// until ctx is done or a server fails; then it shuts every server down
+// within shutdownGrace.
+func runServers(ctx context.Context, log *slog.Logger, tlsConfig *tls.Config, dataDir string, ls []listener) error {
+	lns := make([]net.Listener, 0, len(ls))
+	defer func() {
+		for _, ln := range lns {
+			_ = ln.Close() // already closed by Shutdown, except on a failed bind
+		}
+	}()
+	ready := []any{"data_dir", dataDir, "tls", tlsConfig != nil, "version", cli.Version}
+	for _, l := range ls {
+		ln, err := net.Listen("tcp", l.addr)
+		if err != nil {
+			return fmt.Errorf("listener %s: %w", l.name, err)
+		}
+		lns = append(lns, ln)
+		ready = append(ready, l.name+"_addr", ln.Addr().String())
+	}
+
+	failed := make(chan error, len(ls))
+	srvs := make([]*http.Server, len(ls))
+	for i, l := range ls {
+		srvs[i] = &http.Server{
+			Handler:           l.handler,
+			TLSConfig:         tlsConfig,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       60 * time.Second,
+			WriteTimeout:      60 * time.Second,
+			IdleTimeout:       120 * time.Second,
+			MaxHeaderBytes:    64 << 10,
+			ErrorLog:          slog.NewLogLogger(log.With("listener", l.name).Handler(), slog.LevelWarn),
+		}
+		go func() {
+			var err error
+			if tlsConfig != nil {
+				err = srvs[i].ServeTLS(lns[i], "", "")
+			} else {
+				err = srvs[i].Serve(lns[i])
+			}
+			failed <- fmt.Errorf("listener %s: %w", l.name, err)
+		}()
+	}
+	log.Info("ready", ready...)
+
+	var err error
+	select {
+	case err = <-failed:
 	case <-ctx.Done():
 	}
-
 	grace, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
-	if err := srv.Shutdown(grace); err != nil {
-		return err
+	done := make(chan error, len(srvs))
+	for _, srv := range srvs {
+		go func() { done <- srv.Shutdown(grace) }()
 	}
-	log.Info("stopped", "listener", "data")
-	return nil
+	for range srvs {
+		err = errors.Join(err, <-done)
+	}
+	return err
 }

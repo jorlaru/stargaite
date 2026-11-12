@@ -18,7 +18,7 @@ b4d8f17068b35ee6060cc2f69a16fb48740d706fbba81661c318649c114a6998  golangci-lint-
 endef
 export LINT_SHA256
 
-.PHONY: ci check tools ci-container image
+.PHONY: ci check tools ci-container image image-test
 
 # Tools and checks run with an empty environment, so none can lean on an ambient credential.
 ci:
@@ -60,3 +60,13 @@ image: export VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/nul
 image:
 	docker build --build-arg VERSION -t $(IMAGE) .
 	test "$$(docker run --rm $(IMAGE) version)" = "$$VERSION"
+
+# A read-only root and a volume on /data: the ready line proves that the non-root
+# user writes the data directory, and SIGTERM must stop the proxy with exit 0.
+image-test: image
+	@id=$$(docker run -d --read-only -v /data $(IMAGE)) || exit 1; \
+	for i in $$(seq 40); do docker logs $$id 2>&1 | grep -q '"msg":"ready"' && break; sleep 0.25; done; \
+	docker stop -t 35 $$id >/dev/null; \
+	code=$$(docker inspect -f '{{.State.ExitCode}}' $$id); logs=$$(docker logs $$id 2>&1); \
+	docker container rm --volumes $$id >/dev/null; echo "$$logs"; \
+	echo "$$logs" | grep -q '"msg":"ready","data_dir":"/data"' && echo "$$logs" | grep -q '"msg":"stopped"' && test "$$code" = 0

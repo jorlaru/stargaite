@@ -17,4 +17,4 @@ jobs:
         with:
           persist-credentials: false
       - run: make ci-container
-      - run: make image
+      - run: make image-test

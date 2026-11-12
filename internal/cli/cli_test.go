@@ -70,7 +70,7 @@ func TestMainExitCodes(t *testing.T) {
 		{name: "command help", args: []string{"version", "--help"}, code: 0},
 		{name: "no command", code: 2},
 		{name: "unknown command", args: []string{"nope"}, code: 2},
-		{name: "a command not shipped yet", args: []string{"keys", "create", "x"}, code: 2},
+		{name: "a command not shipped yet", args: []string{"usage", "show"}, code: 2},
 		{name: "flag before the command", args: []string{"--json", "version"}, code: 2},
 		{name: "unknown flag", args: []string{"version", "--nope"}, code: 2},
 		{name: "wrong flag value", args: []string{"version", "--json=maybe"}, code: 2},

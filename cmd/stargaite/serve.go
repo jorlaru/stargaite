@@ -139,7 +139,7 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 	if code == 0 {
 		if err := runServers(ctx, log, tlsConfig, ready, []listener{
 			{"admin", *adminAddr, admin.Handler(cfg, keyHash, log)},
-			{"data", *dataAddr, api.Handler()},
+			{"data", *dataAddr, api.Handler(cfg, log)},
 		}); err != nil {
 			log.Error("server failed", "error", err.Error())
 			code = 1

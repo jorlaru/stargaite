@@ -2,7 +2,11 @@ package config
 
 import (
 	"cmp"
+	"crypto/sha256"
+	"slices"
+	"time"
 
+	"github.com/jorlaru/stargaite/internal/auth"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/transport"
 )
@@ -46,10 +50,43 @@ type Model struct {
 	Targets []*Target
 }
 
-// Key is a client key as published. Its secrets are not reachable from it.
+// Key is a client key as published. Its secrets are not reachable from it:
+// Secrets shows their public ids and ends, which a read lists, never a hash.
 type Key struct {
-	Name string
-	Spec domain.Key
+	Name    string
+	Spec    domain.Key
+	Secrets []SecretView
+}
+
+// Allows reports whether the key may use alias: it is listed, or the list is
+// ["*"] (SEC-2). An empty list reaches nothing.
+func (k *Key) Allows(alias string) bool {
+	return slices.Equal(k.Spec.Models, []string{"*"}) || slices.Contains(k.Spec.Models, alias)
+}
+
+// dummyHash is what a token with an unknown public id is compared against, so
+// that an unknown id costs the same comparison as a known one.
+var dummyHash = sha256.Sum256([]byte("stargaite: no secret has this public id"))
+
+// Authenticate returns the key a client token belongs to. The token must have
+// the shape of a client key, its public id must be published and its hash
+// must match, and the secret must not have reached its valid_until: a secret
+// in its grace is valid until then, and not at that instant (SEC-8). Any
+// failure is the same false, which the caller answers 401 invalid_api_key.
+func (s *Snapshot) Authenticate(token string, now time.Time) (*Key, bool) {
+	id, ok := auth.Parse(token)
+	if !ok {
+		return nil, false
+	}
+	sec, found := s.secrets[id]
+	hash := sec.hash
+	if !found {
+		hash = dummyHash
+	}
+	if !auth.Equal(token, hash) || !found || (sec.validUntil != 0 && now.UnixMilli() >= sec.validUntil) {
+		return nil, false
+	}
+	return sec.key, true
 }
 
 // secret is one secret of a key, found by its public id.
@@ -104,8 +141,9 @@ func build(st *State, env Env, findings []domain.Finding) *Snapshot {
 		}
 		s.Models[name] = m
 	}
+	views := secretsByKey(st.Secrets)
 	for name, spec := range d.Keys {
-		s.Keys[name] = &Key{Name: name, Spec: spec}
+		s.Keys[name] = &Key{Name: name, Spec: spec, Secrets: views[name]}
 	}
 	for _, sec := range st.Secrets {
 		if k := s.Keys[sec.KeyName]; k != nil {

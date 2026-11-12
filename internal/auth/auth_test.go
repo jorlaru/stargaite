@@ -79,3 +79,28 @@ func TestEqual(t *testing.T) {
 		}
 	}
 }
+
+// TestParse: the shape only; every byte of the parts must be in the alphabet.
+func TestParse(t *testing.T) {
+	token, id, _, err := Issue(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := Parse(token); !ok || got != id {
+		t.Fatalf("Parse(%q) = %q, %v", token, got, ok)
+	}
+	secret, err := Secret(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{
+		"", Prefix, token[:len(token)-1], token + "a", strings.ToUpper(token), " " + token, token + "\n",
+		strings.Replace(token, "-", "_", 2), token[:25] + "a" + token[26:], // no "-" between the parts
+		token[:13] + "1" + token[14:], token[:len(token)-1] + "8", token[:len(token)-2] + "é",
+		secret, "sk-stargaitE-" + token[13:], "SK-STARGAITE-" + token[13:],
+	} {
+		if _, ok := Parse(bad); ok {
+			t.Errorf("Parse(%q) accepts it", bad)
+		}
+	}
+}

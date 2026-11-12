@@ -41,15 +41,27 @@ var client = &http.Client{
 }
 
 // fill puts the value of a body flag at its path. "--flag=" sends null, which
-// a merge patch reads as "clear" (design section 13, point 20). The row, not
-// the text, fixes the type of a scalar.
+// a merge patch reads as "clear" (design section 13, point 20), and so does
+// the empty value of a pair, for that entry alone. The row, not the text,
+// fixes the type of a scalar.
 func fill(body map[string]any, f flagSpec, v string) error {
 	path := slices.Clip(strings.Split(f.path, "."))
 	if v == "" {
-		put(body, path, nil)
+		// A key's models is required, so its null would always be refused:
+		// "--model=" empties the list instead, which stops the key.
+		var empty any
+		if f.kind == kindList && f.path == "models" {
+			empty = []any{}
+		}
+		put(body, path, empty)
 		return nil
 	}
 	switch f.kind {
+	case kindAll:
+		if v != "true" {
+			return fmt.Errorf("takes no value")
+		}
+		appendTo(body, path, "*")
 	case kindString:
 		put(body, path, v)
 	case kindBool:
@@ -64,13 +76,21 @@ func fill(body map[string]any, f flagSpec, v string) error {
 		}
 		put(body, path, jsontext.Value(v))
 	case kindTypedPairs, kindStringPairs:
+		// A merge patch cannot clear a whole block and set one of its
+		// entries, so a pair after "--flag=" is refused, never dropped.
+		if prev, set := parent(body, path)[path[len(path)-1]]; set && prev == nil {
+			return fmt.Errorf("a pair cannot follow the empty value, which clears the whole block")
+		}
 		for _, pair := range strings.Split(v, ",") {
 			name, value, ok := strings.Cut(pair, "=")
 			if !ok || name == "" {
 				return fmt.Errorf("%q is not name=value", pair)
 			}
 			var typed any = value
-			if raw := jsontext.Value(value); f.kind == kindTypedPairs && raw.IsValid() && strings.ContainsRune("0tf", rune(raw.Kind())) {
+			switch raw := jsontext.Value(value); {
+			case value == "":
+				typed = nil
+			case f.kind == kindTypedPairs && raw.IsValid() && strings.ContainsRune("0tf", rune(raw.Kind())):
 				typed = raw
 			}
 			put(body, append(path, name), typed)
@@ -255,6 +275,17 @@ func render(w io.Writer, name string, v jsontext.Value) error {
 			return err
 		}
 		for _, k := range slices.Sorted(maps.Keys(m)) {
+			if name == "" && k == "secrets" && m[k].Kind() == '{' {
+				// The tokens a change issued: each on a line of its own.
+				var tokens map[string]string
+				if err := json.Unmarshal(m[k], &tokens); err != nil {
+					return err
+				}
+				for _, key := range slices.Sorted(maps.Keys(tokens)) {
+					say(w, "secrets.%s (shown once, never again):\n%s\n", printable(key), printable(tokens[key]))
+				}
+				continue
+			}
 			if err := render(w, strings.TrimPrefix(name+"."+k, "."), m[k]); err != nil {
 				return err
 			}

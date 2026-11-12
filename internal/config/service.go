@@ -104,6 +104,10 @@ func Open(ctx context.Context, st *store.Store, env func() Env, now func() time.
 // keeps it to the end, across any change (RES-7).
 func (s *Service) Snapshot() *Snapshot { return s.snap.Load() }
 
+// Now is the clock the service was opened with: what a change records and
+// what a key's valid_until is measured against, so tests inject one clock.
+func (s *Service) Now() time.Time { return s.now() }
+
 // Commit runs the change pipeline of design section 4. The error is always a
 // *domain.Error: 400 with findings, the refusal Mutate returned, or 500 when
 // the store fails, and then nothing is published.
@@ -354,19 +358,20 @@ func encodeIn[V any](m map[string]V, name string) (json.RawMessage, error) {
 	return Encode(v)
 }
 
-// secretView is what a diff and an audit row show of a key's secrets.
-type secretView struct {
+// SecretView is what a diff, an audit row and a read show of a key's secret:
+// its public id and its end, never its hash.
+type SecretView struct {
 	PublicID   string `json:"public_id"`
 	ValidUntil int64  `json:"valid_until,omitzero"`
 }
 
-func secretsByKey(secrets []KeySecret) map[string][]secretView {
-	m := map[string][]secretView{}
+func secretsByKey(secrets []KeySecret) map[string][]SecretView {
+	m := map[string][]SecretView{}
 	for _, s := range secrets {
-		m[s.KeyName] = append(m[s.KeyName], secretView{s.PublicID, s.ValidUntil})
+		m[s.KeyName] = append(m[s.KeyName], SecretView{s.PublicID, s.ValidUntil})
 	}
 	for _, list := range m {
-		slices.SortFunc(list, func(a, b secretView) int { return cmp.Compare(a.PublicID, b.PublicID) })
+		slices.SortFunc(list, func(a, b SecretView) int { return cmp.Compare(a.PublicID, b.PublicID) })
 	}
 	return m
 }

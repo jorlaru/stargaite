@@ -2,13 +2,11 @@ package config
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/json/jsontext"
 	"fmt"
 	"maps"
 	"slices"
 
-	"github.com/jorlaru/stargaite/internal/auth"
 	"github.com/jorlaru/stargaite/internal/domain"
 )
 
@@ -64,11 +62,10 @@ func (s *Service) Apply(ctx context.Context, file *domain.Document, prune, dryRu
 				return nil, domain.NewError(domain.CodeConflict, fmt.Sprintf("key %.64q is revoked, and a revoked name is never reused", name))
 			}
 			if _, exists := d.Keys[name]; !exists {
-				token, id, hash, err := auth.Issue(rand.Reader)
+				token, err := st.NewSecret(name, now)
 				if err != nil {
 					return nil, err
 				}
-				st.Secrets = append(st.Secrets, KeySecret{PublicID: id, KeyName: name, Hash: hash, CreatedAt: now})
 				issued[name] = token
 			}
 			d.Keys[name] = file.Keys[name]
@@ -76,14 +73,9 @@ func (s *Service) Apply(ctx context.Context, file *domain.Document, prune, dryRu
 		if prune {
 			for name := range d.Keys {
 				if _, named := file.Keys[name]; !named {
-					delete(d.Keys, name)
-					st.Revoked[name] = now
+					st.Revoke(name, now)
 				}
 			}
-			st.Secrets = slices.DeleteFunc(st.Secrets, func(sec KeySecret) bool {
-				_, declared := d.Keys[sec.KeyName]
-				return !declared
-			})
 		}
 		return issued, nil
 	}})

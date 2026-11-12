@@ -19,6 +19,10 @@ type Finding struct {
 	Message  string `json:"message"`
 }
 
+// RequestIDHeader carries the request id on every response of both listeners
+// (kick-off section 15).
+const RequestIDHeader = "X-Stargaite-Request-Id"
+
 // Error codes of the error model (kick-off section 15) that the admin API and
 // the authenticated data-plane route answer with.
 const (

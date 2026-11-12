@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -124,7 +125,20 @@ func TestCommandWalk(t *testing.T) {
 		"models show":   {{[]string{"m@"}, 0}, {[]string{"nope"}, 1}},
 		"models set":    {{[]string{"m@", "--param", "enable_search=drop", "--trace-sample-rate", "0"}, 0}, {[]string{"m@", "--target", "nope/x"}, 1}},
 		"models remove": {{[]string{"m@", "--yes"}, 0}, {[]string{"nope", "--yes"}, 1}},
-		"export":        {{nil, 0}},
+		"keys create": {
+			{[]string{"k@", "--model", "fast", "--model", "deep", "--budget", "limit_usd=10,reset_interval=monthly", "--rpm-limit", "5", "--trace-sample-rate", "0.5"}, 0},
+			{[]string{"all@", "--all-models"}, 0},
+			{[]string{"k@", "--model", "fast"}, 1}, {[]string{"none"}, 1}, {[]string{"x", "--all-models", "--model", "fast"}, 1},
+		},
+		"keys list": {{nil, 0}},
+		"keys show": {{[]string{"k@"}, 0}, {[]string{"nope"}, 1}},
+		"keys set": {
+			{[]string{"k@", "--all-models", "--budget=", "--max-parallel-requests", "2"}, 0}, {[]string{"k@", "--model="}, 0},
+			{[]string{"nope", "--rpm-limit", "1"}, 1},
+		},
+		"keys rotate": {{[]string{"k@"}, 0}, {[]string{"k@", "--grace", "5m"}, 0}, {[]string{"k@", "--grace", "soon"}, 1}, {[]string{"nope"}, 1}},
+		"keys revoke": {{[]string{"all@", "--yes"}, 0}, {[]string{"all@", "--yes"}, 1}, {[]string{"nope", "--yes"}, 1}},
+		"export":      {{nil, 0}},
 		"apply": {
 			{[]string{"-f", example, "--dry-run"}, 0}, {[]string{"-f", example}, 0}, {[]string{"-f", invalid}, 1},
 			{[]string{"-f", example, "--prune", "--yes"}, 0}, {[]string{"-f", example, "--prune", "--dry-run"}, 0},
@@ -258,6 +272,29 @@ func TestRequests(t *testing.T) {
 		{[]string{"models", "show", "fast"}, "GET", "/admin/v1/models/fast", ""},
 		{[]string{"models", "set", "fast", "--target", "4", "--effort="}, "PATCH", "/admin/v1/models/fast", `{"reasoning":{"effort":null},"targets":["4"]}`},
 		{[]string{"models", "remove", "fast", "--yes"}, "DELETE", "/admin/v1/models/fast", ""},
+		{[]string{"keys", "list"}, "GET", "/admin/v1/keys", ""},
+		{
+			[]string{"keys", "create", "my-agent", "--model", "fast", "--model", "4", "--budget", "limit_usd=100,reset_interval=monthly", "--rpm-limit", "60",
+				"--tpm-limit", "7", "--max-parallel-requests", "5", "--quota-share", "minimax-plan=0.4", "--trace-sample-rate", "0.1"},
+			"POST", "/admin/v1/keys",
+			`{"budget":{"limit_usd":100,"reset_interval":"monthly"},"max_parallel_requests":5,"models":["fast","4"],"name":"my-agent","quota_share":{"minimax-plan":0.4},` +
+				`"rpm_limit":60,"tpm_limit":7,"trace_sample_rate":0.1}`,
+		},
+		{[]string{"keys", "create", "all", "--all-models"}, "POST", "/admin/v1/keys", `{"models":["*"],"name":"all"}`},
+		{[]string{"keys", "create", "none", "--model="}, "POST", "/admin/v1/keys", `{"models":[],"name":"none"}`},
+		{[]string{"keys", "set", "k", "--model="}, "PATCH", "/admin/v1/keys/k", `{"models":[]}`},
+		{[]string{"keys", "set", "k", "--model=", "--model", "fast"}, "PATCH", "/admin/v1/keys/k", `{"models":["fast"]}`},
+		{[]string{"keys", "show", "a.b"}, "GET", "/admin/v1/keys/a.b", ""},
+		{[]string{"keys", "set", "a.b", "--all-models", "--quota-share", "p=", "--rpm-limit="}, "PATCH", "/admin/v1/keys/a.b", `{"models":["*"],"quota_share":{"p":null},"rpm_limit":null}`},
+		{[]string{"keys", "set", "k", "--model", "fast", "--all-models"}, "PATCH", "/admin/v1/keys/k", `{"models":["fast","*"]}`},
+		{[]string{"keys", "rotate", "k"}, "POST", "/admin/v1/keys/k/rotate", `{}`},
+		{[]string{"keys", "rotate", "k", "--grace", "30m"}, "POST", "/admin/v1/keys/k/rotate", `{"grace":"30m"}`},
+		{[]string{"keys", "revoke", "a/b", "--yes"}, "POST", "/admin/v1/keys/a%2Fb/revoke", `{}`},
+		// An empty pair value clears that entry; "--flag=" after pairs clears the block.
+		{[]string{"targets", "set", "p/m", "--capabilities", "tools=,vision=true", "--pricing", "as_of=", "--effort-map", "max="}, "PATCH", "/admin/v1/targets/p%2Fm",
+			`{"capabilities":{"tools":null,"vision":true},"pricing":{"as_of":null},"reasoning":{"map":{"max":null}}}`},
+		{[]string{"providers", "set", "p", "--target-defaults", "dialect=", "--cost-report", "path=a,usd_per_unit=1", "--cost-report="}, "PATCH", "/admin/v1/providers/p",
+			`{"cost_report":null,"target_defaults":{"dialect":null}}`},
 	} {
 		*got = recorded{}
 		if r := runMain(vars, tc.args...); r.code != 0 {
@@ -325,6 +362,18 @@ func TestUsage(t *testing.T) {
 		{"models", "add", "m", "--level", "low"},
 		{"models", "show", "m", "n"},
 		{"models", "remove", "m"},
+		{"keys", "create"},
+		{"keys", "create", "k", "--all-models=false"},
+		{"keys", "create", "k", "--all-models=yes"},
+		{"keys", "set", "k", "--quota-share", "p"},
+		{"keys", "set", "k", "--content", "24h"},
+		{"keys", "rotate"},
+		{"keys", "rotate", "k", "--model", "fast"},
+		{"keys", "revoke", "k"},
+		{"keys", "revoke", "k", "--json"},
+		// A merge patch cannot clear a block and set one of its entries.
+		{"targets", "set", "p/m", "--capabilities=", "--capabilities", "tools=true"},
+		{"keys", "set", "k", "--budget=", "--budget", "limit_usd=1"},
 	} {
 		*got = recorded{}
 		r := runMain(vars, args...)
@@ -419,15 +468,46 @@ resource.note: "red\x1b[31m"
 resource.tags: x, y
 resource.timeouts.connect_ms: 100
 revision: 2
-secrets.a: sk-x
+secrets.a (shown once, never again):
+sk-x
 `
 	if r.code != 0 || r.stdout != want {
 		t.Errorf("exit %d, stderr %q, stdout\n%s\nwant\n%s", r.code, r.stderr, r.stdout, want)
 	}
 }
 
-// TestAnnexBByCommand: the providers, targets and aliases of annex B built
-// one command at a time equal those of the applied file (AC-39 over annex B).
+// TestPairClears: an empty pair value sends null for that entry, so a
+// capability or a target default goes back to undeclared, and "--model="
+// empties a key's models, which stops the key (design section 6).
+func TestPairClears(t *testing.T) {
+	vars := adminServer(t)
+	for _, args := range [][]string{
+		{"providers", "add", "openrouter"},
+		{"targets", "add", "openrouter/m", "--kind", "chat", "--capabilities", "tools=true,vision=false", "--effort-map", "max=high,low=minimal"},
+		{"targets", "set", "openrouter/m", "--capabilities", "tools=", "--effort-map", "max="},
+		{"providers", "set", "openrouter", "--target-defaults", "dialect="},
+		{"keys", "create", "k", "--all-models"},
+		{"keys", "set", "k", "--model="},
+	} {
+		if r := runMain(vars, args...); r.code != 0 {
+			t.Fatalf("%q: exit %d, stderr %s", args, r.code, r.stderr)
+		}
+	}
+	doc := exported(t, vars)
+	if got := string(doc["targets"]); !strings.Contains(got, `"capabilities":{"vision":false}`) || !strings.Contains(got, `"map":{"low":"minimal"}`) {
+		t.Errorf("targets %s", got)
+	}
+	if got := string(doc["providers"]); !strings.Contains(got, `"target_defaults":{"output_cap_param":"max_tokens"}`) {
+		t.Errorf("providers %s", got)
+	}
+	if got := string(doc["keys"]); !strings.Contains(got, `"models":[]`) {
+		t.Errorf("keys %s", got)
+	}
+}
+
+// TestAnnexBByCommand: the providers, targets, aliases and keys of annex B
+// built one command at a time equal those of the applied file, secrets aside,
+// which export never shows (AC-39 over annex B).
 // Two targets are created by models add and completed by targets set.
 func TestAnnexBByCommand(t *testing.T) {
 	built := adminServer(t)
@@ -457,6 +537,8 @@ func TestAnnexBByCommand(t *testing.T) {
 		{"targets", "set", "tei-embed/bge-m3", "--kind", "embeddings"},
 		{"models", "add", "rerank", "--target", "tei-rerank/bge-reranker-v2-m3", "--trace-sample-rate", "0"},
 		{"targets", "set", "tei-rerank/bge-reranker-v2-m3", "--kind", "rerank"},
+		{"keys", "create", "classifier-flow", "--model", "fast", "--model", "embed", "--model", "rerank", "--budget", "limit_usd=30,reset_interval=monthly",
+			"--max-parallel-requests", "10", "--trace-sample-rate", "0.1"},
 	} {
 		r := runMain(built, append(args, "--json")...)
 		if r.code != 0 {
@@ -466,12 +548,18 @@ func TestAnnexBByCommand(t *testing.T) {
 			t.Errorf("%q: the created target is not in the diff: %s", args, r.stdout)
 		}
 	}
+	// Without --json, keys create prints the token on a line of its own.
+	r := runMain(built, "keys", "create", "invoice-agent", "--model", "fast", "--model", "deep", "--budget", "limit_usd=100,reset_interval=monthly",
+		"--rpm-limit", "60", "--max-parallel-requests", "5", "--quota-share", "minimax-plan=0.4")
+	if r.code != 0 || !regexp.MustCompile(`(?m)^secrets\.invoice-agent \(shown once, never again\):\nsk-stargaite-[a-z2-7]{12}-[a-z2-7]{52}$`).MatchString(r.stdout) {
+		t.Errorf("keys create: exit %d, stdout %s", r.code, r.stdout)
+	}
 	applied := adminServer(t)
 	if r := runMain(applied, "apply", "-f", "../../config.example.yaml"); r.code != 0 {
 		t.Fatalf("apply: exit %d, stderr %s", r.code, r.stderr)
 	}
 	got, want := exported(t, built), exported(t, applied)
-	for _, kind := range []string{"providers", "targets", "models"} {
+	for _, kind := range []string{"providers", "targets", "models", "keys"} {
 		if g, w := got[kind], want[kind]; !bytes.Equal(g, w) || len(w) < 100 {
 			t.Errorf("%s built by command:\n%s\napplied:\n%s", kind, g, w)
 		}

@@ -28,7 +28,7 @@ import (
 
 const (
 	// RequestIDHeader is on every response of the listener.
-	RequestIDHeader = "X-Stargaite-Request-Id"
+	RequestIDHeader = domain.RequestIDHeader
 	// maxBody caps a JSON body; the apply route takes config.MaxYAMLBytes.
 	maxBody = 1 << 20
 	// refusalLogEvery rate-limits the log line of a failed authentication:
@@ -68,7 +68,8 @@ var routes = []route{
 	{"DELETE /admin/v1/providers/{name}", (*server).removeProvider},
 	// A target id holds "/": the trailing wildcard takes the rest of the
 	// path, unescaped, so the CLI escapes the whole id and "." or ".."
-	// segments of an upstream id are never cleaned away.
+	// segments of an upstream id are never cleaned away. Sent unescaped,
+	// such an id gets the mux's redirect, which the wrapper refuses.
 	{"GET /admin/v1/targets", (*server).listTargets},
 	{"POST /admin/v1/targets", (*server).addTarget},
 	{"GET /admin/v1/targets/{id...}", (*server).showTarget},
@@ -79,6 +80,12 @@ var routes = []route{
 	{"GET /admin/v1/models/{name}", (*server).showModel},
 	{"PATCH /admin/v1/models/{name}", (*server).setModel},
 	{"DELETE /admin/v1/models/{name}", (*server).removeModel},
+	{"GET /admin/v1/keys", (*server).listKeys},
+	{"POST /admin/v1/keys", (*server).createKey},
+	{"GET /admin/v1/keys/{name}", (*server).showKey},
+	{"PATCH /admin/v1/keys/{name}", (*server).setKey},
+	{"POST /admin/v1/keys/{name}/rotate", (*server).rotateKey},
+	{"POST /admin/v1/keys/{name}/revoke", (*server).revokeKey},
 }
 
 // Handler returns the admin listener's handler. keyHash is the SHA-256 of the
@@ -107,6 +114,16 @@ func Handler(cfg *config.Service, keyHash [32]byte, log *slog.Logger) http.Handl
 		rec := &recorder{ResponseWriter: w, mux: pattern == ""}
 		mux.ServeHTTP(rec, r)
 		switch {
+		case rec.status/100 == 3:
+			// Only the mux redirects: to the cleaned path of a path with "."
+			// or ".." segments or "//", or to the path with the trailing "/"
+			// of a route that ends in a wildcard.
+			// A client that followed it could write to another resource
+			// than the one it named, so the request is refused instead.
+			w.Header().Del("Location")
+			rec.status = http.StatusBadRequest // what the request line records
+			write(w, rec.status, envelope{domain.NewError(domain.CodeInvalidRequest,
+				`the path is not canonical: it has a "." or ".." segment or "//", or lacks a trailing "/"; escape an id whole, each "/" as %2F`)})
 		case rec.mux && rec.status == http.StatusNotFound:
 			write(w, rec.status, envelope{domain.NewError(domain.CodeNotFound, "no such route")})
 		case rec.mux && rec.status == http.StatusMethodNotAllowed:
@@ -132,9 +149,10 @@ func (s *server) refused(r *http.Request, id string) {
 	s.refusedAt, s.refusals = time.Now(), 0
 }
 
-// recorder keeps the status for the request log line. For a request no route
-// matched, it drops the mux's own plain-text 404 and 405, which the wrapper
-// answers in the envelope instead; a redirect of the mux passes through.
+// recorder keeps the status for the request log line. It drops the mux's own
+// answers, which the wrapper answers in the envelope instead: a redirect,
+// which no route ever answers, and for a request no route matched, the
+// plain-text 404 and 405.
 type recorder struct {
 	http.ResponseWriter
 	status int
@@ -159,7 +177,7 @@ func (rec *recorder) Write(b []byte) (int, error) {
 }
 
 func (rec *recorder) dropped() bool {
-	return rec.mux && (rec.status == http.StatusNotFound || rec.status == http.StatusMethodNotAllowed)
+	return rec.status/100 == 3 || (rec.mux && (rec.status == http.StatusNotFound || rec.status == http.StatusMethodNotAllowed))
 }
 
 type envelope struct {

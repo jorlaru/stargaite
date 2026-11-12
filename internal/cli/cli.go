@@ -43,11 +43,12 @@ const (
 	kindString      flagKind = iota // a value the command reads itself or, with a path, a JSON string at path
 	kindBool                        // the same, given without a value; with a path, true or false at path
 	kindNumber                      // a JSON number at path
-	kindTypedPairs                  // name=value pairs under path, comma-separated or repeated: a JSON number, true or false is sent as that literal, anything else as a string
-	kindStringPairs                 // the same, every value sent as a string
+	kindTypedPairs                  // name=value pairs under path, comma-separated or repeated: a JSON number, true or false is sent as that literal, "name=" as null, anything else as a string
+	kindStringPairs                 // the same, every value but "name=" sent as a string
 	kindQuota                       // <window>:<unit>=<n>, repeated: appends {"window": window, unit: n} to the list at path
 	kindList                        // repeated: appends the value, a JSON string, to the list at path, in order
 	kindRaw                         // one JSON value, sent verbatim at path
+	kindAll                         // given without a value: appends "*" to the list at path
 )
 
 // flagSpec is one flag of a command. A one-letter name is the short form the
@@ -141,6 +142,19 @@ var modelFlags = []flagSpec{
 	{"trace-sample-rate", kindNumber, "trace_sample_rate", "the share of requests traced, 0 to 1"},
 }
 
+// keyFlags are the fields of a key (kick-off section 6); --content ships with
+// phase 3.
+var keyFlags = []flagSpec{
+	{"model", kindList, "models", "an alias the key may use, repeated"},
+	{"all-models", kindAll, "models", `every alias: models ["*"]`},
+	{"budget", kindTypedPairs, "budget", "limit_usd=<usd>,reset_interval=<daily|monthly|never>"},
+	{"rpm-limit", kindNumber, "rpm_limit", "requests per minute"},
+	{"tpm-limit", kindNumber, "tpm_limit", "tokens per minute"},
+	{"max-parallel-requests", kindNumber, "max_parallel_requests", "requests in flight (5 when undeclared)"},
+	{"quota-share", kindTypedPairs, "quota_share", "<provider>=<fraction>: the share of each window of a subscription provider"},
+	{"trace-sample-rate", kindNumber, "trace_sample_rate", "the share of requests traced, 0 to 1"},
+}
+
 // add is the request of a command that creates the resource its positional
 // argument names: the body flags given, plus that argument as member key.
 func add(collection, key string) func(input) (string, string, any) {
@@ -161,6 +175,14 @@ func named(method, collection string) func(input) (string, string, any) {
 			body = in.body
 		}
 		return method, collection + "/" + url.PathEscape(in.args[0]), body
+	}
+}
+
+// action is the request of a command that acts on the key its positional
+// argument names: a POST with the body flags given, {} when none.
+func action(verb string) func(input) (string, string, any) {
+	return func(in input) (string, string, any) {
+		return http.MethodPost, "/keys/" + url.PathEscape(in.args[0]) + "/" + verb, in.body
 	}
 }
 
@@ -192,6 +214,14 @@ var commands = []command{
 	{words: []string{"models", "show"}, args: []string{"name"}, request: named(http.MethodGet, "/models")},
 	{words: []string{"models", "set"}, args: []string{"name"}, flags: modelFlags, request: named(http.MethodPatch, "/models")},
 	{words: []string{"models", "remove"}, args: []string{"name"}, needsYes: func(input) bool { return true }, request: named(http.MethodDelete, "/models")},
+	{words: []string{"keys", "create"}, args: []string{"name"}, flags: keyFlags, request: add("/keys", "name")},
+	{words: []string{"keys", "list"}, request: get("/keys")},
+	{words: []string{"keys", "show"}, args: []string{"name"}, request: named(http.MethodGet, "/keys")},
+	{words: []string{"keys", "set"}, args: []string{"name"}, flags: keyFlags, request: named(http.MethodPatch, "/keys")},
+	{words: []string{"keys", "rotate"}, args: []string{"name"}, flags: []flagSpec{
+		{"grace", kindString, "grace", "how long the secret in use stays valid, such as 30m (default 1h)"},
+	}, request: action("rotate")},
+	{words: []string{"keys", "revoke"}, args: []string{"name"}, needsYes: func(input) bool { return true }, request: action("revoke")},
 	{words: []string{"export"}, request: func(in input) (string, string, any) {
 		if in.json {
 			return http.MethodGet, "/export?format=json", nil
@@ -255,7 +285,7 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 			in.flags[f.name] = fs.String(f.name, "", f.usage)
 		case f.kind == kindBool && f.path == "":
 			in.bools[f.name] = fs.Bool(f.name, false, f.usage)
-		case f.kind == kindBool:
+		case f.kind == kindBool || f.kind == kindAll:
 			fs.BoolFunc(f.name, f.usage, func(v string) error { return fill(in.body, f, v) })
 		default:
 			fs.Func(f.name, f.usage, func(v string) error { return fill(in.body, f, v) })

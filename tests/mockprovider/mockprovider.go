@@ -5,11 +5,15 @@
 package mockprovider
 
 import (
+	"cmp"
+	"encoding/json"
 	"io"
 	"maps"
 	"net/http"
 	"slices"
+	"strings"
 	"sync"
+	"time"
 )
 
 // Step is one scripted reply. A zero Status means 200.
@@ -17,6 +21,11 @@ type Step struct {
 	Status int
 	Header http.Header
 	Body   []byte
+	Chunks [][]byte      // raw SSE bytes, each written and flushed after the headers; Body is ignored
+	Delay  time.Duration // before the status line: a late first byte
+	Gap    time.Duration // between chunks: silence
+	Hang   bool          // after the body or the chunks, block until the request's context ends
+	Cut    bool          // after the body or the chunks, abort the connection
 }
 
 // Call is one request as received: the body holds its exact bytes.
@@ -46,12 +55,37 @@ var defaults = map[string]string{
 		`"usage":{"input_tokens":1,"output_tokens":2}}`,
 }
 
+// streams are the replies of an empty queue to a body with "stream": true,
+// by route: OpenAI chat chunks with a usage chunk, sent unasked, and [DONE];
+// the Anthropic Messages events.
+var streams = map[string][]string{
+	"/chat/completions": {
+		`{"id":"chatcmpl-mock","object":"chat.completion.chunk","created":0,"model":"mock","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-mock","object":"chat.completion.chunk","created":0,"model":"mock","choices":[{"index":0,"delta":{"content":"mock "},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-mock","object":"chat.completion.chunk","created":0,"model":"mock","choices":[{"index":0,"delta":{"content":"reply"},"finish_reason":null}]}`,
+		`{"id":"chatcmpl-mock","object":"chat.completion.chunk","created":0,"model":"mock","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`,
+		`{"id":"chatcmpl-mock","object":"chat.completion.chunk","created":0,"model":"mock","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`,
+		`[DONE]`,
+	},
+	"/v1/messages": {
+		"event: message_start\ndata: " + `{"type":"message_start","message":{"id":"msg_mock","type":"message","role":"assistant","model":"mock","content":[],` +
+			`"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}`,
+		"event: content_block_start\ndata: " + `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+		"event: ping\ndata: " + `{"type":"ping"}`,
+		"event: content_block_delta\ndata: " + `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"mock reply"}}`,
+		"event: content_block_stop\ndata: " + `{"type":"content_block_stop","index":0}`,
+		"event: message_delta\ndata: " + `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}`,
+		"event: message_stop\ndata: " + `{"type":"message_stop"}`,
+	},
+}
+
 // New returns a server with an empty script.
 func New() *Server { return &Server{} }
 
 // ServeHTTP records the request, then answers POST /chat/completions,
 // /embeddings and /v1/messages; any other route gets 404 or 405 and leaves the
-// script untouched.
+// script untouched. With an empty queue, a body with "stream": true gets the
+// route's default stream, if it has one.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	s.mu.Lock()
@@ -72,14 +106,69 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	case step != nil:
-		maps.Copy(w.Header(), step.Header)
-		if step.Status != 0 {
-			w.WriteHeader(step.Status)
-		}
-		_, _ = w.Write(step.Body)
+		reply(w, r, step)
 	default:
+		var req struct{ Stream bool }
+		if events := streams[r.URL.Path]; json.Unmarshal(body, &req) == nil && req.Stream && events != nil {
+			step = &Step{}
+			for _, e := range events {
+				if !strings.HasPrefix(e, "event:") {
+					e = "data: " + e
+				}
+				step.Chunks = append(step.Chunks, []byte(e+"\n\n"))
+			}
+			reply(w, r, step)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, def)
+	}
+}
+
+// reply answers with step. A step with Chunks defaults its Content-Type to
+// text/event-stream. A wait ends early, and the reply with it, when the
+// request's context ends.
+func reply(w http.ResponseWriter, r *http.Request, step *Step) {
+	maps.Copy(w.Header(), step.Header)
+	if step.Chunks != nil && w.Header().Get("Content-Type") == "" {
+		w.Header().Set("Content-Type", "text/event-stream")
+	}
+	rc := http.NewResponseController(w)
+	wait := func(d time.Duration) bool {
+		if d <= 0 {
+			return true
+		}
+		t := time.NewTimer(d)
+		defer t.Stop()
+		select {
+		case <-t.C:
+			return true
+		case <-r.Context().Done():
+			return false
+		}
+	}
+	if !wait(step.Delay) {
+		return
+	}
+	w.WriteHeader(cmp.Or(step.Status, http.StatusOK))
+	if step.Chunks == nil {
+		_, _ = w.Write(step.Body)
+	}
+	for i, c := range step.Chunks {
+		if i > 0 && !wait(step.Gap) {
+			return
+		}
+		_, _ = w.Write(c)
+		_ = rc.Flush()
+	}
+	if step.Hang || step.Cut {
+		_ = rc.Flush() // what was written reaches the client first
+	}
+	if step.Hang {
+		<-r.Context().Done()
+	}
+	if step.Cut {
+		panic(http.ErrAbortHandler)
 	}
 }
 

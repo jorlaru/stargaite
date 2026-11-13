@@ -2,13 +2,16 @@ package mockprovider
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"maps"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"testing"
+	"time"
 )
 
 func send(t *testing.T, srv *httptest.Server, method, path string, header http.Header, body []byte) (int, http.Header, []byte) {
@@ -90,4 +93,82 @@ func TestScript(t *testing.T) {
 	if n := len(m.Calls()); n != 5 {
 		t.Errorf("%d calls recorded, want 5", n)
 	}
+}
+
+// An empty queue answers "stream": true with the route's default stream:
+// chat chunks with a usage chunk and [DONE], and the Messages events.
+func TestDefaultStreams(t *testing.T) {
+	srv := httptest.NewServer(New())
+	defer srv.Close()
+	for path, last := range map[string]string{"/chat/completions": "data: [DONE]\n\n", "/v1/messages": "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"} {
+		status, header, body := send(t, srv, http.MethodPost, path, nil, []byte(`{"stream":true}`))
+		if status != http.StatusOK || header.Get("Content-Type") != "text/event-stream" || !bytes.HasSuffix(body, []byte(last)) {
+			t.Errorf("%s: %d %q %s", path, status, header.Get("Content-Type"), body)
+		}
+		for event := range bytes.SplitSeq(bytes.TrimSuffix(body, []byte("\n\n")), []byte("\n\n")) {
+			_, data, _ := bytes.Cut(event, []byte("data: "))
+			if !json.Valid(data) && string(data) != "[DONE]" {
+				t.Errorf("%s: event %q", path, event)
+			}
+		}
+	}
+	if status, header, _ := send(t, srv, http.MethodPost, "/chat/completions", nil, []byte(`{"stream":false}`)); status != http.StatusOK || header.Get("Content-Type") != "application/json" {
+		t.Errorf("stream false: %d %v", status, header)
+	}
+	if status, header, _ := send(t, srv, http.MethodPost, "/embeddings", nil, []byte(`{"stream":true}`)); status != http.StatusOK || header.Get("Content-Type") != "application/json" {
+		t.Errorf("embeddings: %d %v", status, header)
+	}
+}
+
+// Chunks are flushed one by one with Gap between them, after Delay; Hang
+// holds the reply until the request ends; Cut aborts it.
+func TestStreamSteps(t *testing.T) {
+	m := New()
+	srv := httptest.NewServer(m)
+	defer srv.Close()
+	m.Script(Step{Chunks: [][]byte{[]byte("data: 1\n\n"), []byte("data: 2\n\n")}, Delay: 50 * time.Millisecond, Gap: 100 * time.Millisecond})
+	start := time.Now()
+	resp, err := srv.Client().Post(srv.URL+"/chat/completions", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := time.Since(start)
+	buf := make([]byte, 64)
+	n, err := resp.Body.Read(buf)
+	if err != nil || string(buf[:n]) != "data: 1\n\n" || resp.Header.Get("Content-Type") != "text/event-stream" || first < 50*time.Millisecond {
+		t.Errorf("first chunk %q after %v: %v", buf[:n], first, err)
+	}
+	rest, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil || string(rest) != "data: 2\n\n" || time.Since(start) < 150*time.Millisecond {
+		t.Errorf("second chunk %q after %v: %v", rest, time.Since(start), err)
+	}
+
+	m.Script(Step{Status: http.StatusTeapot, Header: http.Header{"Content-Type": {"text/plain"}}, Chunks: [][]byte{[]byte("x")}, Cut: true})
+	resp, err = srv.Client().Post(srv.URL+"/chat/completions", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusTeapot || resp.Header.Get("Content-Type") != "text/plain" || string(body) != "x" || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Errorf("cut: %d %q %v", resp.StatusCode, body, err)
+	}
+
+	m.Script(Step{Body: []byte("held"), Hang: true})
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/chat/completions", nil)
+	resp, err = srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n, err = resp.Body.Read(buf)
+	if string(buf[:n]) != "held" {
+		t.Errorf("hang: %q %v", buf[:n], err)
+	}
+	cancel()
+	if _, err := io.ReadAll(resp.Body); err == nil {
+		t.Error("the held reply ended without an error")
+	}
+	_ = resp.Body.Close()
 }

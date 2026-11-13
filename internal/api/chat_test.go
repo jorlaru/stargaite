@@ -116,7 +116,6 @@ func TestChatHeaders(t *testing.T) {
 		{name: "repeated key", key: "agent", body: `{"model":"plain","model":"plain","messages":[]}`, status: 400, code: "invalid_request", param: "model"},
 		{name: "unknown parameter", key: "agent", body: chatBody("plain", `,"enable_search":true`), status: 400, code: "unknown_parameter", param: "enable_search"},
 		{name: "effort off the scale", key: "agent", body: chatBody("fast", `,"reasoning_effort":"default"`), status: 400, code: "invalid_reasoning_effort", param: "reasoning_effort"},
-		{name: "stream until C14", key: "agent", body: chatBody("plain", `,"stream":true`), status: 400, code: "invalid_request", param: "stream"},
 		{name: "cap above the alias's", key: "agent", body: chatBody("fast", `,"max_tokens":501`), status: 422, code: "max_output_tokens_exceeded", param: "max_tokens"},
 		{name: "no target serves the endpoint", key: "agent", body: chatBody("anth", ""), status: 422, code: "endpoint_not_supported"},
 		{name: "no target takes tools", key: "agent", body: chatBody("notools", tools), status: 422, code: "capability_mismatch", param: "tools"},
@@ -252,7 +251,7 @@ func TestChatHeaders(t *testing.T) {
 			}
 		}
 	}
-	if calls := len(mock.Calls()); attempts != calls || requests != 31 || refused != 1 {
+	if calls := len(mock.Calls()); attempts != calls || requests != 30 || refused != 1 {
 		t.Errorf("%d attempt lines for %d calls, %d request lines, %d refusal lines", attempts, calls, requests, refused)
 	}
 	if !strings.Contains(log, `"msg":"attempt"`) || !strings.Contains(log, `"usage":{"input":1,"cache_read":0,"cache_write":0,"output":2}`) ||

@@ -29,6 +29,7 @@ import (
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/store"
+	"github.com/jorlaru/stargaite/tests/mockprovider"
 )
 
 // adminKey is an admin key given through STARGAITE_ADMIN_KEY.
@@ -250,10 +251,11 @@ func TestServeLoadsTheConfiguration(t *testing.T) {
 }
 
 // TestServeDeadlines (phase-2 design section 10, AC-22): a synchronous chat
-// completion that lasts longer than both servers' read and write timeouts is
-// not cut, because the data plane clears its read deadline once the body is
-// read and sets its write deadline per provider call. The configuration is
-// stored before serve starts, so no admin call races the lowered timeouts.
+// completion and a stream that last longer than both servers' read and write
+// timeouts are not cut, because the data plane clears its read deadline once
+// the body is read and sets its write deadline per provider call, which a
+// stream moves per event (SEC-6). The configuration is stored before serve
+// starts, so no admin call races the lowered timeouts.
 func TestServeDeadlines(t *testing.T) {
 	const reply = `{"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"late"},"finish_reason":"stop"}]}`
 	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -265,6 +267,11 @@ func TestServeDeadlines(t *testing.T) {
 		}
 	}))
 	t.Cleanup(slow.Close)
+	mock := mockprovider.New()
+	mock.Script(mockprovider.Step{Chunks: [][]byte{[]byte("data: {\"choices\":[]}\n\n"), []byte("data: {\"choices\":[]}\n\n"),
+		[]byte("data: {\"choices\":[]}\n\n"), []byte("data: [DONE]\n\n")}, Gap: 200 * time.Millisecond})
+	sse := httptest.NewServer(mock)
+	t.Cleanup(sse.Close)
 	dir := t.TempDir()
 	st, err := store.Open(context.Background(), dir)
 	if err != nil {
@@ -280,9 +287,12 @@ func TestServeDeadlines(t *testing.T) {
 	}
 	if _, err := cfg.Commit(context.Background(), config.Change{Summary: "apply", Mutate: func(s *config.State) (map[string]string, error) {
 		s.Doc.Providers["slow"] = domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: slow.URL, Billing: domain.BillingNone, AllowPrivateNetwork: true}
+		s.Doc.Providers["sse"] = domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: sse.URL, Billing: domain.BillingNone, AllowPrivateNetwork: true}
 		s.Doc.Targets["slow/m"] = domain.Target{Kind: domain.KindChat}
+		s.Doc.Targets["sse/m"] = domain.Target{Kind: domain.KindChat}
 		s.Doc.Models["fast"] = domain.Model{Targets: []string{"slow/m"}}
-		s.Doc.Keys["agent"] = domain.Key{Models: []string{"fast"}}
+		s.Doc.Models["stream"] = domain.Model{Targets: []string{"sse/m"}}
+		s.Doc.Keys["agent"] = domain.Key{Models: []string{"fast", "stream"}}
 		s.Secrets = append(s.Secrets, config.KeySecret{PublicID: id, KeyName: "agent", Hash: hash})
 		return nil, nil
 	}}); err != nil {
@@ -295,22 +305,25 @@ func TestServeDeadlines(t *testing.T) {
 	serverReadTimeout, serverWriteTimeout = 200*time.Millisecond, 200*time.Millisecond
 	t.Cleanup(func() { serverReadTimeout, serverWriteTimeout = 60*time.Second, 60*time.Second })
 	ready, stop := start(t, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), "--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0")
-	req, err := http.NewRequest(http.MethodPost, "http://"+ready.DataAddr+"/v1/chat/completions", strings.NewReader(`{"model":"fast","messages":[{"role":"user","content":"hi"}]}`))
-	if err != nil {
-		t.Fatal(err)
+	for alias, want := range map[string]string{"fast": reply, "stream": "data: {\"choices\":[]}\n\ndata: {\"choices\":[]}\n\ndata: {\"choices\":[]}\n\ndata: [DONE]\n\n"} {
+		req, err := http.NewRequest(http.MethodPost, "http://"+ready.DataAddr+"/v1/chat/completions",
+			strings.NewReader(`{"model":"`+alias+`","messages":[{"role":"user","content":"hi"}],"stream":`+map[string]string{"fast": "false", "stream": "true"}[alias]+`}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		began := time.Now()
+		resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+		if err != nil {
+			t.Fatalf("%s: the call was cut after %v: %v", alias, time.Since(began), err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil || resp.StatusCode != http.StatusOK || string(body) != want || time.Since(began) < 600*time.Millisecond {
+			t.Errorf("%s: status %d after %v: %q, error %v", alias, resp.StatusCode, time.Since(began), body, err)
+		}
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	began := time.Now()
-	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
-	if err != nil {
-		t.Fatalf("the call was cut after %v: %v", time.Since(began), err)
-	}
-	body, err := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	if err != nil || resp.StatusCode != http.StatusOK || string(body) != reply || time.Since(began) < 600*time.Millisecond {
-		t.Errorf("status %d after %v: %s, error %v", resp.StatusCode, time.Since(began), body, err)
-	}
-	if code, log := stop(); code != 0 || !strings.Contains(log, `"msg":"attempt"`) || !strings.Contains(log, `"msg":"request"`) {
+	if code, log := stop(); code != 0 || strings.Count(log, `"msg":"attempt"`) != 2 || strings.Count(log, `"msg":"request"`) != 2 {
 		t.Errorf("exit %d; log %s", code, log)
 	}
 }

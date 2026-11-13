@@ -1,6 +1,7 @@
 // Package openai reads the responses of providers of the openai protocol to
-// chat completions on the native path (design section 7). The relay sends
-// their bytes unchanged; this package only observes them.
+// chat completions on the native path (design sections 7 and 9), synchronous
+// and streamed. The relay sends their bytes unchanged; this package only
+// observes them.
 package openai
 
 import (
@@ -39,19 +40,27 @@ func Observe(body []byte) (domain.Observed, error) {
 			o.ToolCalls++
 		}
 	}
-	if u, ok := b.Get("usage"); ok && u[0] == '{' {
-		o.Usage = &domain.Usage{
-			Input:      num(b, "usage", "prompt_tokens"),
-			CacheRead:  num(b, "usage", "prompt_tokens_details", "cached_tokens"),
-			CacheWrite: num(b, "usage", "prompt_tokens_details", "cache_write_tokens"),
-			Output:     num(b, "usage", "completion_tokens"),
-		}
-		if _, ok := b.Get("usage", "completion_tokens_details", "reasoning_tokens"); ok {
-			r := num(b, "usage", "completion_tokens_details", "reasoning_tokens")
-			o.Usage.Reasoning = &r
-		}
-	}
+	o.Usage = usage(b)
 	return o, nil
+}
+
+// usage is the usage object of a response or a chunk (USE-3); nil when it
+// is absent or null.
+func usage(b *params.Body) *domain.Usage {
+	if u, ok := b.Get("usage"); !ok || u[0] != '{' {
+		return nil
+	}
+	u := &domain.Usage{
+		Input:      num(b, "usage", "prompt_tokens"),
+		CacheRead:  num(b, "usage", "prompt_tokens_details", "cached_tokens"),
+		CacheWrite: num(b, "usage", "prompt_tokens_details", "cache_write_tokens"),
+		Output:     num(b, "usage", "completion_tokens"),
+	}
+	if _, ok := b.Get("usage", "completion_tokens_details", "reasoning_tokens"); ok {
+		r := num(b, "usage", "completion_tokens_details", "reasoning_tokens")
+		u.Reasoning = &r
+	}
+	return u
 }
 
 // str is the string at path, unescaped; "" when absent or not a string.

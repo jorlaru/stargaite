@@ -544,6 +544,22 @@ func TestMessagesThinking(t *testing.T) {
 		{"a forced budget is written into a new thinking when the on fragment writes none", head + `,"thinking":{"type":"disabled","budget_tokens":1024}}`, forcedHigh,
 			domain.Target{Reasoning: &domain.Reasoning{Dialect: "thinking_budget", Levels: []string{"high"}, Budgets: map[string]int64{"high": 1024}, On: map[string]json.RawMessage{"temperature": rm(`1`)}}},
 			out + `,"temperature":1,"thinking":{"budget_tokens":1024}}`, "output_config.effort:forced,thinking:dropped,temperature:added", "budget:1024", "budget:1024", "alias_forced"},
+		// Settled in C13: an adaptive or between_tools thinking without a client
+		// effort is replaced by the alias level's form in both modes (RSN-1); a
+		// form that writes no thinking drops it, listed.
+		{"adaptive thinking is dropped toward reasoning_effort", head + `,"thinking":{"type":"adaptive"}}`, high, levelled,
+			out + `,"reasoning_effort":"high"}`, "reasoning_effort:added,thinking:dropped", "", "high", "alias_default"},
+		{"between_tools is dropped toward enable_thinking in forced mode", head + `,"thinking":{"type":"between_tools"}}`, forcedHigh, enable,
+			out + `,"enable_thinking":true}`, "enable_thinking:added,thinking:dropped", "", "on", "alias_forced"},
+		{"adaptive thinking is dropped by the off form of reasoning_effort", head + `,"thinking":{"type":"adaptive","display":"summarized"}}`, domain.ModelReasoning{Effort: "none", Mode: "default"}, levelled,
+			out + `,"reasoning_effort":"none"}`, "reasoning_effort:added,thinking:dropped", "", "none", "alias_default"},
+		{"adaptive thinking is dropped toward none", head + `,"thinking":{"type":"adaptive"}}`, high, domain.Target{},
+			out + `}`, "output_config.effort:dropped,thinking:dropped", "", "", "provider_default"},
+		{"a budget goes into a new thinking in place of an adaptive one", head + `,"thinking":{"type":"adaptive"}}`, high,
+			domain.Target{Reasoning: &domain.Reasoning{Dialect: "thinking_budget", Levels: []string{"high"}, Budgets: map[string]int64{"high": 1024}, On: map[string]json.RawMessage{"temperature": rm(`1`)}}},
+			out + `,"temperature":1,"thinking":{"budget_tokens":1024}}`, "thinking.budget_tokens:added,thinking:dropped,temperature:added", "", "budget:1024", "alias_default"},
+		{"without an alias level the adaptive thinking is forwarded", head + `,"thinking":{"type":"adaptive"}}`, domain.ModelReasoning{}, levelled,
+			out + `,"thinking":{"type":"adaptive"}}`, "", "", "", "provider_default"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			got, skip := run(t, "messages", tt.body, &domain.Model{Reasoning: tt.alias}, tt.target)

@@ -183,6 +183,15 @@ func TestClientsHaveSeparatePools(t *testing.T) {
 	}
 }
 
+// A dial the transport keeps after its request gave up ends at the
+// backstop; the request's own connect timer ends the call long before.
+func TestClientDialBackstop(t *testing.T) {
+	tr := NewClient(false, answer(t)).Transport.(*http.Transport)
+	if tr.TLSHandshakeTimeout != time.Minute || dialer(false).Timeout != time.Minute {
+		t.Errorf("TLS handshake %v, dial %v", tr.TLSHandshakeTimeout, dialer(false).Timeout)
+	}
+}
+
 func TestClientNeedsAResolver(t *testing.T) {
 	defer func() {
 		if recover() == nil {

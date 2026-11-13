@@ -38,11 +38,14 @@ var (
 	tokenLine  = regexp.MustCompile(`(?m)^sk-stargaite-\S+$`)
 	curlURL    = regexp.MustCompile(regexp.QuoteMeta(dataDefault) + `(/\S*)`)
 	curlHeader = regexp.MustCompile(`-H "([^"]+)"`)
+	curlData   = regexp.MustCompile(`-d '([^']*)'`)
+	traceID    = regexp.MustCompile(`^[0-9a-f]{32}$`)
 )
 
 // TestQuickStart runs the quick start of README.md with the built binary,
-// then checks what it left: /v1/models with the new key, no call to the
-// provider, a second serve on the same directory refused (AC-42), and the same
+// then checks what it left: the first answer of the chat completion with its
+// PAR-9 headers and the one call the provider got (AC-04), /v1/models with the
+// new key, a second serve on the same directory refused (AC-42), and the same
 // export and the same key after a restart (RES-9). The guide's commands use
 // the default data directory and addresses; here the environment points them
 // at a temporary directory and at ports the system chose.
@@ -51,10 +54,11 @@ func TestQuickStart(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
 	env := []string{"STARGAITE_DATA_DIR=" + dir, "STARGAITE_LISTEN=127.0.0.1:0", "STARGAITE_ADMIN_LISTEN=127.0.0.1:0"}
 	var (
-		mock    *mockprovider.Server
-		mockURL string
-		srv     *server
-		token   string
+		mock     *mockprovider.Server
+		mockURL  string
+		srv      *server
+		token    string
+		answered bool
 	)
 	cli := func(args ...string) string {
 		t.Helper()
@@ -96,20 +100,40 @@ func TestQuickStart(t *testing.T) {
 			if h := curlHeader.FindStringSubmatch(line); h != nil {
 				header = []string{h[1]}
 			}
-			if status, body := get(t, "http://"+srv.data+m[1], header...); status != http.StatusOK {
+			// curl -d sends a POST with a form content type, which the proxy ignores.
+			method, data := http.MethodGet, ""
+			if d := curlData.FindStringSubmatch(line); d != nil {
+				method, data = http.MethodPost, d[1]
+				header = append(header, "Content-Type: application/x-www-form-urlencoded")
+			}
+			status, h, body := send(t, method, "http://"+srv.data+m[1], data, header...)
+			if status != http.StatusOK {
 				t.Fatalf("%s: status %d: %s", line, status, body)
+			}
+			if method == http.MethodPost {
+				answered = true
+				var completion struct {
+					Choices []struct{ Message struct{ Content string } }
+				}
+				if err := json.Unmarshal(body, &completion); err != nil || len(completion.Choices) != 1 || completion.Choices[0].Message.Content == "" {
+					t.Errorf("%s: body %s", line, body)
+				}
+				if h.Get("X-Stargaite-Request-Id") == "" || !traceID.MatchString(h.Get("X-Stargaite-Trace-Id")) || h.Get("X-Stargaite-Target") != "mock/mock" ||
+					h.Values("X-Stargaite-Reasoning-Effort") != nil || h.Values("X-Stargaite-Params-Changed") != nil {
+					t.Errorf("%s: headers %v", line, h)
+				}
 			}
 		default:
 			t.Fatalf("a quick start line this test does not run: %q", line)
 		}
 	}
-	if srv == nil || mock == nil || token == "" {
-		t.Fatalf("the quick start did not start the proxy and the mock provider and create a key")
+	if srv == nil || mock == nil || token == "" || !answered {
+		t.Fatalf("the quick start did not start the proxy and the mock provider, create a key and get an answer")
 	}
 
 	models := func() {
 		t.Helper()
-		status, body := get(t, "http://"+srv.data+"/v1/models", "Authorization: Bearer "+token)
+		status, _, body := send(t, http.MethodGet, "http://"+srv.data+"/v1/models", "", "Authorization: Bearer "+token)
 		var list struct {
 			Object string
 			Data   []struct{ ID string }
@@ -119,8 +143,11 @@ func TestQuickStart(t *testing.T) {
 		}
 	}
 	models()
-	if calls := mock.Calls(); len(calls) != 0 {
-		t.Errorf("phase 1 sends nothing to a provider; the mock received %d calls", len(calls))
+	// The one call of the quick start, with the upstream model id and no
+	// credential: the mock provider declares none.
+	if calls := mock.Calls(); len(calls) != 1 || calls[0].Path != "/chat/completions" ||
+		string(calls[0].Body) != `{"model":"mock","messages":[{"role":"user","content":"hi"}]}` || calls[0].Header.Values("Authorization") != nil {
+		t.Errorf("the mock received %+v", calls)
 	}
 	before := cli("export")
 	if !strings.Contains(before, "my-agent") || strings.Contains(before, token) {
@@ -135,6 +162,10 @@ func TestQuickStart(t *testing.T) {
 	code, log := srv.stop(t)
 	if code != 0 || !strings.Contains(log, `"msg":"stopped"`) {
 		t.Fatalf("stop: exit %d, log:\n%s", code, log)
+	}
+	// OPS-9: the provider call and the request each logged once, with the key and the alias.
+	if strings.Count(log, `"msg":"attempt"`) != 1 || !strings.Contains(log, `"key":"my-agent","alias":"fast","attempts":1,"status":200`) {
+		t.Errorf("log:\n%s", log)
 	}
 	srv = start(t, bin, env, "serve")
 	models()
@@ -223,12 +254,12 @@ func run(t *testing.T, dir string, env []string, name string, args ...string) (c
 	return cmd.ProcessState.ExitCode(), out.String(), errOut.String()
 }
 
-// get sends one GET with the given "Name: value" headers.
-func get(t *testing.T, url string, headers ...string) (int, []byte) {
+// send sends one request with the given body and "Name: value" headers.
+func send(t *testing.T, method, url, body string, headers ...string) (int, http.Header, []byte) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, method, url, strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,11 +272,11 @@ func get(t *testing.T, url string, headers ...string) (int, []byte) {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return resp.StatusCode, body
+	return resp.StatusCode, resp.Header, b
 }
 
 // server is a running serve, killed at the end of the test if still running.

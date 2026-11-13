@@ -727,6 +727,12 @@ func TestSnapshotBuild(t *testing.T) {
 			t.Errorf("alias %s targets %v", name, ids)
 		}
 	}
+	// A stored target whose provider is not published is not published
+	// either, nor listed by the aliases that name it.
+	orphan := &State{Doc: domain.Document{Targets: map[string]domain.Target{"gone/m": {}}, Models: map[string]domain.Model{"a": {Targets: []string{"gone/m"}}}}}
+	if o := build(orphan, Env{}, nil); len(o.Targets) != 0 || len(o.Models["a"].Targets) != 0 {
+		t.Errorf("orphan target published: %+v %+v", o.Targets, o.Models["a"])
+	}
 	k := snap.Keys["invoice-agent"]
 	if a, b := snap.secrets["aaaaaaaaaaaa"], snap.secrets["bbbbbbbbbbbb"]; len(snap.secrets) != 2 || a.key != k || b.key != k || a.hash != hash1 || a.validUntil != 9 || b.hash != hash2 || b.validUntil != 0 {
 		t.Errorf("secrets %+v", snap.secrets)

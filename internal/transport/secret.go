@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"strings"
 )
 
 const redacted = "[redacted]"
@@ -33,3 +35,21 @@ func (Secret) MarshalJSON() ([]byte, error) { return []byte(`"` + redacted + `"`
 
 // LogValue writes "[redacted]" in a log record.
 func (Secret) LogValue() slog.Value { return slog.StringValue(redacted) }
+
+// SetHeader sets name to prefix plus the value on an outbound request's
+// header; the zero Secret, a provider without a credential, sets nothing.
+func (s Secret) SetHeader(h http.Header, name, prefix string) {
+	if s.value != nil {
+		h.Set(name, prefix+*s.value)
+	}
+}
+
+// Redact replaces the value in text, a provider's own message, with
+// "[redacted]": a provider that echoes the credential cannot carry it into a
+// log or a response.
+func (s Secret) Redact(text string) string {
+	if s.value == nil || *s.value == "" {
+		return text
+	}
+	return strings.ReplaceAll(text, *s.value, redacted)
+}

@@ -130,6 +130,9 @@ func build(st *State, env Env, findings []domain.Finding) *Snapshot {
 	}
 	for id, spec := range d.Targets {
 		provider, upstream, _ := domain.SplitTarget(id)
+		if s.Providers[provider] == nil {
+			continue // so Target.Provider is never nil (phase-1 design section 9)
+		}
 		s.Targets[id] = &Target{ID: id, Upstream: upstream, Spec: spec, Provider: s.Providers[provider]}
 	}
 	for name, spec := range d.Models {

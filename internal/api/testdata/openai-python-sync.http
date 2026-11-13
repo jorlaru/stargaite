@@ -1,0 +1,20 @@
+POST /v1/chat/completions HTTP/1.1
+Host: 127.0.0.1:36971
+Accept-Encoding: gzip, deflate
+Connection: keep-alive
+authorization: Bearer sk-stargaite-recorded
+accept: application/json
+content-type: application/json
+user-agent: OpenAI/Python 3.50.0
+x-stainless-lang: python
+x-stainless-package-version: 3.50.0
+x-stainless-os: Linux
+x-stainless-arch: x64
+x-stainless-runtime: CPython
+x-stainless-runtime-version: 3.13.18
+x-stainless-async: false
+x-stainless-retry-count: 0
+x-stainless-read-timeout: 600
+Content-Length: 60
+
+{"model":"fast","messages":[{"role":"user","content":"hi"}]}

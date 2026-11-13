@@ -16,6 +16,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jorlaru/stargaite/internal/auth"
 	"github.com/jorlaru/stargaite/internal/cli"
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
@@ -244,6 +246,72 @@ func TestServeLoadsTheConfiguration(t *testing.T) {
 		t.Errorf("the lock was not released: %v", err)
 	} else {
 		_ = st.Close()
+	}
+}
+
+// TestServeDeadlines (phase-2 design section 10, AC-22): a synchronous chat
+// completion that lasts longer than both servers' read and write timeouts is
+// not cut, because the data plane clears its read deadline once the body is
+// read and sets its write deadline per provider call. The configuration is
+// stored before serve starts, so no admin call races the lowered timeouts.
+func TestServeDeadlines(t *testing.T) {
+	const reply = `{"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"late"},"finish_reason":"stop"}]}`
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		select {
+		case <-time.After(600 * time.Millisecond):
+			_, _ = io.WriteString(w, reply)
+		case <-r.Context().Done():
+		}
+	}))
+	t.Cleanup(slow.Close)
+	dir := t.TempDir()
+	st, err := store.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Open(context.Background(), st, func() config.Env { return config.Env{Lookup: func(string) (string, bool) { return "", false }} }, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, id, hash, err := auth.Issue(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.Commit(context.Background(), config.Change{Summary: "apply", Mutate: func(s *config.State) (map[string]string, error) {
+		s.Doc.Providers["slow"] = domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: slow.URL, Billing: domain.BillingNone, AllowPrivateNetwork: true}
+		s.Doc.Targets["slow/m"] = domain.Target{Kind: domain.KindChat}
+		s.Doc.Models["fast"] = domain.Model{Targets: []string{"slow/m"}}
+		s.Doc.Keys["agent"] = domain.Key{Models: []string{"fast"}}
+		s.Secrets = append(s.Secrets, config.KeySecret{PublicID: id, KeyName: "agent", Hash: hash})
+		return nil, nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	serverReadTimeout, serverWriteTimeout = 200*time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() { serverReadTimeout, serverWriteTimeout = 60*time.Second, 60*time.Second })
+	ready, stop := start(t, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), "--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0")
+	req, err := http.NewRequest(http.MethodPost, "http://"+ready.DataAddr+"/v1/chat/completions", strings.NewReader(`{"model":"fast","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	began := time.Now()
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatalf("the call was cut after %v: %v", time.Since(began), err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusOK || string(body) != reply || time.Since(began) < 600*time.Millisecond {
+		t.Errorf("status %d after %v: %s, error %v", resp.StatusCode, time.Since(began), body, err)
+	}
+	if code, log := stop(); code != 0 || !strings.Contains(log, `"msg":"attempt"`) || !strings.Contains(log, `"msg":"request"`) {
+		t.Errorf("exit %d; log %s", code, log)
 	}
 }
 

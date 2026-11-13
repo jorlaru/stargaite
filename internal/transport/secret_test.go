@@ -6,6 +6,7 @@ import (
 	jsonv2 "encoding/json/v2"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -57,5 +58,32 @@ func TestSecretIsRedacted(t *testing.T) {
 	slog.New(slog.NewTextHandler(&logs, nil)).Info("x", "credential", s, "holder", holder)
 	if strings.Contains(logs.String(), planted) || !strings.Contains(logs.String(), redacted) {
 		t.Errorf("logs: %s", &logs)
+	}
+}
+
+// TestSecretSetHeader: the value reaches only the header named, after its
+// prefix; the zero Secret sets nothing.
+func TestSecretSetHeader(t *testing.T) {
+	h := http.Header{}
+	Secret{}.SetHeader(h, "Authorization", "Bearer ")
+	if len(h) != 0 {
+		t.Errorf("the zero Secret set %v", h)
+	}
+	NewSecret(planted).SetHeader(h, "Authorization", "Bearer ")
+	NewSecret(planted).SetHeader(h, "x-api-key", "")
+	if len(h) != 2 || h.Get("Authorization") != "Bearer "+planted || h.Get("X-Api-Key") != planted {
+		t.Errorf("header %v", h)
+	}
+}
+
+func TestSecretRedact(t *testing.T) {
+	if got := NewSecret(planted).Redact("bad key " + planted + ", " + planted); got != "bad key [redacted], [redacted]" {
+		t.Errorf("Redact: %q", got)
+	}
+	if got := (Secret{}).Redact("text"); got != "text" {
+		t.Errorf("zero Secret: %q", got)
+	}
+	if got := NewSecret("").Redact("text"); got != "text" {
+		t.Errorf("empty Secret: %q", got)
 	}
 }

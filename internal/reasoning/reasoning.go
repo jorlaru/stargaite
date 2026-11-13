@@ -191,8 +191,13 @@ func Translate(c Choice, b *params.Body, ep domain.Endpoint, r *domain.Reasoning
 	// An alias in forced mode replaces any client control (RSN-1), so on
 	// messages the client's thinking goes too unless the form writes its own.
 	// A client effort resolves to nothing only under a forced provider_default.
+	// A thinking of type adaptive or between_tools without a client effort is
+	// replaced by the form of an alias level in either mode, unless it is kept
+	// below: a form that writes no thinking drops it, listed.
 	_, thinking := b.Get("thinking")
-	replace := thinking && ep == domain.EndpointMessages && c.Requested != "" && (c.Source == SourceAliasForced || c.Level == "")
+	kind := str(b, "thinking", "type")
+	replace := thinking && ep == domain.EndpointMessages && (c.Requested != "" && (c.Source == SourceAliasForced || c.Level == "") ||
+		c.Requested == "" && c.Level != "" && (kind == "adaptive" || kind == "between_tools"))
 	if c.Level == "" || d == domain.DialectNone {
 		if clientSent {
 			e.Ops = deleteEffort(b, ep)
@@ -248,7 +253,6 @@ func Translate(c Choice, b *params.Body, ep domain.Endpoint, r *domain.Reasoning
 	// above none, and, without a client effort, a thinking of type adaptive or
 	// between_tools stays toward adaptive_effort.
 	// Kept, it is not touched at all, a level member inside it included.
-	kind := str(b, "thinking", "type")
 	// The level resolved, not the one sent: none raised to a level toward a
 	// target that cannot disable reasoning keeps nothing.
 	keep := thinking && ep == domain.EndpointMessages && !off && c.Level != "none" && (c.Source == SourceClient ||
@@ -260,7 +264,7 @@ func Translate(c Choice, b *params.Body, ep domain.Endpoint, r *domain.Reasoning
 	var replaced, side []Change
 	// A form that does not write thinking leaves nothing to replace the
 	// client's: it is deleted before the level member, which may live inside it.
-	drop := replace && !slices.ContainsFunc(write, func(m member) bool { return m.name == "thinking" })
+	drop := replace && !keep && !slices.ContainsFunc(write, func(m member) bool { return m.name == "thinking" })
 	if drop {
 		e.Ops = append(e.Ops, params.Op{Path: []string{"thinking"}})
 		replaced = append(replaced, Change{"thinking", ActionDropped})

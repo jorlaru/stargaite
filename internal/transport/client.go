@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/netip"
 	"syscall"
+	"time"
 )
 
 // NewClient returns an HTTP client for outbound calls that applies SEC-4 at
@@ -17,7 +18,10 @@ import (
 // dialer checks again the address actually connected to. Proxy variables are
 // ignored, redirects are returned as responses, certificates are verified.
 // Each call has its own connection pool. Deadlines come from the request's
-// context.
+// context. The transport keeps a dial going after its request gave up, for a
+// later request, so the dial and the TLS handshake also have a backstop of
+// their own (dialBackstop), far above any connect timeout (RES-3): a provider
+// that accepts and never completes the handshake cannot hold a dial forever.
 func NewClient(allowPrivate bool, resolve Resolver) *http.Client {
 	if resolve == nil {
 		panic("transport: NewClient needs a resolver")
@@ -25,7 +29,8 @@ func NewClient(allowPrivate bool, resolve Resolver) *http.Client {
 	d := dialer(allowPrivate)
 	return &http.Client{
 		Transport: &http.Transport{
-			Proxy: nil, // SEC-4: the check would see the proxy's address
+			TLSHandshakeTimeout: dialBackstop,
+			Proxy:               nil, // SEC-4: the check would see the proxy's address
 			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 				host, port, err := net.SplitHostPort(address)
 				if err != nil {
@@ -60,10 +65,13 @@ func NewClient(allowPrivate bool, resolve Resolver) *http.Client {
 	}
 }
 
+// dialBackstop bounds a dial and a TLS handshake that no request waits for.
+const dialBackstop = time.Minute
+
 // dialer refuses, through Control, a connection to an address that SEC-4
 // does not allow, whatever led the dial there.
 func dialer(allowPrivate bool) *net.Dialer {
-	return &net.Dialer{Control: func(_, address string, _ syscall.RawConn) error {
+	return &net.Dialer{Timeout: dialBackstop, Control: func(_, address string, _ syscall.RawConn) error {
 		ap, err := netip.ParseAddrPort(address)
 		if err != nil {
 			return err

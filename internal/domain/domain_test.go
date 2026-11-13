@@ -470,6 +470,35 @@ func TestNewError(t *testing.T) {
 	}
 }
 
+// TestUpstreamError: a provider's own 400, 404, 413, 422 and 429 keep their
+// status with the type of section 15, everything else is 502; Retry-After is
+// kept on a 429 only, and never encoded in the body.
+func TestUpstreamError(t *testing.T) {
+	for _, tt := range []struct {
+		status, want int
+		typ, retry   string
+	}{
+		{400, 400, "invalid_request_error", ""},
+		{404, 404, "not_found_error", ""},
+		{413, 413, "invalid_request_error", ""},
+		{422, 422, "invalid_request_error", ""},
+		{429, 429, "rate_limit_error", "7"},
+		{409, 502, "api_error", ""},
+		{500, 502, "api_error", ""},
+		{529, 502, "api_error", ""},
+		{302, 502, "api_error", ""},
+		{0, 502, "api_error", ""},
+	} {
+		e := UpstreamError(tt.status, "m", "7")
+		if e.Status != tt.want || e.Type != tt.typ || e.Code != CodeUpstreamError || e.Message != "m" || e.RetryAfter != tt.retry {
+			t.Errorf("UpstreamError(%d) = %+v", tt.status, e)
+		}
+		if b, _ := json.Marshal(e); strings.Contains(string(b), "7") {
+			t.Errorf("Retry-After in the body: %s", b)
+		}
+	}
+}
+
 // The two envelopes are the examples of the kick-off (section 15) and of the
 // design (a refused change), byte for byte once compacted.
 func TestErrorEnvelope(t *testing.T) {

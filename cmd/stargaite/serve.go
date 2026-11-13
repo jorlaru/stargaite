@@ -23,10 +23,19 @@ import (
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/store"
+	"github.com/jorlaru/stargaite/internal/transport"
 )
 
 // shutdownGrace bounds how long in-flight requests may take to finish on a stop signal.
 const shutdownGrace = 30 * time.Second
+
+// The servers' read and write timeouts (SEC-6). A data-plane request clears
+// its read deadline once its body is read and moves its write deadline per
+// provider call (phase-2 design section 10); tests lower both.
+var (
+	serverReadTimeout  = 60 * time.Second
+	serverWriteTimeout = 60 * time.Second
+)
 
 // serve runs the proxy until SIGINT or SIGTERM. Each flag falls back to its
 // STARGAITE_<FLAG> variable; the flag wins. Logs are JSON lines on stderr.
@@ -139,7 +148,8 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 	if code == 0 {
 		if err := runServers(ctx, log, tlsConfig, ready, []listener{
 			{"admin", *adminAddr, admin.Handler(cfg, keyHash, log)},
-			{"data", *dataAddr, api.Handler(cfg, log)},
+			{"data", *dataAddr, api.Handler(api.Deps{Config: cfg, Log: log, Clients: [2]*http.Client{
+				transport.NewClient(false, systemResolver), transport.NewClient(true, systemResolver)}})},
 		}); err != nil {
 			log.Error("server failed", "error", err.Error())
 			code = 1
@@ -155,8 +165,8 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 	return code
 }
 
-// systemResolver is the resolver of set time (CheckResolved) and, from phase
-// 2, of dial time: both ask the same source.
+// systemResolver is the resolver of set time (CheckResolved) and of dial
+// time, in both outbound clients: both ask the same source.
 func systemResolver(ctx context.Context, host string) ([]netip.Addr, error) {
 	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 }
@@ -206,8 +216,8 @@ func runServers(ctx context.Context, log *slog.Logger, tlsConfig *tls.Config, re
 			Handler:           l.handler,
 			TLSConfig:         tlsConfig,
 			ReadHeaderTimeout: 10 * time.Second,
-			ReadTimeout:       60 * time.Second,
-			WriteTimeout:      60 * time.Second,
+			ReadTimeout:       serverReadTimeout,
+			WriteTimeout:      serverWriteTimeout,
 			IdleTimeout:       120 * time.Second,
 			MaxHeaderBytes:    64 << 10,
 			ErrorLog:          slog.NewLogLogger(log.With("listener", l.name).Handler(), slog.LevelWarn),

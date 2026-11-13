@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -21,11 +22,13 @@ import (
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/store"
+	"github.com/jorlaru/stargaite/internal/transport"
 )
 
 const (
 	adminKey = "test-admin-key-of-at-least-32-characters"
 	testNow  = 1_790_000_000_000
+	planted  = "sk-PLANTED-credential-of-"
 )
 
 // logBuffer is a log destination that concurrent requests may share.
@@ -63,7 +66,9 @@ func newFixture(t *testing.T) *fixture {
 	t.Cleanup(func() { _ = st.Close() })
 	env := func() config.Env {
 		return config.Env{
-			Lookup: func(string) (string, bool) { return "x", true },
+			// A reference starting with MISSING does not resolve; any other
+			// resolves to a planted value that must never leave the proxy.
+			Lookup: func(name string) (string, bool) { return planted + name, !strings.HasPrefix(name, "MISSING") },
 			Resolve: func(_ context.Context, host string) ([]netip.Addr, error) {
 				if host == "localhost" {
 					return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
@@ -79,8 +84,12 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	log := &logBuffer{}
+	noDNS := func(context.Context, string) ([]netip.Addr, error) {
+		return nil, errors.New("no name is resolved in tests")
+	}
 	return &fixture{admin.Handler(cfg, sha256.Sum256([]byte(adminKey)), slog.New(slog.NewJSONHandler(log, nil))),
-		Handler(cfg, slog.New(slog.NewJSONHandler(log, nil))), now, log}
+		Handler(Deps{Config: cfg, Log: slog.New(slog.NewJSONHandler(log, nil)),
+			Clients: [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)}}), now, log}
 }
 
 // call sends one request to h with the Authorization header given, if any.
@@ -111,6 +120,10 @@ func (f *fixture) models(t *testing.T, token string) []string {
 	w := call(f.data, "Bearer "+token, http.MethodGet, "/v1/models", nil)
 	if w.Header().Get(domain.RequestIDHeader) == "" || w.Header().Get("Content-Type") != "application/json" {
 		t.Errorf("headers %v", w.Header())
+	}
+	// PAR-9: the trace id on every response to an authenticated request.
+	if trace := w.Header().Get(traceHeader); (w.Code == http.StatusOK) != (len(trace) == 32) {
+		t.Errorf("status %d with trace id %q", w.Code, trace)
 	}
 	if w.Code == http.StatusUnauthorized {
 		var env struct{ Error domain.Error }

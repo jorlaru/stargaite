@@ -7,8 +7,9 @@ one data directory. MIT licensed.
 **Status: phase 2 in progress.** What works today: the store, the admin API and the CLI, providers (with eighteen
 built-in presets), targets, model aliases, client keys with rotation and revocation, `export`/`apply`/`validate`,
 `models explain`, `GET /v1/models`, and `POST /v1/chat/completions`, synchronous and streamed, toward providers of
-the `openai` protocol and of the `anthropic` protocol (translated to the Messages API), with the parameter contract
-and reasoning control of the alias. `POST /v1/messages` and fallback arrive in the next steps of phase 2. The full specification is
+the `openai` protocol and of the `anthropic` protocol (translated to the Messages API), and `POST /v1/messages`,
+synchronous and streamed, toward providers of the `anthropic` protocol, with the parameter contract and reasoning
+control of the alias. Fallback arrives in the next steps of phase 2. The full specification is
 [kick-off.md](kick-off.md); the designs are [docs/design/phase-1.md](docs/design/phase-1.md) and
 [docs/design/phase-2.md](docs/design/phase-2.md).
 
@@ -42,6 +43,18 @@ completion to it and gets the mock provider's answer, with the response headers 
 terminal; `kill %1 %2` stops them.
 `./stargaite --help` lists every command, and each one accepts `--json`, never prompts, and exits `0` on success, `1`
 on failure and `2` on wrong usage; `remove`, `keys revoke` and `apply --prune` (unless `--dry-run`) need `--yes`.
+
+## Anthropic clients
+
+`POST /v1/messages` is the Anthropic Messages API, served by targets of the `anthropic` protocol: an Anthropic SDK
+works with its base URL set to the data plane (`http://127.0.0.1:4000`), a client key as its API key and an alias as
+the model. The key is read from `x-api-key` or `Authorization: Bearer`; with both, `Authorization` wins. Of the
+client's headers only `anthropic-version` (else `2023-06-01`) and `anthropic-beta` reach the provider. The answer and
+the stream are relayed as the provider sent them, thinking blocks and their signatures included, so a tool loop with
+thinking works; a target that declares `inline_think_tags` has its `<think>` blocks removed from text blocks. Errors
+use the Anthropic envelope, `{"type":"error","error":{"type":...,"message":"<code>: ..."}}`, with the code also in
+the `x-stargaite-error-code` header. A target of the `openai` protocol is skipped, so an alias with no other answers
+`422 endpoint_not_supported`. `./stargaite models explain <alias> --endpoint messages` shows the bytes it would send.
 
 ## The admin key and the data directory
 
@@ -99,3 +112,6 @@ and use `--admin-url https://<cert name>:4001`; a certificate from a public CA n
 `make ci` runs every check (format, vet, tidy, lint, vulnerability scan, four cross-builds, `go test -race ./...`,
 including `tests/e2e`) with Go 1.27 or later; `make ci-container` runs the same inside the Go image, and
 `make image-test` builds the image and runs it. No check needs a secret, and the tests use no network beyond loopback.
+`tests/contract` runs the per-target cases against a live provider only when `STARGAITE_CONTRACT_BASE_URL` and
+`STARGAITE_CONTRACT_API_KEY` are set (its package comment lists the variables); it costs tokens, and without them it
+is skipped.

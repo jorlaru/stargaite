@@ -50,7 +50,7 @@ func newStreamFixture(t *testing.T, yaml string) *streamFixture {
 	mock := mockprovider.New()
 	srv := httptest.NewServer(mock)
 	t.Cleanup(srv.Close)
-	tokens := f.apply(t, strings.Replace(yaml, "MOCK", srv.URL, 1))
+	tokens := f.apply(t, strings.ReplaceAll(yaml, "base_url: MOCK", "base_url: "+srv.URL))
 	data := httptest.NewServer(f.data)
 	t.Cleanup(data.Close)
 	return &streamFixture{fixture: f, mock: mock, mockURL: srv.URL, url: data.URL, token: tokens["agent"]}

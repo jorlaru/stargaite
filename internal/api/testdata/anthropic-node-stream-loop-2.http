@@ -1,0 +1,24 @@
+POST /v1/messages HTTP/1.1
+host: 127.0.0.1:44467
+connection: keep-alive
+Accept: application/json
+User-Agent: Anthropic/JS 0.93.0
+X-Stainless-Retry-Count: 0
+X-Stainless-Timeout: 600
+X-Stainless-Lang: js
+X-Stainless-Package-Version: 0.93.0
+X-Stainless-OS: Linux
+X-Stainless-Arch: x64
+X-Stainless-Runtime: node
+X-Stainless-Runtime-Version: v24.19.0
+anthropic-version: 2023-06-01
+x-api-key: sk-stargaite-recorded
+content-type: application/json
+anthropic-beta: interleaved-thinking-2025-05-14
+x-stainless-helper-method: stream
+accept-language: *
+sec-fetch-mode: cors
+accept-encoding: gzip, deflate
+content-length: 679
+
+{"model":"claude","max_tokens":400,"thinking":{"type":"adaptive"},"tools":[{"name":"get_weather","description":"Current weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],"messages":[{"role":"user","content":"What is the weather in Paris?"},{"role":"assistant","content":[{"type":"thinking","thinking":"The user wants the weather in Paris.","signature":"EqQBCkYIBxgCKkBzaWduYXR1cmU="},{"type":"text","text":"Let me check."},{"type":"tool_use","id":"toolu_01","name":"get_weather","input":{"city":"Paris"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"18 C and sunny"}]}],"stream":true}

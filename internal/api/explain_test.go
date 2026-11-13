@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
 	"math/rand/v2"
 	"net/http"
@@ -155,6 +156,81 @@ func corpusBody(r *rand.Rand, alias string) string {
 	return "{" + strings.Join(members, []string{",", ", ", ",\n  "}[r.IntN(3)]) + "}"
 }
 
+// corpusMessagesBody is a generated Messages body for alias, as corpusBody
+// is for chat: thinking blocks with signatures, redacted thinking and tool
+// results in the conversation, and every form of the client's reasoning
+// control (RSN-1).
+func corpusMessagesBody(r *rand.Rand, alias string) string {
+	pick := func(p float64) bool { return r.Float64() < p }
+	messages := []string{
+		`[{"role":"user","content":"hi"}]`,
+		`[{"role":"user","content":[{"type":"text","text":"h\u00e9llo \"q\" é"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}]}]`,
+		`[{"role":"user","content":"weather?"},{"role":"assistant","content":[` + loopThinking + `,{"type":"tool_use","id":"t1","name":"f","input":{"city":"Paris"}}]},` +
+			`{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"18 C"}]}]`,
+		`[{"role":"user","content":"a"},{"role":"assistant","content":[{"type":"redacted_thinking","data":"EmwKAhgB"},{"type":"text","text":"b"}]},{"role":"user","content":"c"}]`,
+	}
+	members := []string{`"messages":` + messages[r.IntN(len(messages))]}
+	if pick(0.7) {
+		members = append(members, `"max_tokens":`+strconv.Itoa(r.IntN(1200)))
+	}
+	if pick(0.3) {
+		members = append(members, []string{`"system":"be brief"`, `"system":[{"type":"text","text":"terse","cache_control":{"type":"ephemeral"}}]`}[r.IntN(2)])
+	}
+	format := ""
+	if pick(0.15) {
+		format = `"format":{"type":"json_schema","schema":{"type":"object"}}`
+	}
+	if pick(0.4) {
+		effort := domain.Levels[r.IntN(len(domain.Levels))]
+		if pick(0.05) {
+			effort = "default" // off the scale (RSN-11)
+		}
+		members = append(members, `"output_config":{`+strings.Join(slices.DeleteFunc([]string{format, `"effort":"` + effort + `"`}, func(s string) bool { return s == "" }), ",")+`}`)
+	} else if format != "" {
+		members = append(members, `"output_config":{`+format+`}`)
+	}
+	if pick(0.4) {
+		members = append(members, []string{`"thinking":{"type":"adaptive"}`, `"thinking":{"type":"disabled"}`, `"thinking":{"type":"enabled","budget_tokens":2048}`,
+			`"thinking":{"type":"adaptive","display":"summarized"}`, `"thinking":{"type":"between_tools"}`}[r.IntN(5)])
+	}
+	if pick(0.3) {
+		members = append(members, `"temperature":0.5`)
+	}
+	if pick(0.2) {
+		members = append(members, `"top_p":0.9`)
+	}
+	if pick(0.1) {
+		members = append(members, `"top_k":5`)
+	}
+	if pick(0.2) {
+		members = append(members, []string{`"tools":[{"name":"f","input_schema":{"type":"object"}}]`, `"tools":[{"name":"f","input_schema":{"type":"object"},"strict":true}]`}[r.IntN(2)])
+		if pick(0.5) {
+			members = append(members, `"tool_choice":{"type":"auto"}`)
+		}
+	}
+	if pick(0.1) {
+		members = append(members, `"stop_sequences":["END"]`)
+	}
+	if pick(0.1) {
+		members = append(members, `"metadata":{"user_id":"u1"}`)
+	}
+	if pick(0.25) {
+		members = append(members, `"stream":true`)
+	}
+	if rules := strings.HasSuffix(alias, "-p"); rules && pick(0.4) {
+		members = append(members, `"x_fwd":{"a":[1,2]}`)
+	}
+	if rules := strings.HasSuffix(alias, "-p"); rules && pick(0.4) {
+		members = append(members, []string{`"x_drop":1`, `"seed":7`}[r.IntN(2)])
+	}
+	if pick(0.03) {
+		members = append(members, `"x_other":1`) // no rule (PAR-2)
+	}
+	r.Shuffle(len(members), func(i, j int) { members[i], members[j] = members[j], members[i] })
+	members = slices.Insert(members, r.IntN(len(members)+1), `"model":"`+alias+`"`)
+	return "{" + strings.Join(members, []string{",", ", ", ",\n  "}[r.IntN(3)]) + "}"
+}
+
 // explainBlock is one target of the answer of models explain, as a client
 // reads it.
 type explainBlock struct {
@@ -178,16 +254,20 @@ type attemptLine struct {
 }
 
 // TestCorpus is the corpus property of phase-2 design section 12 for chat
-// toward openai and anthropic targets, synchronous and streamed, over
-// generated bodies, aliases of every dialect and
-// both alias modes, with a fixed seed. For every body, models explain and the
-// data plane are given the same bytes and must agree:
+// toward openai and anthropic targets and for /v1/messages, synchronous and
+// streamed, over generated bodies, aliases of every dialect and both alias
+// modes, with a fixed seed. For every body, models explain and the data
+// plane are given the same bytes and must agree:
 //   - a refusal of explain is the data plane's, with the same status, code
-//     and param, and no provider is called;
+//     and param (on /v1/messages the code is in x-stargaite-error-code, as
+//     the Anthropic envelope has no param), and no provider is called;
 //   - every target skipped answers the 422 of the first skip (RES-10);
 //   - otherwise the first target explain did not skip is called once, with
 //     the exact bytes explain shows (AC-17), at its URL, with its headers plus
-//     the credential, which explain never shows;
+//     the credential, which explain never shows; on /v1/messages the client's
+//     anthropic-version and anthropic-beta replace the ones explain shows,
+//     which has no inbound headers (PAR-14), and the answer is the
+//     provider's, byte for byte;
 //   - the PAR-9 headers and the attempt handed to finish carry the change
 //     list and the effort and cap that explain shows, which equal the values
 //     read from the bytes the provider received (AC-18);
@@ -205,33 +285,102 @@ func TestCorpus(t *testing.T) {
 		t.Fatalf("export: %s", w.Body)
 	}
 
-	const seed, n = 15, 800
+	// The mock's own answers to a Messages request, which the native relay
+	// passes on byte for byte.
+	native := map[bool]string{}
+	for _, stream := range []bool{false, true} {
+		resp, err := http.Post(srv.URL+"/v1/messages", "application/json", strings.NewReader(fmt.Sprintf(`{"stream":%t}`, stream)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		native[stream] = string(b)
+	}
+	var anth []string // the aliases with an anthropic target
+	for _, a := range names {
+		if strings.HasPrefix(a, "anth-") || a == "mixed3" {
+			anth = append(anth, a)
+		}
+	}
+
+	const seed, n = 15, 1200
 	r := rand.New(rand.NewPCG(seed, seed))
 	served, refused, allSkipped, streamed, translatedStreams := map[string]int{}, 0, 0, 0, 0
+	msgServed, msgRefused, msgSkipped, msgStreamed := 0, 0, 0, 0
 	logged := 0
 	for i := range n {
-		alias := names[r.IntN(len(names))]
-		body := corpusBody(r, alias)
+		ep, alias := domain.EndpointChat, names[r.IntN(len(names))]
+		if r.Float64() < 0.4 {
+			ep = domain.EndpointMessages
+			if r.Float64() < 0.8 {
+				alias = anth[r.IntN(len(anth))]
+			}
+		}
+		messages := ep == domain.EndpointMessages
+		var body string
+		if messages {
+			body = corpusMessagesBody(r, alias)
+		} else {
+			body = corpusBody(r, alias)
+		}
 		fail := func(format string, args ...any) {
 			t.Helper()
-			t.Fatalf("seed %d, body %d to %s:\n%s\n%s", seed, i, alias, body, fmt.Sprintf(format, args...))
+			t.Fatalf("seed %d, body %d to %s %s:\n%s\n%s", seed, i, ep, alias, body, fmt.Sprintf(format, args...))
 		}
-		req, _ := json.Marshal(map[string]string{"body": body})
+		req, _ := json.Marshal(map[string]string{"endpoint": string(ep), "body": body})
 		before := len(mock.Calls())
 		ew := call(f.admin, "Bearer "+adminKey, http.MethodPost, "/admin/v1/models/"+alias+"/explain", req)
-		w := f.chat("Bearer "+tokens["agent"], body)
+		var w *httptest.ResponseRecorder
+		var version, beta string
+		if messages {
+			header := []string{"X-Api-Key", tokens["agent"]}
+			if r.Float64() < 0.3 {
+				header = []string{"Authorization", "Bearer " + tokens["agent"]}
+			}
+			if r.Float64() < 0.3 {
+				version = "2026-10-21"
+				header = append(header, "Anthropic-Version", version)
+			}
+			if r.Float64() < 0.3 {
+				beta = "interleaved-thinking-2025-05-14"
+				header = append(header, "Anthropic-Beta", beta)
+			}
+			w = f.messages(body, header...)
+		} else {
+			w = f.chat("Bearer "+tokens["agent"], body)
+		}
 		calls := mock.Calls()[before:]
 		if strings.Contains(ew.Body.String(), planted) {
 			fail("explain shows the credential: %s", ew.Body)
 		}
 		h := w.Header()
+		// The data plane's error code and param, in either envelope.
+		answered := func() (string, string) {
+			var e struct{ Error domain.Error }
+			_ = json.Unmarshal(w.Body.Bytes(), &e)
+			if !messages {
+				return e.Error.Code, e.Error.Param
+			}
+			code, _, _ := strings.Cut(e.Error.Message, ": ")
+			if code != h.Get(errorCodeHeader) {
+				fail("the message %q does not lead with the code %q", e.Error.Message, h.Get(errorCodeHeader))
+			}
+			return code, ""
+		}
 
 		if ew.Code != http.StatusOK {
 			refused++
-			var a, b struct{ Error domain.Error }
+			if messages {
+				msgRefused++
+			}
+			var a struct{ Error domain.Error }
 			_ = json.Unmarshal(ew.Body.Bytes(), &a)
-			_ = json.Unmarshal(w.Body.Bytes(), &b)
-			if ew.Code != w.Code || a.Error.Code != b.Error.Code || a.Error.Param != b.Error.Param || a.Error.Code == "" || len(calls) != 0 {
+			code, param := answered()
+			if messages {
+				a.Error.Param = ""
+			}
+			if ew.Code != w.Code || a.Error.Code != code || a.Error.Param != param || a.Error.Code == "" || len(calls) != 0 {
 				fail("explain %d %s, data plane %d %s, %d calls", ew.Code, ew.Body, w.Code, w.Body, len(calls))
 			}
 			continue
@@ -243,10 +392,12 @@ func TestCorpus(t *testing.T) {
 		k := slices.IndexFunc(ex.Targets, func(b explainBlock) bool { return b.Skipped == nil })
 		if k < 0 {
 			allSkipped++
-			var e struct{ Error domain.Error }
-			_ = json.Unmarshal(w.Body.Bytes(), &e)
 			s := ex.Targets[0].Skipped
-			if w.Code != http.StatusUnprocessableEntity || e.Error.Code != s.Code || e.Error.Param != s.Param || len(calls) != 0 {
+			if messages {
+				msgSkipped++
+				s.Param = ""
+			}
+			if code, param := answered(); w.Code != http.StatusUnprocessableEntity || code != s.Code || param != s.Param || len(calls) != 0 {
 				fail("every target skipped (%s), data plane %d %s, %d calls", ew.Body, w.Code, w.Body, len(calls))
 			}
 			continue
@@ -257,7 +408,17 @@ func TestCorpus(t *testing.T) {
 		}
 		got := calls[0]
 		served[b.Target]++
-		if strings.Contains(body, `"stream":true`) {
+		stream := strings.Contains(body, `"stream":true`)
+		switch {
+		case messages:
+			msgServed++
+			if stream {
+				msgStreamed++
+			}
+			if w.Body.String() != native[stream] {
+				fail("the client got\n%s\nthe provider answered\n%s", w.Body, native[stream])
+			}
+		case stream:
 			streamed++
 			if !strings.HasSuffix(w.Body.String(), "data: [DONE]\n\n") {
 				fail("the stream did not end with [DONE]: %s", w.Body)
@@ -290,8 +451,15 @@ func TestCorpus(t *testing.T) {
 				sent.Del(name)
 			}
 		}
-		if !maps.EqualFunc(sent, b.Header, slices.Equal) {
-			fail("headers: explain %q, the provider got %q", b.Header, got.Header)
+		shown := b.Header.Clone()
+		if version != "" {
+			shown.Set("Anthropic-Version", version)
+		}
+		if beta != "" {
+			shown.Set("Anthropic-Beta", beta)
+		}
+		if !maps.EqualFunc(sent, shown, slices.Equal) {
+			fail("headers: explain %q, the client's version %q and beta %q, the provider got %q", b.Header, version, beta, got.Header)
 		}
 		switch {
 		case anthropic && (got.Header.Get("X-Api-Key") != planted+"ANTH_KEY" || got.Header.Values("Authorization") != nil || got.Path != "/v1/messages"):
@@ -331,24 +499,27 @@ func TestCorpus(t *testing.T) {
 
 		// AC-09: what differs is what is listed.
 		check := listed
-		if anthropic {
+		if anthropic && !messages {
 			check = translated
 		}
-		if err := check(body, got.Body, b.Changes, reasoning.Dialect(decl.Reasoning), b.Target); err != nil {
+		group := append([]string{reasoning.Inbound(ep)[0]}, domain.DialectKeys[reasoning.Dialect(decl.Reasoning)]...)
+		if err := check(body, got.Body, b.Changes, group, b.Target); err != nil {
 			fail("%v; changes %q; the provider received\n%s", err, b.Changes, got.Body)
 		}
 	}
 
-	t.Logf("seed %d: %d bodies; %d refused, %d with every target skipped, %d served (%d streams, %d toward anthropic): %v",
-		seed, n, refused, allSkipped, n-refused-allSkipped, streamed, translatedStreams, served)
+	t.Logf("seed %d: %d bodies; %d refused, %d with every target skipped, %d served (%d chat streams, %d toward anthropic): %v; "+
+		"on /v1/messages %d refused, %d with every target skipped, %d served (%d streams)",
+		seed, n, refused, allSkipped, n-refused-allSkipped, streamed, translatedStreams, served, msgRefused, msgSkipped, msgServed, msgStreamed)
 	for _, id := range corpusTargets {
 		if served[id] == 0 {
 			t.Errorf("no generated body was served by %s", id)
 		}
 	}
-	if refused == 0 || allSkipped == 0 || streamed == 0 || translatedStreams == 0 {
-		t.Errorf("the corpus has %d refusals, %d bodies every target skipped, %d streams and %d streams toward anthropic; each kind needs one",
-			refused, allSkipped, streamed, translatedStreams)
+	if refused == 0 || allSkipped == 0 || streamed == 0 || translatedStreams == 0 || msgRefused == 0 || msgSkipped == 0 || msgServed == 0 || msgStreamed == 0 {
+		t.Errorf("the corpus has %d refusals, %d bodies every target skipped, %d streams and %d streams toward anthropic; "+
+			"on /v1/messages %d refusals, %d bodies every target skipped, %d served and %d streams; each kind needs one",
+			refused, allSkipped, streamed, translatedStreams, msgRefused, msgSkipped, msgServed, msgStreamed)
 	}
 }
 
@@ -394,7 +565,7 @@ var mapped = []string{"model", "max_tokens", "system", "messages", "tools", "too
 // cap and user and assistant turns only; every member outside the mapping
 // and the dialect's members is listed; a forwarded member arrives byte for
 // byte and a dropped one is absent unless listed again as written.
-func translated(inbound string, received []byte, changes, dialect, target string) error {
+func translated(inbound string, received []byte, changes string, group []string, target string) error {
 	in, e1 := params.Scan([]byte(inbound), nil)
 	out, e2 := params.Scan(received, nil)
 	if e1 != nil || e2 != nil {
@@ -432,7 +603,6 @@ func translated(inbound string, received []byte, changes, dialect, target string
 			return fmt.Errorf("%s is listed dropped but was sent", c)
 		}
 	}
-	group := append([]string{"reasoning_effort"}, domain.DialectKeys[dialect]...)
 	for _, n := range out.Keys() {
 		if !slices.Contains(mapped, n) && !slices.Contains(group, n) && !names[n] {
 			return fmt.Errorf("%s was sent but is neither mapped nor listed", n)
@@ -441,25 +611,26 @@ func translated(inbound string, received []byte, changes, dialect, target string
 	return nil
 }
 
-// listed checks AC-09 on one request: every top-level member but model that
-// differs between the inbound body and the bytes received is named by the
-// change list, and every change names a member that changed. The effort
-// change is named after the client's member or the dialect's (PAR-3), so it
-// stands for every member the dialect writes; a forwarded member is listed
+// listed checks AC-09 on one request on a native path: every top-level
+// member but model that differs between the inbound body and the bytes
+// received is named by the change list, and every change names a member that
+// changed. The effort change is named after the client's member or the
+// dialect's (PAR-3), so it stands for every member of group, the client's
+// effort member and those the dialect writes; a forwarded member is listed
 // unchanged; a dropped one is absent, unless listed again as written; an
 // alias effort dropped toward a none target is listed though the client sent
-// none (C12).
-func listed(inbound string, received []byte, changes, dialect, target string) error {
-	in, e1 := params.Scan([]byte(inbound), nil)
-	out, e2 := params.Scan(received, nil)
+// none (C12), and so is a client effort on /v1/messages that a thinking of
+// type disabled requested (RSN-1), which leaves with the thinking.
+func listed(inbound string, received []byte, changes string, group []string, target string) error {
+	in, e1 := params.Scan([]byte(inbound), params.MessagesOut)
+	out, e2 := params.Scan(received, params.MessagesOut)
 	if e1 != nil || e2 != nil {
 		return fmt.Errorf("scan: %v %v", e1, e2)
 	}
 	if v, _ := out.Get("model"); string(v) != strconv.Quote(upstream(target)) {
 		return fmt.Errorf("model %s sent to %s", v, target)
 	}
-	group := append([]string{"reasoning_effort"}, domain.DialectKeys[dialect]...)
-	present := func(b *params.Body, n string) bool { _, ok := b.Get(n); return ok }
+	present := func(b *params.Body, path ...string) bool { _, ok := b.Get(path...); return ok }
 	differs := func(n string) bool {
 		a, okA := in.Get(n)
 		b, okB := out.Get(n)
@@ -482,7 +653,7 @@ func listed(inbound string, received []byte, changes, dialect, target string) er
 			}
 			continue
 		case action == "dropped":
-			if present(out, top) && !again {
+			if present(out, strings.Split(name, ".")...) && !again {
 				return fmt.Errorf("%s is listed dropped but was sent", c)
 			}
 		case slices.Contains(group, top):

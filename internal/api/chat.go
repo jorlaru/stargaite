@@ -27,6 +27,9 @@ const (
 	targetHeader  = "X-Stargaite-Target"
 	effortHeader  = "X-Stargaite-Reasoning-Effort"
 	changedHeader = "X-Stargaite-Params-Changed"
+	// errorCodeHeader repeats the code of an error on /v1/messages, whose
+	// envelope has no code member (kick-off section 15).
+	errorCodeHeader = "X-Stargaite-Error-Code"
 )
 
 // The causes that end an attempt early: the RES-3 timers, a stream that ends
@@ -43,12 +46,13 @@ var (
 // request is one authenticated inference request (design section 4).
 type request struct {
 	id, traceID string           // traceID: 16 random bytes in hex until phase 3 reads traceparent
-	ep          domain.Endpoint  // chat
+	ep          domain.Endpoint  // chat or messages
 	snap        *config.Snapshot // loaded once (RES-7)
 	key         *config.Key
 	alias       string // the body's "model" string, set before the lookup; "" when the body named none
 	model       *config.Model
 	body        *params.Body
+	header      http.Header // anthropic-version and anthropic-beta, from /v1/messages only (PAR-14)
 	client      *plan.Client
 	attempts    []*attempt
 	err         *domain.Error // what the client got; nil on success
@@ -77,12 +81,21 @@ type relay struct {
 	observed func() domain.Observed
 }
 
-// relayFor is the relay of an attempt toward t for client c: chat toward
-// openai is the native relay, chat toward anthropic the translated one,
-// whose chunks take created from now.
-func relayFor(t *config.Target, c *plan.Client, now func() time.Time) relay {
+// relayFor is the relay of an attempt on endpoint ep toward t for client c:
+// messages toward anthropic is the native Messages relay; chat toward
+// openai is the native chat relay, chat toward anthropic the translated one,
+// whose chunks take created from now. Build skips messages toward openai.
+func relayFor(ep domain.Endpoint, t *config.Target, c *plan.Client, now func() time.Time) relay {
 	tg, p := &t.Spec, &t.Provider.Spec
-	if p.Protocol == domain.ProtocolAnthropic {
+	switch {
+	case ep == domain.EndpointMessages:
+		s := anthropic.NewStream(tg, p)
+		return relay{
+			sync:     func(body []byte, _ time.Time) ([]byte, domain.Observed, error) { return anthropic.Observe(tg, p, body) },
+			event:    s.Event,
+			observed: s.Observed,
+		}
+	case p.Protocol == domain.ProtocolAnthropic:
 		s := anthropic.NewChatStream(tg, p, c.Usage, now)
 		return relay{
 			sync: func(body []byte, now time.Time) ([]byte, domain.Observed, error) {
@@ -100,22 +113,34 @@ func relayFor(t *config.Target, c *plan.Client, now func() time.Time) relay {
 	}
 }
 
-// chat serves POST /v1/chat/completions (design section 4, steps 1 to 8),
-// synchronous and streamed, toward openai and anthropic targets. done runs
-// on every exit
-// once the key is authenticated, a panic included. A stream that fails once
-// committed has already written its terminal event, so it gets no envelope.
-func (h *handler) chat(w http.ResponseWriter, r *http.Request) {
-	rq := &request{id: w.Header().Get(domain.RequestIDHeader), ep: domain.EndpointChat, snap: h.Config.Snapshot(), started: time.Now()}
-	if rq.key, rq.traceID = h.authenticate(w, r, rq.snap); rq.key == nil {
-		return
-	}
-	defer h.done(rq)
-	if rq.err = h.check(w, r, rq); rq.err == nil {
-		rq.err = h.route(w, r, rq)
-	}
-	if rq.err != nil && (len(rq.attempts) == 0 || !rq.attempts[len(rq.attempts)-1].written) {
-		fail(w, rq.err)
+// infer serves POST /v1/chat/completions and POST /v1/messages (design
+// sections 4 and 8, steps 1 to 8), synchronous and streamed. done runs on
+// every exit once the key is authenticated, a panic included. Every error is
+// in the envelope of ep; a stream that fails once committed has already
+// written its terminal event, so it gets no envelope. Only /v1/messages
+// keeps the client's anthropic-version and anthropic-beta, for Build to
+// forward toward an anthropic target (PAR-14).
+func (h *handler) infer(ep domain.Endpoint) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rq := &request{id: w.Header().Get(domain.RequestIDHeader), ep: ep, snap: h.Config.Snapshot(), started: time.Now()}
+		if rq.key, rq.traceID = h.authenticate(w, r, rq.snap, ep); rq.key == nil {
+			return
+		}
+		defer h.done(rq)
+		if ep == domain.EndpointMessages {
+			rq.header = http.Header{}
+			for _, name := range []string{"Anthropic-Version", "Anthropic-Beta"} {
+				if v := r.Header.Values(name); v != nil {
+					rq.header[name] = v
+				}
+			}
+		}
+		if rq.err = h.check(w, r, rq); rq.err == nil {
+			rq.err = h.route(w, r, rq)
+		}
+		if rq.err != nil && (len(rq.attempts) == 0 || !rq.attempts[len(rq.attempts)-1].written) {
+			fail(w, ep, rq.err)
+		}
 	}
 }
 
@@ -132,8 +157,12 @@ func (h *handler) check(w http.ResponseWriter, r *http.Request, rq *request) *do
 	// a request that lasts longer than it (design section 10).
 	_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
 
+	walk := params.Chat.Walk
+	if rq.ep == domain.EndpointMessages {
+		walk = params.Messages.Walk
+	}
 	var pe *params.Error
-	if rq.body, pe = params.Scan(raw, params.Chat.Walk); pe != nil {
+	if rq.body, pe = params.Scan(raw, walk); pe != nil {
 		e := domain.NewError(pe.Code, pe.Message)
 		e.Param = pe.Param
 		return e
@@ -168,7 +197,7 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request, rq *request) *do
 	var static []plan.Skip
 	excluded := false
 	for i, t := range rq.model.Targets {
-		out, skip := plan.Build(plan.Input{Endpoint: rq.ep, Body: rq.body, Model: &rq.model.Spec,
+		out, skip := plan.Build(plan.Input{Endpoint: rq.ep, Body: rq.body, Header: rq.header, Model: &rq.model.Spec,
 			Upstream: t.Upstream, Target: &t.Spec, Provider: &t.Provider.Spec, Client: rq.client})
 		if skip != nil {
 			if skip.Code == domain.CodeInternalError {
@@ -199,13 +228,14 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request, rq *request) *do
 // stream), the write deadline, the call and the answer. A synchronous body is
 // read whole up to max_response_bytes (RES-4) and, for a 2xx the adapter can
 // read, relayed as the adapter maps it: unchanged but for the think-tag edits
-// (RSN-12) toward openai, translated toward anthropic; a 2xx stream is
-// relayed as it arrives (stream). The PAR-9 headers go out with the status line. It returns the section 15 error
-// of the call, nil once the response is relayed.
+// (RSN-12) on the native paths, translated for chat toward anthropic; a 2xx
+// stream is relayed as it arrives (stream). The PAR-9 headers go out with
+// the status line. It returns the section 15 error of the call, nil once the
+// response is relayed.
 func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *config.Target, out *plan.Outgoing, n int) *domain.Error {
 	a := &attempt{n: n, target: t, out: out, started: time.Now()}
 	defer h.finish(rq, a)
-	rl := relayFor(t, rq.client, h.Config.Now)
+	rl := relayFor(rq.ep, t, rq.client, h.Config.Now)
 	rq.attempts = append(rq.attempts, a)
 	w.Header().Set(targetHeader, t.ID)
 	if out.Effort.Sent != nil {
@@ -337,10 +367,12 @@ func failed(ctx context.Context, a *attempt, err error) *domain.Error {
 // the section 15 error the caller answers, 502 upstream_error for an
 // upstream error event whatever status its type documents, which goes to the
 // cause (section 15 point 15); after it, the terminal event, written here:
-// an OpenAI error chunk is relayed as it is, being in the client's format;
-// any other failure, an Anthropic error event included, is data:
-// {"error":{...}} with no [DONE] after it. A failed write ends the attempt
-// with nothing more to answer: the client is gone.
+// an upstream error already in the client's format (an OpenAI error chunk
+// on chat, an Anthropic error event on messages) is relayed as it is; any
+// other failure is the proxy's own event in the envelope of the endpoint:
+// data: {"error":{...}} with no [DONE] after it on chat, event: error with
+// the Anthropic envelope on messages. A failed write ends the attempt with
+// nothing more to answer: the client is gone.
 func (h *handler) stream(ctx context.Context, w http.ResponseWriter, rq *request, a *attempt, rl relay, resp *http.Response, idle *time.Timer) *domain.Error {
 	if mt, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mt != "text/event-stream" {
 		a.cause = fmt.Errorf("the answer is %.100q, not an event stream", resp.Header.Get("Content-Type"))
@@ -418,16 +450,22 @@ func (h *handler) stream(ctx context.Context, w http.ResponseWriter, rq *request
 	case errors.As(err, &event):
 		a.cause = errors.New(credential.Redact(event.Error()))
 		e = domain.NewError(domain.CodeUpstreamError, "the provider's stream reported an error")
+		if a.written && rq.ep == domain.EndpointMessages {
+			_ = emit("error", ev.Data)
+			return e
+		}
 	case errors.Is(a.cause, errIdleTimeout):
 		e = domain.NewError(domain.CodeUpstreamTimeout, "the provider did not answer in time: "+a.cause.Error())
 	default:
 		e = domain.NewError(domain.CodeUpstreamError, "the provider's stream failed")
 	}
 	if a.written {
-		data, _ := config.Encode(struct {
-			Error *domain.Error `json:"error"`
-		}{e})
-		_ = write(transport.Event{Data: data})
+		name := ""
+		if rq.ep == domain.EndpointMessages {
+			name = "error"
+		}
+		data, _ := config.Encode(envelope(rq.ep, e))
+		_ = write(transport.Event{Name: name, Data: data})
 	}
 	return e
 }

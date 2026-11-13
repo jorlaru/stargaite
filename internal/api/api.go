@@ -67,28 +67,39 @@ func Handler(d Deps) http.Handler {
 	mux.HandleFunc("GET /health/live", ok)
 	mux.HandleFunc("GET /health/ready", ok)
 	mux.HandleFunc("GET /v1/models", h.models)
-	mux.HandleFunc("POST /v1/chat/completions", h.chat)
+	mux.HandleFunc("POST /v1/chat/completions", h.infer(domain.EndpointChat))
+	mux.HandleFunc("POST /v1/messages", h.infer(domain.EndpointMessages))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(domain.RequestIDHeader, rand.Text())
 		mux.ServeHTTP(w, r)
 	})
 }
 
-// authenticate returns the key of the client token in Authorization: Bearer
-// (step 1), checked against snap, and the trace id it sets on the response
-// (PAR-9). The admin key never has the shape of a client key, so it is refused
-// like any other wrong token (SEC-2). A failure answers 401 invalid_api_key
-// and is logged rate-limited, never with the token, so a flood of wrong
-// tokens cannot grow the log (OPS-9).
-func (h *handler) authenticate(w http.ResponseWriter, r *http.Request, snap *config.Snapshot) (*config.Key, string) {
+// authenticate returns the key of the client token (step 1), checked
+// against snap, and the trace id it sets on the response (PAR-9). The token
+// is in Authorization: Bearer or, on /v1/messages, in x-api-key (ACT-1);
+// when both are sent, Authorization wins. The admin key never has the shape
+// of a client key, so it is refused like any other wrong token (SEC-2). A
+// failure answers 401 invalid_api_key in the envelope of ep and is logged
+// rate-limited, never with the token, so a flood of wrong tokens cannot grow
+// the log (OPS-9).
+func (h *handler) authenticate(w http.ResponseWriter, r *http.Request, snap *config.Snapshot, ep domain.Endpoint) (*config.Key, string) {
 	now := h.Config.Now()
 	var key *config.Key
-	scheme, token, _ := strings.Cut(r.Header.Get("Authorization"), " ")
-	if strings.EqualFold(scheme, "Bearer") {
-		key, _ = snap.Authenticate(token, now)
+	want := "a valid client key is required: Authorization: Bearer sk-stargaite-..."
+	if ep == domain.EndpointMessages {
+		want = "a valid client key is required: x-api-key: sk-stargaite-... or Authorization: Bearer sk-stargaite-..."
+	}
+	if v := r.Header.Get("Authorization"); v != "" || ep != domain.EndpointMessages {
+		scheme, token, _ := strings.Cut(v, " ")
+		if strings.EqualFold(scheme, "Bearer") {
+			key, _ = snap.Authenticate(token, now)
+		}
+	} else {
+		key, _ = snap.Authenticate(r.Header.Get("X-Api-Key"), now)
 	}
 	if key == nil {
-		fail(w, domain.NewError(domain.CodeInvalidAPIKey, "a valid client key is required: Authorization: Bearer sk-stargaite-..."))
+		fail(w, ep, domain.NewError(domain.CodeInvalidAPIKey, want))
 		if n, ok := h.refused.tick(now); ok {
 			h.Log.Warn("authentication failed", "request_id", w.Header().Get(domain.RequestIDHeader), "method", r.Method, "path", r.URL.Path,
 				"status", http.StatusUnauthorized, "remote", r.RemoteAddr, "failures", n)
@@ -122,7 +133,7 @@ type model struct {
 // the key, never the token (OPS-9).
 func (h *handler) models(w http.ResponseWriter, r *http.Request) {
 	snap := h.Config.Snapshot()
-	key, trace := h.authenticate(w, r, snap)
+	key, trace := h.authenticate(w, r, snap, domain.EndpointChat)
 	if key == nil {
 		return
 	}
@@ -140,15 +151,40 @@ func (h *handler) models(w http.ResponseWriter, r *http.Request) {
 		"status", http.StatusOK, "key", key.Name)
 }
 
-// fail writes e in the OpenAI envelope (kick-off section 15), with its
-// Retry-After header when it has one.
-func fail(w http.ResponseWriter, e *domain.Error) {
+// fail writes e in the envelope of ep (kick-off section 15), with its
+// Retry-After header when it has one: the OpenAI envelope, or on
+// /v1/messages the Anthropic one with the code in x-stargaite-error-code.
+func fail(w http.ResponseWriter, ep domain.Endpoint, e *domain.Error) {
 	if e.RetryAfter != "" {
 		w.Header().Set("Retry-After", e.RetryAfter)
 	}
-	write(w, e.Status, struct {
+	if ep == domain.EndpointMessages {
+		w.Header().Set(errorCodeHeader, e.Code)
+	}
+	write(w, e.Status, envelope(ep, e))
+}
+
+// anthropicError is the Anthropic envelope (kick-off section 15), which has
+// no code member: the code leads the message.
+type anthropicError struct {
+	Type  string `json:"type"`
+	Error struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+	} `json:"error"`
+}
+
+// envelope is e in the error envelope of ep: {"type":"error","error":
+// {"type","message":"<code>: <message>"}} on /v1/messages, else {"error":e}.
+func envelope(ep domain.Endpoint, e *domain.Error) any {
+	if ep == domain.EndpointMessages {
+		a := anthropicError{Type: "error"}
+		a.Error.Type, a.Error.Message = e.Type, e.Code+": "+e.Message
+		return a
+	}
+	return struct {
 		Error *domain.Error `json:"error"`
-	}{e})
+	}{e}
 }
 
 func write(w http.ResponseWriter, status int, v any) {

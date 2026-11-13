@@ -1,0 +1,22 @@
+POST /v1/messages HTTP/1.1
+host: 127.0.0.1:44467
+connection: keep-alive
+Accept: application/json
+User-Agent: Anthropic/JS 0.93.0
+X-Stainless-Retry-Count: 0
+X-Stainless-Timeout: 600
+X-Stainless-Lang: js
+X-Stainless-Package-Version: 0.93.0
+X-Stainless-OS: Linux
+X-Stainless-Arch: x64
+X-Stainless-Runtime: node
+X-Stainless-Runtime-Version: v24.19.0
+anthropic-version: 2023-06-01
+x-api-key: sk-stargaite-recorded
+content-type: application/json
+accept-language: *
+sec-fetch-mode: cors
+accept-encoding: gzip, deflate
+content-length: 82
+
+{"model":"claude","max_tokens":256,"messages":[{"role":"user","content":"Hello"}]}

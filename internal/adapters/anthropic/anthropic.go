@@ -2,7 +2,9 @@
 // anthropic protocol (design section 7): the request into a Messages body,
 // built from the client's raw values, and the Messages answer back into a
 // chat completion, synchronous or streamed (design section 9), with the
-// think-tag edits of a target that declares inline_think_tags (RSN-12).
+// think-tag edits of a target that declares inline_think_tags (RSN-12). On
+// the native path (/v1/messages, design section 8) it observes the Messages
+// answer and stream the relay passes through, with the same edits.
 package anthropic
 
 import (

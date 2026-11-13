@@ -1,0 +1,51 @@
+[
+	{
+		"level": "none",
+		"sent": "none",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"none\",\"max_tokens\":8192}"
+	},
+	{
+		"level": "minimal",
+		"sent": "minimal",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"minimal\",\"max_tokens\":8192}"
+	},
+	{
+		"level": "low",
+		"sent": "low",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"low\",\"max_tokens\":8192}"
+	},
+	{
+		"level": "medium",
+		"sent": "medium",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"medium\",\"max_tokens\":8192}"
+	},
+	{
+		"level": "high",
+		"sent": "high",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"high\",\"max_tokens\":8192}"
+	},
+	{
+		"level": "xhigh",
+		"sent": "xhigh",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"xhigh\",\"max_tokens\":8192}"
+	},
+	{
+		"level": "max",
+		"sent": "max",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"max\",\"max_tokens\":8192}"
+	}
+]

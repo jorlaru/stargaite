@@ -1,0 +1,54 @@
+[
+	{
+		"level": "none",
+		"sent": "none",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"disabled\"}}"
+	},
+	{
+		"level": "minimal",
+		"sent": "low",
+		"source": "client",
+		"adjusted": true,
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"low\"}}"
+	},
+	{
+		"level": "low",
+		"sent": "low",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"low\"}}"
+	},
+	{
+		"level": "medium",
+		"sent": "medium",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"medium\"}}"
+	},
+	{
+		"level": "high",
+		"sent": "high",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"high\"}}"
+	},
+	{
+		"level": "xhigh",
+		"sent": "high",
+		"source": "client",
+		"adjusted": true,
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"high\"}}"
+	},
+	{
+		"level": "max",
+		"sent": "high",
+		"source": "client",
+		"adjusted": true,
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"high\"}}"
+	}
+]

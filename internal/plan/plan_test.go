@@ -20,14 +20,14 @@ import (
 var update = flag.Bool("update", false, "rewrite the golden files")
 
 var (
-	openai    = &domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.example.com/v1"}
-	anthropic = &domain.Provider{Protocol: domain.ProtocolAnthropic, BaseURL: "https://api.example.com/"}
+	openai = &domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.example.com/v1"}
+	anth   = &domain.Provider{Protocol: domain.ProtocolAnthropic, BaseURL: "https://api.example.com/"}
 )
 
 // provider is the native provider of ep.
 func provider(ep domain.Endpoint) *domain.Provider {
 	if ep == domain.EndpointMessages {
-		return anthropic
+		return anth
 	}
 	return openai
 }
@@ -35,6 +35,12 @@ func provider(ep domain.Endpoint) *domain.Provider {
 // run scans body with the inbound walk of ep, checks it against the alias m
 // and builds it for target t of the native protocol, as the data plane does.
 func run(t *testing.T, ep domain.Endpoint, body string, m *domain.Model, tg domain.Target) (*Outgoing, *Skip) {
+	t.Helper()
+	return runTo(t, ep, provider(ep), body, m, tg)
+}
+
+// runTo is run toward a target of provider p.
+func runTo(t *testing.T, ep domain.Endpoint, p *domain.Provider, body string, m *domain.Model, tg domain.Target) (*Outgoing, *Skip) {
 	t.Helper()
 	s, _, _ := schema(ep)
 	b, e := params.Scan([]byte(body), s.Walk)
@@ -48,7 +54,7 @@ func run(t *testing.T, ep domain.Endpoint, body string, m *domain.Model, tg doma
 	if tg.Kind == "" {
 		tg.Kind = domain.KindChat
 	}
-	return Build(Input{Endpoint: ep, Body: b, Model: m, Upstream: "up-1", Target: &tg, Provider: provider(ep), Client: c})
+	return Build(Input{Endpoint: ep, Body: b, Model: m, Upstream: "up-1", Target: &tg, Provider: p, Client: c})
 }
 
 func val(p *string) string {
@@ -133,13 +139,18 @@ type entry struct {
 // TestDialectGoldens is RSN-11 and AC-13 at unit level: per endpoint and
 // dialect, the seven levels of the scale through the default forms, the
 // fragments, a map, undeclared levels, can_disable false and both alias
-// modes, in testdata/<endpoint>/<dialect>/<case>.json.
+// modes, in testdata/<endpoint>/<dialect>/<case>.json; chat toward an
+// anthropic target, the translated path, in testdata/chat-anthropic, with
+// the alias cap every anthropic target needs (PAR-7).
 func TestDialectGoldens(t *testing.T) {
 	cases := []string{"default", "fragments", "map", "no-levels", "cannot-disable", "alias-default", "alias-forced"}
-	for _, ep := range []domain.Endpoint{domain.EndpointChat, domain.EndpointMessages} {
-		body := chatBody
-		if ep == domain.EndpointMessages {
+	for _, dir := range []string{"chat", "messages", "chat-anthropic"} {
+		ep, p, body := domain.Endpoint(dir), provider(domain.Endpoint(dir)), chatBody
+		switch dir {
+		case "messages":
 			body = messagesBody
+		case "chat-anthropic":
+			ep, p = domain.EndpointChat, anth
 		}
 		for _, d := range dialects {
 			for _, c := range cases {
@@ -149,6 +160,9 @@ func TestDialectGoldens(t *testing.T) {
 				var got []entry
 				for _, l := range domain.Levels {
 					m := &domain.Model{}
+					if p == anth && ep == domain.EndpointChat {
+						m.MaxOutputTokens = 8192
+					}
 					in := body(l)
 					switch c {
 					case "alias-default":
@@ -156,13 +170,13 @@ func TestDialectGoldens(t *testing.T) {
 					case "alias-forced":
 						m.Reasoning, in = domain.ModelReasoning{Effort: l, Mode: domain.ModeForced}, body("medium")
 					}
-					out, skip := run(t, ep, in, m, domain.Target{Reasoning: reasoningFor(d, strings.TrimPrefix(c, "alias-"))})
+					out, skip := runTo(t, ep, p, in, m, domain.Target{Reasoning: reasoningFor(d, strings.TrimPrefix(c, "alias-"))})
 					if skip != nil {
 						t.Fatalf("%s %s %s %s: skipped %+v", ep, d, c, l, skip)
 					}
 					got = append(got, entry{l, val(out.Effort.Sent), out.EffortSource, out.EffortAdjusted, Header(out.Changes), string(out.Body)})
 				}
-				golden(t, filepath.Join("testdata", string(ep), d, c+".json"), got)
+				golden(t, filepath.Join("testdata", dir, d, c+".json"), got)
 			}
 		}
 	}
@@ -363,23 +377,39 @@ func TestSkips(t *testing.T) {
 		param  string
 	}{
 		{"messages toward openai", "messages", `{"model":"a","max_tokens":1,` + msgs + `}`, nil, domain.Target{}, openai, "endpoint_not_supported", ""},
-		{"chat toward anthropic until C17", "chat", `{"model":"a",` + msgs + `}`, nil, domain.Target{}, anthropic, "endpoint_not_supported", ""},
+		{"a chat stream toward anthropic until C18", "chat", `{"model":"a",` + msgs + `,"stream":true}`, nil, domain.Target{}, anth, "endpoint_not_supported", "stream"},
 		{"chat toward an embeddings target", "chat", `{"model":"a",` + msgs + `}`, nil, domain.Target{Kind: domain.KindEmbeddings}, openai, "endpoint_not_supported", ""},
 		{"tools", "chat", `{"model":"a",` + msgs + `,"tool_choice":"none"}`, nil, domain.Target{Capabilities: domain.Capabilities{Tools: no}}, openai, "capability_mismatch", "tools"},
 		{"structured output", "chat", `{"model":"a",` + msgs + `,"response_format":{"type":"json_schema","json_schema":{}}}`, nil,
 			domain.Target{Capabilities: domain.Capabilities{StructuredOutput: no}}, openai, "capability_mismatch", "structured_output"},
 		{"strict schema", "messages", `{"model":"a","max_tokens":1,` + msgs + `,"tools":[{"name":"f","strict":true}]}`, nil,
-			domain.Target{Capabilities: domain.Capabilities{StrictSchema: no}}, anthropic, "capability_mismatch", "strict_schema"},
+			domain.Target{Capabilities: domain.Capabilities{StrictSchema: no}}, anth, "capability_mismatch", "strict_schema"},
 		{"vision", "messages", `{"model":"a","max_tokens":1,"messages":[{"role":"user","content":[{"type":"image"}]}]}`, nil,
-			domain.Target{Capabilities: domain.Capabilities{Vision: no}}, anthropic, "capability_mismatch", "vision"},
+			domain.Target{Capabilities: domain.Capabilities{Vision: no}}, anth, "capability_mismatch", "vision"},
 		{"unsupported known parameter", "chat", `{"model":"a",` + msgs + `,"seed":1}`, nil, domain.Target{UnsupportedParams: []string{"seed"}}, openai, "unsupported_parameter", "seed"},
 		{"unsupported forwarded parameter", "chat", `{"model":"a",` + msgs + `,"x_tag":1}`, &domain.Model{Params: map[string]string{"x_tag": "forward"}},
 			domain.Target{UnsupportedParams: []string{"x_tag"}}, openai, "unsupported_parameter", "x_tag"},
 		{"client cap above the target", "chat", `{"model":"a",` + msgs + `,"max_completion_tokens":10}`, nil, domain.Target{MaxOutputTokens: 9}, openai, "max_output_tokens_exceeded", ""},
 		{"client budget toward another dialect", "messages", `{"model":"a","max_tokens":4096,` + msgs + `,"thinking":{"type":"enabled","budget_tokens":2048}}`, nil,
-			domain.Target{Reasoning: &domain.Reasoning{Dialect: "adaptive_effort"}}, anthropic, "capability_mismatch", "thinking.budget_tokens"},
+			domain.Target{Reasoning: &domain.Reasoning{Dialect: "adaptive_effort"}}, anth, "capability_mismatch", "thinking.budget_tokens"},
 		{"client budget toward none", "messages", `{"model":"a","max_tokens":4096,` + msgs + `,"thinking":{"type":"enabled","budget_tokens":2048}}`, nil,
-			domain.Target{}, anthropic, "capability_mismatch", "thinking.budget_tokens"},
+			domain.Target{}, anth, "capability_mismatch", "thinking.budget_tokens"},
+		// Chat toward anthropic: keys with no equivalent and untranslatable
+		// content (PAR-12, design section 7), unless a drop rule removes the key.
+		{"no equivalent toward anthropic", "chat", `{"model":"a",` + msgs + `,"temperature":1,"seed":1}`, nil, domain.Target{}, anth, "unsupported_parameter", "seed"},
+		{"n above 1 toward anthropic", "chat", `{"model":"a",` + msgs + `,"n":2}`, nil, domain.Target{}, anth, "unsupported_parameter", "n"},
+		{"json_object toward anthropic", "chat", `{"model":"a",` + msgs + `,"response_format":{"type":"json_object"}}`, nil, domain.Target{}, anth, "unsupported_parameter", "response_format"},
+		{"a drop rule on another key does not help", "chat", `{"model":"a",` + msgs + `,"logprobs":true,"user":"u"}`, &domain.Model{Params: map[string]string{"user": "drop"}},
+			domain.Target{}, anth, "unsupported_parameter", "logprobs"},
+		{"a message name toward anthropic", "chat", `{"model":"a","messages":[{"role":"user","name":"ann","content":"hi"}]}`, nil, domain.Target{}, anth,
+			"unsupported_parameter", "messages[0].name"},
+		{"an audio part toward anthropic", "chat", `{"model":"a","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{}}]}]}`, nil, domain.Target{}, anth,
+			"unsupported_parameter", "messages[0].content[0]"},
+		{"unsupported known parameter toward anthropic", "chat", `{"model":"a",` + msgs + `,"temperature":1}`, nil, domain.Target{UnsupportedParams: []string{"temperature"}}, anth,
+			"unsupported_parameter", "temperature"},
+		{"PAR-4 before the translation", "chat", `{"model":"a","messages":[{"role":"user","content":[{"type":"input_audio","input_audio":{}}]}]}`, nil,
+			domain.Target{Capabilities: domain.Capabilities{Vision: no}}, anth, "capability_mismatch", "vision"},
+		{"client cap above the target toward anthropic", "chat", `{"model":"a",` + msgs + `,"max_tokens":10}`, nil, domain.Target{MaxOutputTokens: 9}, anth, "max_output_tokens_exceeded", ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			s, _, _ := schema(tt.ep)
@@ -395,6 +425,70 @@ func TestSkips(t *testing.T) {
 			out, skip := Build(Input{Endpoint: tt.ep, Body: b, Model: tt.m, Upstream: "up-1", Target: &tt.target, Provider: tt.p, Client: c})
 			if out != nil || skip == nil || skip.Code != tt.code || skip.Param != tt.param {
 				t.Errorf("got %+v, %+v; want %s %s", out, skip, tt.code, tt.param)
+			}
+		})
+	}
+}
+
+// TestTranslated is chat toward an anthropic target through Build: the new
+// body of the adapter, listed protocol:translated once and first, then the
+// alias's rules, the cap and the reasoning edit on that body; a key with no
+// equivalent is dropped under a drop rule (PAR-12); a forwarded member is
+// copied byte for byte; every sent value is read back from the result.
+func TestTranslated(t *testing.T) {
+	const msgs = `"messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]`
+	const sent = `"system":[{"type":"text","text":"be brief"}],"messages":[{"role":"user","content":"hi"}]`
+	adaptive := domain.Target{Reasoning: &domain.Reasoning{Dialect: "adaptive_effort", Levels: []string{"low", "medium", "high"}, CanDisable: new(true)}}
+	budget := domain.Target{Reasoning: &domain.Reasoning{Dialect: "thinking_budget", Levels: []string{"low", "high"}, Budgets: map[string]int64{"low": 1024, "high": 4096}}}
+	effort := domain.Target{Reasoning: &domain.Reasoning{Dialect: "reasoning_effort"}}
+	high := domain.ModelReasoning{Effort: "high", Mode: "default"}
+	for _, tt := range []struct {
+		name, body string
+		m          domain.Model
+		target     domain.Target
+		want       string
+		changes    string
+		effort     string
+		cap        int64
+	}{
+		{"alias cap and effort added", `{"model":"a",` + msgs + `}`, domain.Model{MaxOutputTokens: 1000, Reasoning: high}, adaptive,
+			`{"model":"up-1",` + sent + `,"max_tokens":1000,"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}`,
+			"protocol:translated,max_tokens:added,output_config.effort:added", "high", 1000},
+		{"the client's effort and cap, with structured output", `{"model":"a",` + msgs + `,"reasoning_effort":"low","max_completion_tokens":300,"max_tokens":200,` +
+			`"response_format":{"type":"json_schema","json_schema":{"name":"r","schema":{"type":"object"}}}}`, domain.Model{MaxOutputTokens: 1000, Reasoning: high}, adaptive,
+			`{"model":"up-1","max_tokens":300,` + sent + `,"output_config":{"format":{"type":"json_schema","schema":{"type":"object"}},"effort":"low"},"thinking":{"type":"adaptive"}}`,
+			"protocol:translated,reasoning_effort:translated", "low", 300},
+		{"a budget for the client's effort", `{"model":"a",` + msgs + `,"reasoning_effort":"medium","max_tokens":8000}`, domain.Model{}, budget,
+			`{"model":"up-1","max_tokens":8000,` + sent + `,"thinking":{"type":"enabled","budget_tokens":1024}}`,
+			"protocol:translated,reasoning_effort:translated", "budget:1024", 8000},
+		{"the client's effort kept toward a reasoning_effort dialect", `{"model":"a",` + msgs + `,"reasoning_effort":"low","max_tokens":10}`, domain.Model{}, effort,
+			`{"model":"up-1","max_tokens":10,` + sent + `,"reasoning_effort":"low"}`, "protocol:translated", "low", 10},
+		{"an effort toward none is dropped", `{"model":"a",` + msgs + `,"reasoning_effort":"low","max_tokens":10}`, domain.Model{}, domain.Target{},
+			`{"model":"up-1","max_tokens":10,` + sent + `}`, "protocol:translated,reasoning_effort:dropped", "", 10},
+		{"drop rules on keys with no equivalent, a forward rule", `{"model":"a","seed":7,` + msgs + `,"x_tag":{"b":[1, 2]},"user":"u","temperature":0.5,"max_tokens":10}`,
+			domain.Model{Params: map[string]string{"seed": "drop", "user": "drop", "x_tag": "forward", "temperature": "drop"}}, domain.Target{},
+			`{"model":"up-1","max_tokens":10,` + sent + `,"temperature":0.5,"x_tag":{"b":[1, 2]}}`, "protocol:translated,seed:dropped,x_tag:forwarded,user:dropped", "", 10},
+		{"an unsupported key dropped", `{"model":"a",` + msgs + `,"temperature":0.5,"top_p":1,"max_tokens":10}`,
+			domain.Model{Params: map[string]string{"temperature": "drop"}}, domain.Target{UnsupportedParams: []string{"temperature"}},
+			`{"model":"up-1","max_tokens":10,` + sent + `,"top_p":1}`, "protocol:translated,temperature:dropped", "", 10},
+		{"the client's cap dropped: sent as max_tokens again", `{"model":"a",` + msgs + `,"max_tokens":500}`,
+			domain.Model{MaxOutputTokens: 1000, Params: map[string]string{"max_tokens": "drop"}}, domain.Target{UnsupportedParams: []string{"max_tokens"}},
+			`{"model":"up-1",` + sent + `,"max_tokens":500}`, "protocol:translated,max_tokens:dropped,max_tokens:translated", "", 500},
+		{"untranslatable content in dropped members", `{"model":"a",` + msgs + `,"response_format":{"type":"json_schema","json_schema":{"name":"r"}},` +
+			`"tools":[{"type":"function","function":{"description":"d"}}],"max_tokens":10}`,
+			domain.Model{Params: map[string]string{"response_format": "drop", "tools": "drop"}}, domain.Target{UnsupportedParams: []string{"response_format", "tools"}},
+			`{"model":"up-1","max_tokens":10,` + sent + `}`, "protocol:translated,response_format:dropped,tools:dropped", "", 10},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			out, skip := runTo(t, domain.EndpointChat, anth, tt.body, &tt.m, tt.target)
+			if skip != nil {
+				t.Fatal(skip)
+			}
+			if string(out.Body) != tt.want || Header(out.Changes) != tt.changes || val(out.Effort.Sent) != tt.effort || out.MaxOutput.Sent == nil || *out.MaxOutput.Sent != tt.cap {
+				t.Errorf("got %s %q effort %q cap %v", out.Body, Header(out.Changes), val(out.Effort.Sent), out.MaxOutput.Sent)
+			}
+			if out.URL != "https://api.example.com/v1/messages" || out.Header.Get("anthropic-version") != "2023-06-01" || len(out.Header) != 2 {
+				t.Errorf("%s %v", out.URL, out.Header)
 			}
 		})
 	}
@@ -468,7 +562,7 @@ func TestURLAndHeaders(t *testing.T) {
 		{nil, "2023-06-01", ""},
 		{http.Header{"Anthropic-Version": {"2026-10-21"}, "Anthropic-Beta": {"a,b"}, "X-Other": {"x"}}, "2026-10-21", "a,b"},
 	} {
-		out, _ := Build(Input{Endpoint: "messages", Body: b, Header: tt.in, Upstream: "up-1", Target: &tg, Provider: anthropic, Client: c})
+		out, _ := Build(Input{Endpoint: "messages", Body: b, Header: tt.in, Upstream: "up-1", Target: &tg, Provider: anth, Client: c})
 		if out.URL != "https://api.example.com/v1/messages" || out.Header.Get("anthropic-version") != tt.version ||
 			out.Header.Get("anthropic-beta") != tt.beta || out.Header.Get("X-Other") != "" {
 			t.Errorf("messages %v: %s %v", tt.in, out.URL, out.Header)

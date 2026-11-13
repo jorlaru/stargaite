@@ -1,0 +1,51 @@
+[
+	{
+		"level": "none",
+		"sent": "none",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated,temperature:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"temperature\":0.6,\"thinking\":{\"type\":\"disabled\"}}"
+	},
+	{
+		"level": "minimal",
+		"sent": "on",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"adaptive\"}}"
+	},
+	{
+		"level": "low",
+		"sent": "on",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"adaptive\"}}"
+	},
+	{
+		"level": "medium",
+		"sent": "on",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"adaptive\"}}"
+	},
+	{
+		"level": "high",
+		"sent": "on",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"adaptive\"}}"
+	},
+	{
+		"level": "xhigh",
+		"sent": "on",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"adaptive\"}}"
+	},
+	{
+		"level": "max",
+		"sent": "on",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"adaptive\"}}"
+	}
+]

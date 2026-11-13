@@ -1,0 +1,52 @@
+[
+	{
+		"level": "none",
+		"sent": "on",
+		"source": "client",
+		"adjusted": true,
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"enabled\"}}"
+	},
+	{
+		"level": "minimal",
+		"sent": "on",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"enabled\"}}"
+	},
+	{
+		"level": "low",
+		"sent": "on",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"enabled\"}}"
+	},
+	{
+		"level": "medium",
+		"sent": "on",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"enabled\"}}"
+	},
+	{
+		"level": "high",
+		"sent": "on",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"enabled\"}}"
+	},
+	{
+		"level": "xhigh",
+		"sent": "on",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"enabled\"}}"
+	},
+	{
+		"level": "max",
+		"sent": "on",
+		"source": "client",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"enabled\"}}"
+	}
+]

@@ -1,0 +1,54 @@
+[
+	{
+		"level": "none",
+		"sent": "none",
+		"source": "alias_forced",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:forced",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"reasoning\":{\"effort\":\"none\"}}"
+	},
+	{
+		"level": "minimal",
+		"sent": "low",
+		"source": "alias_forced",
+		"adjusted": true,
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:forced",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"reasoning\":{\"effort\":\"low\"}}"
+	},
+	{
+		"level": "low",
+		"sent": "low",
+		"source": "alias_forced",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:forced",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"reasoning\":{\"effort\":\"low\"}}"
+	},
+	{
+		"level": "medium",
+		"sent": "medium",
+		"source": "alias_forced",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:forced",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"reasoning\":{\"effort\":\"medium\"}}"
+	},
+	{
+		"level": "high",
+		"sent": "high",
+		"source": "alias_forced",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:forced",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"reasoning\":{\"effort\":\"high\"}}"
+	},
+	{
+		"level": "xhigh",
+		"sent": "high",
+		"source": "alias_forced",
+		"adjusted": true,
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:forced",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"reasoning\":{\"effort\":\"high\"}}"
+	},
+	{
+		"level": "max",
+		"sent": "high",
+		"source": "alias_forced",
+		"adjusted": true,
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:forced",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"reasoning\":{\"effort\":\"high\"}}"
+	}
+]

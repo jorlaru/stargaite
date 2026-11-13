@@ -1,0 +1,54 @@
+[
+	{
+		"level": "none",
+		"sent": "none",
+		"source": "alias_forced",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:forced",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"none\",\"max_tokens\":8192}"
+	},
+	{
+		"level": "minimal",
+		"sent": "low",
+		"source": "alias_forced",
+		"adjusted": true,
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:forced",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"low\",\"max_tokens\":8192}"
+	},
+	{
+		"level": "low",
+		"sent": "low",
+		"source": "alias_forced",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:forced",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"low\",\"max_tokens\":8192}"
+	},
+	{
+		"level": "medium",
+		"sent": "medium",
+		"source": "alias_forced",
+		"changes": "protocol:translated,max_tokens:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"medium\",\"max_tokens\":8192}"
+	},
+	{
+		"level": "high",
+		"sent": "high",
+		"source": "alias_forced",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:forced",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"high\",\"max_tokens\":8192}"
+	},
+	{
+		"level": "xhigh",
+		"sent": "high",
+		"source": "alias_forced",
+		"adjusted": true,
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:forced",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"high\",\"max_tokens\":8192}"
+	},
+	{
+		"level": "max",
+		"sent": "high",
+		"source": "alias_forced",
+		"adjusted": true,
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:forced",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"high\",\"max_tokens\":8192}"
+	}
+]

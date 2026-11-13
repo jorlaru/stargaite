@@ -150,8 +150,9 @@ func dialect(t domain.Target) string {
 }
 
 // written lists the top-level body keys the proxy itself can write toward a
-// target, which no forward rule may name (PAR-2). The fields of the protocol
-// adapter are not listed yet (design section 13, point 6).
+// target, which no forward rule may name (PAR-2): the reasoning dialect and
+// its fragments, the output cap, stream_options and, toward anthropic, the
+// keys the chat adapter writes outside params.Chat.Known (design section 5).
 func written(t domain.Target, protocol string) []string {
 	keys := slices.Clone(domain.DialectKeys[dialect(t)])
 	if t.Reasoning != nil {
@@ -160,7 +161,7 @@ func written(t domain.Target, protocol string) []string {
 	}
 	keys = append(keys, cmp.Or(t.OutputCapParam, domain.DefaultOutputCapParam), "stream_options")
 	if protocol == domain.ProtocolAnthropic {
-		keys = append(keys, "max_tokens") // every cap toward anthropic is max_tokens (PAR-6)
+		keys = append(keys, "max_tokens", "system", "stop_sequences", "tool_choice", "output_config") // max_tokens: every cap toward anthropic (PAR-6)
 	}
 	return keys
 }

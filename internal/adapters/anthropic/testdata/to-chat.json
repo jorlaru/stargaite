@@ -1,0 +1,196 @@
+[
+	{
+		"name": "text",
+		"messages": "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-x\",\"content\":[{\"type\":\"text\",\"text\":\"Hi \\u00e9 \\\"q\\\"\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}",
+		"chat": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1790000000,\"model\":\"claude-x\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Hi \\u00e9 \\\"q\\\"\"},\"finish_reason\":\"stop\",\"logprobs\":null}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0}}}",
+		"observed": {
+			"ResponseModel": "claude-x",
+			"FinishReason": "end_turn",
+			"Usage": {
+				"input": 10,
+				"cache_read": 0,
+				"cache_write": 0,
+				"output": 5
+			},
+			"VisibleBytes": 9,
+			"ToolCalls": 0,
+			"Stripped": false
+		}
+	},
+	{
+		"name": "thinking dropped, text joined, tool calls with their input bytes",
+		"messages": "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-x\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"plan\",\"signature\":\"sig\"},{\"type\":\"redacted_thinking\",\"data\":\"x\"},{\"type\":\"text\",\"text\":\"Checking\"},{\"type\":\"text\",\"text\":\" both.\"},{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\",\"input\":{\"city\": \"Paris\"}},{\"type\":\"tool_use\",\"id\":\"toolu_2\",\"name\":\"get_weather\",\"input\":{}}],\"stop_reason\":\"tool_use\",\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":3,\"cache_read_input_tokens\":20,\"output_tokens\":40,\"output_tokens_details\":{\"thinking_tokens\":12}}}",
+		"chat": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1790000000,\"model\":\"claude-x\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Checking both.\",\"tool_calls\":[{\"id\":\"toolu_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\": \\\"Paris\\\"}\"}},{\"id\":\"toolu_2\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\",\"logprobs\":null}],\"usage\":{\"prompt_tokens\":33,\"completion_tokens\":40,\"total_tokens\":73,\"prompt_tokens_details\":{\"cached_tokens\":20,\"cache_write_tokens\":3},\"completion_tokens_details\":{\"reasoning_tokens\":12}}}",
+		"observed": {
+			"ResponseModel": "claude-x",
+			"FinishReason": "tool_use",
+			"Usage": {
+				"input": 33,
+				"cache_read": 20,
+				"cache_write": 3,
+				"output": 40,
+				"reasoning": 12
+			},
+			"VisibleBytes": 14,
+			"ToolCalls": 2,
+			"Stripped": false
+		}
+	},
+	{
+		"name": "only a tool call: content null",
+		"messages": "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-x\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"now\",\"input\":{}}],\"stop_reason\":\"tool_use\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}",
+		"chat": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1790000000,\"model\":\"claude-x\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"t\",\"type\":\"function\",\"function\":{\"name\":\"now\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\",\"logprobs\":null}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0}}}",
+		"observed": {
+			"ResponseModel": "claude-x",
+			"FinishReason": "tool_use",
+			"Usage": {
+				"input": 10,
+				"cache_read": 0,
+				"cache_write": 0,
+				"output": 5
+			},
+			"VisibleBytes": 0,
+			"ToolCalls": 1,
+			"Stripped": false
+		}
+	},
+	{
+		"name": "no content, no usage",
+		"messages": "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-x\",\"content\":[],\"stop_reason\":\"max_tokens\"}",
+		"chat": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1790000000,\"model\":\"claude-x\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null},\"finish_reason\":\"length\",\"logprobs\":null}]}",
+		"observed": {
+			"ResponseModel": "claude-x",
+			"FinishReason": "max_tokens",
+			"Usage": null,
+			"VisibleBytes": 0,
+			"ToolCalls": 0,
+			"Stripped": false
+		}
+	},
+	{
+		"name": "stop_sequence",
+		"messages": "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-x\",\"content\":[{\"type\":\"text\",\"text\":\"a\"}],\"stop_reason\":\"stop_sequence\",\"stop_sequence\":\"END\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}",
+		"chat": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1790000000,\"model\":\"claude-x\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"a\"},\"finish_reason\":\"stop\",\"logprobs\":null}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0}}}",
+		"observed": {
+			"ResponseModel": "claude-x",
+			"FinishReason": "stop_sequence",
+			"Usage": {
+				"input": 10,
+				"cache_read": 0,
+				"cache_write": 0,
+				"output": 5
+			},
+			"VisibleBytes": 1,
+			"ToolCalls": 0,
+			"Stripped": false
+		}
+	},
+	{
+		"name": "context window",
+		"messages": "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-x\",\"content\":[{\"type\":\"text\",\"text\":\"a\"}],\"stop_reason\":\"model_context_window_exceeded\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}",
+		"chat": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1790000000,\"model\":\"claude-x\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"a\"},\"finish_reason\":\"length\",\"logprobs\":null}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0}}}",
+		"observed": {
+			"ResponseModel": "claude-x",
+			"FinishReason": "model_context_window_exceeded",
+			"Usage": {
+				"input": 10,
+				"cache_read": 0,
+				"cache_write": 0,
+				"output": 5
+			},
+			"VisibleBytes": 1,
+			"ToolCalls": 0,
+			"Stripped": false
+		}
+	},
+	{
+		"name": "refusal",
+		"messages": "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-x\",\"content\":[],\"stop_reason\":\"refusal\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}",
+		"chat": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1790000000,\"model\":\"claude-x\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null},\"finish_reason\":\"content_filter\",\"logprobs\":null}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0}}}",
+		"observed": {
+			"ResponseModel": "claude-x",
+			"FinishReason": "refusal",
+			"Usage": {
+				"input": 10,
+				"cache_read": 0,
+				"cache_write": 0,
+				"output": 5
+			},
+			"VisibleBytes": 0,
+			"ToolCalls": 0,
+			"Stripped": false
+		}
+	},
+	{
+		"name": "pause_turn",
+		"messages": "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-x\",\"content\":[{\"type\":\"text\",\"text\":\"a\"}],\"stop_reason\":\"pause_turn\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}",
+		"chat": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1790000000,\"model\":\"claude-x\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"a\"},\"finish_reason\":\"stop\",\"logprobs\":null}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0}}}",
+		"observed": {
+			"ResponseModel": "claude-x",
+			"FinishReason": "pause_turn",
+			"Usage": {
+				"input": 10,
+				"cache_read": 0,
+				"cache_write": 0,
+				"output": 5
+			},
+			"VisibleBytes": 1,
+			"ToolCalls": 0,
+			"Stripped": false
+		}
+	},
+	{
+		"name": "think tags in a text block, escaped, per block",
+		"messages": "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-x\",\"content\":[{\"type\":\"text\",\"text\":\"\\u003cthink\\u003eplan\\u003c/think\\u003e\\n\\nHi\"},{\"type\":\"text\",\"text\":\" more<think>unclosed\"},{\"type\":\"text\",\"text\":\" \\u00e9 kept\"},{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"f\",\"input\":{\"q\":\"<think>\"}}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}",
+		"chat": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1790000000,\"model\":\"claude-x\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\\n\\nHi more \\u00e9 kept\",\"tool_calls\":[{\"id\":\"t\",\"type\":\"function\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"q\\\":\\\"<think>\\\"}\"}}]},\"finish_reason\":\"stop\",\"logprobs\":null}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0}}}",
+		"observed": {
+			"ResponseModel": "claude-x",
+			"FinishReason": "end_turn",
+			"Usage": {
+				"input": 10,
+				"cache_read": 0,
+				"cache_write": 0,
+				"output": 5
+			},
+			"VisibleBytes": 17,
+			"ToolCalls": 1,
+			"Stripped": true
+		}
+	},
+	{
+		"name": "think tags not declared",
+		"messages": "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-x\",\"content\":[{\"type\":\"text\",\"text\":\"<think>a</think>b\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}",
+		"chat": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1790000000,\"model\":\"claude-x\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"<think>a</think>b\"},\"finish_reason\":\"stop\",\"logprobs\":null}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0}}}",
+		"observed": {
+			"ResponseModel": "claude-x",
+			"FinishReason": "end_turn",
+			"Usage": {
+				"input": 10,
+				"cache_read": 0,
+				"cache_write": 0,
+				"output": 5
+			},
+			"VisibleBytes": 17,
+			"ToolCalls": 0,
+			"Stripped": false
+		}
+	},
+	{
+		"name": "only a block",
+		"messages": "{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-x\",\"content\":[{\"type\":\"text\",\"text\":\"<think>a</think>\"}],\"stop_reason\":\"end_turn\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}",
+		"chat": "{\"id\":\"msg_1\",\"object\":\"chat.completion\",\"created\":1790000000,\"model\":\"claude-x\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"stop\",\"logprobs\":null}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15,\"prompt_tokens_details\":{\"cached_tokens\":0,\"cache_write_tokens\":0}}}",
+		"observed": {
+			"ResponseModel": "claude-x",
+			"FinishReason": "end_turn",
+			"Usage": {
+				"input": 10,
+				"cache_read": 0,
+				"cache_write": 0,
+				"output": 5
+			},
+			"VisibleBytes": 0,
+			"ToolCalls": 0,
+			"Stripped": true
+		}
+	}
+]

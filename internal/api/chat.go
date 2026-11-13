@@ -12,6 +12,7 @@ import (
 	"net/http/httptrace"
 	"time"
 
+	"github.com/jorlaru/stargaite/internal/adapters/anthropic"
 	"github.com/jorlaru/stargaite/internal/adapters/openai"
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
@@ -66,8 +67,37 @@ type attempt struct {
 	started, firstByte, ended time.Time       // firstByte: when the response headers arrived
 }
 
+// relay is how one attempt's answer reaches the client (design section 9),
+// chosen by the (endpoint, protocol) pair: sync maps a 2xx body, event and
+// observed relay a 2xx stream. event is nil for a pair whose stream Build
+// skips (chat toward anthropic until step C18); observed stands in for end
+// until then.
+type relay struct {
+	sync     func(body []byte, now time.Time) ([]byte, domain.Observed, error)
+	event    func(name string, data []byte, emit func(name string, data []byte) error) error
+	observed func() domain.Observed
+}
+
+// relayFor is the relay of an attempt toward t: chat toward openai is the
+// native relay, chat toward anthropic the translated one.
+func relayFor(t *config.Target) relay {
+	tg, p := &t.Spec, &t.Provider.Spec
+	if p.Protocol == domain.ProtocolAnthropic {
+		return relay{sync: func(body []byte, now time.Time) ([]byte, domain.Observed, error) {
+			return anthropic.ToChat(tg, p, body, now)
+		}}
+	}
+	s := openai.NewStream(tg, p)
+	return relay{
+		sync:     func(body []byte, _ time.Time) ([]byte, domain.Observed, error) { return openai.Observe(tg, p, body) },
+		event:    s.Event,
+		observed: s.Observed,
+	}
+}
+
 // chat serves POST /v1/chat/completions (design section 4, steps 1 to 8),
-// synchronous and streamed, toward openai targets. done runs on every exit
+// synchronous and streamed toward openai targets, synchronous toward
+// anthropic targets. done runs on every exit
 // once the key is authenticated, a panic included. A stream that fails once
 // committed has already written its terminal event, so it gets no envelope.
 func (h *handler) chat(w http.ResponseWriter, r *http.Request) {
@@ -163,13 +193,15 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request, rq *request) *do
 // (connect, then total for a synchronous call, or first byte and idle for a
 // stream), the write deadline, the call and the answer. A synchronous body is
 // read whole up to max_response_bytes (RES-4) and, for a 2xx the adapter can
-// read, relayed unchanged but for the adapter's think-tag edits (RSN-12); a
-// 2xx stream is relayed as it arrives (relay). The
+// read, relayed as the adapter maps it: unchanged but for the think-tag edits
+// (RSN-12) toward openai, translated toward anthropic; a 2xx stream is
+// relayed as it arrives (stream). The
 // PAR-9 headers go out with the status line. It returns the section 15 error
 // of the call, nil once the response is relayed.
 func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *config.Target, out *plan.Outgoing, n int) *domain.Error {
 	a := &attempt{n: n, target: t, out: out, started: time.Now()}
 	defer h.finish(rq, a)
+	rl := relayFor(t)
 	rq.attempts = append(rq.attempts, a)
 	w.Header().Set(targetHeader, t.ID)
 	if out.Effort.Sent != nil {
@@ -210,7 +242,11 @@ func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *c
 	if err == nil {
 		// Only the headers Build wrote and the credential reach the provider (PAR-14).
 		req.Header = out.Header.Clone()
-		t.Provider.Credential.SetHeader(req.Header, "Authorization", "Bearer ")
+		if t.Provider.Spec.Protocol == domain.ProtocolAnthropic {
+			t.Provider.Credential.SetHeader(req.Header, "x-api-key", "")
+		} else {
+			t.Provider.Credential.SetHeader(req.Header, "Authorization", "Bearer ")
+		}
 		client := h.Clients[0]
 		if t.Provider.Spec.AllowPrivateNetwork {
 			client = h.Clients[1]
@@ -225,7 +261,7 @@ func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *c
 	defer func() { _ = resp.Body.Close() }()
 	a.status, a.firstByte = resp.StatusCode, time.Now()
 	if rq.client.Stream && a.status/100 == 2 {
-		return h.relay(ctx, w, rq, a, resp, idle)
+		return h.stream(ctx, w, rq, a, rl, resp, idle)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err == nil && int64(len(body)) > limit && a.status/100 == 2 {
@@ -237,9 +273,9 @@ func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *c
 
 	switch s := a.status; {
 	case s/100 == 2:
-		if body, a.obs, err = openai.Observe(&t.Spec, &t.Provider.Spec, body); err != nil {
+		if body, a.obs, err = rl.sync(body, h.Config.Now()); err != nil {
 			a.cause = err
-			return domain.NewError(domain.CodeUpstreamError, "the provider's answer is not a chat completion")
+			return domain.NewError(domain.CodeUpstreamError, "the provider's answer is not usable")
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -285,7 +321,7 @@ func failed(ctx context.Context, a *attempt, err error) *domain.Error {
 	return domain.NewError(domain.CodeUpstreamError, "the provider call failed")
 }
 
-// relay sends a 2xx stream to the client as it arrives (design section 9,
+// stream sends a 2xx stream to the client as it arrives (design section 9,
 // RES-1, RES-4). Each upstream event resets the idle timer and moves the
 // write deadline. Comments before the commit are dropped; the first event
 // the adapter emits commits the response: status 200, the SSE headers and
@@ -297,7 +333,7 @@ func failed(ctx context.Context, a *attempt, err error) *domain.Error {
 // relayed as it is, being in the client's format, any other failure is
 // data: {"error":{...}} with no [DONE] after it. A failed write ends the
 // attempt with nothing more to answer: the client is gone.
-func (h *handler) relay(ctx context.Context, w http.ResponseWriter, rq *request, a *attempt, resp *http.Response, idle *time.Timer) *domain.Error {
+func (h *handler) stream(ctx context.Context, w http.ResponseWriter, rq *request, a *attempt, rl relay, resp *http.Response, idle *time.Timer) *domain.Error {
 	if mt, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mt != "text/event-stream" {
 		a.cause = fmt.Errorf("the answer is %.100q, not an event stream", resp.Header.Get("Content-Type"))
 		return domain.NewError(domain.CodeUpstreamError, "the provider's answer is not an event stream")
@@ -323,7 +359,6 @@ func (h *handler) relay(ctx context.Context, w http.ResponseWriter, rq *request,
 	}
 	emit := func(name string, data []byte) error { return write(transport.Event{Name: name, Data: data}) }
 
-	s := openai.NewStream(&a.target.Spec, &a.target.Provider.Spec)
 	events := transport.NewEventReader(resp.Body, rq.snap.Settings.MaxResponseBytes)
 	silence := ms(rq.snap.Settings.Timeouts.StreamIdleMS)
 	var ev transport.Event
@@ -343,11 +378,11 @@ func (h *handler) relay(ctx context.Context, w http.ResponseWriter, rq *request,
 				err = write(ev)
 			}
 		default:
-			err = s.Event(ev.Name, ev.Data, emit)
+			err = rl.event(ev.Name, ev.Data, emit)
 		}
 		idle.Reset(silence)
 	}
-	a.obs = s.Observed()
+	a.obs = rl.observed()
 	if err == io.EOF { // [DONE] was relayed
 		return nil
 	}

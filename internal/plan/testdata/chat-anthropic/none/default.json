@@ -1,0 +1,44 @@
+[
+	{
+		"level": "none",
+		"source": "provider_default",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:dropped",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192}"
+	},
+	{
+		"level": "minimal",
+		"source": "provider_default",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:dropped",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192}"
+	},
+	{
+		"level": "low",
+		"source": "provider_default",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:dropped",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192}"
+	},
+	{
+		"level": "medium",
+		"source": "provider_default",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:dropped",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192}"
+	},
+	{
+		"level": "high",
+		"source": "provider_default",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:dropped",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192}"
+	},
+	{
+		"level": "xhigh",
+		"source": "provider_default",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:dropped",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192}"
+	},
+	{
+		"level": "max",
+		"source": "provider_default",
+		"changes": "protocol:translated,max_tokens:added,reasoning_effort:dropped",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192}"
+	}
+]

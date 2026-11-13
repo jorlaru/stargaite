@@ -117,7 +117,7 @@ func TestChatHeaders(t *testing.T) {
 		{name: "unknown parameter", key: "agent", body: chatBody("plain", `,"enable_search":true`), status: 400, code: "unknown_parameter", param: "enable_search"},
 		{name: "effort off the scale", key: "agent", body: chatBody("fast", `,"reasoning_effort":"default"`), status: 400, code: "invalid_reasoning_effort", param: "reasoning_effort"},
 		{name: "cap above the alias's", key: "agent", body: chatBody("fast", `,"max_tokens":501`), status: 422, code: "max_output_tokens_exceeded", param: "max_tokens"},
-		{name: "no target serves the endpoint", key: "agent", body: chatBody("anth", ""), status: 422, code: "endpoint_not_supported"},
+		{name: "no target serves the endpoint", key: "agent", body: chatBody("anth", `,"stream":true`), status: 422, code: "endpoint_not_supported", param: "stream"},
 		{name: "no target takes tools", key: "agent", body: chatBody("notools", tools), status: 422, code: "capability_mismatch", param: "tools"},
 		{name: "credential unresolved", key: "agent", body: chatBody("off", ""), status: 503, code: "no_target_available"},
 
@@ -433,5 +433,174 @@ func TestSDKRequests(t *testing.T) {
 		if calls := mock.Calls(); len(calls) == 0 || string(calls[len(calls)-1].Body) != want || calls[len(calls)-1].Header.Get("X-Stainless-Lang") != "" {
 			t.Errorf("%s: the provider got %+v", name, calls)
 		}
+	}
+}
+
+const anthropicConfig = `version: 1
+providers:
+  mock: { protocol: openai, base_url: MOCK, api_key_env: MOCK_KEY, billing: none, allow_private_network: true }
+  anth: { protocol: anthropic, base_url: MOCK, api_key_env: ANTH_KEY, billing: none, allow_private_network: true }
+targets:
+  anth/claude-up: { kind: chat, inline_think_tags: true, reasoning: { dialect: adaptive_effort, levels: [low, medium, high], can_disable: true } }
+  mock/up-2: { kind: chat }
+models:
+  claude: { targets: [anth/claude-up], reasoning: { effort: high, mode: default }, max_output_tokens: 500 }
+  both: { targets: [anth/claude-up, mock/up-2], max_output_tokens: 500 }
+keys:
+  agent: { models: ["*"] }
+`
+
+// TestChatAnthropic is AC-20 for synchronous requests and AC-19 on a text
+// block: the OpenAI SDK requests recorded for AC-01 (testdata/*.http), sent
+// to an alias whose target speaks the anthropic protocol, reach the provider
+// as a Messages body at /v1/messages with x-api-key and the pinned
+// anthropic-version, and the Messages answer comes back as a chat completion
+// with the fields the SDKs require: the text without its think tags, the tool
+// calls with their arguments as a JSON string, the finish reason and the
+// usage mapped. The attempt line keeps the provider's own stop_reason and
+// records the removal. Provider errors keep the section 15 statuses; a stream
+// skips the anthropic target until step C18 and goes to the next one.
+func TestChatAnthropic(t *testing.T) {
+	f := newFixture(t)
+	mock := mockprovider.New()
+	srv := httptest.NewServer(mock)
+	t.Cleanup(srv.Close)
+	tokens := f.apply(t, strings.ReplaceAll(anthropicConfig, "base_url: MOCK", "base_url: "+srv.URL))
+	auth := "Bearer " + tokens["agent"]
+	const reply = `{"id":"msg_01","type":"message","role":"assistant","model":"claude-up-2026","content":[` +
+		`{"type":"thinking","thinking":"The user wants weather.","signature":"c2ln"},` +
+		`{"type":"text","text":"<think>call the tool</think>Let me check."},` +
+		`{"type":"tool_use","id":"toolu_01","name":"get_weather","input":{"city":"Paris"}}],` +
+		`"stop_reason":"tool_use","stop_sequence":null,` +
+		`"usage":{"input_tokens":20,"cache_creation_input_tokens":5,"cache_read_input_tokens":100,"output_tokens":30}}`
+
+	for _, name := range []string{"python-sync-tools", "node-sync-tools"} {
+		raw, err := os.ReadFile("testdata/openai-" + name + ".http")
+		if err != nil {
+			t.Fatal(err)
+		}
+		recorded, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(raw)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(recorded.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body = bytes.Replace(body, []byte(`"model":"fast"`), []byte(`"model":"claude"`), 1)
+		r := httptest.NewRequest(recorded.Method, recorded.URL.Path, bytes.NewReader(body))
+		r.Header = recorded.Header.Clone()
+		r.Header.Set("Authorization", auth)
+		r.Header.Set("Anthropic-Version", "2026-10-21") // only /v1/messages forwards it (PAR-14)
+		mock.Script(mockprovider.Step{Header: http.Header{"Content-Type": {"application/json"}}, Body: []byte(reply)})
+		before := len(mock.Calls())
+		w := httptest.NewRecorder()
+		f.data.ServeHTTP(w, r)
+
+		calls := mock.Calls()[before:]
+		const want = `{"model":"claude-up","messages":[{"role":"user","content":"What is the weather in Paris?"}],` +
+			`"tools":[{"name":"get_weather","description":"Current weather","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],` +
+			`"max_tokens":500,"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}`
+		if len(calls) != 1 || calls[0].Path != "/v1/messages" || string(calls[0].Body) != want {
+			t.Fatalf("%s: the provider got %+v", name, calls)
+		}
+		h := calls[0].Header
+		if h.Get("X-Api-Key") != planted+"ANTH_KEY" || h.Values("Authorization") != nil || h.Get("Anthropic-Version") != "2023-06-01" ||
+			h.Get("Content-Type") != "application/json" || h.Get("X-Stainless-Lang") != "" {
+			t.Errorf("%s: provider headers %v", name, h)
+		}
+		if w.Code != http.StatusOK || w.Header().Get("Content-Type") != "application/json" || w.Header().Get(targetHeader) != "anth/claude-up" ||
+			w.Header().Get(changedHeader) != "protocol:translated,max_tokens:added,output_config.effort:added" || w.Header().Get(effortHeader) != "high" {
+			t.Errorf("%s: %d %v %s", name, w.Code, w.Header(), w.Body)
+		}
+		var got struct {
+			ID, Object, Model *string
+			Created           *int64
+			Choices           []struct {
+				Index        *int
+				FinishReason *string `json:"finish_reason"`
+				Message      *struct {
+					Role, Content *string
+					ToolCalls     []struct {
+						ID, Type *string
+						Function struct{ Name, Arguments string }
+					} `json:"tool_calls"`
+				}
+			}
+			Usage struct {
+				Prompt     int64 `json:"prompt_tokens"`
+				Completion int64 `json:"completion_tokens"`
+				Total      int64 `json:"total_tokens"`
+				Details    struct {
+					Cached int64 `json:"cached_tokens"`
+				} `json:"prompt_tokens_details"`
+			}
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil || *got.ID != "msg_01" || *got.Object != "chat.completion" || *got.Model != "claude-up-2026" ||
+			*got.Created != testNow/1000 || len(got.Choices) != 1 || *got.Choices[0].Index != 0 ||
+			*got.Choices[0].FinishReason != "tool_calls" {
+			t.Fatalf("%s: %v %s", name, err, w.Body)
+		}
+		m := got.Choices[0].Message
+		if *m.Role != "assistant" || *m.Content != "Let me check." || len(m.ToolCalls) != 1 || *m.ToolCalls[0].ID != "toolu_01" || *m.ToolCalls[0].Type != "function" ||
+			m.ToolCalls[0].Function.Name != "get_weather" || m.ToolCalls[0].Function.Arguments != `{"city":"Paris"}` ||
+			got.Usage.Prompt != 125 || got.Usage.Completion != 30 || got.Usage.Total != 155 || got.Usage.Details.Cached != 100 {
+			t.Errorf("%s: %s", name, w.Body)
+		}
+	}
+	if log := f.log.String(); !strings.Contains(log, `"response_model":"claude-up-2026","finish_reason":"tool_use","usage":{"input":125,"cache_read":100,"cache_write":5,"output":30},`+
+		`"visible_bytes":13,"tool_calls":1,"stripped":true`) {
+		t.Errorf("log %s", log)
+	}
+
+	for _, tc := range []struct {
+		name, alias, extra string
+		step               *mockprovider.Step
+		status             int
+		code, param        string
+		message, target    string
+		path               string // the route the provider got; "" when it was not called
+	}{
+		{"the mock's default answer", "claude", "", nil, 200, "", "", "", "anth/claude-up", "/v1/messages"},
+		{"provider 400 in the Anthropic envelope", "claude", "", &mockprovider.Step{Status: 400,
+			Body: []byte(`{"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: too large"},"request_id":"req_1"}`)},
+			400, "upstream_error", "", "max_tokens: too large", "anth/claude-up", "/v1/messages"},
+		{"provider 529", "claude", "", &mockprovider.Step{Status: 529, Body: []byte(`{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`)},
+			502, "upstream_error", "", "the provider answered 529", "anth/claude-up", "/v1/messages"},
+		{"provider 401", "claude", "", &mockprovider.Step{Status: 401, Body: []byte(`{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}`)},
+			502, "upstream_auth_error", "", "", "anth/claude-up", "/v1/messages"},
+		{"a 200 that is not a Messages answer", "claude", "", &mockprovider.Step{Body: []byte(`{"choices":[]}`)},
+			502, "upstream_error", "", "not usable", "anth/claude-up", "/v1/messages"},
+		{"no equivalent", "claude", `,"seed":1`, nil, 422, "unsupported_parameter", "seed", "", "", ""},
+		{"untranslatable content", "claude", `,"messages":[{"role":"user","name":"ann","content":"hi"}]`, nil, 422, "unsupported_parameter", "messages[0].name", "", "", ""},
+		{"a stream skips the anthropic target", "claude", `,"stream":true`, nil, 422, "endpoint_not_supported", "stream", "", "", ""},
+		{"a stream goes to the next target", "both", `,"stream":true`, nil, 200, "", "", "", "mock/up-2", "/chat/completions"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.step != nil {
+				mock.Script(*tc.step)
+			}
+			before := len(mock.Calls())
+			body := chatBody(tc.alias, tc.extra)
+			if strings.HasPrefix(tc.extra, `,"messages"`) {
+				body = `{"model":"` + tc.alias + `"` + tc.extra + `}`
+			}
+			w := f.chat(auth, body)
+			calls := mock.Calls()[before:]
+			if w.Code != tc.status || w.Header().Get(targetHeader) != tc.target || (tc.path == "") != (len(calls) == 0) || len(calls) > 1 ||
+				len(calls) == 1 && calls[0].Path != tc.path || strings.Contains(w.Body.String(), planted) {
+				t.Fatalf("%d %v %s; calls %+v", w.Code, w.Header(), w.Body, calls)
+			}
+			if tc.status == 200 {
+				if !strings.Contains(w.Body.String(), "mock") {
+					t.Errorf("body %s", w.Body)
+				}
+				return
+			}
+			var env struct{ Error domain.Error }
+			if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil || env.Error.Code != tc.code || env.Error.Param != tc.param || !strings.Contains(env.Error.Message, tc.message) {
+				t.Errorf("envelope %s", w.Body)
+			}
+		})
 	}
 }

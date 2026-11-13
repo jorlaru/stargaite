@@ -1,0 +1,107 @@
+[
+	{
+		"name": "minimal",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+	},
+	{
+		"name": "system and developer wherever they stand, raw strings",
+		"chat": "{\"messages\":[{\"role\":\"system\",\"content\":\"be \\u0062rief \\\"q\\\"\"},{\"role\":\"user\",\"content\":\"h\\u00e9llo\"},{\"role\":\"developer\",\"content\":[{\"type\":\"text\",\"text\":\"rule 1\"},{\"type\":\"text\",\"text\":\"rule 2\"}]},{\"role\":\"assistant\",\"content\":\"ok\"}],\"model\":\"fast\"}",
+		"messages": "{\"model\":\"fast\",\"system\":[{\"type\":\"text\",\"text\":\"be \\u0062rief \\\"q\\\"\"},{\"type\":\"text\",\"text\":\"rule 1\"},{\"type\":\"text\",\"text\":\"rule 2\"}],\"messages\":[{\"role\":\"user\",\"content\":\"h\\u00e9llo\"},{\"role\":\"assistant\",\"content\":\"ok\"}]}"
+	},
+	{
+		"name": "images: data URIs split, URLs kept, detail dropped",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"see\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KGgo=\",\"detail\":\"high\"}},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image\\/webp;base64,UklGRg\\u003d\\u003d\"}},{\"type\":\"image_url\",\"image_url\":{\"url\":\"HTTPS://example.com/a.jpg?x=1\\u0026y=2\",\"detail\":\"low\"}}]}]}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"see\"},{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"iVBORw0KGgo=\"}},{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/webp\",\"data\":\"UklGRg==\"}},{\"type\":\"image\",\"source\":{\"type\":\"url\",\"url\":\"HTTPS://example.com/a.jpg?x=1\\u0026y=2\"}}]}]}"
+	},
+	{
+		"name": "a tool loop: tool messages merged, results first, the next user message joined",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"weather in Paris and Rome?\"},{\"role\":\"assistant\",\"content\":null,\"refusal\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\": \\\"Paris\\\"}\"}},{\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\" {\\n\\\"city\\\":\\\"Rome\\\"} \"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"18 C\"},{\"role\":\"tool\",\"tool_call_id\":\"call_2\",\"content\":[{\"type\":\"text\",\"text\":\"21 C\"}]},{\"role\":\"user\",\"content\":\"and tomorrow?\"},{\"role\":\"assistant\",\"content\":\"Let me check.\",\"tool_calls\":[{\"id\":\"call_3\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_3\",\"content\":\"rain\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}},\"strict\":true}}]}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"weather in Paris and Rome?\"},{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"get_weather\",\"input\":{\"city\": \"Paris\"}},{\"type\":\"tool_use\",\"id\":\"call_2\",\"name\":\"get_weather\",\"input\":{\n\"city\":\"Rome\"}}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call_1\",\"content\":\"18 C\"},{\"type\":\"tool_result\",\"tool_use_id\":\"call_2\",\"content\":[{\"type\":\"text\",\"text\":\"21 C\"}]},{\"type\":\"text\",\"text\":\"and tomorrow?\"}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Let me check.\"},{\"type\":\"tool_use\",\"id\":\"call_3\",\"name\":\"get_weather\",\"input\":{}}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call_3\",\"content\":\"rain\"}]}],\"tools\":[{\"name\":\"get_weather\",\"description\":\"Weather\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}},\"strict\":true}]}"
+	},
+	{
+		"name": "tools, a named choice and parallel_tool_calls false",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}},\"strict\":true}},{\"type\":\"function\",\"function\":{\"name\":\"now\"}}],\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"now\"}},\"parallel_tool_calls\":false}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":[{\"name\":\"get_weather\",\"description\":\"Weather\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}},\"strict\":true},{\"name\":\"now\",\"input_schema\":{\"type\":\"object\"}}],\"tool_choice\":{\"type\":\"tool\",\"name\":\"now\",\"disable_parallel_tool_use\":true}}"
+	},
+	{
+		"name": "required becomes any",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}},\"strict\":true}}],\"tool_choice\":\"required\"}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":[{\"name\":\"get_weather\",\"description\":\"Weather\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}},\"strict\":true}],\"tool_choice\":{\"type\":\"any\"}}"
+	},
+	{
+		"name": "parallel_tool_calls false without a choice",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}},\"strict\":true}}],\"parallel_tool_calls\":false}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":[{\"name\":\"get_weather\",\"description\":\"Weather\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}},\"strict\":true}],\"tool_choice\":{\"type\":\"auto\",\"disable_parallel_tool_use\":true}}"
+	},
+	{
+		"name": "parallel_tool_calls false with none, absorbed",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}},\"strict\":true}}],\"tool_choice\":\"none\",\"parallel_tool_calls\":false}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":[{\"name\":\"get_weather\",\"description\":\"Weather\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}},\"strict\":true}],\"tool_choice\":{\"type\":\"none\"}}"
+	},
+	{
+		"name": "parallel_tool_calls false without tools, absorbed",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tool_choice\":\"auto\",\"parallel_tool_calls\":false}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tool_choice\":{\"type\":\"auto\"}}"
+	},
+	{
+		"name": "stop as a string, structured output, sampling and the effort",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stop\":\"END\",\"temperature\":0.2,\"top_p\":0.9,\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"r\",\"strict\":true,\"schema\":{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\"}}}}},\"reasoning_effort\":\"high\"}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stop_sequences\":[\"END\"],\"temperature\":0.2,\"top_p\":0.9,\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\",\"properties\":{\"a\":{\"type\":\"string\"}}}}},\"reasoning_effort\":\"high\"}"
+	},
+	{
+		"name": "stop as an array, both caps, defaults absorbed, nulls absent",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stop\":[\"a\",\"b\"],\"max_tokens\":300,\"max_completion_tokens\":900,\"n\":1,\"logprobs\":false,\"store\":false,\"stream\":false,\"parallel_tool_calls\":true,\"response_format\":{\"type\":\"text\"},\"stream_options\":{\"include_usage\":true},\"seed\":null,\"user\":null}",
+		"messages": "{\"model\":\"fast\",\"max_tokens\":900,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stop_sequences\":[\"a\",\"b\"]}"
+	},
+	{
+		"name": "a stream",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true,\"stream_options\":{\"include_usage\":true}}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true}"
+	},
+	{
+		"name": "forwarded members in the client's order, after the mapped ones",
+		"chat": "{\"x_b\":{\"k\":[1,2]},\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"x_a\":\"v\\u0061l\",\"temperature\":1}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"temperature\":1,\"x_b\":{\"k\":[1,2]},\"x_a\":\"v\\u0061l\"}"
+	},
+	{
+		"name": "keys with no equivalent",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"n\":2,\"logprobs\":true,\"top_logprobs\":2,\"logit_bias\":{},\"frequency_penalty\":0,\"presence_penalty\":0,\"seed\":1,\"prediction\":{},\"audio\":{},\"modalities\":[\"text\"],\"verbosity\":\"low\",\"web_search_options\":{},\"moderation\":{},\"prompt_cache_key\":\"k\",\"prompt_cache_options\":{},\"prompt_cache_retention\":\"24h\",\"store\":true,\"metadata\":{},\"service_tier\":\"auto\",\"user\":\"u\",\"safety_identifier\":\"s\",\"functions\":[],\"function_call\":\"auto\"}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+		"no_equivalent": [
+			"n",
+			"logprobs",
+			"top_logprobs",
+			"logit_bias",
+			"frequency_penalty",
+			"presence_penalty",
+			"seed",
+			"prediction",
+			"audio",
+			"modalities",
+			"verbosity",
+			"web_search_options",
+			"moderation",
+			"prompt_cache_key",
+			"prompt_cache_options",
+			"prompt_cache_retention",
+			"store",
+			"metadata",
+			"service_tier",
+			"user",
+			"safety_identifier",
+			"functions",
+			"function_call"
+		]
+	},
+	{
+		"name": "custom tools, allowed_tools and json_object",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"description\":\"Weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}},\"strict\":true}},{\"type\":\"custom\",\"custom\":{\"name\":\"c\"}}],\"tool_choice\":{\"type\":\"allowed_tools\",\"allowed_tools\":{\"mode\":\"auto\",\"tools\":[]}},\"response_format\":{\"type\":\"json_object\"}}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":[{\"name\":\"get_weather\",\"description\":\"Weather\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}}},\"strict\":true}]}",
+		"no_equivalent": [
+			"tools",
+			"tool_choice",
+			"response_format"
+		]
+	}
+]

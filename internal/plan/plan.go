@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jorlaru/stargaite/internal/adapters/anthropic"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/params"
 	"github.com/jorlaru/stargaite/internal/reasoning"
@@ -259,19 +260,27 @@ func Header(cs []Change) string {
 }
 
 // Build edits the inbound body for one target (design section 5): the
-// endpoint, PAR-4, the alias's rules and PAR-12, the cap, the reasoning edit
-// and its side keys, in the order of Changes. Drops are applied first, so the
-// cap and the reasoning edit see the body without them; the rest is one Edit.
-// Every sent value is read back from the result (PAR-8). Chat toward an anthropic target is
-// the translated path of step C17 and is skipped until then.
+// endpoint, PAR-4, the protocol mapping, the alias's rules and PAR-12, the
+// cap, the reasoning edit and its side keys, in the order of Changes. Drops
+// are applied first, so the mapping, the cap and the reasoning edit see the
+// body without them; the rest is one Edit. Chat toward an anthropic target is
+// the translated path: the new body of anthropic.FromChat, listed
+// protocol:translated, takes the cap and the reasoning edit in place of the
+// client's body, and a key with no equivalent is handled like an unsupported
+// one (PAR-12); a stream toward it is skipped until step C18. Every sent
+// value is read back from the result (PAR-8).
 func Build(in Input) (*Outgoing, *Skip) {
 	ep, b, t, p := in.Endpoint, in.Body, in.Target, in.Provider
 	m, c := cmp.Or(in.Model, &domain.Model{}), cmp.Or(in.Client, &Client{})
 	s, outWalk, ok := schema(ep)
-	native := ok && t.Kind == domain.KindChat &&
-		(ep == domain.EndpointChat && p.Protocol == domain.ProtocolOpenAI || ep == domain.EndpointMessages && p.Protocol == domain.ProtocolAnthropic)
-	if !native {
+	chat := ok && t.Kind == domain.KindChat
+	translated := chat && ep == domain.EndpointChat && p.Protocol == domain.ProtocolAnthropic
+	native := chat && (ep == domain.EndpointChat && p.Protocol == domain.ProtocolOpenAI || ep == domain.EndpointMessages && p.Protocol == domain.ProtocolAnthropic)
+	if !native && !translated {
 		return nil, &Skip{Code: domain.CodeEndpointNotSupported}
+	}
+	if translated && c.Stream {
+		return nil, &Skip{Code: domain.CodeEndpointNotSupported, Param: "stream"} // the stream translation is step C18
 	}
 	for _, f := range []struct {
 		used bool
@@ -293,13 +302,21 @@ func Build(in Input) (*Outgoing, *Skip) {
 	if err != nil {
 		return nil, &Skip{Code: domain.CodeInternalError, Param: err.Error()}
 	}
+	var translatedBody []byte
+	var noEquivalent []string
+	var untranslatable string
+	if translated {
+		translatedBody, noEquivalent, untranslatable = anthropic.FromChat(b)
+		out.Changes = append(out.Changes, Change{Name: "protocol", Action: reasoning.ActionTranslated})
+	}
 	var drops []params.Op
 	for _, k := range b.Keys() {
 		rule := m.Params[k]
+		unsupported := slices.Contains(t.UnsupportedParams, k) || slices.Contains(noEquivalent, k)
 		switch {
-		case slices.Contains(t.UnsupportedParams, k) && rule != domain.ParamDrop:
+		case unsupported && rule != domain.ParamDrop:
 			return nil, &Skip{Code: domain.CodeUnsupportedParameter, Param: k}
-		case rule == domain.ParamDrop && (!s.Known[k] || slices.Contains(t.UnsupportedParams, k)):
+		case rule == domain.ParamDrop && (!s.Known[k] || unsupported):
 			drops = append(drops, params.Op{Path: []string{k}})
 			out.Changes = append(out.Changes, Change{Name: k, Action: reasoning.ActionDropped})
 		case rule == domain.ParamForward && !s.Known[k]:
@@ -315,6 +332,19 @@ func Build(in Input) (*Outgoing, *Skip) {
 		}
 		var e *params.Error
 		if b, e = params.ReadBack(raw, s.Walk); e != nil {
+			return nil, &Skip{Code: domain.CodeInternalError, Param: e.Message}
+		}
+		if translated {
+			translatedBody, _, untranslatable = anthropic.FromChat(b)
+		}
+	}
+	// Content inside a dropped member does not skip the target (PAR-12).
+	if untranslatable != "" {
+		return nil, &Skip{Code: domain.CodeUnsupportedParameter, Param: untranslatable}
+	}
+	if translated {
+		var e *params.Error
+		if b, e = params.ReadBack(translatedBody, outWalk); e != nil {
 			return nil, &Skip{Code: domain.CodeInternalError, Param: e.Message}
 		}
 	}

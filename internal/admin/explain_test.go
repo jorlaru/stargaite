@@ -68,10 +68,18 @@ func TestExplain(t *testing.T) {
 			`{"target":"local/up-1","skipped":{"code":"capability_mismatch","param":"tools"}},` +
 			`{"target":"local/up-2",` + dropped + `,"max_output":{"requested":null,"alias":500,"sent":500},"changes":"max_tokens:added,reasoning_effort:dropped",` + chat +
 			`,"body":"{ \"model\" : \"up-2\",\n` + strings.ReplaceAll(msg, `"`, `\"`) + `,\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\"}}],\"max_tokens\":500}"}]}`},
-		{name: "chat toward an anthropic target", alias: "deep", body: `{"endpoint":"chat"}`, status: 200, answer: `{"targets":[` +
-			`{"target":"anth/m","skipped":{"code":"endpoint_not_supported"}},` +
-			`{"target":"local/up-2",` + none + `,"max_output":{"requested":null,"alias":1000,"sent":1000},"changes":"max_tokens:added",` + chat +
+		{name: "chat toward an anthropic target", alias: "deep", body: `{"endpoint":"chat","effort":"low"}`, status: 200, answer: `{"targets":[` +
+			`{"target":"anth/m","effort":{"requested":"low","alias":null,"sent":"low","source":"client","adjusted":false},` +
+			`"max_output":{"requested":null,"alias":1000,"sent":1000},"changes":"protocol:translated,max_tokens:added,reasoning_effort:translated",` +
+			`"url":"http://127.0.0.1:1/v1/messages","header":{"Anthropic-Version":["2023-06-01"],"Content-Type":["application/json"]},` +
+			`"body":"{\"model\":\"m\",` + strings.ReplaceAll(msg, `"`, `\"`) + `,\"max_tokens\":1000,\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"low\"}}"},` +
+			`{"target":"local/up-2","effort":{"requested":"low","alias":null,"sent":null,"source":"provider_default","adjusted":false},` +
+			`"max_output":{"requested":null,"alias":1000,"sent":1000},"changes":"max_tokens:added,reasoning_effort:dropped",` + chat +
 			`,"body":"{\"model\":\"up-2\",` + strings.ReplaceAll(msg, `"`, `\"`) + `,\"max_tokens\":1000}"}]}`},
+		{name: "a chat stream toward an anthropic target", alias: "deep", body: `{"body":"{\"model\":\"deep\",` + strings.ReplaceAll(msg, `"`, `\"`) + `,\"stream\":true}"}`,
+			status: 200, answer: `{"targets":[{"target":"anth/m","skipped":{"code":"endpoint_not_supported","param":"stream"}},` +
+				`{"target":"local/up-2",` + none + `,"max_output":{"requested":null,"alias":1000,"sent":1000},"changes":"max_tokens:added",` + chat +
+				`,"body":"{\"model\":\"up-2\",` + strings.ReplaceAll(msg, `"`, `\"`) + `,\"stream\":true,\"max_tokens\":1000}"}]}`},
 		{name: "messages", alias: "deep", body: `{"endpoint":"messages","effort":"high"}`, status: 200, answer: `{"targets":[` +
 			`{"target":"anth/m","effort":{"requested":"high","alias":null,"sent":"high","source":"client","adjusted":false},` +
 			`"max_output":{"requested":null,"alias":1000,"sent":1000},"changes":"max_tokens:added,output_config.effort:translated",` +

@@ -494,6 +494,17 @@ func TestValidate(t *testing.T) {
 			edit(d.Targets, sn, func(t *domain.Target) { t.OutputCapParam = "max_completion_tokens" })
 			edit(d.Models, "deep", func(m *domain.Model) { m.Params = map[string]string{"max_tokens": "forward"} })
 		}, []string{"error PAR-2 param_collision models/deep params.max_tokens"}},
+		{"PAR-2 the keys the chat adapter writes toward anthropic", func(d *domain.Document) {
+			edit(d.Models, "deep", func(m *domain.Model) {
+				m.Params = map[string]string{"system": "forward", "stop_sequences": "forward", "tool_choice": "forward", "top_k": "forward"}
+			})
+		}, []string{"error PAR-2 param_collision models/deep params.stop_sequences", "error PAR-2 param_collision models/deep params.system",
+			"error PAR-2 param_collision models/deep params.tool_choice"}},
+		{"PAR-2 the chat adapter's keys are free toward openai", func(d *domain.Document) {
+			edit(d.Models, "fast", func(m *domain.Model) {
+				m.Targets, m.Params = []string{qw}, map[string]string{"system": "forward", "stop_sequences": "forward", "output_config": "forward"}
+			})
+		}, nil},
 		{"PAR-2 forward rule naming stream_options", func(d *domain.Document) {
 			edit(d.Models, "embed", func(m *domain.Model) { m.Params = map[string]string{"stream_options": "forward"} })
 		}, []string{"error PAR-2 param_collision models/embed params.stream_options"}},

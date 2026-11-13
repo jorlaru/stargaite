@@ -1,0 +1,51 @@
+[
+	{
+		"level": "none",
+		"sent": "none",
+		"source": "alias_default",
+		"changes": "protocol:translated,max_tokens:added,enable_thinking:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"enable_thinking\":false}"
+	},
+	{
+		"level": "minimal",
+		"sent": "on",
+		"source": "alias_default",
+		"changes": "protocol:translated,max_tokens:added,enable_thinking:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"enable_thinking\":true}"
+	},
+	{
+		"level": "low",
+		"sent": "on",
+		"source": "alias_default",
+		"changes": "protocol:translated,max_tokens:added,enable_thinking:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"enable_thinking\":true}"
+	},
+	{
+		"level": "medium",
+		"sent": "on",
+		"source": "alias_default",
+		"changes": "protocol:translated,max_tokens:added,enable_thinking:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"enable_thinking\":true}"
+	},
+	{
+		"level": "high",
+		"sent": "on",
+		"source": "alias_default",
+		"changes": "protocol:translated,max_tokens:added,enable_thinking:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"enable_thinking\":true}"
+	},
+	{
+		"level": "xhigh",
+		"sent": "on",
+		"source": "alias_default",
+		"changes": "protocol:translated,max_tokens:added,enable_thinking:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"enable_thinking\":true}"
+	},
+	{
+		"level": "max",
+		"sent": "on",
+		"source": "alias_default",
+		"changes": "protocol:translated,max_tokens:added,enable_thinking:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"enable_thinking\":true}"
+	}
+]

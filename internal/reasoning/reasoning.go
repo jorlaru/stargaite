@@ -188,6 +188,11 @@ func Translate(c Choice, b *params.Body, ep domain.Endpoint, r *domain.Reasoning
 	if strings.HasPrefix(c.Level, BudgetPrefix) {
 		return e // forwarded unchanged toward thinking_budget; Build skips other dialects (RSN-1)
 	}
+	// An alias in forced mode replaces any client control (RSN-1), so on
+	// messages the client's thinking goes too unless the form writes its own.
+	// A client effort resolves to nothing only under a forced provider_default.
+	_, thinking := b.Get("thinking")
+	replace := thinking && ep == domain.EndpointMessages && c.Requested != "" && (c.Source == SourceAliasForced || c.Level == "")
 	if c.Level == "" || d == domain.DialectNone {
 		if clientSent {
 			e.Ops = deleteEffort(b, ep)
@@ -195,9 +200,7 @@ func Translate(c Choice, b *params.Body, ep domain.Endpoint, r *domain.Reasoning
 		if clientSent || c.Level != "" {
 			e.Changes = []Change{{inName, ActionDropped}}
 		}
-		// A forced provider_default replaces any client control (RSN-1), so on
-		// messages the client's thinking goes too.
-		if _, ok := b.Get("thinking"); ok && c.Level == "" && c.Requested != "" && ep == domain.EndpointMessages {
+		if replace {
 			e.Ops = append(e.Ops, params.Op{Path: []string{"thinking"}})
 			e.Changes = append(e.Changes, Change{"thinking", ActionDropped})
 		}
@@ -246,7 +249,6 @@ func Translate(c Choice, b *params.Body, ep domain.Endpoint, r *domain.Reasoning
 	// between_tools stays toward adaptive_effort.
 	// Kept, it is not touched at all, a level member inside it included.
 	kind := str(b, "thinking", "type")
-	_, thinking := b.Get("thinking")
 	// The level resolved, not the one sent: none raised to a level toward a
 	// target that cannot disable reasoning keeps nothing.
 	keep := thinking && ep == domain.EndpointMessages && !off && c.Level != "none" && (c.Source == SourceClient ||
@@ -256,7 +258,14 @@ func Translate(c Choice, b *params.Body, ep domain.Endpoint, r *domain.Reasoning
 		action = ActionTranslated
 	}
 	var replaced, side []Change
-	rewrote := false // the level member's top-level object was written whole
+	// A form that does not write thinking leaves nothing to replace the
+	// client's: it is deleted before the level member, which may live inside it.
+	drop := replace && !slices.ContainsFunc(write, func(m member) bool { return m.name == "thinking" })
+	if drop {
+		e.Ops = append(e.Ops, params.Op{Path: []string{"thinking"}})
+		replaced = append(replaced, Change{"thinking", ActionDropped})
+	}
+	rewrote := drop && level != nil && f.level[0] == "thinking" // the level member's top-level object was written whole, or deleted
 	for _, m := range write {
 		old, ok := b.Get(m.name)
 		if ok && (bytes.Equal(old, m.value) || keep && m.name == "thinking") {

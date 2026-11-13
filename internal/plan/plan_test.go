@@ -301,12 +301,24 @@ func TestCaps(t *testing.T) {
 			`{"model":"up-1",` + msgs + `,"max_tokens":1000}`, "max_tokens:added", -1, 1000, "", 1000},
 		{"alias cap under a custom output_cap_param", "chat", `{"model":"a",` + msgs + `}`, 77, domain.Target{OutputCapParam: "max_new_tokens"},
 			`{"model":"up-1",` + msgs + `,"max_new_tokens":77}`, "max_new_tokens:added", -1, 77, "", 77},
-		{"client cap dropped by PAR-12: the alias cap", "chat", `{"model":"a",` + msgs + `,"max_tokens":500}`, 1000,
+		{"client cap dropped by PAR-12: the client's cap under output_cap_param, not the alias cap", "chat", `{"model":"a",` + msgs + `,"max_tokens":500}`, 1000,
 			domain.Target{OutputCapParam: "max_completion_tokens", UnsupportedParams: []string{"max_tokens"}},
-			`{"model":"up-1",` + msgs + `,"max_completion_tokens":1000}`, "max_tokens:dropped,max_completion_tokens:added", 500, 1000, "", 1000},
-		{"client cap dropped by PAR-12, no alias cap: no target limit to check", "chat", `{"model":"a",` + msgs + `,"max_tokens":9000}`, 0,
+			`{"model":"up-1",` + msgs + `,"max_completion_tokens":500}`, "max_tokens:dropped,max_completion_tokens:translated", 500, 500, "", 1000},
+		{"client cap dropped by PAR-12, no alias cap: still checked against the target limit", "chat", `{"model":"a",` + msgs + `,"max_tokens":9000}`, 0,
 			domain.Target{MaxOutputTokens: 8192, OutputCapParam: "max_completion_tokens", UnsupportedParams: []string{"max_tokens"}},
-			`{"model":"up-1",` + msgs + `}`, "max_tokens:dropped", 9000, -1, "", 0},
+			"", "", 0, 0, "max_output_tokens_exceeded", 0},
+		{"client cap dropped by PAR-12, no alias cap, within the target limit", "chat", `{"model":"a",` + msgs + `,"max_tokens":500}`, 0,
+			domain.Target{MaxOutputTokens: 8192, UnsupportedParams: []string{"max_tokens"}, OutputCapParam: "max_completion_tokens"},
+			`{"model":"up-1",` + msgs + `,"max_completion_tokens":500}`, "max_tokens:dropped,max_completion_tokens:translated", 500, 500, "", 0},
+		{"client cap dropped by PAR-12 under the target's own cap name: written again", "chat", `{"model":"a",` + msgs + `,"max_tokens":500,"seed":1}`, 1000,
+			domain.Target{UnsupportedParams: []string{"max_tokens"}},
+			`{"model":"up-1",` + msgs + `,"seed":1,"max_tokens":500}`, "max_tokens:dropped,max_tokens:translated", 500, 500, "", 1000},
+		{"one client cap member dropped by PAR-12: the other is forwarded", "chat", `{"model":"a",` + msgs + `,"max_tokens":900,"max_completion_tokens":300}`, 1000,
+			domain.Target{UnsupportedParams: []string{"max_tokens"}},
+			`{"model":"up-1",` + msgs + `,"max_completion_tokens":300}`, "max_tokens:dropped", 900, 300, "", 1000},
+		{"one client cap member dropped by PAR-12, no alias cap: the requested cap is checked", "chat", `{"model":"a",` + msgs + `,"max_tokens":900,"max_completion_tokens":300}`, 0,
+			domain.Target{MaxOutputTokens: 500, UnsupportedParams: []string{"max_tokens"}},
+			"", "", 0, 0, "max_output_tokens_exceeded", 0},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			// The drop rule acts only toward a target that lists max_tokens as unsupported (PAR-12).
@@ -478,6 +490,9 @@ func TestMessagesThinking(t *testing.T) {
 	budgetOn := domain.Target{Reasoning: &domain.Reasoning{Dialect: "thinking_budget", Levels: []string{"low"}, Budgets: map[string]int64{"low": 1024}, CanDisable: new(false)}}
 	adaptiveOn := domain.Target{Reasoning: &domain.Reasoning{Dialect: "adaptive_effort", Levels: []string{"low", "high"}, CanDisable: new(false)}}
 	low := domain.ModelReasoning{Effort: "low", Mode: "default"}
+	forcedHigh := domain.ModelReasoning{Effort: "high", Mode: "forced"}
+	enable := domain.Target{Reasoning: &domain.Reasoning{Dialect: "enable_thinking", Levels: []string{"on"}, CanDisable: new(true)}}
+	levelled := domain.Target{Reasoning: &domain.Reasoning{Dialect: "reasoning_effort", Levels: []string{"low", "medium", "high"}, CanDisable: new(true)}}
 	for _, tt := range []struct {
 		name, body string
 		alias      domain.ModelReasoning
@@ -516,6 +531,19 @@ func TestMessagesThinking(t *testing.T) {
 			out + `,"thinking":{"type":"enabled"}}`, "output_config.effort:dropped", "high", "", "provider_default"},
 		{"an effort a kept adaptive thinking does not carry toward a toggle", head + `,"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}`, domain.ModelReasoning{}, toggle,
 			out + `,"thinking":{"type":"adaptive"}}`, "output_config.effort:dropped", "high", "", "provider_default"},
+		// A forced effort replaces the client's control (RSN-1): a thinking the
+		// form does not write is dropped, whatever the dialect.
+		{"a forced effort drops a client budget toward enable_thinking", head + `,"thinking":{"type":"enabled","budget_tokens":2048}}`, forcedHigh, enable,
+			out + `,"enable_thinking":true}`, "output_config.effort:forced,thinking:dropped", "budget:2048", "on", "alias_forced"},
+		{"a forced effort drops a client budget toward reasoning_effort", head + `,"thinking":{"type":"enabled","budget_tokens":2048}}`, forcedHigh, levelled,
+			out + `,"reasoning_effort":"high"}`, "output_config.effort:forced,thinking:dropped", "budget:2048", "high", "alias_forced"},
+		{"a forced effort drops a client budget toward none", head + `,"thinking":{"type":"enabled","budget_tokens":2048}}`, forcedHigh, domain.Target{},
+			out + `}`, "output_config.effort:dropped,thinking:dropped", "budget:2048", "", "provider_default"},
+		{"a forced effort drops the client's effort and thinking toward reasoning_effort", head + `,"thinking":{"type":"enabled"},"output_config":{"effort":"low"}}`, forcedHigh, levelled,
+			out + `,"reasoning_effort":"high"}`, "output_config.effort:forced,thinking:dropped", "low", "high", "alias_forced"},
+		{"a forced budget is written into a new thinking when the on fragment writes none", head + `,"thinking":{"type":"disabled","budget_tokens":1024}}`, forcedHigh,
+			domain.Target{Reasoning: &domain.Reasoning{Dialect: "thinking_budget", Levels: []string{"high"}, Budgets: map[string]int64{"high": 1024}, On: map[string]json.RawMessage{"temperature": rm(`1`)}}},
+			out + `,"temperature":1,"thinking":{"budget_tokens":1024}}`, "output_config.effort:forced,thinking:dropped,temperature:added", "budget:1024", "budget:1024", "alias_forced"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			got, skip := run(t, "messages", tt.body, &domain.Model{Reasoning: tt.alias}, tt.target)

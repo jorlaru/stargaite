@@ -324,12 +324,18 @@ func Build(in Input) (*Outgoing, *Skip) {
 	if p.Protocol == domain.ProtocolOpenAI {
 		capName = cmp.Or(t.OutputCapParam, domain.DefaultOutputCapParam)
 	}
+	// The requested cap is the client's even when a drop rule removed its
+	// members: it is checked and sent as is, and the alias cap only fills in
+	// for a client that sent none.
 	switch kept, _ := largest(b, capNames(ep)); {
-	case kept == nil && m.MaxOutputTokens > 0:
+	case c.Cap == nil && m.MaxOutputTokens > 0:
 		ops = append(ops, params.Op{Path: []string{capName}, Value: strconv.AppendInt(nil, m.MaxOutputTokens, 10)})
 		out.Changes = append(out.Changes, Change{Name: capName, Action: reasoning.ActionAdded})
-	case kept != nil && m.MaxOutputTokens == 0 && t.MaxOutputTokens > 0 && *kept > t.MaxOutputTokens:
+	case c.Cap != nil && m.MaxOutputTokens == 0 && t.MaxOutputTokens > 0 && *c.Cap > t.MaxOutputTokens:
 		return nil, &Skip{Code: domain.CodeMaxOutputTokensExceeded}
+	case c.Cap != nil && kept == nil: // every client cap member was dropped (PAR-12)
+		ops = append(ops, params.Op{Path: []string{capName}, Value: strconv.AppendInt(nil, *c.Cap, 10)})
+		out.Changes = append(out.Changes, Change{Name: capName, Action: reasoning.ActionTranslated})
 	}
 
 	choice := reasoning.Resolve(c.Effort, m.Reasoning)

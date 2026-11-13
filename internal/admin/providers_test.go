@@ -83,7 +83,7 @@ func TestAddProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 	withDialect := preset(t, "openai")
-	withDialect.TargetDefaults.Dialect = domain.DialectReasoningEffort
+	withDialect.TargetDefaults.Dialect = domain.DialectReasoningObject
 	noKey := preset(t, "anthropic")
 	noKey.APIKeyEnv = ""
 
@@ -95,13 +95,13 @@ func TestAddProvider(t *testing.T) {
 		{"openrouter", `{"name":"openrouter"}`, preset(t, "openrouter"), "resolved"},
 		// The plan of kick-off section 7.3, which gives the provider of annex B.
 		{"minimax-plan", `{"name":"minimax-plan","preset":"minimax","protocol":"anthropic","base_url":"https://api.minimax.io/anthropic",
-			"api_key_env":"MINIMAX_PLAN_API_KEY","target_defaults":{"dialect":"adaptive_effort"},"billing":"subscription",
+			"api_key_env":"MINIMAX_PLAN_API_KEY","target_defaults":{"dialect":"adaptive_effort","output_cap_param":null},"billing":"subscription",
 			"quota":[{"window":"5h","requests":1500},{"window":"7d","requests":15000}]}`, annexB.Providers["minimax-plan"], "resolved"},
 		// A provider that no preset names takes only what the request declares.
 		{"my-vllm", `{"name":"my-vllm","protocol":"openai","base_url":"http://vllm.internal:8000/v1","allow_private_network":true,"billing":"none"}`,
 			domain.Provider{Protocol: "openai", BaseURL: "http://vllm.internal:8000/v1", AllowPrivateNetwork: true, Billing: "none"}, "none"},
 		// An object member merges into the preset's; null removes a member.
-		{"mine", `{"name":"mine","preset":"openai","target_defaults":{"dialect":"reasoning_effort"}}`, withDialect, "unresolved"},
+		{"mine", `{"name":"mine","preset":"openai","target_defaults":{"dialect":"reasoning_object"}}`, withDialect, "unresolved"},
 		{"anthropic", `{"name":"anthropic","api_key_env":null}`, noKey, "none"},
 	} {
 		res := f.addProvider(t, tc.body)

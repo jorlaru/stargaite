@@ -107,7 +107,7 @@ func TestAddTarget(t *testing.T) {
 			domain.Target{Kind: "chat", Reasoning: &domain.Reasoning{Dialect: domain.DialectReasoningObject, Levels: []string{"low", "high"}, CanDisable: new(true)}}},
 		{`{"id":"openrouter/b","kind":"chat","reasoning":{"dialect":"reasoning_effort"}}`,
 			domain.Target{Kind: "chat", OutputCapParam: "max_tokens", Reasoning: &domain.Reasoning{Dialect: domain.DialectReasoningEffort}}},
-		{`{"id":"openai/gpt","kind":"chat"}`, domain.Target{Kind: "chat", OutputCapParam: "max_completion_tokens"}},
+		{`{"id":"openai/gpt","kind":"chat"}`, domain.Target{Kind: "chat", OutputCapParam: "max_completion_tokens", Reasoning: &domain.Reasoning{Dialect: domain.DialectReasoningEffort}}},
 		// A provider without target_defaults gives nothing: the dialect stays undeclared, which is none.
 		{`{"id":"tei/bge-m3","kind":"embeddings"}`, domain.Target{Kind: "embeddings"}},
 	} {

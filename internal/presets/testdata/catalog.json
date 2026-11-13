@@ -6,6 +6,7 @@
 		"api_key_env": "OPENAI_API_KEY",
 		"billing": "pay_per_use",
 		"target_defaults": {
+			"dialect": "reasoning_effort",
 			"output_cap_param": "max_completion_tokens"
 		}
 	},
@@ -49,7 +50,10 @@
 		"protocol": "openai",
 		"base_url": "https://api.minimax.io/v1",
 		"api_key_env": "MINIMAX_API_KEY",
-		"billing": "pay_per_use"
+		"billing": "pay_per_use",
+		"target_defaults": {
+			"output_cap_param": "max_completion_tokens"
+		}
 	},
 	{
 		"name": "zai",
@@ -69,7 +73,10 @@
 		"name": "dashscope",
 		"protocol": "openai",
 		"api_key_env": "DASHSCOPE_API_KEY",
-		"billing": "pay_per_use"
+		"billing": "pay_per_use",
+		"target_defaults": {
+			"output_cap_param": "max_completion_tokens"
+		}
 	},
 	{
 		"name": "ollama",
@@ -104,7 +111,12 @@
 		"protocol": "openai",
 		"base_url": "https://api.x.ai/v1",
 		"api_key_env": "XAI_API_KEY",
-		"billing": "pay_per_use"
+		"billing": "pay_per_use",
+		"cost_report": {
+			"path": "usage.cost_in_usd_ticks",
+			"usd_per_unit": 1e-10
+		},
+		"stream_usage": "request"
 	},
 	{
 		"name": "mistral",
@@ -120,7 +132,10 @@
 		"protocol": "openai",
 		"base_url": "https://api.groq.com/openai/v1",
 		"api_key_env": "GROQ_API_KEY",
-		"billing": "pay_per_use"
+		"billing": "pay_per_use",
+		"target_defaults": {
+			"output_cap_param": "max_completion_tokens"
+		}
 	},
 	{
 		"name": "together",
@@ -144,6 +159,9 @@
 		"protocol": "openai",
 		"base_url": "https://api.cerebras.ai/v1",
 		"api_key_env": "CEREBRAS_API_KEY",
-		"billing": "pay_per_use"
+		"billing": "pay_per_use",
+		"target_defaults": {
+			"output_cap_param": "max_completion_tokens"
+		}
 	}
 ]

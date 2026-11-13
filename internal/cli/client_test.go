@@ -525,7 +525,7 @@ func TestAnnexBByCommand(t *testing.T) {
 		{"providers", "add", "openrouter"},
 		{"providers", "add", "anthropic"},
 		{"providers", "add", "minimax-plan", "--preset", "minimax", "--protocol", "anthropic", "--base-url", "https://api.minimax.io/anthropic",
-			"--api-key-env", "MINIMAX_PLAN_API_KEY", "--target-defaults", "dialect=adaptive_effort", "--billing", "subscription",
+			"--api-key-env", "MINIMAX_PLAN_API_KEY", "--target-defaults", "dialect=adaptive_effort,output_cap_param=", "--billing", "subscription",
 			"--quota", "5h:requests=1500", "--quota", "7d:requests=15000"},
 		{"providers", "add", "tei-embed", "--protocol", "openai", "--base-url", "http://localhost:8080/v1", "--billing", "none", "--allow-private-network"},
 		{"providers", "add", "tei-rerank", "--protocol", "openai", "--base-url", "http://localhost:8081/v1", "--rerank-url", "http://localhost:8081/rerank",

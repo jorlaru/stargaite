@@ -224,7 +224,7 @@ Two upstream protocols cover the providers of §7.2. With `openai` the proxy app
 
 | Inbound endpoint | To an `openai` target | To an `anthropic` target |
 |---|---|---|
-| `POST /v1/chat/completions` | Native | Translated by the adapter: the system prompt moves to the top level, tool calls become `tool_use` and `tool_result` blocks, usage and finish reason are mapped back |
+| `POST /v1/chat/completions` | Native | Translated by the adapter: the system prompt moves to the top level, tool calls become `tool_use` and `tool_result` blocks, images, `stop`, `tool_choice` and `parallel_tool_calls` are mapped, usage and finish reason are mapped back (`pause_turn` as `stop`). A chat feature with no faithful equivalent, such as `n` above 1, logprobs, `json_object` or a message `name`, skips the target (PAR-12) |
 | `POST /v1/messages` | Not supported: the target is skipped | Native |
 | `POST /v1/embeddings` | Native | Not supported: the target is skipped |
 | `POST /v1/rerank` | Forwarded to the provider's `rerank_url` with only `model` replaced by the upstream model id | Not supported: the target is skipped |
@@ -246,24 +246,24 @@ providers, not models, and no preset sets `allow_private_network`.
 
 | Preset | Protocol | Base URL | Key variable | Notes |
 |---|---|---|---|---|
-| `openai` | `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` | New targets send the output cap as `max_completion_tokens` |
+| `openai` | `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` | New targets send the effort as `reasoning_effort` and the output cap as `max_completion_tokens` |
 | `anthropic` | `anthropic` | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` | — |
-| `openrouter` | `openai` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | Reports the cost of each request in `usage.cost` |
-| `deepinfra` | `openai` | `https://api.deepinfra.com/v1/openai` | `DEEPINFRA_API_KEY` | Reports an estimated cost in `usage.estimated_cost` |
-| `minimax` | `openai` | `https://api.minimax.io/v1` | `MINIMAX_API_KEY` | Its Anthropic-format endpoint is `https://api.minimax.io/anthropic` |
+| `openrouter` | `openai` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | Reports the cost of each request in `usage.cost`, stated in credits |
+| `deepinfra` | `openai` | `https://api.deepinfra.com/v1/openai` | `DEEPINFRA_API_KEY` | — |
+| `minimax` | `openai` | `https://api.minimax.io/v1` | `MINIMAX_API_KEY` | Its Anthropic-format endpoint is `https://api.minimax.io/anthropic`. New targets send the output cap as `max_completion_tokens` |
 | `zai` | `openai` | `https://api.z.ai/api/paas/v4` | `ZAI_API_KEY` | GLM models |
 | `moonshot` | `openai` | `https://api.moonshot.ai/v1` | `MOONSHOT_API_KEY` | Kimi models |
-| `dashscope` | `openai` | set by the operator | `DASHSCOPE_API_KEY` | Qwen models. The compatible-mode URL depends on the region and the workspace, for example `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` |
+| `dashscope` | `openai` | set by the operator | `DASHSCOPE_API_KEY` | Qwen models. The compatible-mode URL depends on the region and the workspace, for example `https://dashscope-intl.aliyuncs.com/compatible-mode/v1`. New targets send the output cap as `max_completion_tokens` |
 | `ollama` | `openai` | `http://localhost:11434/v1` | none | `billing: none`. Needs `--allow-private-network` |
 | `tei` | `openai` | set by the operator | none | Text Embeddings Inference: embeddings under `/v1`, rerank at `/rerank`; one instance serves one model. `billing: none`. Usually needs `--allow-private-network` |
 | `deepseek` | `openai` | `https://api.deepseek.com` | `DEEPSEEK_API_KEY` | — |
 | `gemini` | `openai` | `https://generativelanguage.googleapis.com/v1beta/openai` | `GEMINI_API_KEY` | — |
-| `xai` | `openai` | `https://api.x.ai/v1` | `XAI_API_KEY` | Reports the cost of each request in its own unit |
+| `xai` | `openai` | `https://api.x.ai/v1` | `XAI_API_KEY` | Reports the cost of each request in `usage.cost_in_usd_ticks`, in units of 1e-10 USD; in streams only when `include_usage` is set |
 | `mistral` | `openai` | `https://api.mistral.ai/v1` | `MISTRAL_API_KEY` | — |
-| `groq` | `openai` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | — |
+| `groq` | `openai` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` | New targets send the output cap as `max_completion_tokens` |
 | `together` | `openai` | `https://api.together.ai/v1` | `TOGETHER_API_KEY` | Has a rerank endpoint |
 | `fireworks` | `openai` | `https://api.fireworks.ai/inference/v1` | `FIREWORKS_API_KEY` | — |
-| `cerebras` | `openai` | `https://api.cerebras.ai/v1` | `CEREBRAS_API_KEY` | — |
+| `cerebras` | `openai` | `https://api.cerebras.ai/v1` | `CEREBRAS_API_KEY` | New targets send the output cap as `max_completion_tokens` |
 
 Any other OpenAI-compatible or Anthropic-compatible service is added with explicit flags:
 `stargaite providers add my-vllm --protocol openai --base-url http://vllm.internal:8000/v1 --allow-private-network --billing none`.
@@ -289,7 +289,7 @@ bought; there are no plan presets:
 ```console
 $ stargaite providers add minimax-plan --preset minimax --protocol anthropic \
     --base-url https://api.minimax.io/anthropic --api-key-env MINIMAX_PLAN_API_KEY \
-    --target-defaults dialect=adaptive_effort \
+    --target-defaults dialect=adaptive_effort,output_cap_param= \
     --billing subscription --quota 5h:requests=1500 --quota 7d:requests=15000
 ```
 
@@ -315,12 +315,12 @@ All `proposed`.
 
 | Id | Rule |
 |---|---|
-| PAR-1 | Each inbound endpoint has a schema of known body parameters, pinned to a published version of the format it implements (OpenAI Chat Completions, Anthropic Messages, OpenAI Embeddings). `max_tokens` and `max_completion_tokens` are both known on chat completions. The schema covers the top-level keys of the body; nested objects are validated only where the proxy reads or translates them (`thinking`, `output_config`, `stream_options`, the type of `response_format`), and anything else inside a known parameter is forwarded as is. A body that repeats a key in any object the proxy reads or writes, or that is not valid UTF-8, gets `400 invalid_request` |
+| PAR-1 | Each inbound endpoint has a schema of known body parameters, pinned to the provider's public reference of the format it implements (OpenAI Chat Completions, Anthropic Messages, OpenAI Embeddings) as read on a recorded date, which each release moves (R7). `max_tokens` and `max_completion_tokens` are both known on chat completions. The schema covers the top-level keys of the body; nested objects are validated only where the proxy reads or translates them (`thinking`, `output_config`, `stream_options`, the type of `response_format`), and anything else inside a known parameter is forwarded as is. A body that repeats a key in any object the proxy reads or writes, or that is not valid UTF-8, gets `400 invalid_request` |
 | PAR-2 | An unknown top-level parameter is rejected with `400 unknown_parameter` and its name, unless the model alias has a rule for it in `params`: `forward` (sent to the provider unchanged) or `drop` (removed). There is no global "drop what is not supported" switch. A `forward` rule is refused as a change when its name is a key the proxy itself can write toward a target of the alias (the reasoning dialect and its fragments, the output-cap parameter, `stream_options`, a field of the protocol adapter): those values are set only through the client's standard field and the alias's own settings |
 | PAR-3 | The proxy never removes or adds a parameter, or changes its value, without listing it as `name:action` in three places: the span attribute `stargaite.params.changed`, the usage record and the response header `x-stargaite-params-changed`. `name` is the inbound parameter name, or the outbound name when the client sent no such parameter. Actions: `dropped`; `added` (a value the client did not send, such as the alias's effort or cap); `translated` (the client's parameter left under another name or with another value, such as an effort respelled by the target's dialect or adjusted to another level); `forced` (an alias value replaced the client's); `forwarded` (an unknown parameter let through by a rule). The fixed field mapping of a protocol adapter (§7.1) is listed once, as `protocol:translated`. Replacing the alias with the upstream model id and the client key with the provider credential are not listed: they have attributes of their own |
-| PAR-4 | Contractual features never degrade. A request uses a feature when it carries `tools` or `tool_choice` (`tools`), a `response_format` with a JSON schema (`structured_output`), `strict: true` (`strict_schema`) or non-text input (`vision`). A target that declares a used feature `false` is skipped; if none is left the request gets `422 capability_mismatch` before any provider is called. The proxy does not count input tokens: a request that exceeds the provider's context length gets the provider's own error (§15) |
+| PAR-4 | Contractual features never degrade. A request uses a feature when it carries `tools` or `tool_choice` (`tools`), a JSON schema in `response_format` or, on `/v1/messages`, in `output_config.format` (`structured_output`), `strict: true` in that schema or in a tool (`strict_schema`) or non-text input (`vision`). A target that declares a used feature `false` is skipped; if none is left the request gets `422 capability_mismatch` before any provider is called. The proxy does not count input tokens: a request that exceeds the provider's context length gets the provider's own error (§15) |
 | PAR-5 | An alias's `requires` list is checked on every change: each target, primary or fallback, must declare each required capability `true`, or the change is refused |
-| PAR-6 | The output cap has three recorded layers: requested by the client, set by the alias (`max_output_tokens`) and sent. The proxy only sends a cap that comes from the client or from the alias; there is no internal constant and a cap is never lowered to fit. The alias's value is used when the client sends none, and a client value above it gets `422 max_output_tokens_exceeded`. An alias cap above the declared `max_output_tokens` of one of its targets is refused as a change; with no alias cap, a client cap above a target's declared limit makes that target ineligible. Toward an `openai` target a client cap keeps the parameter name the client used and an alias cap is sent under the target's `output_cap_param` (`max_tokens` by default); toward an `anthropic` target every cap is sent as `max_tokens` |
+| PAR-6 | The output cap has three recorded layers: requested by the client (the larger of `max_tokens` and `max_completion_tokens` when a chat body sends both), set by the alias (`max_output_tokens`) and sent. The proxy only sends a cap that comes from the client or from the alias; there is no internal constant and a cap is never lowered to fit. The alias's value is used when the client sends none, and a client value above it gets `422 max_output_tokens_exceeded`. An alias cap above the declared `max_output_tokens` of one of its targets is refused as a change; with no alias cap, a client cap above a target's declared limit makes that target ineligible. Toward an `openai` target a client cap keeps the parameter name or names the client used and an alias cap is sent under the target's `output_cap_param` (`max_tokens` by default); toward an `anthropic` target every cap is sent as `max_tokens` |
 | PAR-7 | If the upstream protocol requires a cap (Anthropic Messages does) and the alias sets none, the change is refused. The proxy never fills one in |
 | PAR-8 | Every "sent" value in spans, usage records, headers and `explain` is read back from the final serialized outgoing body, after the last transformation, for each attempt, by the same single-pass scanner that enforces PAR-1 |
 | PAR-9 | Every response carries `x-stargaite-request-id`. Every response to an authenticated request also carries `x-stargaite-trace-id`, also when its span is sampled out. A response for which a target was selected carries `x-stargaite-target` (the target that served, or the last one tried), `x-stargaite-reasoning-effort` (the value sent, when there is one) and `x-stargaite-params-changed` (when not empty) |
@@ -328,7 +328,7 @@ All `proposed`.
 | PAR-11 | Changing the settings of one alias never changes the body sent by another alias, even when they share a target |
 | PAR-12 | Known parameters are forwarded unchanged. A target that lists a parameter of the request in `unsupported_params`, or whose protocol has no equivalent for it, is skipped, unless the alias has a `drop` rule for that parameter: then it is removed for that target and listed. If no target is left the request gets `422 unsupported_parameter` with the parameter's name |
 | PAR-13 | A change that a reasoning dialect imposes on other parameters (for example, a provider that only accepts a fixed `temperature` while reasoning) is a change like any other and is listed |
-| PAR-14 | No client header reaches the provider except `anthropic-version` and `anthropic-beta`, and those only from `/v1/messages` to an `anthropic` target. Never `Authorization`, `x-api-key`, `traceparent`, `x-session-id` or any `x-stargaite-*`. When the client sends no `anthropic-version`, the proxy sends the version pinned with PAR-1. Unknown client headers are ignored, not errors |
+| PAR-14 | No client header reaches the provider except `anthropic-version` and `anthropic-beta`, and those only from `/v1/messages` to an `anthropic` target. Never `Authorization`, `x-api-key`, `traceparent`, `x-session-id` or any `x-stargaite-*`. When the client sends no `anthropic-version`, the proxy sends `2023-06-01`, one pinned constant. Unknown client headers are ignored, not errors |
 
 ## 9. Reasoning control
 
@@ -354,13 +354,17 @@ own tests. A target may override the default "on" and "off" forms with its own f
 | `thinking_budget` | `"thinking": {"type": "enabled", "budget_tokens": N}` | `"thinking": {"type": "disabled"}` | Anthropic Messages, the older token-budget form |
 | `adaptive_effort` | `"thinking": {"type": "adaptive"}` with `"output_config": {"effort": "<level>"}` | `"thinking": {"type": "disabled"}` and no effort | Anthropic Messages, the effort form, and compatible endpoints |
 
+Some models refuse the default "off" form of `adaptive_effort`, or accept it only at some levels: such a target
+declares `can_disable: false` or its own `off` fragment, and an ability to turn reasoning off that depends on the
+level cannot be declared in v1. The newer Anthropic models refuse `thinking_budget`, which stays for the older ones.
+
 ### 9.2 Rules
 
 | Id | Rule |
 |---|---|
-| RSN-1 | The canonical scale and the inbound fields are those of §9.1. On `/v1/messages`: `thinking.type: disabled` with no `output_config.effort` is requested effort `none`; with an effort, the effort is the requested level and `thinking` is forwarded unchanged; `thinking.type: adaptive` with no effort counts as no client effort. A client `thinking.budget_tokens` is recorded as `budget:<N>` and forwarded unchanged to a `thinking_budget` target; other targets are skipped, and if none is left the request gets `422 capability_mismatch`. An alias in `forced` mode replaces any of these with its own effort |
+| RSN-1 | The canonical scale and the inbound fields are those of §9.1. On `/v1/messages`, where `none` and `minimal` are valid and translated like any level: `thinking.type: disabled` with no `output_config.effort` is requested effort `none`; with an effort above `none`, the effort is the requested level and `thinking` is forwarded unchanged, while an effort `none` sends the target's "off" form, which replaces the client's `thinking`, listed `thinking:translated`; `thinking.type: adaptive` or `between_tools` with no effort counts as no client effort, and when the alias supplies a level other than `none` that `thinking` is kept toward an `adaptive_effort` target, with only the level written, and replaced by the "on" form toward other dialects, listed `thinking:forced`; `thinking.display` is forwarded unchanged. A client `thinking.budget_tokens` is recorded as `budget:<N>` and forwarded unchanged to a `thinking_budget` target; other targets are skipped, and if none is left the request gets `422 capability_mismatch`. An alias in `forced` mode replaces any of these with its own effort |
 | RSN-2 | Reasoning controls are declared per target, never looked up by model name in a table inside the code. A new target starts with the `dialect` of its provider's `target_defaults`; levels and the ability to turn reasoning off are per model and are never guessed. A provider without `target_defaults` gives its new targets the dialect `none`. Afterwards only the stored declaration counts |
-| RSN-3 | A target's `reasoning` block holds: `dialect`; `levels`, the levels the provider accepts natively; `can_disable`, whether reasoning can be turned off; `budgets`, the tokens per level for `thinking_budget`; `on` and `off`, optional exact outgoing fragments that replace the default forms of §9.1 when the provider's spelling differs; and an optional `map` from a canonical level to the level sent. On/off dialects have the single level `on`. `levels` and `can_disable` may be undeclared, like a capability (§6): with no `levels`, a level is sent as is in the dialect's form and nothing is adjusted; with `can_disable` undeclared, `none` is sent in the "off" form and RSN-7 does not apply. A change is refused for a target that declares `can_disable: false` and no `levels`, and for a `thinking_budget` target without `levels` and a `budgets` entry for each. `validate` warns about every chat target whose dialect is not `none` and that leaves `levels` or `can_disable` undeclared |
+| RSN-3 | A target's `reasoning` block holds: `dialect`; `levels`, the levels the provider accepts natively; `can_disable`, whether reasoning can be turned off; `budgets`, the tokens per level for `thinking_budget`; `on` and `off`, optional exact outgoing fragments that replace the default forms of §9.1 when the provider's spelling differs; and an optional `map` from a canonical level to the level sent. On a dialect with levels, an `on` fragment replaces the "on" part and the level is still written. On/off dialects have the single level `on`. `levels` and `can_disable` may be undeclared, like a capability (§6): with no `levels`, a level is sent as is in the dialect's form and nothing is adjusted; with `can_disable` undeclared, `none` is sent in the "off" form and RSN-7 does not apply. A change is refused for a target that declares `can_disable: false` and no `levels`, for a `thinking_budget` target without `levels` and a `budgets` entry for each, for an `on` fragment with a top-level key that holds the dialect's level (which would be overwritten), and for an alias whose `max_output_tokens` is at or below a `budgets` entry of one of its targets. `validate` warns about every chat target whose dialect is not `none` and that leaves `levels` or `can_disable` undeclared |
 | RSN-4 | Translation is deterministic, per target, in this order: an entry in `map` wins; a level in `levels` is sent as is; `none` sends the "off" form unless `can_disable` is `false`, and then becomes the target's lowest level; any other level becomes the nearest one in `levels` by position in the canonical scale, the lower one on a tie; with an on/off dialect every level except `none` means on. A client effort that leaves under another name or at another level is listed as `translated` (PAR-3); it is recorded as adjusted only when the level changed |
 | RSN-5 | Each alias declares `reasoning.effort` and `reasoning.mode`. With `default`, the client's value wins when present and the alias's value is used otherwise. With `forced`, the alias's value always wins and the client's is recorded as requested. An alias that sets an effort never lets a request leave without one toward a target whose dialect is not `none`; toward a `none` target the effort is dropped and listed, and `validate` warns about every alias that sets an effort and has such a target. `effort: provider_default` is the explicit way to send nothing |
 | RSN-6 | Every request records the effort requested by the client, the effort set by the alias, the effort sent, its source and whether translation adjusted it. The effort sent is read from the outgoing body (PAR-8) in the dialect's own terms: the level; `on` for an on/off dialect; `budget:<N>` for `thinking_budget`; `none` when the body turns reasoning off; empty when the body carries no reasoning control. The source is `client`, `alias_default`, `alias_forced`, or `provider_default` when the body carries no reasoning control, whatever the cause |
@@ -562,12 +566,12 @@ All `proposed`.
 
 | Id | Rule |
 |---|---|
-| RES-1 | An alias has one primary target and at most two fallbacks. A fallback is tried on a connection error, a timeout, `429` or any `5xx` from the provider, as long as nothing has been sent to the client; a target excluded at step 5 of §14.1 is passed over the same way. Never on a `3xx` or on any `4xx` other than `429`, and never after the first SSE chunk has been sent. There are no automatic retries against the same target |
+| RES-1 | An alias has one primary target and at most two fallbacks. A fallback is tried on a connection error, a timeout, `429` or any `5xx` from the provider, or a stream `error` event whose type the provider documents with one of those statuses, as long as nothing has been sent to the client; a target excluded at step 5 of §14.1 is passed over the same way. Never on a `3xx` or on any `4xx` other than `429`, and never after the first SSE chunk has been sent. There are no automatic retries against the same target |
 | RES-2 | One circuit breaker per target. Only failures eligible for fallback count. Five of them within 30 s open it for 20 s. Then it is half-open: it lets two requests through and treats the target as open for all others; if both succeed it closes, and if either fails it opens for another 20 s. These values are constants in v1 |
-| RES-3 | Timeouts: connection 5 s; first byte 30 s, for streaming requests only; silence between chunks 120 s; total 180 s for non-streaming requests, which have no first-byte timer. They are settings |
-| RES-4 | The proxy never buffers a streaming response. A non-streaming response is read in full, up to `max_response_bytes`, before anything is sent to the client, so a failure while reading it is still eligible for fallback. When a stream fails after its first chunk was sent, the proxy emits one terminal error event in the format of the inbound endpoint and closes; the usage record is written with what was observed. When it transforms SSE chunks it preserves valid events, keeps JSON well formed, duplicates nothing and does not reorder tool calls |
+| RES-3 | Timeouts: connection 5 s; first byte 30 s, for streaming requests only; silence between chunks 120 s; total 180 s per provider call for non-streaming requests, which have no first-byte timer. They are settings |
+| RES-4 | The proxy never buffers a streaming response. A non-streaming response is read in full, up to `max_response_bytes`, before anything is sent to the client, so a failure while reading it is still eligible for fallback. When a stream fails after its first chunk was sent, the proxy emits one terminal error event in the format of the inbound endpoint and closes (on chat completions a `data:` object with a top-level `error` and no `[DONE]` after it; on `/v1/messages` an `error` event); the usage record is written with what was observed. When it transforms SSE chunks it preserves valid events, keeps JSON well formed, duplicates nothing and does not reorder tool calls |
 | RES-5 | When the client disconnects, the upstream call is cancelled within 1 s and the usage record is still written |
-| RES-6 | On `SIGTERM` the proxy stops accepting requests, waits up to 30 s for those in flight, persists pending records, closes the store and exits |
+| RES-6 | On `SIGTERM` the proxy stops accepting requests, waits up to 30 s for those in flight, persists pending records, closes the store and exits. A request still running when the wait ends gets `internal_error` with the message "server stopping", as an envelope or as the terminal event of RES-4 |
 | RES-7 | A configuration change never cuts a request in flight; a test keeps a stream open across an `apply` |
 | RES-8 | A fallback only uses targets that satisfy the alias's contract, which is checked on every change (PAR-5) |
 | RES-9 | A restart recovers configuration, keys, budgets, quota counters, usage records and aggregates from the store |
@@ -617,8 +621,8 @@ same `type`; that envelope has no `code` field, so the code leads the message an
 What a provider's own error becomes, once no fallback is left: a `400`, `404`, `413` or `422` is returned with the
 provider's status and message, with `code: upstream_error`. A `401` or `403` means the operator's credential is
 wrong, not the client's: it is returned as `502 upstream_auth_error` with a fixed message, and the provider's text
-goes only to the log. A `429` is returned as `429 upstream_error` with the provider's `Retry-After`. A `5xx`, a `3xx` or
-any other status is returned as `502 upstream_error`.
+goes only to the log. A `429` is returned as `429 upstream_error` with the provider's `Retry-After`. A `5xx`, a `3xx`,
+any other status, or a stream `error` event before anything was sent to the client, is returned as `502 upstream_error`.
 
 ## 16. Security
 
@@ -730,14 +734,14 @@ Each feature is meant to be an independent change.
 | admin-cli | Admin API on its own listener, admin key bootstrap, audit, and the CLI as its client: `--json`, exit codes, `export`, `apply`, `validate` | P0 | 1 | state-store |
 | keys-auth | Keys (create, rotate, revoke), authentication, the alias allow-list and `/v1/models`, the first authenticated route | P0 | 1 | admin-cli |
 | providers-targets | Providers with presets, URL guardrails and credential references; targets with capabilities and prices | P0 | 1 | admin-cli |
-| chat-completions | `/v1/chat/completions` synchronous and SSE, the `openai` adapter | P0 | 2 | keys-auth, providers-targets |
+| chat-completions | `/v1/chat/completions` synchronous and SSE, the `openai` adapter, body size (LIM-6) | P0 | 2 | keys-auth, providers-targets |
 | param-contract | Known-parameter schemas, rules for unknown parameters, capability checks, the list of changes, response headers, output-cap layers | P0 | 2 | chat-completions |
 | reasoning-control | Dialects, per-target declaration, translation table, alias modes, the validation rule, `models explain`, removal of inline think tags | P0 | 2 | param-contract |
 | anthropic-adapter | The native `anthropic` adapter for chat completions | P0 | 2 | reasoning-control |
 | messages-endpoint | `/v1/messages`, native toward `anthropic` targets | P0 | 2 | anthropic-adapter |
 | resilience | Timeouts, fallback, circuit breaker, cancellation, graceful shutdown | P0 | 2 | chat-completions |
 | usage-accounting | Usage records, cost with its source, the batch writer and its failure policy, daily aggregates, `usage show` | P0 | 3 | chat-completions |
-| limits | Parallel slots, `rpm_limit`, `tpm_limit`, body size | P0 | 3 | chat-completions |
+| limits | Parallel slots, `rpm_limit`, `tpm_limit` | P0 | 3 | chat-completions |
 | budgets | USD budgets per key, per alias and global | P0 | 3 | usage-accounting |
 | subscription-quotas | The `subscription` billing mode, quota windows, `quota_share`, `usage quota` | P0 | 3 | usage-accounting |
 | telemetry-otlp | Span schema, OTLP exporter and queue, `telemetry set`, `test` and `status`, `traceparent`, sampling, content opt-in | P0 | 3 | usage-accounting |
@@ -760,7 +764,9 @@ Each feature is meant to be an independent change.
 ## 21. Acceptance criteria and test strategy
 
 v1 is accepted when all of these hold, together with the requirements of §19. A criterion is checked once the last
-feature it needs exists; the column names the feature that owns it.
+feature it needs exists; the column names the feature that owns it. A criterion that also cites a span or a usage
+record is checked in phase 2 through the response headers and what the proxy observed of each provider call, and
+extended to the span and the usage record in phase 3.
 
 | Id | Criterion | Rules | Feature |
 |---|---|---|---|
@@ -782,7 +788,7 @@ feature it needs exists; the column names the feature that owns it.
 | AC-16 | With two aliases on one target, changing one does not change the body the other sends, and every level of the model is reached through that one target | PAR-11, RSN-8 | reasoning-control |
 | AC-17 | For the same input, the body returned by `models explain` is byte-identical to the one the mock provider receives | PAR-10 | reasoning-control |
 | AC-18 | For every dialect and every attempt, the "sent" values of effort and output cap in the span, the usage record and the headers equal what the mock provider received | RSN-6, PAR-8, USE-5, TEL-9 | reasoning-control |
-| AC-19 | A target that declares inline think tags has them removed from the visible content, also when split across chunks, unclosed or quoted literally, and the removal is recorded | RSN-12 | reasoning-control |
+| AC-19 | A target that declares inline think tags has them removed from the visible content, also when split across chunks, unclosed or quoted literally (a JSON-escaped spelling of a tag), and the removal is recorded | RSN-12 | reasoning-control |
 | AC-20 | A chat completions request to an `anthropic` target returns an OpenAI-shaped response, synchronous and streaming, with the system prompt, tool calls, usage and finish reason mapped | PRI-3, ADR-005 | anthropic-adapter |
 | AC-21 | On a fallback the effort is translated again for the new target and the failed attempt is a child span of the same trace; when no target is left the error is the one RES-10 states | RES-1, RES-10, RSN-10, TEL-6 | resilience |
 | AC-22 | Five eligible failures in 30 s open a target's circuit for 20 s and the two trial requests close or reopen it; each timeout of RES-3 fires at its value, and a non-streaming request longer than 30 s is not cut | RES-2, RES-3 | resilience |
@@ -858,7 +864,7 @@ Success and abandonment thresholds with a deadline are `open` (OQ-3).
 
 | Category | We believe that | Will lead to | Measured with |
 |---|---|---|---|
-| use | an OpenAI or Anthropic client moves to the proxy by changing only the base URL, the key and the model name | replacing a general-purpose gateway without touching agent logic | AC-01 and AC-02 with unmodified client SDKs |
+| use | an OpenAI or Anthropic client moves to the proxy by changing only the base URL, the key and the model name | replacing a general-purpose gateway without touching agent logic | AC-01 and AC-02: in CI with request bytes recorded from the official SDKs; with unmodified client SDKs, run by maintainers against the mock provider before each release |
 | visibility | recording requested, alias and sent values, read from the outgoing body, ends the misdiagnosis of reasoning effort | answering "what did this request send, and did it matter?" with one command | Whether `models explain` and `usage show` answer it without reading code or provider logs |
 | telemetry | one OTLP exporter with one fixed schema survives upgrades of the proxy and of the backend | no reconfiguration and no lost attribution after an upgrade | The golden test and the integration job across versions |
 | data | a local SQLite store is enough as the official record of usage | reliable budgets without an external database | Committed records lost: 0 |
@@ -916,12 +922,12 @@ published, and it is settled; so is the CI host of OQ-4.
 | OQ-2 | The unit and the kind of window of each subscription plan's allowance (requests or tokens; sliding or fixed), which fixes the `quota` an operator declares and whether LIM-8 needs fixed windows besides sliding ones | Checked against each provider's published terms |
 | OQ-3 | Success and abandonment thresholds, with a deadline, for the hypotheses of §23 | — |
 | OQ-4 | The CI host and how releases are distributed (binaries, a public image registry), within PUB-5 | Settled for the CI host: GitHub Actions, with a workflow that only calls make targets. Proposal for releases: binaries on the repository's release page and the image at `ghcr.io/jorlaru/stargaite` |
-| OQ-5 | Whether any consumer needs the Responses API | Out of v1 unless confirmed |
+| OQ-5 | Whether any consumer needs the Responses API | Out of v1 unless confirmed. Evidence so far: some OpenAI models offer tool calling, or some effort levels, only on the Responses API; their targets declare `tools: false` and their real `levels`, so PAR-4 and RSN-4 handle them |
 | OQ-6 | Whether to ship `config-import` for people coming from another gateway | Out of v1 unless confirmed |
 | OQ-7 | The default `max_parallel_requests` of a new key | Proposal: 5 |
 | OQ-8 | Whether the binary, the variable prefix and the key prefix keep the full project name | Proposal: yes |
 | OQ-9 | The identity the project is published under: commit author, copyright holder in the license, hosting namespace in the module path and the image name (PUB-2) | Settled: the commit author is the project identity `StargAIte`, the license names `StargAIte contributors`, and the hosting namespace is `github.com/jorlaru` |
-| OQ-10 | How thinking blocks survive a tool loop on the translated path (chat completions to an `anthropic` target), where the OpenAI format has no field for them | Proposal: return them in an opaque field of the assistant message that the client echoes back, and omit them when it does not; to be settled with the contract suite against a live provider |
+| OQ-10 | How thinking blocks survive a tool loop on the translated path (chat completions to an `anthropic` target), where the OpenAI format has no field for them | Settled for phase 2: thinking blocks are dropped on the translated path, a chat tool loop with thinking toward an `anthropic` target is unsupported, and `/v1/messages` is the documented path for it. Proposal: return them in an opaque field of the assistant message that the client echoes back, and omit them when it does not; to be settled with the contract suite against a live provider |
 
 ## 27. Glossary
 

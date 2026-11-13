@@ -474,3 +474,63 @@ func TestChatStreamAcrossApply(t *testing.T) {
 		t.Errorf("calls %+v", calls)
 	}
 }
+
+// TestChatThink is AC-19 through the data plane, toward a target that
+// declares inline_think_tags: the synchronous answer loses every block, an
+// escaped one included, with every other byte the provider's; the stream
+// fixture, whose tags are split across chunks and escaped, gives the same
+// client bytes split at every byte offset and one byte per chunk; the removal
+// is on the attempt line (stripped, visible bytes). A target that does not
+// declare them gets the provider's bytes, tags included.
+func TestChatThink(t *testing.T) {
+	yaml := strings.Replace(strings.Replace(streamConfig, "  mock/up-2: { kind: chat }\n",
+		"  mock/up-2: { kind: chat }\n  mock/up-3: { kind: chat, inline_think_tags: true }\n", 1),
+		"  plain: { targets: [mock/up-2] }\n", "  plain: { targets: [mock/up-2] }\n  think: { targets: [mock/up-3] }\n", 1)
+	s := newStreamFixture(t, strings.Replace(yaml, "agent: { models: [fast, plain] }", "agent: { models: [fast, plain, think] }", 1))
+	reply := `{"id":"x","object":"chat.completion","created":0,"model":"up-3","choices":[{"index":0,"message":{"role":"assistant",` +
+		`"content":"<think>plan</think>\n\nHi <think>more</think>there é"},"finish_reason":"stop"}],"usage":null}`
+	attempt := func() string {
+		log := s.log.String()
+		return log[strings.LastIndex(log, `"msg":"attempt"`):]
+	}
+	s.mock.Script(mockprovider.Step{Body: []byte(reply)})
+	if resp, got := s.post(t, chatBody("think", "")); resp.StatusCode != http.StatusOK ||
+		got != strings.Replace(reply, `"<think>plan</think>\n\nHi <think>more</think>there é"`, `"\n\nHi there é"`, 1) ||
+		!strings.Contains(attempt(), `"visible_bytes":13,"tool_calls":0,"stripped":true`) {
+		t.Errorf("sync: %d %s; %s", resp.StatusCode, got, attempt())
+	}
+	s.mock.Script(mockprovider.Step{Body: []byte(reply)})
+	if resp, got := s.post(t, chatBody("plain", "")); resp.StatusCode != http.StatusOK || got != reply ||
+		!strings.Contains(attempt(), `"stripped":false`) {
+		t.Errorf("sync without inline_think_tags: %d %s; %s", resp.StatusCode, got, attempt())
+	}
+
+	up, err := os.ReadFile("testdata/openai-think.up.sse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	down, err := os.ReadFile("testdata/openai-think.down.sse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bytewise [][]byte
+	for i := range up {
+		bytewise = append(bytewise, up[i:i+1])
+	}
+	splits := [][][]byte{bytewise}
+	for i := 0; i <= len(up); i++ {
+		splits = append(splits, [][]byte{up[:i], up[i:]})
+	}
+	for _, chunks := range splits {
+		s.mock.Script(mockprovider.Step{Chunks: chunks})
+		if resp, got := s.post(t, streamBody("think")); resp.StatusCode != http.StatusOK || got != string(down) ||
+			!strings.Contains(attempt(), `"finish_reason":"stop","usage":{"input":9,"cache_read":0,"cache_write":0,"output":20},"visible_bytes":27,"tool_calls":0,"stripped":true`) {
+			t.Fatalf("split %d: %d %q; %s", len(chunks[0]), resp.StatusCode, got, attempt())
+		}
+	}
+	s.mock.Script(mockprovider.Step{Chunks: [][]byte{up}})
+	if resp, got := s.post(t, streamBody("plain")); resp.StatusCode != http.StatusOK ||
+		got != string(up) || !strings.Contains(attempt(), `"stripped":false`) {
+		t.Errorf("stream without inline_think_tags: %d %q", resp.StatusCode, got)
+	}
+}

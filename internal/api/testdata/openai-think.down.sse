@@ -1,0 +1,18 @@
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"model":"up-3","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"model":"up-3","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"model":"up-3","choices":[{"index":0,"delta":{"content":""},"finish_reason":null}]}
+
+: ping
+
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"model":"up-3","choices":[{"index":0,"delta":{"content":"\n\nHello <b"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"model":"up-3","choices":[{"index":0,"delta":{"content":">there</b>. Bye "},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"model":"up-3","choices":[{"index":0,"delta":{"content":"<"},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-2","object":"chat.completion.chunk","created":1,"model":"up-3","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":20,"total_tokens":29}}
+
+data: [DONE]
+

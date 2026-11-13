@@ -163,7 +163,8 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request, rq *request) *do
 // (connect, then total for a synchronous call, or first byte and idle for a
 // stream), the write deadline, the call and the answer. A synchronous body is
 // read whole up to max_response_bytes (RES-4) and, for a 2xx the adapter can
-// read, relayed unchanged; a 2xx stream is relayed as it arrives (relay). The
+// read, relayed unchanged but for the adapter's think-tag edits (RSN-12); a
+// 2xx stream is relayed as it arrives (relay). The
 // PAR-9 headers go out with the status line. It returns the section 15 error
 // of the call, nil once the response is relayed.
 func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *config.Target, out *plan.Outgoing, n int) *domain.Error {
@@ -236,7 +237,7 @@ func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *c
 
 	switch s := a.status; {
 	case s/100 == 2:
-		if a.obs, err = openai.Observe(body); err != nil {
+		if body, a.obs, err = openai.Observe(&t.Spec, &t.Provider.Spec, body); err != nil {
 			a.cause = err
 			return domain.NewError(domain.CodeUpstreamError, "the provider's answer is not a chat completion")
 		}
@@ -290,11 +291,12 @@ func failed(ctx context.Context, a *attempt, err error) *domain.Error {
 // the adapter emits commits the response: status 200, the SSE headers and
 // the PAR-9 headers already set. Every event is written and flushed at once,
 // with the credential replaced in it, and nothing is buffered beyond the
-// event being read. A failure before the commit is the section 15 error the
-// caller answers; after it, the terminal event, written here: an upstream
-// error chunk is relayed as it is, being in the client's format, any other
-// failure is data: {"error":{...}} with no [DONE] after it. A failed write
-// ends the attempt with nothing more to answer: the client is gone.
+// event being read and the at most 7 bytes of a think-tag stripper (RSN-12).
+// A failure before the commit is the section 15 error the caller answers;
+// after it, the terminal event, written here: an upstream error chunk is
+// relayed as it is, being in the client's format, any other failure is
+// data: {"error":{...}} with no [DONE] after it. A failed write ends the
+// attempt with nothing more to answer: the client is gone.
 func (h *handler) relay(ctx context.Context, w http.ResponseWriter, rq *request, a *attempt, resp *http.Response, idle *time.Timer) *domain.Error {
 	if mt, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mt != "text/event-stream" {
 		a.cause = fmt.Errorf("the answer is %.100q, not an event stream", resp.Header.Get("Content-Type"))
@@ -321,7 +323,7 @@ func (h *handler) relay(ctx context.Context, w http.ResponseWriter, rq *request,
 	}
 	emit := func(name string, data []byte) error { return write(transport.Event{Name: name, Data: data}) }
 
-	var s openai.Stream
+	s := openai.NewStream(&a.target.Spec, &a.target.Provider.Spec)
 	events := transport.NewEventReader(resp.Body, rq.snap.Settings.MaxResponseBytes)
 	silence := ms(rq.snap.Settings.Timeouts.StreamIdleMS)
 	var ev transport.Event

@@ -11,6 +11,7 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -532,5 +533,230 @@ func TestChatThink(t *testing.T) {
 	if resp, got := s.post(t, streamBody("plain")); resp.StatusCode != http.StatusOK ||
 		got != string(up) || !strings.Contains(attempt(), `"stripped":false`) {
 		t.Errorf("stream without inline_think_tags: %d %q", resp.StatusCode, got)
+	}
+}
+
+// anthropicStreamConfig has one target of the anthropic protocol that
+// declares inline_think_tags, and RES-3 stream timers in milliseconds.
+const anthropicStreamConfig = `version: 1
+settings: { timeouts: { first_byte_ms: 300, stream_idle_ms: 300 }, max_response_bytes: 4096 }
+providers:
+  anth: { protocol: anthropic, base_url: MOCK, api_key_env: ANTH_KEY, billing: none, allow_private_network: true }
+targets:
+  anth/claude-up: { kind: chat, inline_think_tags: true }
+models:
+  claude: { targets: [anth/claude-up], max_output_tokens: 500 }
+keys:
+  agent: { models: [claude] }
+`
+
+// events is the SSE bytes of Messages events, as name and data pairs.
+func events(pairs ...string) [][]byte {
+	var out [][]byte
+	for i := 0; i < len(pairs); i += 2 {
+		out = append(out, []byte("event: "+pairs[i]+"\ndata: "+pairs[i+1]+"\n\n"))
+	}
+	return out
+}
+
+const (
+	messageStart = `{"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","model":"claude-up-2026","content":[],"usage":{"input_tokens":3,"output_tokens":1}}}`
+	textStart    = `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`
+	messageStop  = `{"type":"message_stop"}`
+)
+
+func textDelta(text string) string {
+	return `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"` + text + `"}}`
+}
+
+func anthropicChunk(choice string) string {
+	return `data: {"id":"msg_01","object":"chat.completion.chunk","created":1790000000,"model":"claude-up-2026","choices":[` + choice + `]}` + "\n\n"
+}
+
+// TestChatAnthropicStream is AC-20 for streams: a streamed chat completion
+// toward an anthropic target is sent as a Messages stream, without
+// stream_options, and the fixture of Messages events, with thinking, pings,
+// think tags split and escaped across text deltas, and a tool call in
+// fragments, gives the same chat chunks split at every byte offset and one
+// byte per chunk: the role first, the text without its think block, the
+// tool call opened once and its arguments in order, the finish reason
+// mapped, the usage chunk the client asked for and [DONE]. The attempt line
+// keeps the provider's stop_reason and the usage. The stream requests
+// recorded from the OpenAI SDKs get chunks with every field the SDKs'
+// ChatCompletionChunk requires.
+func TestChatAnthropicStream(t *testing.T) {
+	s := newStreamFixture(t, anthropicStreamConfig)
+	up, err := os.ReadFile("testdata/anthropic-stream.up.sse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	down, err := os.ReadFile("testdata/anthropic-stream.down.sse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bytewise [][]byte
+	for i := range up {
+		bytewise = append(bytewise, up[i:i+1])
+	}
+	splits := [][][]byte{bytewise}
+	for i := 0; i <= len(up); i++ {
+		splits = append(splits, [][]byte{up[:i], up[i:]})
+	}
+	body := chatBody("claude", `,"stream":true,"stream_options":{"include_usage":true}`)
+	visible := len("Let me check the weather in París.")
+	for _, chunks := range splits {
+		s.mock.Script(mockprovider.Step{Chunks: chunks})
+		resp, got := s.post(t, body)
+		log := s.log.String()
+		if resp.StatusCode != http.StatusOK || got != string(down) || resp.Header.Get("Content-Type") != "text/event-stream" ||
+			resp.Header.Get(targetHeader) != "anth/claude-up" || resp.Header.Get(changedHeader) != "protocol:translated,max_tokens:added" ||
+			!strings.Contains(log[strings.LastIndex(log, `"msg":"attempt"`):], `"response_model":"claude-up-2026","finish_reason":"tool_use",`+
+				`"usage":{"input":125,"cache_read":100,"cache_write":5,"output":30},"visible_bytes":`+strconv.Itoa(visible)+`,"tool_calls":1,"stripped":true`) {
+			t.Fatalf("split %d: %d %v %q; %s", len(chunks[0]), resp.StatusCode, resp.Header, got, log[strings.LastIndex(log, `"msg":"attempt"`):])
+		}
+	}
+	calls := s.mock.Calls()
+	if c := calls[len(calls)-1]; c.Path != "/v1/messages" || c.Header.Get("X-Api-Key") != planted+"ANTH_KEY" ||
+		string(c.Body) != `{"model":"claude-up","messages":[{"role":"user","content":"hi"}],"stream":true,"max_tokens":500}` {
+		t.Errorf("the provider got %s %s %v", c.Path, c.Body, c.Header)
+	}
+
+	for _, name := range []string{"python-stream", "node-stream"} {
+		raw, err := os.ReadFile("testdata/openai-" + name + ".http")
+		if err != nil {
+			t.Fatal(err)
+		}
+		recorded, err := http.ReadRequest(bufio.NewReader(bytes.NewReader(raw)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sdk, err := io.ReadAll(recorded.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.mock.Script(mockprovider.Step{Chunks: [][]byte{up}})
+		resp, got := s.post(t, strings.Replace(string(sdk), `"model":"fast"`, `"model":"claude"`, 1))
+		if resp.StatusCode != http.StatusOK || !strings.HasSuffix(got, "data: [DONE]\n\n") {
+			t.Fatalf("%s: %d %q", name, resp.StatusCode, got)
+		}
+		usage := false
+		for e := range strings.SplitSeq(strings.TrimSuffix(got, "\n\ndata: [DONE]\n\n"), "\n\n") {
+			if e == ": ping" {
+				continue
+			}
+			var c struct {
+				ID, Object, Model *string
+				Created           *int64
+				Choices           []struct {
+					Index        *int
+					Delta        *struct{}
+					FinishReason *string `json:"finish_reason"`
+				}
+				Usage *struct {
+					TotalTokens *int `json:"total_tokens"`
+				}
+			}
+			data, ok := strings.CutPrefix(e, "data: ")
+			if err := json.Unmarshal([]byte(data), &c); !ok || err != nil || c.ID == nil || c.Object == nil || *c.Object != "chat.completion.chunk" ||
+				c.Model == nil || c.Created == nil || c.Choices == nil {
+				t.Errorf("%s: event %q", name, e)
+			}
+			for _, ch := range c.Choices {
+				if ch.Index == nil || ch.Delta == nil {
+					t.Errorf("%s: choice without index or delta in %q", name, e)
+				}
+			}
+			usage = usage || c.Usage != nil && c.Usage.TotalTokens != nil
+		}
+		calls := s.mock.Calls()
+		if c := calls[len(calls)-1]; !usage || strings.Contains(string(c.Body), "stream_options") || !strings.Contains(string(c.Body), `"stream":true`) {
+			t.Errorf("%s: usage chunk %v; the provider got %s", name, usage, c.Body)
+		}
+	}
+}
+
+// TestChatAnthropicStreamFaults: the commit rule on the translated stream.
+// An error event before anything reached the client is not relayed: 502
+// upstream_error, its type and documented status in the cause; after the
+// commit it ends the stream with the terminal event and no [DONE]. A ping is
+// a comment, dropped before the commit and relayed after it. Events that
+// write nothing, thinking deltas, keep the stream alive past stream_idle_ms.
+func TestChatAnthropicStreamFaults(t *testing.T) {
+	s := newStreamFixture(t, anthropicStreamConfig)
+	overloaded := `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded ` + planted + `ANTH_KEY"}}`
+	role := anthropicChunk(`{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}`)
+	text := func(s string) string {
+		return anthropicChunk(`{"index":0,"delta":{"content":"` + s + `"},"finish_reason":null}`)
+	}
+	stop := anthropicChunk(`{"index":0,"delta":{},"finish_reason":"stop"}`) + "data: [DONE]\n\n"
+	thinking := `{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"hmm"}}`
+	for _, tc := range []struct {
+		name          string
+		step          mockprovider.Step
+		status        int
+		code, message string // the envelope's, before the commit
+		body          string // the client's bytes, after the commit
+		cause         string
+	}{
+		{name: "an error event first", step: mockprovider.Step{Chunks: events("error", overloaded)},
+			status: 502, code: "upstream_error", message: "the provider's stream reported an error", cause: `\"overloaded_error\", status 529: Overloaded [redacted]`},
+		{name: "a ping, then an error event", step: mockprovider.Step{Chunks: events("ping", `{"type":"ping"}`, "error",
+			`{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}`)},
+			status: 502, code: "upstream_error", message: "the provider's stream reported an error", cause: `\"invalid_request_error\", status 400: bad`},
+		{name: "content before message_start", step: mockprovider.Step{Chunks: events("content_block_delta", textDelta("a"))},
+			status: 502, code: "upstream_error", message: "the provider's stream failed", cause: "an event of the stream"},
+		{name: "provider 529", step: mockprovider.Step{Status: 529, Body: []byte(overloaded)},
+			status: 502, code: "upstream_error", message: "the provider answered 529"},
+
+		{name: "a ping before the commit is dropped", step: mockprovider.Step{Chunks: events("ping", `{"type":"ping"}`, "message_start", messageStart,
+			"ping", `{"type":"ping"}`, "message_stop", messageStop)}, status: 200, body: role + ": ping\n\n" + stop},
+		{name: "thinking keeps it alive", step: mockprovider.Step{Chunks: events("message_start", messageStart, "content_block_delta", thinking,
+			"content_block_delta", thinking, "content_block_delta", thinking, "content_block_delta", thinking, "content_block_start", textStart,
+			"content_block_delta", textDelta("ok"), "message_stop", messageStop), Gap: 120 * time.Millisecond}, status: 200, body: role + text("ok") + stop},
+		{name: "an error event after the commit", step: mockprovider.Step{Chunks: events("message_start", messageStart, "content_block_start", textStart,
+			"content_block_delta", textDelta("a"), "error", overloaded, "message_stop", messageStop)},
+			status: 200, body: role + text("a") + terminal("the provider's stream reported an error", "upstream_error"), cause: "overloaded_error"},
+		{name: "cut after the commit", step: mockprovider.Step{Chunks: events("message_start", messageStart), Cut: true},
+			status: 200, body: role + terminal("the provider's stream failed", "upstream_error"), cause: "unexpected EOF"},
+		{name: "ended before message_stop", step: mockprovider.Step{Chunks: events("message_start", messageStart)},
+			status: 200, body: role + terminal("the provider's stream failed", "upstream_error"), cause: "the stream ended before its last event"},
+		{name: "silent after the commit", step: mockprovider.Step{Chunks: events("message_start", messageStart), Hang: true},
+			status: 200, body: role + terminal("the provider did not answer in time: idle timeout", "upstream_timeout"), cause: "idle timeout"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s.mock.Script(tc.step)
+			before := len(s.mock.Calls())
+			resp, got := s.post(t, streamBody("claude"))
+			if resp.StatusCode != tc.status || resp.Header.Get(targetHeader) != "anth/claude-up" || strings.Contains(got, planted) {
+				t.Fatalf("status %d, headers %v: %q", resp.StatusCode, resp.Header, got)
+			}
+			if tc.status == 200 {
+				if resp.Header.Get("Content-Type") != "text/event-stream" || got != tc.body {
+					t.Errorf("body %q", got)
+				}
+			} else {
+				var env struct{ Error domain.Error }
+				if err := json.Unmarshal([]byte(got), &env); err != nil || resp.Header.Get("Content-Type") != "application/json" || env.Error.Code != tc.code ||
+					!strings.Contains(env.Error.Message, tc.message) {
+					t.Errorf("envelope %s", got)
+				}
+			}
+			if len(s.mock.Calls()) != before+1 {
+				t.Errorf("%d calls", len(s.mock.Calls())-before)
+			}
+			log := s.log.String()
+			line := log[strings.LastIndex(log, `"msg":"attempt"`):]
+			if strings.Contains(line, `"cause":"`) != (tc.cause != "") || !strings.Contains(line, tc.cause) || strings.Contains(log, planted) {
+				t.Errorf("attempt line %s", line)
+			}
+		})
+	}
+	var attempts, requests int
+	for line := range strings.SplitSeq(strings.TrimSpace(s.log.String()), "\n") {
+		attempts += strings.Count(line, `"msg":"attempt"`)
+		requests += strings.Count(line, `"msg":"request"`)
+	}
+	if calls := len(s.mock.Calls()); attempts != calls || requests != calls {
+		t.Errorf("%d attempt lines and %d request lines for %d calls", attempts, requests, calls)
 	}
 }

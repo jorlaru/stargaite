@@ -1,8 +1,8 @@
 // Package anthropic translates chat completions toward providers of the
 // anthropic protocol (design section 7): the request into a Messages body,
-// built from the client's raw values, and the synchronous Messages answer
-// back into a chat completion, with the think-tag edits of a target that
-// declares inline_think_tags (RSN-12).
+// built from the client's raw values, and the Messages answer back into a
+// chat completion, synchronous or streamed (design section 9), with the
+// think-tag edits of a target that declares inline_think_tags (RSN-12).
 package anthropic
 
 import (
@@ -433,10 +433,49 @@ func str(b *params.Body, path ...string) string {
 	return s
 }
 
-// num is the integer at path; 0 when absent or not an integer.
-func num(b *params.Body, path ...string) int64 {
-	n, _ := strconv.ParseInt(string(get(b, path...)), 10, 64)
-	return n
+// counts are the token counts of Anthropic usage objects read so far: the
+// latest integer of each field wins, as message_delta repeats them
+// cumulatively (design section 8).
+type counts struct {
+	seen                                 bool // a usage object was read
+	input, cacheRead, cacheWrite, output int64
+	thinking                             *int64 // output_tokens_details.thinking_tokens; nil when not reported
+}
+
+// read takes each field of the usage object at path that is an integer.
+func (c *counts) read(b *params.Body, path ...string) {
+	if u := get(b, path...); len(u) == 0 || u[0] != '{' {
+		return
+	}
+	c.seen = true
+	for _, f := range []struct {
+		name []string
+		to   *int64
+	}{{[]string{"input_tokens"}, &c.input}, {[]string{"cache_read_input_tokens"}, &c.cacheRead},
+		{[]string{"cache_creation_input_tokens"}, &c.cacheWrite}, {[]string{"output_tokens"}, &c.output}} {
+		if n, err := strconv.ParseInt(string(get(b, slices.Concat(path, f.name)...)), 10, 64); err == nil {
+			*f.to = n
+		}
+	}
+	if n, err := strconv.ParseInt(string(get(b, slices.Concat(path, []string{"output_tokens_details", "thinking_tokens"})...)), 10, 64); err == nil {
+		c.thinking = &n
+	}
+}
+
+// usage is the domain.Usage of the counts (USE-3), Anthropic's three input
+// counts summed, and the chat usage object written back (design section 7);
+// nil when no usage object was read.
+func (c *counts) usage() (*domain.Usage, []byte) {
+	if !c.seen {
+		return nil, nil
+	}
+	u := &domain.Usage{Input: c.input + c.cacheRead + c.cacheWrite, CacheRead: c.cacheRead, CacheWrite: c.cacheWrite, Output: c.output, Reasoning: c.thinking}
+	chat := fmt.Appendf(nil, `{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d,"prompt_tokens_details":{"cached_tokens":%d,"cache_write_tokens":%d}`,
+		u.Input, u.Output, u.Input+u.Output, u.CacheRead, u.CacheWrite)
+	if c.thinking != nil {
+		chat = fmt.Appendf(chat, `,"completion_tokens_details":{"reasoning_tokens":%d}`, *c.thinking)
+	}
+	return u, append(chat, '}')
 }
 
 // finish maps a stop_reason to a finish_reason (design section 7);
@@ -510,21 +549,11 @@ func ToChat(t *domain.Target, _ *domain.Provider, body []byte, now time.Time) ([
 	reason := cmp.Or(finish[o.FinishReason], "stop")
 	out := fmt.Appendf(nil, `{"id":%s,"object":"chat.completion","created":%d,"model":%s,"choices":[{"index":0,"message":%s,"finish_reason":%q,"logprobs":null}]`,
 		id, now.Unix(), model, msg, reason)
-	if u, ok := b.Get("usage"); ok && u[0] == '{' {
-		o.Usage = &domain.Usage{
-			CacheRead:  num(b, "usage", "cache_read_input_tokens"),
-			CacheWrite: num(b, "usage", "cache_creation_input_tokens"),
-			Output:     num(b, "usage", "output_tokens"),
-		}
-		o.Usage.Input = num(b, "usage", "input_tokens") + o.Usage.CacheRead + o.Usage.CacheWrite
-		out = fmt.Appendf(out, `,"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d,"prompt_tokens_details":{"cached_tokens":%d,"cache_write_tokens":%d}`,
-			o.Usage.Input, o.Usage.Output, o.Usage.Input+o.Usage.Output, o.Usage.CacheRead, o.Usage.CacheWrite)
-		if _, ok := b.Get("usage", "output_tokens_details", "thinking_tokens"); ok {
-			r := num(b, "usage", "output_tokens_details", "thinking_tokens")
-			o.Usage.Reasoning = &r
-			out = fmt.Appendf(out, `,"completion_tokens_details":{"reasoning_tokens":%d}`, r)
-		}
-		out = append(out, '}')
+	var c counts
+	c.read(b, "usage")
+	if u, chat := c.usage(); u != nil {
+		o.Usage = u
+		out = fmt.Appendf(out, `,"usage":%s`, chat)
 	}
 	return append(out, '}'), o, nil
 }

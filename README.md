@@ -6,10 +6,9 @@ one data directory. MIT licensed.
 
 **Status: phase 2 in progress.** What works today: the store, the admin API and the CLI, providers (with eighteen
 built-in presets), targets, model aliases, client keys with rotation and revocation, `export`/`apply`/`validate`,
-`models explain`, `GET /v1/models`, and `POST /v1/chat/completions`, synchronous and streamed toward providers of
-the `openai` protocol and synchronous toward providers of the `anthropic` protocol (translated to the Messages API),
-with the parameter contract and reasoning control of the alias. Streams toward Anthropic targets,
-`POST /v1/messages` and fallback arrive in the next steps of phase 2. The full specification is
+`models explain`, `GET /v1/models`, and `POST /v1/chat/completions`, synchronous and streamed, toward providers of
+the `openai` protocol and of the `anthropic` protocol (translated to the Messages API), with the parameter contract
+and reasoning control of the alias. `POST /v1/messages` and fallback arrive in the next steps of phase 2. The full specification is
 [kick-off.md](kick-off.md); the designs are [docs/design/phase-1.md](docs/design/phase-1.md) and
 [docs/design/phase-2.md](docs/design/phase-2.md).
 

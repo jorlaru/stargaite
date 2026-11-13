@@ -25,9 +25,8 @@ import (
 // of the anthropic protocol on the same mock, and three aliases per target:
 // an effort in default mode with a cap, a forced effort, and parameter
 // rules. Three aliases list several targets, so a static skip sends the
-// request to the next one (a stream skips an anthropic target until step
-// C18); another skips both targets with different codes, so the first skip
-// is told from the last (RES-10).
+// request to the next one; another skips both targets with different codes,
+// so the first skip is told from the last (RES-10).
 const corpusConfig = `version: 1
 providers:
   mock: { protocol: openai, base_url: MOCK, api_key_env: MOCK_KEY, billing: none, allow_private_network: true }
@@ -179,7 +178,8 @@ type attemptLine struct {
 }
 
 // TestCorpus is the corpus property of phase-2 design section 12 for chat
-// toward openai targets, over generated bodies, aliases of every dialect and
+// toward openai and anthropic targets, synchronous and streamed, over
+// generated bodies, aliases of every dialect and
 // both alias modes, with a fixed seed. For every body, models explain and the
 // data plane are given the same bytes and must agree:
 //   - a refusal of explain is the data plane's, with the same status, code
@@ -207,7 +207,7 @@ func TestCorpus(t *testing.T) {
 
 	const seed, n = 15, 800
 	r := rand.New(rand.NewPCG(seed, seed))
-	served, refused, allSkipped, streamed := map[string]int{}, 0, 0, 0
+	served, refused, allSkipped, streamed, translatedStreams := map[string]int{}, 0, 0, 0, 0
 	logged := 0
 	for i := range n {
 		alias := names[r.IntN(len(names))]
@@ -259,6 +259,12 @@ func TestCorpus(t *testing.T) {
 		served[b.Target]++
 		if strings.Contains(body, `"stream":true`) {
 			streamed++
+			if !strings.HasSuffix(w.Body.String(), "data: [DONE]\n\n") {
+				fail("the stream did not end with [DONE]: %s", w.Body)
+			}
+			if strings.HasPrefix(b.Target, "anth/") {
+				translatedStreams++
+			}
 		}
 
 		// AC-17: the bytes, the URL and the headers explain shows.
@@ -333,14 +339,16 @@ func TestCorpus(t *testing.T) {
 		}
 	}
 
-	t.Logf("seed %d: %d bodies; %d refused, %d with every target skipped, %d served (%d streams): %v", seed, n, refused, allSkipped, n-refused-allSkipped, streamed, served)
+	t.Logf("seed %d: %d bodies; %d refused, %d with every target skipped, %d served (%d streams, %d toward anthropic): %v",
+		seed, n, refused, allSkipped, n-refused-allSkipped, streamed, translatedStreams, served)
 	for _, id := range corpusTargets {
 		if served[id] == 0 {
 			t.Errorf("no generated body was served by %s", id)
 		}
 	}
-	if refused == 0 || allSkipped == 0 || streamed == 0 {
-		t.Errorf("the corpus has %d refusals, %d bodies every target skipped and %d streams; each kind needs one", refused, allSkipped, streamed)
+	if refused == 0 || allSkipped == 0 || streamed == 0 || translatedStreams == 0 {
+		t.Errorf("the corpus has %d refusals, %d bodies every target skipped, %d streams and %d streams toward anthropic; each kind needs one",
+			refused, allSkipped, streamed, translatedStreams)
 	}
 }
 

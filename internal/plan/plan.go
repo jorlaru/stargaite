@@ -267,8 +267,7 @@ func Header(cs []Change) string {
 // the translated path: the new body of anthropic.FromChat, listed
 // protocol:translated, takes the cap and the reasoning edit in place of the
 // client's body, and a key with no equivalent is handled like an unsupported
-// one (PAR-12); a stream toward it is skipped until step C18. Every sent
-// value is read back from the result (PAR-8).
+// one (PAR-12). Every sent value is read back from the result (PAR-8).
 func Build(in Input) (*Outgoing, *Skip) {
 	ep, b, t, p := in.Endpoint, in.Body, in.Target, in.Provider
 	m, c := cmp.Or(in.Model, &domain.Model{}), cmp.Or(in.Client, &Client{})
@@ -278,9 +277,6 @@ func Build(in Input) (*Outgoing, *Skip) {
 	native := chat && (ep == domain.EndpointChat && p.Protocol == domain.ProtocolOpenAI || ep == domain.EndpointMessages && p.Protocol == domain.ProtocolAnthropic)
 	if !native && !translated {
 		return nil, &Skip{Code: domain.CodeEndpointNotSupported}
-	}
-	if translated && c.Stream {
-		return nil, &Skip{Code: domain.CodeEndpointNotSupported, Param: "stream"} // the stream translation is step C18
 	}
 	for _, f := range []struct {
 		used bool

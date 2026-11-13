@@ -77,7 +77,9 @@ func TestExplain(t *testing.T) {
 			`"max_output":{"requested":null,"alias":1000,"sent":1000},"changes":"max_tokens:added,reasoning_effort:dropped",` + chat +
 			`,"body":"{\"model\":\"up-2\",` + strings.ReplaceAll(msg, `"`, `\"`) + `,\"max_tokens\":1000}"}]}`},
 		{name: "a chat stream toward an anthropic target", alias: "deep", body: `{"body":"{\"model\":\"deep\",` + strings.ReplaceAll(msg, `"`, `\"`) + `,\"stream\":true}"}`,
-			status: 200, answer: `{"targets":[{"target":"anth/m","skipped":{"code":"endpoint_not_supported","param":"stream"}},` +
+			status: 200, answer: `{"targets":[{"target":"anth/m",` + none + `,"max_output":{"requested":null,"alias":1000,"sent":1000},"changes":"protocol:translated,max_tokens:added",` +
+				`"url":"http://127.0.0.1:1/v1/messages","header":{"Anthropic-Version":["2023-06-01"],"Content-Type":["application/json"]},` +
+				`"body":"{\"model\":\"m\",` + strings.ReplaceAll(msg, `"`, `\"`) + `,\"stream\":true,\"max_tokens\":1000}"},` +
 				`{"target":"local/up-2",` + none + `,"max_output":{"requested":null,"alias":1000,"sent":1000},"changes":"max_tokens:added",` + chat +
 				`,"body":"{\"model\":\"up-2\",` + strings.ReplaceAll(msg, `"`, `\"`) + `,\"stream\":true,\"max_tokens\":1000}"}]}`},
 		{name: "messages", alias: "deep", body: `{"endpoint":"messages","effort":"high"}`, status: 200, answer: `{"targets":[` +

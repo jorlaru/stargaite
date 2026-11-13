@@ -64,6 +64,7 @@ targets:
   mock/up-3: { kind: chat, capabilities: { tools: false } }
   off/m: { kind: chat }
   anth/m: { kind: chat }
+  mock/emb: { kind: embeddings }
 models:
   fast: { targets: [mock/up-1], reasoning: { effort: high, mode: default }, max_output_tokens: 500 }
   forced: { targets: [mock/up-1], reasoning: { effort: high, mode: forced } }
@@ -73,8 +74,9 @@ models:
   mixed: { targets: [mock/up-3, mock/up-2] }
   anth: { targets: [anth/m], max_output_tokens: 100 }
   off: { targets: [off/m] }
+  emb: { targets: [mock/emb] }
 keys:
-  agent: { models: [fast, forced, plain, rules, notools, mixed, anth, off] }
+  agent: { models: [fast, forced, plain, rules, notools, mixed, anth, off, emb] }
   other: { models: [plain] }
   none: { models: [] }
 `
@@ -117,7 +119,7 @@ func TestChatHeaders(t *testing.T) {
 		{name: "unknown parameter", key: "agent", body: chatBody("plain", `,"enable_search":true`), status: 400, code: "unknown_parameter", param: "enable_search"},
 		{name: "effort off the scale", key: "agent", body: chatBody("fast", `,"reasoning_effort":"default"`), status: 400, code: "invalid_reasoning_effort", param: "reasoning_effort"},
 		{name: "cap above the alias's", key: "agent", body: chatBody("fast", `,"max_tokens":501`), status: 422, code: "max_output_tokens_exceeded", param: "max_tokens"},
-		{name: "no target serves the endpoint", key: "agent", body: chatBody("anth", `,"stream":true`), status: 422, code: "endpoint_not_supported", param: "stream"},
+		{name: "no target serves the endpoint", key: "agent", body: chatBody("emb", ""), status: 422, code: "endpoint_not_supported"},
 		{name: "no target takes tools", key: "agent", body: chatBody("notools", tools), status: 422, code: "capability_mismatch", param: "tools"},
 		{name: "credential unresolved", key: "agent", body: chatBody("off", ""), status: 503, code: "no_target_available"},
 
@@ -458,8 +460,8 @@ keys:
 // with the fields the SDKs require: the text without its think tags, the tool
 // calls with their arguments as a JSON string, the finish reason and the
 // usage mapped. The attempt line keeps the provider's own stop_reason and
-// records the removal. Provider errors keep the section 15 statuses; a stream
-// skips the anthropic target until step C18 and goes to the next one.
+// records the removal. Provider errors keep the section 15 statuses; a
+// stream is served by the anthropic target (TestChatAnthropicStream).
 func TestChatAnthropic(t *testing.T) {
 	f := newFixture(t)
 	mock := mockprovider.New()
@@ -573,8 +575,8 @@ func TestChatAnthropic(t *testing.T) {
 			502, "upstream_error", "", "not usable", "anth/claude-up", "/v1/messages"},
 		{"no equivalent", "claude", `,"seed":1`, nil, 422, "unsupported_parameter", "seed", "", "", ""},
 		{"untranslatable content", "claude", `,"messages":[{"role":"user","name":"ann","content":"hi"}]`, nil, 422, "unsupported_parameter", "messages[0].name", "", "", ""},
-		{"a stream skips the anthropic target", "claude", `,"stream":true`, nil, 422, "endpoint_not_supported", "stream", "", "", ""},
-		{"a stream goes to the next target", "both", `,"stream":true`, nil, 200, "", "", "", "mock/up-2", "/chat/completions"},
+		{"a stream toward the anthropic target", "claude", `,"stream":true`, nil, 200, "", "", "", "anth/claude-up", "/v1/messages"},
+		{"a stream toward the first of both protocols", "both", `,"stream":true`, nil, 200, "", "", "", "anth/claude-up", "/v1/messages"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.step != nil {

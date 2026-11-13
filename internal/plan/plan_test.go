@@ -377,7 +377,6 @@ func TestSkips(t *testing.T) {
 		param  string
 	}{
 		{"messages toward openai", "messages", `{"model":"a","max_tokens":1,` + msgs + `}`, nil, domain.Target{}, openai, "endpoint_not_supported", ""},
-		{"a chat stream toward anthropic until C18", "chat", `{"model":"a",` + msgs + `,"stream":true}`, nil, domain.Target{}, anth, "endpoint_not_supported", "stream"},
 		{"chat toward an embeddings target", "chat", `{"model":"a",` + msgs + `}`, nil, domain.Target{Kind: domain.KindEmbeddings}, openai, "endpoint_not_supported", ""},
 		{"tools", "chat", `{"model":"a",` + msgs + `,"tool_choice":"none"}`, nil, domain.Target{Capabilities: domain.Capabilities{Tools: no}}, openai, "capability_mismatch", "tools"},
 		{"structured output", "chat", `{"model":"a",` + msgs + `,"response_format":{"type":"json_schema","json_schema":{}}}`, nil,
@@ -478,6 +477,8 @@ func TestTranslated(t *testing.T) {
 			`"tools":[{"type":"function","function":{"description":"d"}}],"max_tokens":10}`,
 			domain.Model{Params: map[string]string{"response_format": "drop", "tools": "drop"}}, domain.Target{UnsupportedParams: []string{"response_format", "tools"}},
 			`{"model":"up-1","max_tokens":10,` + sent + `}`, "protocol:translated,response_format:dropped,tools:dropped", "", 10},
+		{"a stream: stream_options is the relay's, not sent", `{"model":"a",` + msgs + `,"stream":true,"stream_options":{"include_usage":true},"max_tokens":10}`,
+			domain.Model{}, domain.Target{}, `{"model":"up-1","max_tokens":10,` + sent + `,"stream":true}`, "protocol:translated", "", 10},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			out, skip := runTo(t, domain.EndpointChat, anth, tt.body, &tt.m, tt.target)

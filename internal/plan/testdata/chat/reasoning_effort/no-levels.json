@@ -1,0 +1,44 @@
+[
+	{
+		"level": "none",
+		"sent": "none",
+		"source": "client",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"none\"}"
+	},
+	{
+		"level": "minimal",
+		"sent": "minimal",
+		"source": "client",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"minimal\"}"
+	},
+	{
+		"level": "low",
+		"sent": "low",
+		"source": "client",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"low\"}"
+	},
+	{
+		"level": "medium",
+		"sent": "medium",
+		"source": "client",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"medium\"}"
+	},
+	{
+		"level": "high",
+		"sent": "high",
+		"source": "client",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"high\"}"
+	},
+	{
+		"level": "xhigh",
+		"sent": "xhigh",
+		"source": "client",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"xhigh\"}"
+	},
+	{
+		"level": "max",
+		"sent": "max",
+		"source": "client",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"max\"}"
+	}
+]

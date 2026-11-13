@@ -1,0 +1,54 @@
+[
+	{
+		"level": "none",
+		"sent": "none",
+		"source": "alias_default",
+		"changes": "output_config.effort:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"thinking\":{\"type\":\"disabled\"}}"
+	},
+	{
+		"level": "minimal",
+		"sent": "low",
+		"source": "alias_default",
+		"adjusted": true,
+		"changes": "output_config.effort:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"low\"}}"
+	},
+	{
+		"level": "low",
+		"sent": "low",
+		"source": "alias_default",
+		"changes": "output_config.effort:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"low\"}}"
+	},
+	{
+		"level": "medium",
+		"sent": "medium",
+		"source": "alias_default",
+		"changes": "output_config.effort:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"medium\"}}"
+	},
+	{
+		"level": "high",
+		"sent": "high",
+		"source": "alias_default",
+		"changes": "output_config.effort:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"high\"}}"
+	},
+	{
+		"level": "xhigh",
+		"sent": "high",
+		"source": "alias_default",
+		"adjusted": true,
+		"changes": "output_config.effort:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"high\"}}"
+	},
+	{
+		"level": "max",
+		"sent": "high",
+		"source": "alias_default",
+		"adjusted": true,
+		"changes": "output_config.effort:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"thinking\":{\"type\":\"adaptive\"},\"output_config\":{\"effort\":\"high\"}}"
+	}
+]

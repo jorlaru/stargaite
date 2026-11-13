@@ -24,7 +24,7 @@ type Finding struct {
 const RequestIDHeader = "X-Stargaite-Request-Id"
 
 // Error codes of the error model (kick-off section 15) that the admin API and
-// the authenticated data-plane route answer with.
+// the data plane answer with. The limits of phase 3 add theirs.
 const (
 	CodeInvalidRequest  = "invalid_request"
 	CodeInvalidAPIKey   = "invalid_api_key"
@@ -32,6 +32,27 @@ const (
 	CodeConflict        = "conflict"
 	CodeRequestTooLarge = "request_too_large"
 	CodeInternalError   = "internal_error"
+
+	CodeUnknownParameter        = "unknown_parameter"
+	CodeInvalidReasoningEffort  = "invalid_reasoning_effort"
+	CodeModelNotAllowed         = "model_not_allowed"
+	CodeModelNotFound           = "model_not_found"
+	CodeEndpointNotSupported    = "endpoint_not_supported"
+	CodeCapabilityMismatch      = "capability_mismatch"
+	CodeMaxOutputTokensExceeded = "max_output_tokens_exceeded"
+	CodeUnsupportedParameter    = "unsupported_parameter"
+	CodeUpstreamError           = "upstream_error"
+	CodeUpstreamAuthError       = "upstream_auth_error"
+	CodeNoTargetAvailable       = "no_target_available"
+	CodeUpstreamTimeout         = "upstream_timeout"
+)
+
+// Endpoint is an inference endpoint: the format of the inbound body.
+type Endpoint string
+
+const (
+	EndpointChat     Endpoint = "chat"     // POST /v1/chat/completions
+	EndpointMessages Endpoint = "messages" // POST /v1/messages
 )
 
 // Error is the error object of the response envelope, {"error": {...}}. The
@@ -55,16 +76,26 @@ func (e *Error) Error() string { return e.Message }
 func NewError(code, message string) *Error {
 	e := &Error{Message: message, Type: "invalid_request_error", Code: code}
 	switch code {
-	case CodeInvalidRequest:
+	case CodeInvalidRequest, CodeUnknownParameter, CodeInvalidReasoningEffort:
 		e.Status = http.StatusBadRequest
 	case CodeInvalidAPIKey:
 		e.Status, e.Type = http.StatusUnauthorized, "authentication_error"
-	case CodeNotFound:
+	case CodeModelNotAllowed:
+		e.Status, e.Type = http.StatusForbidden, "permission_error"
+	case CodeNotFound, CodeModelNotFound:
 		e.Status, e.Type = http.StatusNotFound, "not_found_error"
 	case CodeConflict:
 		e.Status = http.StatusConflict
 	case CodeRequestTooLarge:
 		e.Status = http.StatusRequestEntityTooLarge
+	case CodeEndpointNotSupported, CodeCapabilityMismatch, CodeMaxOutputTokensExceeded, CodeUnsupportedParameter:
+		e.Status = http.StatusUnprocessableEntity
+	case CodeUpstreamError, CodeUpstreamAuthError:
+		e.Status, e.Type = http.StatusBadGateway, "api_error"
+	case CodeNoTargetAvailable:
+		e.Status, e.Type = http.StatusServiceUnavailable, "overloaded_error"
+	case CodeUpstreamTimeout:
+		e.Status, e.Type = http.StatusGatewayTimeout, "api_error"
 	default:
 		e.Status, e.Type, e.Code = http.StatusInternalServerError, "api_error", CodeInternalError
 	}

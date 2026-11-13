@@ -1,0 +1,44 @@
+[
+	{
+		"level": "none",
+		"source": "provider_default",
+		"changes": "reasoning_effort:dropped",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+	},
+	{
+		"level": "minimal",
+		"source": "provider_default",
+		"changes": "reasoning_effort:dropped",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+	},
+	{
+		"level": "low",
+		"source": "provider_default",
+		"changes": "reasoning_effort:dropped",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+	},
+	{
+		"level": "medium",
+		"source": "provider_default",
+		"changes": "reasoning_effort:dropped",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+	},
+	{
+		"level": "high",
+		"source": "provider_default",
+		"changes": "reasoning_effort:dropped",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+	},
+	{
+		"level": "xhigh",
+		"source": "provider_default",
+		"changes": "reasoning_effort:dropped",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+	},
+	{
+		"level": "max",
+		"source": "provider_default",
+		"changes": "reasoning_effort:dropped",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+	}
+]

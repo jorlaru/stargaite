@@ -1,0 +1,54 @@
+[
+	{
+		"level": "none",
+		"sent": "none",
+		"source": "client",
+		"changes": "output_config.effort:translated",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"thinking\":{\"type\":\"between_tools\"}}"
+	},
+	{
+		"level": "minimal",
+		"sent": "low",
+		"source": "client",
+		"adjusted": true,
+		"changes": "output_config.effort:translated",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"low\"},\"thinking\":{\"type\":\"adaptive\",\"display\":\"summarized\"}}"
+	},
+	{
+		"level": "low",
+		"sent": "low",
+		"source": "client",
+		"changes": "output_config.effort:translated",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"low\"},\"thinking\":{\"type\":\"adaptive\",\"display\":\"summarized\"}}"
+	},
+	{
+		"level": "medium",
+		"sent": "medium",
+		"source": "client",
+		"changes": "output_config.effort:translated",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"medium\"},\"thinking\":{\"type\":\"adaptive\",\"display\":\"summarized\"}}"
+	},
+	{
+		"level": "high",
+		"sent": "high",
+		"source": "client",
+		"changes": "output_config.effort:translated",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"high\"},\"thinking\":{\"type\":\"adaptive\",\"display\":\"summarized\"}}"
+	},
+	{
+		"level": "xhigh",
+		"sent": "high",
+		"source": "client",
+		"adjusted": true,
+		"changes": "output_config.effort:translated",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"high\"},\"thinking\":{\"type\":\"adaptive\",\"display\":\"summarized\"}}"
+	},
+	{
+		"level": "max",
+		"sent": "high",
+		"source": "client",
+		"adjusted": true,
+		"changes": "output_config.effort:translated",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"high\"},\"thinking\":{\"type\":\"adaptive\",\"display\":\"summarized\"}}"
+	}
+]

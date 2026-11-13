@@ -266,6 +266,45 @@ func TestValidate(t *testing.T) {
 				t.Reasoning.Dialect, t.Reasoning.Levels, t.Reasoning.Budgets = "thinking_budget", []string{"low", "high"}, map[string]int64{"low": 1024, "high": 8192}
 			})
 		}, nil},
+		{"RSN-3 a budget at the alias cap", func(d *domain.Document) {
+			edit(d.Targets, qw, func(t *domain.Target) {
+				t.Reasoning.Dialect, t.Reasoning.Levels, t.Reasoning.Budgets = "thinking_budget", []string{"low", "high"}, map[string]int64{"low": 1024, "high": 32000}
+			})
+		}, []string{"error RSN-3 budget_exceeds_cap models/fast max_output_tokens"}},
+		{"RSN-3 budgets with no alias cap", func(d *domain.Document) {
+			edit(d.Targets, qw, func(t *domain.Target) {
+				t.Reasoning.Dialect, t.Reasoning.Levels, t.Reasoning.Budgets = "thinking_budget", []string{"low"}, map[string]int64{"low": 64000}
+				t.MaxOutputTokens = 0
+			})
+			edit(d.Targets, mm, func(t *domain.Target) { t.MaxOutputTokens = 0 })
+			edit(d.Models, "fast", func(m *domain.Model) { m.Targets, m.MaxOutputTokens = []string{qw}, 0 })
+		}, nil},
+		{"RSN-3 an on fragment holding the level member", func(d *domain.Document) {
+			edit(d.Targets, qw, func(t *domain.Target) {
+				t.Reasoning.On = map[string]json.RawMessage{"reasoning": json.RawMessage(`{"summary":"auto"}`), "temperature": json.RawMessage(`1`)}
+			})
+			edit(d.Targets, sn, func(t *domain.Target) {
+				t.Reasoning.On = map[string]json.RawMessage{"output_config": json.RawMessage(`{}`), "thinking": json.RawMessage(`{"type":"adaptive","display":"summarized"}`)}
+			})
+		}, []string{"error RSN-3 fragment_overwritten targets/" + sn + " reasoning.on.output_config",
+			"error RSN-3 fragment_overwritten targets/" + qw + " reasoning.on.reasoning"}},
+		{"RSN-3 a thinking_budget on fragment", func(d *domain.Document) {
+			edit(d.Targets, qw, func(t *domain.Target) {
+				t.Reasoning.Dialect, t.Reasoning.Levels, t.Reasoning.Budgets = "thinking_budget", []string{"low"}, map[string]int64{"low": 1024}
+				t.Reasoning.On = map[string]json.RawMessage{"thinking": json.RawMessage(`{"type":"enabled","display":"summarized"}`)}
+			})
+		}, nil},
+		{"RSN-3 a thinking_budget on fragment that is not an object or holds the budget", func(d *domain.Document) {
+			edit(d.Targets, qw, func(t *domain.Target) {
+				t.Reasoning.Dialect, t.Reasoning.Levels, t.Reasoning.Budgets = "thinking_budget", []string{"low"}, map[string]int64{"low": 1024}
+				t.Reasoning.On = map[string]json.RawMessage{"thinking": json.RawMessage(`true`)}
+			})
+			edit(d.Targets, sn, func(t *domain.Target) {
+				t.Reasoning.Dialect, t.Reasoning.Levels, t.Reasoning.Budgets = "thinking_budget", []string{"low"}, map[string]int64{"low": 1024}
+				t.Reasoning.On = map[string]json.RawMessage{"thinking": json.RawMessage(`{"type":"enabled","budget_tokens":1}`)}
+			})
+		}, []string{"error RSN-3 fragment_overwritten targets/" + sn + " reasoning.on.thinking",
+			"error RSN-3 fragment_overwritten targets/" + qw + " reasoning.on.thinking"}},
 		{"RSN-3 budget for an undeclared level", func(d *domain.Document) {
 			edit(d.Targets, qw, func(t *domain.Target) {
 				t.Reasoning.Dialect, t.Reasoning.Levels, t.Reasoning.Budgets = "thinking_budget", []string{"low"}, map[string]int64{"low": 1024, "max": 1}
@@ -279,6 +318,12 @@ func TestValidate(t *testing.T) {
 		}, []string{"error RSN-3 invalid_value targets/" + qw + " reasoning.map"}},
 		{"RSN-3 map to an empty level", func(d *domain.Document) {
 			edit(d.Targets, qw, func(t *domain.Target) { t.Reasoning.Map = map[string]string{"max": ""} })
+		}, []string{"error RSN-3 invalid_value targets/" + qw + " reasoning.map"}},
+		{"RSN-3 thinking_budget map to a level without a budget", func(d *domain.Document) {
+			edit(d.Targets, qw, func(t *domain.Target) {
+				t.Reasoning.Dialect, t.Reasoning.Levels, t.Reasoning.Budgets = "thinking_budget", []string{"low"}, map[string]int64{"low": 1024}
+				t.Reasoning.Map = map[string]string{"minimal": "minimal", "max": "low", "none": "none"}
+			})
 		}, []string{"error RSN-3 invalid_value targets/" + qw + " reasoning.map"}},
 		{"RSN-3 map to the provider's own spelling", func(d *domain.Document) {
 			edit(d.Targets, qw, func(t *domain.Target) { t.Reasoning.Map = map[string]string{"max": "x-high", "none": "off"} })

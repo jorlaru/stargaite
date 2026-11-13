@@ -1,0 +1,54 @@
+[
+	{
+		"level": "none",
+		"sent": "none",
+		"source": "alias_forced",
+		"changes": "output_config.effort:forced",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"thinking\":{\"type\":\"disabled\"}}"
+	},
+	{
+		"level": "minimal",
+		"sent": "low",
+		"source": "alias_forced",
+		"adjusted": true,
+		"changes": "output_config.effort:forced",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"low\"},\"thinking\":{\"type\":\"adaptive\"}}"
+	},
+	{
+		"level": "low",
+		"sent": "low",
+		"source": "alias_forced",
+		"changes": "output_config.effort:forced",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"low\"},\"thinking\":{\"type\":\"adaptive\"}}"
+	},
+	{
+		"level": "medium",
+		"sent": "medium",
+		"source": "alias_forced",
+		"changes": "output_config.effort:forced",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"medium\"},\"thinking\":{\"type\":\"adaptive\"}}"
+	},
+	{
+		"level": "high",
+		"sent": "high",
+		"source": "alias_forced",
+		"changes": "output_config.effort:forced",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"high\"},\"thinking\":{\"type\":\"adaptive\"}}"
+	},
+	{
+		"level": "xhigh",
+		"sent": "high",
+		"source": "alias_forced",
+		"adjusted": true,
+		"changes": "output_config.effort:forced",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"high\"},\"thinking\":{\"type\":\"adaptive\"}}"
+	},
+	{
+		"level": "max",
+		"sent": "high",
+		"source": "alias_forced",
+		"adjusted": true,
+		"changes": "output_config.effort:forced",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"high\"},\"thinking\":{\"type\":\"adaptive\"}}"
+	}
+]

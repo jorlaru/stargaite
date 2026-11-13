@@ -1,0 +1,54 @@
+[
+	{
+		"level": "none",
+		"sent": "none",
+		"source": "alias_forced",
+		"changes": "output_config.effort:forced",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"reasoning_effort\":\"none\"}"
+	},
+	{
+		"level": "minimal",
+		"sent": "low",
+		"source": "alias_forced",
+		"adjusted": true,
+		"changes": "output_config.effort:forced",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"reasoning_effort\":\"low\"}"
+	},
+	{
+		"level": "low",
+		"sent": "low",
+		"source": "alias_forced",
+		"changes": "output_config.effort:forced",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"reasoning_effort\":\"low\"}"
+	},
+	{
+		"level": "medium",
+		"sent": "medium",
+		"source": "alias_forced",
+		"changes": "output_config.effort:forced",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"reasoning_effort\":\"medium\"}"
+	},
+	{
+		"level": "high",
+		"sent": "high",
+		"source": "alias_forced",
+		"changes": "output_config.effort:forced",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"reasoning_effort\":\"high\"}"
+	},
+	{
+		"level": "xhigh",
+		"sent": "high",
+		"source": "alias_forced",
+		"adjusted": true,
+		"changes": "output_config.effort:forced",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"reasoning_effort\":\"high\"}"
+	},
+	{
+		"level": "max",
+		"sent": "high",
+		"source": "alias_forced",
+		"adjusted": true,
+		"changes": "output_config.effort:forced",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"reasoning_effort\":\"high\"}"
+	}
+]

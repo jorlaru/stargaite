@@ -167,7 +167,7 @@ func TestSetTarget(t *testing.T) {
 	f := newFixture(t)
 	f.addProvider(t, `{"name":"anthropic"}`)
 	f.addTarget(t, `{"id":"anthropic/m","kind":"chat","reasoning":{"dialect":"thinking_budget","levels":["low","high"],"budgets":{"low":1024,"high":8192},`+
-		`"on":{"thinking":{"type":"enabled","budget_tokens":1}},"off":{"thinking":{"type":"disabled"},"x":1}}}`)
+		`"on":{"thinking":{"type":"enabled","display":"summarized"}},"off":{"thinking":{"type":"disabled"},"x":1}}}`)
 	var res targetAnswer
 	decode(t, f.do(t, http.MethodPatch, "/admin/v1/targets/anthropic%2Fm", []byte(`{"reasoning":{"levels":["low"],"budgets":{"high":null},`+
 		`"on":{"thinking":{"type":"adaptive"}},"off":{"y":[1,2]}},"capabilities":{"tools":true}}`)), http.StatusOK, &res)

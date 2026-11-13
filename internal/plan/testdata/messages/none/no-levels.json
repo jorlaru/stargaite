@@ -1,0 +1,44 @@
+[
+	{
+		"level": "none",
+		"source": "provider_default",
+		"changes": "output_config.effort:dropped",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}}}"
+	},
+	{
+		"level": "minimal",
+		"source": "provider_default",
+		"changes": "output_config.effort:dropped",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}}}"
+	},
+	{
+		"level": "low",
+		"source": "provider_default",
+		"changes": "output_config.effort:dropped",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}}}"
+	},
+	{
+		"level": "medium",
+		"source": "provider_default",
+		"changes": "output_config.effort:dropped",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}}}"
+	},
+	{
+		"level": "high",
+		"source": "provider_default",
+		"changes": "output_config.effort:dropped",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}}}"
+	},
+	{
+		"level": "xhigh",
+		"source": "provider_default",
+		"changes": "output_config.effort:dropped",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}}}"
+	},
+	{
+		"level": "max",
+		"source": "provider_default",
+		"changes": "output_config.effort:dropped",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}}}"
+	}
+]

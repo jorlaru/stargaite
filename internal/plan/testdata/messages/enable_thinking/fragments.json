@@ -1,0 +1,51 @@
+[
+	{
+		"level": "none",
+		"sent": "none",
+		"source": "client",
+		"changes": "output_config.effort:translated,temperature:added",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"enable_thinking\":false,\"temperature\":0.7}"
+	},
+	{
+		"level": "minimal",
+		"sent": "on",
+		"source": "client",
+		"changes": "output_config.effort:translated,thinking_budget:added",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"enable_thinking\":true,\"thinking_budget\":4096}"
+	},
+	{
+		"level": "low",
+		"sent": "on",
+		"source": "client",
+		"changes": "output_config.effort:translated,thinking_budget:added",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"enable_thinking\":true,\"thinking_budget\":4096}"
+	},
+	{
+		"level": "medium",
+		"sent": "on",
+		"source": "client",
+		"changes": "output_config.effort:translated,thinking_budget:added",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"enable_thinking\":true,\"thinking_budget\":4096}"
+	},
+	{
+		"level": "high",
+		"sent": "on",
+		"source": "client",
+		"changes": "output_config.effort:translated,thinking_budget:added",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"enable_thinking\":true,\"thinking_budget\":4096}"
+	},
+	{
+		"level": "xhigh",
+		"sent": "on",
+		"source": "client",
+		"changes": "output_config.effort:translated,thinking_budget:added",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"enable_thinking\":true,\"thinking_budget\":4096}"
+	},
+	{
+		"level": "max",
+		"sent": "on",
+		"source": "client",
+		"changes": "output_config.effort:translated,thinking_budget:added",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"enable_thinking\":true,\"thinking_budget\":4096}"
+	}
+]

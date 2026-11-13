@@ -212,6 +212,44 @@ func TestMaxValues(t *testing.T) {
 	}
 }
 
+// TestBoundHeadroom: a body Scan accepts with exactly maxValues indexed
+// values still takes Edit ops that append into output_config and the top
+// level, and its read-back succeeds, though Scan would refuse the result.
+func TestBoundHeadroom(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(`{"model":"m","output_config":{`)
+	for i := range maxValues - 2 { // the two top-level members count too
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(`"` + strconv.Itoa(i) + `":0`)
+	}
+	b.WriteString(`}}`)
+	body, e := Scan([]byte(b.String()), Messages.Walk)
+	if e != nil {
+		t.Fatalf("at the bound: %+v", e)
+	}
+	out, err := body.Edit(
+		Op{Path: []string{"output_config", "effort"}, Value: []byte(`"high"`)},
+		Op{Path: []string{"output_config", "format"}, Value: []byte(`{}`)}, // its scan sees one value over the bound
+		Op{Path: []string{"thinking"}, Value: []byte(`{"type":"adaptive"}`)},
+		Op{Path: []string{"max_tokens"}, Value: []byte(`1024`)},
+	)
+	if err != nil {
+		t.Fatalf("Edit at the bound: %v", err)
+	}
+	if _, e := Scan(out, MessagesOut); e == nil {
+		t.Fatal("Scan accepted a body over the bound")
+	}
+	rb, e := ReadBack(out, MessagesOut)
+	if e != nil {
+		t.Fatalf("ReadBack: %+v", e)
+	}
+	if v, ok := rb.Get("output_config", "effort"); !ok || string(v) != `"high"` {
+		t.Errorf("read back %s, %v", v, ok)
+	}
+}
+
 // TestUnknownKeys is AC-08 at unit level: Keys gives the caller each
 // top-level name, unescaped, to compare with Known (PAR-2).
 func TestUnknownKeys(t *testing.T) {

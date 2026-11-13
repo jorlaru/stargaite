@@ -1,0 +1,51 @@
+[
+	{
+		"level": "none",
+		"sent": "none",
+		"source": "alias_default",
+		"changes": "enable_thinking:added",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"enable_thinking\":false}"
+	},
+	{
+		"level": "minimal",
+		"sent": "on",
+		"source": "alias_default",
+		"changes": "enable_thinking:added",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"enable_thinking\":true}"
+	},
+	{
+		"level": "low",
+		"sent": "on",
+		"source": "alias_default",
+		"changes": "enable_thinking:added",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"enable_thinking\":true}"
+	},
+	{
+		"level": "medium",
+		"sent": "on",
+		"source": "alias_default",
+		"changes": "enable_thinking:added",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"enable_thinking\":true}"
+	},
+	{
+		"level": "high",
+		"sent": "on",
+		"source": "alias_default",
+		"changes": "enable_thinking:added",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"enable_thinking\":true}"
+	},
+	{
+		"level": "xhigh",
+		"sent": "on",
+		"source": "alias_default",
+		"changes": "enable_thinking:added",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"enable_thinking\":true}"
+	},
+	{
+		"level": "max",
+		"sent": "on",
+		"source": "alias_default",
+		"changes": "enable_thinking:added",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"enable_thinking\":true}"
+	}
+]

@@ -3,6 +3,7 @@ package config
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -429,10 +430,38 @@ func validateReasoning(r *report, res string, rs *domain.Reasoning) {
 		}
 	}
 	for _, l := range slices.Sorted(maps.Keys(rs.Map)) {
-		if !slices.Contains(domain.Levels, l) || rs.Map[l] == "" {
+		v := rs.Map[l]
+		switch {
+		case !slices.Contains(domain.Levels, l) || v == "":
 			r.fail("RSN-3", "invalid_value", res, "reasoning.map", "reasoning.map %.64q must map a level of the canonical scale to a non-empty level", l)
+		case rs.Dialect == domain.DialectThinkingBudget && v != "none" && !slices.Contains(rs.Levels, v):
+			// Only a declared level has a budget to send.
+			r.fail("RSN-3", "invalid_value", res, "reasoning.map", "reasoning.map %.64q must map to none or a declared level of a thinking_budget target", l)
 		}
 	}
+	// An on fragment replaces the on part and the level is still written
+	// (phase-2 design section 15, point 8), so the fragment may not hold the
+	// member the level overwrites. thinking_budget writes its level inside the
+	// thinking its on part writes: a fragment's thinking must be an object
+	// without budget_tokens.
+	if k := levelKeys[rs.Dialect]; k != "" && rs.On[k] != nil {
+		r.fail("RSN-3", "fragment_overwritten", res, "reasoning.on."+k, "the on fragment may not hold %s: the level is written there", k)
+	}
+	if v, ok := rs.On["thinking"]; ok && rs.Dialect == domain.DialectThinkingBudget {
+		var m map[string]json.RawMessage
+		if json.Unmarshal(v, &m) != nil || m == nil || m["budget_tokens"] != nil {
+			r.fail("RSN-3", "fragment_overwritten", res, "reasoning.on.thinking",
+				"the on fragment's thinking must be an object without budget_tokens: the budget is written inside it")
+		}
+	}
+}
+
+// levelKeys holds, for each dialect whose level member is outside its on
+// part, the top-level key of the level member (kick-off section 9.1).
+var levelKeys = map[string]string{
+	domain.DialectReasoningEffort: "reasoning_effort",
+	domain.DialectReasoningObject: "reasoning",
+	domain.DialectAdaptiveEffort:  "output_config",
 }
 
 func validateModel(r *report, doc *domain.Document, name string) {
@@ -492,6 +521,16 @@ func validateModel(r *report, doc *domain.Document, name string) {
 			if m.Params[p] == domain.ParamForward && slices.Contains(keys, p) {
 				r.fail("PAR-2", "param_collision", res, "params."+p,
 					"a forward rule may not name %.64q: the proxy writes it toward target %s", p, id)
+			}
+		}
+		// The budget must stay below the cap (phase-2 design section 15, point 9).
+		if dialect(t) == domain.DialectThinkingBudget && m.MaxOutputTokens > 0 {
+			for _, l := range slices.Sorted(maps.Keys(t.Reasoning.Budgets)) {
+				if b := t.Reasoning.Budgets[l]; b >= m.MaxOutputTokens {
+					r.fail("RSN-3", "budget_exceeds_cap", res, "max_output_tokens",
+						"max_output_tokens %d is at or below the budget %d of level %.64q of target %s", m.MaxOutputTokens, b, l, id)
+					break
+				}
 			}
 		}
 		if t.Reasoning != nil && t.Reasoning.CanDisable != nil && !*t.Reasoning.CanDisable && m.Reasoning.Effort == "" {

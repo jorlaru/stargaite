@@ -1,0 +1,51 @@
+[
+	{
+		"level": "none",
+		"sent": "none",
+		"source": "client",
+		"changes": "reasoning_effort:translated,temperature:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"enable_thinking\":false,\"temperature\":0.7}"
+	},
+	{
+		"level": "minimal",
+		"sent": "on",
+		"source": "client",
+		"changes": "reasoning_effort:translated,thinking_budget:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"enable_thinking\":true,\"thinking_budget\":4096}"
+	},
+	{
+		"level": "low",
+		"sent": "on",
+		"source": "client",
+		"changes": "reasoning_effort:translated,thinking_budget:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"enable_thinking\":true,\"thinking_budget\":4096}"
+	},
+	{
+		"level": "medium",
+		"sent": "on",
+		"source": "client",
+		"changes": "reasoning_effort:translated,thinking_budget:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"enable_thinking\":true,\"thinking_budget\":4096}"
+	},
+	{
+		"level": "high",
+		"sent": "on",
+		"source": "client",
+		"changes": "reasoning_effort:translated,thinking_budget:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"enable_thinking\":true,\"thinking_budget\":4096}"
+	},
+	{
+		"level": "xhigh",
+		"sent": "on",
+		"source": "client",
+		"changes": "reasoning_effort:translated,thinking_budget:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"enable_thinking\":true,\"thinking_budget\":4096}"
+	},
+	{
+		"level": "max",
+		"sent": "on",
+		"source": "client",
+		"changes": "reasoning_effort:translated,thinking_budget:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"enable_thinking\":true,\"thinking_budget\":4096}"
+	}
+]

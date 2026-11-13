@@ -431,7 +431,8 @@ func TestSplitTarget(t *testing.T) {
 	}
 }
 
-// The rows of the error model (kick-off section 15) that phase 1 answers with.
+// The rows of the error model (kick-off section 15) that phases 1 and 2
+// answer with.
 func TestNewError(t *testing.T) {
 	tests := []struct {
 		code   string
@@ -444,6 +445,18 @@ func TestNewError(t *testing.T) {
 		{CodeConflict, http.StatusConflict, "invalid_request_error"},
 		{CodeRequestTooLarge, http.StatusRequestEntityTooLarge, "invalid_request_error"},
 		{CodeInternalError, http.StatusInternalServerError, "api_error"},
+		{CodeUnknownParameter, http.StatusBadRequest, "invalid_request_error"},
+		{CodeInvalidReasoningEffort, http.StatusBadRequest, "invalid_request_error"},
+		{CodeModelNotAllowed, http.StatusForbidden, "permission_error"},
+		{CodeModelNotFound, http.StatusNotFound, "not_found_error"},
+		{CodeEndpointNotSupported, http.StatusUnprocessableEntity, "invalid_request_error"},
+		{CodeCapabilityMismatch, http.StatusUnprocessableEntity, "invalid_request_error"},
+		{CodeMaxOutputTokensExceeded, http.StatusUnprocessableEntity, "invalid_request_error"},
+		{CodeUnsupportedParameter, http.StatusUnprocessableEntity, "invalid_request_error"},
+		{CodeUpstreamError, http.StatusBadGateway, "api_error"},
+		{CodeUpstreamAuthError, http.StatusBadGateway, "api_error"},
+		{CodeNoTargetAvailable, http.StatusServiceUnavailable, "overloaded_error"},
+		{CodeUpstreamTimeout, http.StatusGatewayTimeout, "api_error"},
 	}
 	for _, tt := range tests {
 		var err error = NewError(tt.code, "the message")

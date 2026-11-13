@@ -24,8 +24,10 @@ import (
 type Error struct{ Code, Param, Message string }
 
 // maxValues bounds the members and elements Scan indexes in one body, so the
-// index of a body stays near the default max_body_bytes in memory however
-// dense the body is.
+// index of an untrusted body stays near the default max_body_bytes in memory
+// however dense the body is. The proxy's own later scans of a body Scan
+// accepted (each Edit op, ReadBack) are unbounded: what Build adds to the body
+// must never make it fail for size.
 const maxValues = 100_000
 
 // Body is a scanned JSON object: the raw bytes, which must not be modified
@@ -77,21 +79,35 @@ func isIndex(s string) bool {
 // a walk path reaches (its prefixes included) are indexed, and an indexed
 // object that repeats a name, compared after unescaping, is refused. Every
 // other value is checked for syntax and UTF-8 and skipped, so a repeat inside
-// forwarded content is not an error (PAR-1).
+// forwarded content is not an error (PAR-1). It refuses a body with more than
+// maxValues indexed members and elements.
 func Scan(raw []byte, walk [][]string) (*Body, *Error) {
+	return scan(raw, walkTrie(walk), maxValues)
+}
+
+// ReadBack scans a body the proxy built from one Scan accepted, such as the
+// output of Edit, with no index bound: Build adds members to a body that may
+// sit exactly at the bound (PAR-8). It must never read a client's bytes.
+func ReadBack(raw []byte, walk [][]string) (*Body, *Error) {
+	return scan(raw, walkTrie(walk), -1)
+}
+
+func walkTrie(walk [][]string) trie {
 	t := trie{}
 	for _, p := range walk {
 		t.add(p, false)
 	}
-	return scan(raw, t)
+	return t
 }
 
-func scan(raw []byte, t trie) (*Body, *Error) {
+// scan indexes raw along t, at most limit members and elements; a negative
+// limit is no bound.
+func scan(raw []byte, t trie, limit int) (*Body, *Error) {
 	d := jsontext.NewDecoder(bytes.NewReader(raw), jsontext.AllowDuplicateNames(true))
 	if d.PeekKind() != '{' {
 		return nil, &Error{Code: "invalid_request", Message: "the body must be a JSON object"}
 	}
-	left := maxValues
+	left := limit
 	root, e := value(d, t, "", &left)
 	if e != nil {
 		return nil, e
@@ -110,7 +126,8 @@ func syntax(err error) *Error {
 }
 
 // value reads the next value. A non-nil t indexes an object or an array, path
-// names the value in errors, and left counts the values still indexable.
+// names the value in errors, and left counts the values still indexable; a
+// negative left never reaches -1 again, so it is no bound.
 func value(d *jsontext.Decoder, t trie, path string, left *int) (*node, *Error) {
 	if k := d.PeekKind(); t == nil || k != '{' && k != '[' {
 		v, err := d.ReadValue()
@@ -127,7 +144,7 @@ func value(d *jsontext.Decoder, t trie, path string, left *int) (*node, *Error) 
 	n := &node{start: int(d.InputOffset()) - 1, obj: tok.Kind() == '{', indexed: true}
 	seen := map[string]bool{}
 	for k := d.PeekKind(); k != '}' && k != ']'; k = d.PeekKind() {
-		if *left--; *left < 0 {
+		if *left--; *left == -1 {
 			return nil, &Error{Code: "invalid_request", Message: fmt.Sprintf("the body has more than %d members or elements in the objects and arrays the proxy reads", maxValues)}
 		}
 		if !n.obj {
@@ -256,7 +273,7 @@ func edit(raw []byte, op Op) ([]byte, error) {
 	}
 	t := trie{}
 	t.add(p[:len(p)-1], true)
-	b, e := scan(raw, t)
+	b, e := scan(raw, t, -1)
 	if e != nil {
 		return nil, fmt.Errorf("params: cannot edit %s: %s", strings.Join(p, "."), e.Message)
 	}

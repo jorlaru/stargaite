@@ -1,0 +1,51 @@
+[
+	{
+		"level": "none",
+		"sent": "none",
+		"source": "client",
+		"changes": "output_config.effort:translated",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"thinking\":{\"type\":\"disabled\"}}"
+	},
+	{
+		"level": "minimal",
+		"sent": "minimal",
+		"source": "client",
+		"changes": "output_config.effort:translated",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"minimal\"},\"thinking\":{\"type\":\"adaptive\"}}"
+	},
+	{
+		"level": "low",
+		"sent": "low",
+		"source": "client",
+		"changes": "output_config.effort:translated",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"low\"},\"thinking\":{\"type\":\"adaptive\"}}"
+	},
+	{
+		"level": "medium",
+		"sent": "medium",
+		"source": "client",
+		"changes": "output_config.effort:translated",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"medium\"},\"thinking\":{\"type\":\"adaptive\"}}"
+	},
+	{
+		"level": "high",
+		"sent": "high",
+		"source": "client",
+		"changes": "output_config.effort:translated",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"high\"},\"thinking\":{\"type\":\"adaptive\"}}"
+	},
+	{
+		"level": "xhigh",
+		"sent": "xhigh",
+		"source": "client",
+		"changes": "output_config.effort:translated",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"xhigh\"},\"thinking\":{\"type\":\"adaptive\"}}"
+	},
+	{
+		"level": "max",
+		"sent": "max",
+		"source": "client",
+		"changes": "output_config.effort:translated",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}},\"effort\":\"max\"},\"thinking\":{\"type\":\"adaptive\"}}"
+	}
+]

@@ -145,9 +145,19 @@ func TestQuickStart(t *testing.T) {
 	models()
 	// The one call of the quick start, with the upstream model id and no
 	// credential: the mock provider declares none.
-	if calls := mock.Calls(); len(calls) != 1 || calls[0].Path != "/chat/completions" ||
+	calls := mock.Calls()
+	if len(calls) != 1 || calls[0].Path != "/chat/completions" ||
 		string(calls[0].Body) != `{"model":"mock","messages":[{"role":"user","content":"hi"}]}` || calls[0].Header.Values("Authorization") != nil {
-		t.Errorf("the mock received %+v", calls)
+		t.Fatalf("the mock received %+v", calls)
+	}
+	// models explain, run above without a call, shows the bytes the provider
+	// received for the same request (AC-17).
+	var explained struct {
+		Targets []struct{ Target, Body string }
+	}
+	if out := cli("models", "explain", "fast", "--json"); json.Unmarshal([]byte(out), &explained) != nil || len(explained.Targets) != 1 ||
+		explained.Targets[0].Target != "mock/mock" || explained.Targets[0].Body != string(calls[0].Body) {
+		t.Errorf("models explain answered %s", out)
 	}
 	before := cli("export")
 	if !strings.Contains(before, "my-agent") || strings.Contains(before, token) {

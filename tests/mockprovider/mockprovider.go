@@ -30,9 +30,9 @@ type Step struct {
 
 // Call is one request as received: the body holds its exact bytes.
 type Call struct {
-	Method, Path string
-	Header       http.Header
-	Body         []byte
+	Method, Path, Query string // Query is the raw query, without "?"
+	Header              http.Header
+	Body                []byte
 }
 
 // Server is an http.Handler; it is safe for concurrent use.
@@ -89,7 +89,7 @@ func New() *Server { return &Server{} }
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	s.mu.Lock()
-	s.calls = append(s.calls, Call{Method: r.Method, Path: r.URL.Path, Header: r.Header.Clone(), Body: body})
+	s.calls = append(s.calls, Call{Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery, Header: r.Header.Clone(), Body: body})
 	def, known := defaults[r.URL.Path]
 	var step *Step
 	if err == nil && known && r.Method == http.MethodPost && len(s.queue) > 0 {

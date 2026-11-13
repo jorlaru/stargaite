@@ -18,6 +18,7 @@ import (
 	"strings"
 	"text/tabwriter"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
@@ -72,6 +73,8 @@ func fill(body map[string]any, f flagSpec, v string) error {
 		appendTo(body, path, "*")
 	case kindString:
 		put(body, path, v)
+	case kindFile:
+		put(body, path, textFile(v))
 	case kindBool:
 		b, err := strconv.ParseBool(v)
 		if err != nil {
@@ -153,8 +156,9 @@ func parent(body map[string]any, path []string) map[string]any {
 	return body
 }
 
-// call sends the one request of a command and prints the answer.
-func call(ctx context.Context, name string, in input, method, path string, body any, stdout, stderr io.Writer) int {
+// call sends the one request of a command and prints the answer, through
+// rowRender when it is not nil.
+func call(ctx context.Context, name string, in input, method, path string, body any, rowRender func(io.Writer, []byte) error, stdout, stderr io.Writer) int {
 	base := cmp.Or(*in.flags["admin-url"], in.getenv("STARGAITE_ADMIN_URL"), defaultAdminURL)
 	if u, err := url.Parse(base); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		say(stderr, "%s: the admin URL %q is not an http or https URL\n", name, base)
@@ -176,6 +180,24 @@ func call(ctx context.Context, name string, in input, method, path string, body 
 		}
 		contentType = "application/yaml"
 	default:
+		// A file a body flag names is read now: like -f, one that cannot be
+		// read is a failure, not a wrong usage.
+		if m, ok := b.(map[string]any); ok {
+			for k, v := range m {
+				f, ok := v.(textFile)
+				if !ok {
+					continue
+				}
+				text, err := readFile(string(f))
+				if err == nil && !utf8.Valid(text) {
+					err = fmt.Errorf("%s is not UTF-8 text", f)
+				}
+				if err != nil {
+					return failed(name, in, domain.NewError(domain.CodeInvalidRequest, "the file was not read: "+err.Error()), stdout, stderr)
+				}
+				m[k] = string(text)
+			}
+		}
 		var err error
 		if data, err = config.Encode(b); err != nil {
 			return failed(name, in, domain.NewError(domain.CodeInternalError, err.Error()), stdout, stderr)
@@ -209,7 +231,7 @@ func call(ctx context.Context, name string, in input, method, path string, body 
 	if err != nil {
 		return failed(name, in, unreachable(err.Error()), stdout, stderr)
 	}
-	return show(name, in, resp, answer, stdout, stderr)
+	return show(name, in, resp, answer, rowRender, stdout, stderr)
 }
 
 func unreachable(message string) *domain.Error {
@@ -231,9 +253,10 @@ func failed(name string, in input, e *domain.Error, stdout, stderr io.Writer) in
 }
 
 // show prints an answer: the body unchanged with --json, otherwise rendered
-// for a person, an error on stderr. A 2xx answer is exit 0, unless it holds
-// error findings, as validate does on an invalid configuration.
-func show(name string, in input, resp *http.Response, answer []byte, stdout, stderr io.Writer) int {
+// for a person, through the row's own renderer when it has one, an error on
+// stderr. A 2xx answer is exit 0, unless it holds error findings, as validate
+// does on an invalid configuration.
+func show(name string, in input, resp *http.Response, answer []byte, rowRender func(io.Writer, []byte) error, stdout, stderr io.Writer) int {
 	var findings struct {
 		Findings []domain.Finding `json:"findings"`
 	}
@@ -263,7 +286,10 @@ func show(name string, in input, resp *http.Response, answer []byte, stdout, std
 	case mediaType != "application/json" || !jsontext.Value(answer).IsValid():
 		_, _ = stdout.Write(answer) // the YAML of export
 	default:
-		if err := render(stdout, "", answer); err != nil {
+		if rowRender == nil {
+			rowRender = func(w io.Writer, v []byte) error { return render(w, "", v) }
+		}
+		if err := rowRender(stdout, answer); err != nil {
 			say(stderr, "%s: %v\n", name, err)
 			return exitFailure
 		}
@@ -361,4 +387,74 @@ func cell(v jsontext.Value) string {
 		s = string(v)
 	}
 	return printable(s)
+}
+
+// explained renders the answer of models explain in the layout of kick-off
+// section 3.2: one block per target, a blank line between blocks. Text from
+// the server is printable() like every rendered value; --json has the exact
+// bytes of each body.
+func explained(w io.Writer, answer []byte) error {
+	var v struct {
+		Targets []struct {
+			Target  string `json:"target"`
+			Skipped *struct {
+				Code  string `json:"code"`
+				Param string `json:"param"`
+			} `json:"skipped"`
+			Effort *struct {
+				Requested *string `json:"requested"`
+				Alias     *string `json:"alias"`
+				Sent      *string `json:"sent"`
+				Source    string  `json:"source"`
+				Adjusted  bool    `json:"adjusted"`
+			} `json:"effort"`
+			MaxOutput *struct {
+				Requested *int64 `json:"requested"`
+				Alias     *int64 `json:"alias"`
+				Sent      *int64 `json:"sent"`
+			} `json:"max_output"`
+			Changes string      `json:"changes"`
+			URL     string      `json:"url"`
+			Header  http.Header `json:"header"`
+			Body    string      `json:"body"`
+		} `json:"targets"`
+	}
+	if err := json.Unmarshal(answer, &v); err != nil {
+		return err
+	}
+	line := func(name, value string) { say(w, "%-12s%s\n", name, value) }
+	for i, b := range v.Targets {
+		if i > 0 {
+			say(w, "\n")
+		}
+		line("target", printable(b.Target))
+		switch e, m := b.Effort, b.MaxOutput; {
+		case b.Skipped != nil:
+			line("skipped", strings.TrimSpace(printable(b.Skipped.Code)+" "+printable(b.Skipped.Param)))
+		case e != nil && m != nil:
+			adjusted := ""
+			if e.Adjusted {
+				adjusted = " · adjusted"
+			}
+			line("effort", fmt.Sprintf("requested=%s · alias=%s · sent=%s · source=%s%s", layer(e.Requested), layer(e.Alias), layer(e.Sent), printable(e.Source), adjusted))
+			line("max output", fmt.Sprintf("requested=%s · alias=%s · sent=%s", layer(m.Requested), layer(m.Alias), layer(m.Sent)))
+			line("changes", cmp.Or(printable(b.Changes), "-"))
+			line("url", printable(b.URL))
+			for _, k := range slices.Sorted(maps.Keys(b.Header)) {
+				for _, h := range b.Header[k] {
+					line("header", printable(k+": "+h))
+				}
+			}
+			line("body", printable(b.Body))
+		}
+	}
+	return nil
+}
+
+// layer is one recorded value of a layer, "-" when absent.
+func layer[T string | int64](v *T) string {
+	if v == nil {
+		return "-"
+	}
+	return printable(fmt.Sprint(*v))
 }

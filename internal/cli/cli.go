@@ -49,6 +49,7 @@ const (
 	kindList                        // repeated: appends the value, a JSON string, to the list at path, in order
 	kindRaw                         // one JSON value, sent verbatim at path
 	kindAll                         // given without a value: appends "*" to the list at path
+	kindFile                        // a file path: the file's content, sent as a JSON string at path
 )
 
 // flagSpec is one flag of a command. A one-letter name is the short form the
@@ -67,10 +68,15 @@ type command struct {
 	needsYes func(in input) bool                                      // nil is never; without --yes, exit 2 (OPS-2)
 	request  func(in input) (method, path string, body any)           // the one admin call
 	local    func(ctx context.Context, in input, out io.Writer) error // runs without a server; errRemote hands over to request
+	render   func(out io.Writer, answer []byte) error                 // prints a 2xx answer without --json; nil is the generic renderer
 }
 
 // yamlFile is a request body: the file at that path, sent as YAML.
 type yamlFile string
+
+// textFile is a member of a request body: the content of the file at that
+// path, read when the request is sent and put there as a JSON string.
+type textFile string
 
 func get(path string) func(input) (string, string, any) {
 	return func(input) (string, string, any) { return http.MethodGet, path, nil }
@@ -178,11 +184,11 @@ func named(method, collection string) func(input) (string, string, any) {
 	}
 }
 
-// action is the request of a command that acts on the key its positional
-// argument names: a POST with the body flags given, {} when none.
-func action(verb string) func(input) (string, string, any) {
+// action is the request of a command that acts on the resource its
+// positional argument names: a POST with the body flags given, {} when none.
+func action(collection, verb string) func(input) (string, string, any) {
 	return func(in input) (string, string, any) {
-		return http.MethodPost, "/keys/" + url.PathEscape(in.args[0]) + "/" + verb, in.body
+		return http.MethodPost, collection + "/" + url.PathEscape(in.args[0]) + "/" + verb, in.body
 	}
 }
 
@@ -213,6 +219,12 @@ var commands = []command{
 	{words: []string{"models", "list"}, request: get("/models")},
 	{words: []string{"models", "show"}, args: []string{"name"}, request: named(http.MethodGet, "/models")},
 	{words: []string{"models", "set"}, args: []string{"name"}, flags: modelFlags, request: named(http.MethodPatch, "/models")},
+	{words: []string{"models", "explain"}, args: []string{"name"}, flags: []flagSpec{
+		{"endpoint", kindString, "endpoint", "chat (default) or messages"},
+		{"effort", kindString, "effort", "the client's reasoning effort, set on the body"},
+		{"max-output-tokens", kindNumber, "max_output_tokens", "the client's output cap, set on the body"},
+		{"body", kindFile, "body", "a file holding the exact request body (default: a minimal request to the alias)"},
+	}, request: action("/models", "explain"), render: explained},
 	{words: []string{"models", "remove"}, args: []string{"name"}, needsYes: func(input) bool { return true }, request: named(http.MethodDelete, "/models")},
 	{words: []string{"keys", "create"}, args: []string{"name"}, flags: keyFlags, request: add("/keys", "name")},
 	{words: []string{"keys", "list"}, request: get("/keys")},
@@ -220,8 +232,8 @@ var commands = []command{
 	{words: []string{"keys", "set"}, args: []string{"name"}, flags: keyFlags, request: named(http.MethodPatch, "/keys")},
 	{words: []string{"keys", "rotate"}, args: []string{"name"}, flags: []flagSpec{
 		{"grace", kindString, "grace", "how long the secret in use stays valid, such as 30m (default 1h)"},
-	}, request: action("rotate")},
-	{words: []string{"keys", "revoke"}, args: []string{"name"}, needsYes: func(input) bool { return true }, request: action("revoke")},
+	}, request: action("/keys", "rotate")},
+	{words: []string{"keys", "revoke"}, args: []string{"name"}, needsYes: func(input) bool { return true }, request: action("/keys", "revoke")},
 	{words: []string{"export"}, request: func(in input) (string, string, any) {
 		if in.json {
 			return http.MethodGet, "/export?format=json", nil
@@ -329,7 +341,7 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 		return exitUsage
 	}
 	method, path, body := cmd.request(in)
-	return call(ctx, name, in, method, path, body, stdout, stderr)
+	return call(ctx, name, in, method, path, body, cmd.render, stdout, stderr)
 }
 
 // match returns the command whose words lead args, and the arguments after them.

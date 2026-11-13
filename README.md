@@ -6,10 +6,11 @@ one data directory. MIT licensed.
 
 **Status: phase 2 in progress.** What works today: the store, the admin API and the CLI, providers (with eighteen
 built-in presets), targets, model aliases, client keys with rotation and revocation, `export`/`apply`/`validate`,
-`GET /v1/models`, and `POST /v1/chat/completions`, synchronous and streamed, toward providers of the `openai`
-protocol, with the parameter contract and reasoning control of the alias. Anthropic targets, `POST /v1/messages` and
-fallback arrive in the next steps of phase 2. The full specification is [kick-off.md](kick-off.md); the designs are
-[docs/design/phase-1.md](docs/design/phase-1.md) and [docs/design/phase-2.md](docs/design/phase-2.md).
+`models explain`, `GET /v1/models`, and `POST /v1/chat/completions`, synchronous and streamed, toward providers of
+the `openai` protocol, with the parameter contract and reasoning control of the alias. Anthropic targets,
+`POST /v1/messages` and fallback arrive in the next steps of phase 2. The full specification is
+[kick-off.md](kick-off.md); the designs are [docs/design/phase-1.md](docs/design/phase-1.md) and
+[docs/design/phase-2.md](docs/design/phase-2.md).
 
 ## Quick start
 
@@ -24,6 +25,7 @@ curl -sS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:4000/he
 ./stargaite providers add mock --protocol openai --base-url http://127.0.0.1:4010 --allow-private-network --billing none
 ./stargaite models add fast --target mock/mock
 ./stargaite keys create my-agent --model fast
+./stargaite models explain fast
 curl -s http://127.0.0.1:4000/v1/models -H "Authorization: Bearer sk-stargaite-..."
 curl -s http://127.0.0.1:4000/v1/chat/completions -H "Authorization: Bearer sk-stargaite-..." -d '{"model":"fast","messages":[{"role":"user","content":"hi"}]}'
 ```
@@ -31,9 +33,13 @@ curl -s http://127.0.0.1:4000/v1/chat/completions -H "Authorization: Bearer sk-s
 The mock provider listens on `127.0.0.1:4010`; `serve` puts the data plane on `127.0.0.1:4000`, the admin API on
 `127.0.0.1:4001` and the store in `./data`, and the health check waits until it is up. `models add` also creates the
 target `mock/mock`. `keys create` prints the client key once: paste it in place of `sk-stargaite-...` in the last two
-calls. The first lists the alias `fast`; the second sends a chat completion to it and gets the mock provider's answer,
-with the response headers `x-stargaite-request-id`, `x-stargaite-trace-id` and `x-stargaite-target` (add `-i` to
-`curl` to see them). Both processes log JSON lines to the terminal; `kill %1 %2` stops them.
+calls. `models explain` shows what the alias would send, without calling the provider: per target, the effort and
+output-cap layers, the list of changes, the URL, the headers without the credential and the body, which for the
+minimal request it explains by default are the bytes the last call sends (`--body <file>` explains a request of your
+own; `--json` gives each body's exact bytes). The first `curl` lists the alias `fast`; the second sends a chat
+completion to it and gets the mock provider's answer, with the response headers `x-stargaite-request-id`,
+`x-stargaite-trace-id` and `x-stargaite-target` (add `-i` to `curl` to see them). Both processes log JSON lines to the
+terminal; `kill %1 %2` stops them.
 `./stargaite --help` lists every command, and each one accepts `--json`, never prompts, and exits `0` on success, `1`
 on failure and `2` on wrong usage; `remove`, `keys revoke` and `apply --prune` (unless `--dry-run`) need `--yes`.
 

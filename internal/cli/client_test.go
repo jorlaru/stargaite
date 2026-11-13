@@ -90,6 +90,13 @@ func TestCommandWalk(t *testing.T) {
 
 	example := "../../config.example.yaml"
 	invalid := writeFile(t, "version: 2\n")
+	bodies := t.TempDir()
+	for _, n := range []string{"1", "2"} {
+		body := `{"model":"m` + n + `","messages":[{"role":"user","content":"hi"}],"temperature":0.5}`
+		if err := os.WriteFile(filepath.Join(bodies, "body"+n+".json"), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 	samples := map[string][]struct {
 		args []string
 		code int
@@ -121,9 +128,14 @@ func TestCommandWalk(t *testing.T) {
 			{[]string{"m@", "--target", "walk@/created"}, 1},
 			{[]string{"x", "--target", "walk@/a", "--target", "walk@/b", "--target", "walk@/c", "--target", "walk@/d"}, 1},
 		},
-		"models list":   {{nil, 0}},
-		"models show":   {{[]string{"m@"}, 0}, {[]string{"nope"}, 1}},
-		"models set":    {{[]string{"m@", "--param", "enable_search=drop", "--trace-sample-rate", "0"}, 0}, {[]string{"m@", "--target", "nope/x"}, 1}},
+		"models list": {{nil, 0}},
+		"models show": {{[]string{"m@"}, 0}, {[]string{"nope"}, 1}},
+		"models set":  {{[]string{"m@", "--param", "enable_search=drop", "--trace-sample-rate", "0"}, 0}, {[]string{"m@", "--target", "nope/x"}, 1}},
+		"models explain": {
+			{[]string{"m@"}, 0}, {[]string{"m@", "--effort", "low", "--max-output-tokens", "50", "--body", filepath.Join(bodies, "body@.json")}, 0},
+			{[]string{"m@", "--endpoint", "messages"}, 0}, {[]string{"m@", "--effort", "bogus"}, 1}, {[]string{"m@", "--max-output-tokens", "101"}, 1},
+			{[]string{"m@", "--body", filepath.Join(bodies, "none.json")}, 1}, {[]string{"m@", "--endpoint", "rerank"}, 1}, {[]string{"nope"}, 1},
+		},
 		"models remove": {{[]string{"m@", "--yes"}, 0}, {[]string{"nope", "--yes"}, 1}},
 		"keys create": {
 			{[]string{"k@", "--model", "fast", "--model", "deep", "--budget", "limit_usd=10,reset_interval=monthly", "--rpm-limit", "5", "--trace-sample-rate", "0.5"}, 0},
@@ -204,6 +216,7 @@ func recorder(t *testing.T, status int, body string) (*recorded, map[string]stri
 func TestRequests(t *testing.T) {
 	got, vars := recorder(t, http.StatusOK, "{}\n")
 	file := writeFile(t, "version: 1\n")
+	body := writeFile(t, "{\"model\": \"fast\",\n \"x\":\"\\u001b\"}\n")
 	for _, tc := range []struct {
 		args                 []string
 		method, target, body string
@@ -272,6 +285,12 @@ func TestRequests(t *testing.T) {
 		{[]string{"models", "show", "fast"}, "GET", "/admin/v1/models/fast", ""},
 		{[]string{"models", "set", "fast", "--target", "4", "--effort="}, "PATCH", "/admin/v1/models/fast", `{"reasoning":{"effort":null},"targets":["4"]}`},
 		{[]string{"models", "remove", "fast", "--yes"}, "DELETE", "/admin/v1/models/fast", ""},
+		{[]string{"models", "explain", "fast"}, "POST", "/admin/v1/models/fast/explain", `{}`},
+		{
+			[]string{"models", "explain", "a/b", "--endpoint", "messages", "--effort", "4", "--max-output-tokens", "100", "--body", body},
+			"POST", "/admin/v1/models/a%2Fb/explain", `{"body":"{\"model\": \"fast\",\n \"x\":\"\\u001b\"}\n","effort":"4","endpoint":"messages","max_output_tokens":100}`,
+		},
+		{[]string{"models", "explain", "fast", "--body=", "--effort="}, "POST", "/admin/v1/models/fast/explain", `{"body":null,"effort":null}`},
 		{[]string{"keys", "list"}, "GET", "/admin/v1/keys", ""},
 		{
 			[]string{"keys", "create", "my-agent", "--model", "fast", "--model", "4", "--budget", "limit_usd=100,reset_interval=monthly", "--rpm-limit", "60",
@@ -361,6 +380,9 @@ func TestUsage(t *testing.T) {
 		{"models", "add", "m", "--param", "x"},
 		{"models", "add", "m", "--level", "low"},
 		{"models", "show", "m", "n"},
+		{"models", "explain"},
+		{"models", "explain", "m", "--max-output-tokens", "x"},
+		{"models", "explain", "m", "--body"},
 		{"models", "remove", "m"},
 		{"keys", "create"},
 		{"keys", "create", "k", "--all-models=false"},
@@ -408,6 +430,8 @@ func TestFailures(t *testing.T) {
 		{"unreachable", map[string]string{"STARGAITE_ADMIN_KEY": testKey}, []string{"settings", "show", "--admin-url", refused}, "", codeUnreachable},
 		{"no admin key", nil, []string{"settings", "show", "--admin-url", refused, "--data-dir", t.TempDir()}, "", codeUnreachable},
 		{"unreadable file", vars, []string{"apply", "-f", t.TempDir()}, "", "invalid_request"},
+		{"unreadable body file", vars, []string{"models", "explain", "m", "--body", t.TempDir()}, "", "invalid_request"},
+		{"body file not UTF-8", vars, []string{"models", "explain", "m", "--body", writeFile(t, "{\"model\":\"m\xff\"}")}, "", "invalid_request"},
 		{"refused", refusing, []string{"apply", "-f", writeFile(t, "version: 1\n")}, refusal, ""},
 		{"error findings in a success", invalid, []string{"validate"}, "", ""},
 		{"a redirect is not followed", redirecting, []string{"settings", "show"}, "{}\n", ""},
@@ -479,6 +503,44 @@ resource.timeouts.connect_ms: 100
 revision: 2
 secrets.a (shown once, never again):
 sk-x
+`
+	if r.code != 0 || r.stdout != want {
+		t.Errorf("exit %d, stderr %q, stdout\n%s\nwant\n%s", r.code, r.stderr, r.stdout, want)
+	}
+}
+
+// TestExplainRender: models explain prints the layout of kick-off section
+// 3.2, one block per target; text from the server never reaches the
+// terminal raw.
+func TestExplainRender(t *testing.T) {
+	_, vars := recorder(t, http.StatusOK, `{"targets":[{"target":"anth/m","skipped":{"code":"endpoint_not_supported"}},`+
+		`{"target":"mock/up-1","effort":{"requested":"none","alias":"medium","sent":"low","source":"client","adjusted":true},`+
+		`"max_output":{"requested":null,"alias":32000,"sent":32000},"changes":"reasoning_effort:translated,max_tokens:added",`+
+		`"url":"http://127.0.0.1:4010/chat/completions","header":{"Content-Type":["application/json"]},"body":"{\"model\":\"up-1\",\n\"max_tokens\":32000}"},`+
+		`{"target":"mock/up-2","skipped":{"code":"capability_mismatch","param":"tools"}},`+
+		`{"target":"mock/up-3","effort":{"requested":null,"alias":null,"sent":null,"source":"provider_default","adjusted":false},`+
+		`"max_output":{"requested":null,"alias":null,"sent":null},"changes":"","url":"u","header":{},"body":"{}"}]}`+"\n")
+	r := runMain(vars, "models", "explain", "fast")
+	want := `target      anth/m
+skipped     endpoint_not_supported
+
+target      mock/up-1
+effort      requested=none · alias=medium · sent=low · source=client · adjusted
+max output  requested=- · alias=32000 · sent=32000
+changes     reasoning_effort:translated,max_tokens:added
+url         http://127.0.0.1:4010/chat/completions
+header      Content-Type: application/json
+body        "{\"model\":\"up-1\",\n\"max_tokens\":32000}"
+
+target      mock/up-2
+skipped     capability_mismatch tools
+
+target      mock/up-3
+effort      requested=- · alias=- · sent=- · source=provider_default
+max output  requested=- · alias=- · sent=-
+changes     -
+url         u
+body        {}
 `
 	if r.code != 0 || r.stdout != want {
 		t.Errorf("exit %d, stderr %q, stdout\n%s\nwant\n%s", r.code, r.stderr, r.stdout, want)

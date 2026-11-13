@@ -80,6 +80,7 @@ var routes = []route{
 	{"GET /admin/v1/models/{name}", (*server).showModel},
 	{"PATCH /admin/v1/models/{name}", (*server).setModel},
 	{"DELETE /admin/v1/models/{name}", (*server).removeModel},
+	{"POST /admin/v1/models/{name}/explain", (*server).explainModel},
 	{"GET /admin/v1/keys", (*server).listKeys},
 	{"POST /admin/v1/keys", (*server).createKey},
 	{"GET /admin/v1/keys/{name}", (*server).showKey},

@@ -405,6 +405,16 @@ func (h *handler) finish(rq *request, a *attempt) {
 	if !a.firstByte.IsZero() {
 		attrs = append(attrs, "first_byte_ms", a.firstByte.Sub(a.started).Milliseconds())
 	}
+	// What was sent, as Build read it back from the body (AC-09, AC-18).
+	if c := plan.Header(a.out.Changes); c != "" {
+		attrs = append(attrs, "params_changed", c)
+	}
+	if a.out.Effort.Sent != nil {
+		attrs = append(attrs, "effort_sent", *a.out.Effort.Sent)
+	}
+	if a.out.MaxOutput.Sent != nil {
+		attrs = append(attrs, "max_output_sent", *a.out.MaxOutput.Sent)
+	}
 	attrs = append(attrs, "response_model", a.obs.ResponseModel, "finish_reason", a.obs.FinishReason)
 	if a.obs.Usage != nil {
 		attrs = append(attrs, "usage", a.obs.Usage)

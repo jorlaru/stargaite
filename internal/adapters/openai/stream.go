@@ -26,13 +26,17 @@ type Stream struct {
 	tools map[string]bool                // "choice/tool call" indexes of the tool calls seen
 	think map[string]*reasoning.Stripper // by choice index; nil when the target declares no inline_think_tags
 	last  *params.Body                   // the last chunk read while think is set: the frame of the chunk released at [DONE]
+	quiet bool                           // drop the usage chunk: the proxy asked for it, the client did not
 }
 
 // NewStream is the Stream of one attempt toward target t of provider p,
-// which reads the cost at p's cost_report path.
-func NewStream(t *domain.Target, p *domain.Provider) *Stream {
+// which reads the cost at p's cost_report path. includeUsage is the client's
+// stream_options.include_usage: toward a provider whose stream_usage is
+// request without it, plan.Build asked for the usage chunk (USE-8), so Event
+// observes that chunk and does not emit it.
+func NewStream(t *domain.Target, p *domain.Provider, includeUsage bool) *Stream {
 	cr := report(p)
-	s := &Stream{cost: cr, walk: params.Reply(params.ChatReply, cr.Path)}
+	s := &Stream{cost: cr, walk: params.Reply(params.ChatReply, cr.Path), quiet: p.StreamUsage == domain.StreamUsageRequest && !includeUsage}
 	if t.InlineThinkTags {
 		s.think = map[string]*reasoning.Stripper{}
 	}
@@ -56,7 +60,9 @@ func (e *ErrorChunk) Error() string { return "the provider's stream reported an 
 // of every delta's content, each tool call once, whether a think block was
 // removed, the latest usage that is not null, which arrives when the client
 // asked for it (stream_options.include_usage) or the provider sends it
-// unasked, and the latest cost at the provider's cost_report path.
+// unasked, and the latest cost at the provider's cost_report path. A chunk
+// with no choice and a usage object that only the proxy asked for (NewStream)
+// is observed and not emitted; a "usage": null on any other chunk is relayed.
 //
 // Toward a target that declares inline_think_tags, each choice's delta
 // content goes through its own reasoning.Stripper and is re-encoded only when
@@ -134,7 +140,8 @@ func (s *Stream) Event(_ string, data []byte, emit func(name string, data []byte
 			}
 		}
 	}
-	if u := usage(b); u != nil {
+	u := usage(b)
+	if u != nil {
 		s.obs.Usage = u
 	}
 	if c := params.Cost(b, s.cost.Path, s.cost.USDPerUnit); c != nil {
@@ -142,6 +149,9 @@ func (s *Stream) Event(_ string, data []byte, emit func(name string, data []byte
 	}
 	if s.think != nil {
 		s.last = b
+	}
+	if _, choice := b.Get("choices", "0"); s.quiet && u != nil && !choice {
+		return nil
 	}
 	if ops != nil {
 		var err error

@@ -155,6 +155,123 @@ func TestChatStream(t *testing.T) {
 	}
 }
 
+// streamUsageConfig has one target on the mock behind a provider that leaves
+// stream_usage undeclared and one behind a provider that streams usage only
+// on request (USE-8), and aliases that fall back from each to the other.
+const streamUsageConfig = `version: 1
+settings: { timeouts: { first_byte_ms: 300, stream_idle_ms: 300 } }
+providers:
+  mock: { protocol: openai, base_url: MOCK, api_key_env: MOCK_KEY, billing: none, allow_private_network: true }
+  req: { protocol: openai, base_url: MOCK, api_key_env: MOCK_KEY, billing: none, allow_private_network: true, stream_usage: request }
+targets:
+  mock/up-2: { kind: chat }
+  req/up-2: { kind: chat }
+models:
+  plain: { targets: [mock/up-2] }
+  req: { targets: [req/up-2] }
+  req-first: { targets: [req/up-2, mock/up-2] }
+  plain-first: { targets: [mock/up-2, req/up-2] }
+keys:
+  agent: { models: ["*"] }
+`
+
+// TestChatStreamUsage is USE-8 and AC-33 on a chat stream: the same upstream
+// stream keeps its usage chunk toward an undeclared stream_usage (the golden)
+// and loses it toward stream_usage request when the client did not ask for
+// it, though the record holds the provider's tokens; the provider gets
+// stream_options.include_usage true, listed added, or translated over the
+// client's false, and models explain shows the same bytes and list (AC-17);
+// a client that asked gets the chunk and nothing is listed. On a fallback
+// each attempt decides for its own target. Against a mock that streams usage
+// only on request, a request provider's tokens come from the provider and an
+// undeclared one's are estimated.
+func TestChatStreamUsage(t *testing.T) {
+	s := newStreamFixture(t, streamUsageConfig)
+	up, err := os.ReadFile("testdata/openai-stream.up.sse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	down, err := os.ReadFile("testdata/openai-stream.down.sse")
+	if err != nil {
+		t.Fatal(err)
+	}
+	usageEvent := regexp.MustCompile(`data: \{[^\n]*"choices":\[\],"usage":\{[^\n]*\n\n`)
+	if len(usageEvent.FindAll(down, -1)) != 1 {
+		t.Fatalf("the golden has no single usage event:\n%s", down)
+	}
+	quiet := string(usageEvent.ReplaceAll(down, nil))
+	const injected = `,"stream_options":{"include_usage":true}`
+	for _, tc := range []struct {
+		alias, extra string
+		fail         bool   // the first target answers 500
+		want         string // the client's bytes
+		changes      string
+		sent         string // the members after "stream":true in the body of the call that answered
+	}{
+		{"plain", "", false, string(down), "", ""},
+		{"req", "", false, quiet, "stream_options:added", injected},
+		{"req", `,"stream_options":{"include_usage":true}`, false, string(down), "", `,"stream_options":{"include_usage":true}`},
+		{"req", `,"stream_options":{"include_usage":false}`, false, quiet, "stream_options:translated", injected},
+		{"req-first", "", true, string(down), "", ""},
+		{"plain-first", "", true, quiet, "stream_options:added", injected},
+	} {
+		body := chatBody(tc.alias, `,"stream":true`+tc.extra)
+		if tc.fail {
+			s.mock.Script(mockprovider.Step{Status: http.StatusInternalServerError})
+		}
+		s.mock.Script(mockprovider.Step{Chunks: [][]byte{up}})
+		before := len(s.mock.Calls())
+		resp, got := s.post(t, body)
+		calls := s.mock.Calls()[before:]
+		if resp.StatusCode != http.StatusOK || got != tc.want || resp.Header.Get(changedHeader) != tc.changes || (tc.changes == "") != (resp.Header.Values(changedHeader) == nil) {
+			t.Errorf("%s%s: %d, changes %q, got\n%s", tc.alias, tc.extra, resp.StatusCode, resp.Header.Get(changedHeader), got)
+		}
+		last := calls[len(calls)-1]
+		if want := chatBody("up-2", `,"stream":true`+tc.sent); string(last.Body) != want {
+			t.Errorf("%s%s: the provider got %s, want %s", tc.alias, tc.extra, last.Body, want)
+		}
+		if tc.fail {
+			if len(calls) != 2 || strings.Contains(string(calls[0].Body), "stream_options") == (tc.alias == "plain-first") {
+				t.Errorf("%s: %d calls, the first %s", tc.alias, len(calls), calls[0].Body)
+			}
+			continue
+		}
+		req, _ := json.Marshal(map[string]string{"body": body})
+		var ex struct{ Targets []explainBlock }
+		if w := call(s.admin, "Bearer "+adminKey, http.MethodPost, "/admin/v1/models/"+tc.alias+"/explain", req); json.Unmarshal(w.Body.Bytes(), &ex) != nil ||
+			len(ex.Targets) != 1 || ex.Targets[0].Body != string(last.Body) || ex.Targets[0].Changes != tc.changes {
+			t.Errorf("%s%s: explain %s, the provider got %s", tc.alias, tc.extra, w.Body, last.Body)
+		}
+	}
+	for i, r := range s.stored(t, 8) {
+		if r.Status == http.StatusOK && (r.TokensSource != "provider" || r.Input != 12 || r.Output != 7 || num(r.Reasoning) != 3) {
+			t.Errorf("record %d: %+v", i+1, r)
+		}
+	}
+
+	// AC-33 against a provider that streams usage only when asked.
+	s = newStreamFixture(t, streamUsageConfig)
+	s.mock.UsageOnRequest = true
+	direct, err := http.Post(s.mockURL+"/chat/completions", "application/json", strings.NewReader(`{"stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bare, _ := io.ReadAll(direct.Body)
+	_ = direct.Body.Close()
+	for _, alias := range []string{"req", "plain"} {
+		if resp, got := s.post(t, streamBody(alias)); resp.StatusCode != http.StatusOK || got != string(bare) || usageEvent.MatchString(got) {
+			t.Errorf("%s: %d %s", alias, resp.StatusCode, got)
+		}
+	}
+	rows := s.stored(t, 2)
+	if r := rows[0]; r.Target != "req/up-2" || r.TokensSource != "provider" || r.Input != 1 || r.Output != 2 || str(r.ParamsChanged) != "stream_options:added" {
+		t.Errorf("toward request: %+v", r)
+	}
+	if r := rows[1]; r.Target != "mock/up-2" || r.TokensSource != "estimated" || r.Output != 3 { // "mock reply" is 10 visible bytes
+		t.Errorf("toward undeclared: %+v", r)
+	}
+}
+
 // TestSDKStreamRequests is AC-01 for streams: the stream requests recorded
 // from the OpenAI Python SDK 3.50.0 and Node SDK 7.56.0, which ask for the
 // usage chunk, reach the provider with only the alias's edits, and every

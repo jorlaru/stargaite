@@ -128,7 +128,8 @@ type relay struct {
 // relayFor is the relay of an attempt on endpoint ep toward t for client c:
 // messages toward anthropic is the native Messages relay; chat toward
 // openai is the native chat relay, chat toward anthropic the translated one,
-// whose chunks take created from now. Build skips messages toward openai.
+// whose chunks take created from now; neither relays a usage chunk only the
+// proxy asked for (USE-8). Build skips messages toward openai.
 func relayFor(ep domain.Endpoint, t *config.Target, c *plan.Client, now func() time.Time) relay {
 	tg, p := &t.Spec, &t.Provider.Spec
 	switch {
@@ -149,7 +150,7 @@ func relayFor(ep domain.Endpoint, t *config.Target, c *plan.Client, now func() t
 			observed: s.Observed,
 		}
 	}
-	s := openai.NewStream(tg, p)
+	s := openai.NewStream(tg, p, c.Usage)
 	return relay{
 		sync:     func(body []byte, _ time.Time) ([]byte, domain.Observed, error) { return openai.Observe(tg, p, body) },
 		event:    s.Event,

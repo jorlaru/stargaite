@@ -1,0 +1,60 @@
+[
+	{
+		"case": "request, no stream_options",
+		"changes": "stream_options:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true,\"stream_options\":{\"include_usage\":true}}"
+	},
+	{
+		"case": "request, empty stream_options",
+		"changes": "stream_options:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true,\"stream_options\":{\"include_usage\":true}}"
+	},
+	{
+		"case": "request, another member kept",
+		"changes": "stream_options:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream_options\":{\"x\":[1],\"include_usage\":true},\"stream\":true}"
+	},
+	{
+		"case": "request, the client's false",
+		"changes": "stream_options:translated",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true,\"stream_options\":{\"include_usage\":true,\"x\":1}}"
+	},
+	{
+		"case": "request, the client's true",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true,\"stream_options\":{\"include_usage\":true}}"
+	},
+	{
+		"case": "request, after the alias's changes",
+		"changes": "max_tokens:added,reasoning_effort:added,stream_options:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true,\"max_tokens\":100,\"reasoning_effort\":\"high\",\"stream_options\":{\"include_usage\":true}}"
+	},
+	{
+		"case": "request, not a stream",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":false,\"stream_options\":{\"include_usage\":false}}"
+	},
+	{
+		"case": "request, stream_options unsupported",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true}"
+	},
+	{
+		"case": "native",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true}"
+	},
+	{
+		"case": "none",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true}"
+	},
+	{
+		"case": "undeclared",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true}"
+	},
+	{
+		"case": "request, chat toward anthropic",
+		"changes": "protocol:translated,max_tokens:added",
+		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true,\"max_tokens\":100}"
+	},
+	{
+		"case": "request, messages toward anthropic",
+		"body": "{\"model\":\"up-1\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true}"
+	}
+]

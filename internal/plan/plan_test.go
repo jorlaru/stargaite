@@ -795,3 +795,55 @@ func TestBudgetRewritten(t *testing.T) {
 		t.Errorf("got %s %q %q", out.Body, Header(out.Changes), val(out.Effort.Sent))
 	}
 }
+
+// TestStreamOptions is the USE-8 injection, in testdata/stream_options.json:
+// a chat stream toward an openai target whose provider streams usage only on
+// request gets stream_options.include_usage true, its parent created or its
+// other members kept, listed added, or translated over the client's false,
+// after every other change; a client that asked, a call that does not
+// stream, native, none and undeclared stream_usage, a target that declares
+// stream_options unsupported, and anthropic targets get nothing.
+func TestStreamOptions(t *testing.T) {
+	type injected struct {
+		Case    string `json:"case"`
+		Changes string `json:"changes,omitempty"`
+		Body    string `json:"body"`
+	}
+	request := &domain.Provider{Protocol: domain.ProtocolOpenAI, StreamUsage: domain.StreamUsageRequest}
+	anthRequest := &domain.Provider{Protocol: domain.ProtocolAnthropic, StreamUsage: domain.StreamUsageRequest}
+	alias := &domain.Model{MaxOutputTokens: 100, Reasoning: domain.ModelReasoning{Effort: "high", Mode: domain.ModeDefault}}
+	levels := domain.Target{Reasoning: &domain.Reasoning{Dialect: "reasoning_effort", Levels: []string{"low", "high"}}}
+	body := func(extra string) string {
+		return `{"model":"a","messages":[{"role":"user","content":"hi"}]` + extra + `}`
+	}
+	var got []injected
+	for _, tc := range []struct {
+		name string
+		ep   domain.Endpoint
+		p    *domain.Provider
+		body string
+		m    *domain.Model
+		tg   domain.Target
+	}{
+		{"request, no stream_options", "chat", request, body(`,"stream":true`), nil, domain.Target{}},
+		{"request, empty stream_options", "chat", request, body(`,"stream":true,"stream_options":{}`), nil, domain.Target{}},
+		{"request, another member kept", "chat", request, body(`,"stream_options":{"x":[1]},"stream":true`), nil, domain.Target{}},
+		{"request, the client's false", "chat", request, body(`,"stream":true,"stream_options":{"include_usage":false,"x":1}`), nil, domain.Target{}},
+		{"request, the client's true", "chat", request, body(`,"stream":true,"stream_options":{"include_usage":true}`), nil, domain.Target{}},
+		{"request, after the alias's changes", "chat", request, body(`,"stream":true`), alias, levels},
+		{"request, not a stream", "chat", request, body(`,"stream":false,"stream_options":{"include_usage":false}`), nil, domain.Target{}},
+		{"request, stream_options unsupported", "chat", request, body(`,"stream":true`), nil, domain.Target{UnsupportedParams: []string{"stream_options"}}},
+		{"native", "chat", &domain.Provider{Protocol: domain.ProtocolOpenAI, StreamUsage: domain.StreamUsageNative}, body(`,"stream":true`), nil, domain.Target{}},
+		{"none", "chat", &domain.Provider{Protocol: domain.ProtocolOpenAI, StreamUsage: domain.StreamUsageNone}, body(`,"stream":true`), nil, domain.Target{}},
+		{"undeclared", "chat", openai, body(`,"stream":true`), nil, domain.Target{}},
+		{"request, chat toward anthropic", "chat", anthRequest, body(`,"stream":true,"stream_options":{"include_usage":false}`), &domain.Model{MaxOutputTokens: 100}, domain.Target{}},
+		{"request, messages toward anthropic", "messages", anthRequest, `{"model":"a","max_tokens":10,"messages":[{"role":"user","content":"hi"}],"stream":true}`, nil, domain.Target{}},
+	} {
+		out, skip := runTo(t, tc.ep, tc.p, tc.body, tc.m, tc.tg)
+		if skip != nil {
+			t.Fatalf("%s: skipped %+v", tc.name, skip)
+		}
+		got = append(got, injected{tc.name, Header(out.Changes), string(out.Body)})
+	}
+	golden(t, filepath.Join("testdata", "stream_options.json"), got)
+}

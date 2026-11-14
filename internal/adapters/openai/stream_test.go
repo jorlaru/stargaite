@@ -32,7 +32,7 @@ func TestStream(t *testing.T) {
 		`{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2}}`,
 		`{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":5}}}`,
 	}
-	s := NewStream(&domain.Target{}, &domain.Provider{})
+	s := NewStream(&domain.Target{}, &domain.Provider{}, false)
 	for _, c := range chunks {
 		if err := s.Event("", []byte(c), emit); err != nil {
 			t.Fatalf("%s: %v", c, err)
@@ -78,6 +78,67 @@ func TestStream(t *testing.T) {
 	}
 	if err := s.Event("", []byte(`{"error":null,"choices":[]}`), emit); err != nil {
 		t.Errorf("a null error member: %v", err)
+	}
+}
+
+// TestStreamUsageChunk is USE-8 in the relay: toward a provider whose
+// stream_usage is request, for a client that did not ask for it, the usage
+// chunk (no choice, a usage object) is observed, its cost included, and not
+// emitted; a "usage": null on other chunks, a chunk with a choice and a
+// usage, and every chunk toward native, none or an undeclared stream_usage,
+// or for a client that asked, are emitted as they came.
+func TestStreamUsageChunk(t *testing.T) {
+	chunks := []string{
+		`{"id":"c","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}],"usage":null}`,
+		`{"id":"c","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1}}`,
+		`{"id":"c","choices":[],"usage":null}`,
+		`{"id":"c","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13,"cost":0.5}}`,
+		`[DONE]`,
+	}
+	for _, tc := range []struct {
+		streamUsage  string
+		includeUsage bool
+		dropped      bool
+	}{
+		{domain.StreamUsageRequest, false, true},
+		{domain.StreamUsageRequest, true, false},
+		{domain.StreamUsageNative, false, false},
+		{domain.StreamUsageNone, false, false},
+		{"", false, false},
+	} {
+		var emitted []string
+		emit := func(_ string, data []byte) error {
+			emitted = append(emitted, string(data))
+			return nil
+		}
+		p := &domain.Provider{StreamUsage: tc.streamUsage, CostReport: &domain.CostReport{Path: "usage.cost", USDPerUnit: 1}}
+		s := NewStream(&domain.Target{}, p, tc.includeUsage)
+		for _, c := range chunks {
+			if err := s.Event("", []byte(c), emit); err != nil && err != io.EOF {
+				t.Fatalf("%+v: %s: %v", tc, c, err)
+			}
+		}
+		want := chunks
+		if tc.dropped {
+			want = []string{chunks[0], chunks[1], chunks[2], chunks[4]}
+		}
+		o := s.Observed()
+		if !reflect.DeepEqual(emitted, want) || !reflect.DeepEqual(o.Usage, &domain.Usage{Input: 9, Output: 4}) || o.Cost == nil || *o.Cost != 0.5 {
+			t.Errorf("%+v: emitted %q, observed %+v", tc, emitted, o)
+		}
+	}
+
+	// Toward inline_think_tags, the dropped chunk frames the held text
+	// released before [DONE], without its usage.
+	var emitted []string
+	s := NewStream(&domain.Target{InlineThinkTags: true}, &domain.Provider{StreamUsage: domain.StreamUsageRequest}, false)
+	for _, c := range []string{`{"id":"t","choices":[{"index":0,"delta":{"content":"a<"}}]}`, `{"id":"t","choices":[],"usage":{"prompt_tokens":2}}`, `[DONE]`} {
+		_ = s.Event("", []byte(c), func(_ string, data []byte) error { emitted = append(emitted, string(data)); return nil })
+	}
+	want := []string{`{"id":"t","choices":[{"index":0,"delta":{"content":"a"}}]}`,
+		`{"id":"t","choices":[{"index":0,"delta":{"content":"<"},"finish_reason":null}]}`, `[DONE]`}
+	if !reflect.DeepEqual(emitted, want) || s.Observed().Usage.Input != 2 {
+		t.Errorf("think: emitted %q, observed %+v", emitted, s.Observed())
 	}
 }
 
@@ -136,7 +197,7 @@ func TestStreamThink(t *testing.T) {
 			emitted = append(emitted, string(data))
 			return nil
 		}
-		s := NewStream(&domain.Target{InlineThinkTags: true}, &domain.Provider{})
+		s := NewStream(&domain.Target{InlineThinkTags: true}, &domain.Provider{}, false)
 		for i, c := range in {
 			if err := s.Event("", []byte(c), emit); err != nil && (err != io.EOF || i != len(in)-1) {
 				t.Fatalf("%s: %s: %v", tt.name, c, err)
@@ -147,7 +208,7 @@ func TestStreamThink(t *testing.T) {
 		}
 
 		emitted = nil
-		s = NewStream(&domain.Target{}, &domain.Provider{})
+		s = NewStream(&domain.Target{}, &domain.Provider{}, false)
 		for _, c := range in {
 			_ = s.Event("", []byte(c), emit)
 		}
@@ -224,7 +285,7 @@ func FuzzStreamThink(f *testing.F) {
 			}
 			return nil
 		}
-		s := NewStream(&domain.Target{InlineThinkTags: true}, &domain.Provider{})
+		s := NewStream(&domain.Target{InlineThinkTags: true}, &domain.Provider{}, false)
 		for _, c := range in {
 			if err := s.Event("", []byte(c), emit); err != nil && err != io.EOF {
 				t.Fatalf("%q: %v", c, err)

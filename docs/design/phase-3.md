@@ -362,6 +362,14 @@ Settled in C22:
 - **Output rule.** A `total_tokens` below `prompt_tokens + completion_tokens` leaves `completion_tokens`; a missing total counts as 0. The Mistral fallback applies only when `prompt_tokens_details.cached_tokens` is not an integer.
 - **Estimates.** A `2xx` stream whose relay failed before any event (not an event stream) and an oversized synchronous `2xx` are estimated like a cut stream: input from the bytes sent, output from the visible bytes, which are 0, so `content_empty` is set.
 
+Settled in C24:
+
+- **Place in the change list.** The injection is the last op of `Build` and `stream_options:added` or `:translated` the last change, after the cap, the reasoning edit and its side keys (phase-2 §5 order, extended).
+- **A target that declares `stream_options` unsupported** gets no injection: its `unsupported_params` is the operator's statement that the member must not reach it, and the only way it could be dropped by a rule is that same declaration (`drop` applies to a known key only when it is unsupported). Its stream records estimated tokens unless the provider sends usage anyway.
+- **Which chunk is dropped.** A chunk with no element in `choices` (absent or `[]`) and an object at `usage`, the value the observation reads; a `"usage": null` chunk, with or without choices, is relayed. Toward a target that declares `inline_think_tags`, a dropped chunk is still the frame of the chunk released before `[DONE]`, which never carries `usage`.
+- **Mock.** `Server.UsageOnRequest` is set before the first request; it removes only the default chat stream's usage chunk and leaves scripted steps and the Messages stream alone. The standalone `cmd/mockprovider` gains no flag: a test sets the field.
+- **Corpus.** The C15 corpus gains a provider with `stream_usage: request` and a client `include_usage: false`, and requires at least one request listed `stream_options:added` and one `:translated`, so AC-09, AC-17 and the record cover the injection.
+
 ## 7. Limits
 
 ```go

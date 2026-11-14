@@ -25,13 +25,15 @@ import (
 // can_disable false, a target cap and unsupported parameters, three targets
 // of the anthropic protocol on the same mock, and three aliases per target:
 // an effort in default mode with a cap, a forced effort, and parameter
-// rules. Three aliases list several targets, so a static skip sends the
+// rules; a provider that streams usage only on request (USE-8). Three
+// aliases list several targets, so a static skip sends the
 // request to the next one; another skips both targets with different codes,
 // so the first skip is told from the last (RES-10).
 const corpusConfig = `version: 1
 providers:
   mock: { protocol: openai, base_url: MOCK, api_key_env: MOCK_KEY, billing: none, allow_private_network: true }
   anth: { protocol: anthropic, base_url: MOCK, api_key_env: ANTH_KEY, billing: none, allow_private_network: true }
+  req: { protocol: openai, base_url: MOCK, api_key_env: MOCK_KEY, billing: none, allow_private_network: true, stream_usage: request }
 targets:
   mock/none: { kind: chat }
   mock/re: { kind: chat, reasoning: { dialect: reasoning_effort, levels: [low, medium, high], can_disable: true } }
@@ -46,6 +48,7 @@ targets:
   anth/ae: { kind: chat, inline_think_tags: true, reasoning: { dialect: adaptive_effort, levels: [low, medium, high], can_disable: true } }
   anth/tb: { kind: chat, max_output_tokens: 8000, unsupported_params: [top_p], reasoning: { dialect: thinking_budget, levels: [low, medium, high], budgets: { low: 1024, medium: 2048, high: 4096 } } }
   anth/none: { kind: chat, capabilities: { vision: false } }
+  req/re: { kind: chat, reasoning: { dialect: reasoning_effort, levels: [low, medium, high], can_disable: true } }
 models:
 TARGETS  mixed: { targets: [mock/plain, mock/cap, mock/re], reasoning: { effort: low, mode: default } }
   mixed3: { targets: [anth/ae, mock/re], max_output_tokens: 900, reasoning: { effort: medium, mode: default } }
@@ -56,7 +59,7 @@ keys:
 `
 
 var corpusTargets = []string{"mock/none", "mock/re", "mock/re-free", "mock/ro", "mock/tt", "mock/et", "mock/tb", "mock/ae", "mock/cap", "mock/plain",
-	"anth/ae", "anth/tb", "anth/none"}
+	"anth/ae", "anth/tb", "anth/none", "req/re"}
 
 // corpusAliases are the three aliases of each target, in YAML, named after
 // the target with its slash as a dash. An anthropic target needs a cap on
@@ -138,7 +141,7 @@ func corpusBody(r *rand.Rand, alias string) string {
 	if pick(0.2) {
 		members = append(members, `"stream":true`)
 		if pick(0.5) {
-			members = append(members, `"stream_options":{"include_usage":true}`)
+			members = append(members, `"stream_options":{"include_usage":`+[]string{"true", "false"}[r.IntN(2)]+`}`)
 		}
 	}
 	// Only the aliases with rules take these; any other refuses them (PAR-2).
@@ -309,7 +312,7 @@ func TestCorpus(t *testing.T) {
 	r := rand.New(rand.NewPCG(seed, seed))
 	served, refused, allSkipped, streamed, translatedStreams := map[string]int{}, 0, 0, 0, 0
 	msgServed, msgRefused, msgSkipped, msgStreamed := 0, 0, 0, 0
-	logged := 0
+	logged, injected := 0, map[string]int{} // injected: requests by the stream_options action listed (USE-8)
 	type sentValues struct {
 		changes, effort string
 		maxOutput       *int64
@@ -504,6 +507,11 @@ func TestCorpus(t *testing.T) {
 		}
 
 		recorded[h.Get(domain.RequestIDHeader)] = sentValues{b.Changes, effort, maxOutput}
+		for _, a := range []string{"added", "translated"} {
+			if strings.Contains(b.Changes, "stream_options:"+a) {
+				injected[a]++
+			}
+		}
 
 		// AC-09: what differs is what is listed.
 		check := listed
@@ -533,10 +541,11 @@ func TestCorpus(t *testing.T) {
 			t.Errorf("no generated body was served by %s", id)
 		}
 	}
-	if refused == 0 || allSkipped == 0 || streamed == 0 || translatedStreams == 0 || msgRefused == 0 || msgSkipped == 0 || msgServed == 0 || msgStreamed == 0 {
-		t.Errorf("the corpus has %d refusals, %d bodies every target skipped, %d streams and %d streams toward anthropic; "+
+	if refused == 0 || allSkipped == 0 || streamed == 0 || translatedStreams == 0 || msgRefused == 0 || msgSkipped == 0 || msgServed == 0 || msgStreamed == 0 ||
+		injected["added"] == 0 || injected["translated"] == 0 {
+		t.Errorf("the corpus has %d refusals, %d bodies every target skipped, %d streams and %d streams toward anthropic, stream_options listed %v; "+
 			"on /v1/messages %d refusals, %d bodies every target skipped, %d served and %d streams; each kind needs one",
-			refused, allSkipped, streamed, translatedStreams, msgRefused, msgSkipped, msgServed, msgStreamed)
+			refused, allSkipped, streamed, translatedStreams, injected, msgRefused, msgSkipped, msgServed, msgStreamed)
 	}
 }
 

@@ -261,7 +261,8 @@ func Header(cs []Change) string {
 
 // Build edits the inbound body for one target (design section 5): the
 // endpoint, PAR-4, the protocol mapping, the alias's rules and PAR-12, the
-// cap, the reasoning edit and its side keys, in the order of Changes. Drops
+// cap, the reasoning edit and its side keys, and on a native chat stream the
+// include_usage a request provider needs (USE-8), in the order of Changes. Drops
 // are applied first, so the mapping, the cap and the reasoning edit see the
 // body without them; the rest is one Edit. Chat toward an anthropic target is
 // the translated path: the new body of anthropic.FromChat, listed
@@ -371,6 +372,20 @@ func Build(in Input) (*Outgoing, *Skip) {
 	edit := reasoning.Translate(choice, b, ep, t.Reasoning)
 	ops = append(ops, edit.Ops...)
 	out.Changes = append(out.Changes, edit.Changes...)
+
+	// USE-8: a request provider streams usage only when asked. An explicit
+	// false of the client is a changed value, absent it is an addition (phase-3
+	// design section 17 point 21); a target that declares stream_options
+	// unsupported is not sent it.
+	if native && ep == domain.EndpointChat && c.Stream && !c.Usage && p.StreamUsage == domain.StreamUsageRequest &&
+		!slices.Contains(t.UnsupportedParams, "stream_options") {
+		action := reasoning.ActionAdded
+		if _, ok := b.Get("stream_options", "include_usage"); ok {
+			action = reasoning.ActionTranslated
+		}
+		ops = append(ops, params.Op{Path: []string{"stream_options", "include_usage"}, Value: []byte("true")})
+		out.Changes = append(out.Changes, Change{Name: "stream_options", Action: action})
+	}
 
 	if out.Body, err = b.Edit(ops...); err != nil {
 		return nil, &Skip{Code: domain.CodeInternalError, Param: err.Error()}

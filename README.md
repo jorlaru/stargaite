@@ -59,10 +59,12 @@ that fell back leaves one per attempt: the key, the alias, the target, the model
 when it is not the one sent), the finish reason, the tokens (input with its cache parts, output with its reasoning
 part), the requested, alias and sent effort and output cap, the parameter changes, the configuration revision and the
 version. Tokens are the provider's own figures; when a `2xx` answer brought none, or was cut, they are estimated from
-the bytes (a quarter of them, rounded up) and marked `estimated`. A provider is billed `pay_per_use`, `subscription`
-or `none`; only `pay_per_use` calls have a cost, read from the response at the provider's `cost_report` path when it
-declares one (OpenRouter and xAI do), else computed from the target's `--pricing`, else left empty and counted as
-unpriced: it is never guessed. Records reach the store in batches within 50 ms; on `SIGTERM` the pending ones are
+the bytes (a quarter of them, rounded up) and marked `estimated`. Toward a provider whose `stream_usage` is `request`
+(OpenAI's preset among others), a streamed chat asks for the usage chunk with `stream_options.include_usage`, listed in
+`x-stargaite-params-changed`, and relays that chunk only to a client that asked for it. A provider is billed
+`pay_per_use`, `subscription` or `none`; only `pay_per_use` calls have a cost, read from the response at the provider's
+`cost_report` path when it declares one (OpenRouter and xAI do), else computed from the target's `--pricing`, else left
+empty and counted as unpriced: it is never guessed. Records reach the store in batches within 50 ms; on `SIGTERM` the pending ones are
 written before the store closes, and a record that cannot be stored is written to the log as one `CRITICAL` line
 instead of being lost. A crash loses at most the records not yet committed. When the store fails three commits in a
 row it is unavailable: `pay_per_use` targets are passed over (`503 usage_store_unavailable` when the alias has no

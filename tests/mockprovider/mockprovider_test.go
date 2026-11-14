@@ -120,6 +120,50 @@ func TestDefaultStreams(t *testing.T) {
 	}
 }
 
+// UsageOnRequest sends the default chat stream's usage chunk only to a body
+// with stream_options.include_usage true, and drops nothing else; without it
+// every body gets the chunk. The Messages stream is the same either way.
+func TestUsageOnRequest(t *testing.T) {
+	const usage = `data: {"id":"chatcmpl-mock","object":"chat.completion.chunk","created":0,"model":"mock","choices":[],` +
+		`"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}` + "\n\n"
+	full := map[string][]byte{}
+	srv := httptest.NewServer(New())
+	defer srv.Close()
+	for _, path := range []string{"/chat/completions", "/v1/messages"} {
+		_, _, full[path] = send(t, srv, http.MethodPost, path, nil, []byte(`{"stream":true}`))
+	}
+	if !bytes.Contains(full["/chat/completions"], []byte(usage)) {
+		t.Fatalf("the default stream has no usage chunk: %s", full["/chat/completions"])
+	}
+	m := New()
+	m.UsageOnRequest = true
+	srvOn := httptest.NewServer(m)
+	defer srvOn.Close()
+	for _, tc := range []struct {
+		body  string
+		usage bool
+	}{
+		{`{"stream":true}`, false},
+		{`{"stream":true,"stream_options":{}}`, false},
+		{`{"stream":true,"stream_options":{"include_usage":false}}`, false},
+		{`{"stream":true,"stream_options":{"include_usage":true}}`, true},
+	} {
+		want := bytes.Replace(full["/chat/completions"], []byte(usage), nil, 1)
+		if tc.usage {
+			want = full["/chat/completions"]
+		}
+		if status, _, got := send(t, srvOn, http.MethodPost, "/chat/completions", nil, []byte(tc.body)); status != http.StatusOK || !bytes.Equal(got, want) {
+			t.Errorf("%s: %d %s", tc.body, status, got)
+		}
+		if _, _, got := send(t, srv, http.MethodPost, "/chat/completions", nil, []byte(tc.body)); !bytes.Equal(got, full["/chat/completions"]) {
+			t.Errorf("%s without UsageOnRequest: %s", tc.body, got)
+		}
+	}
+	if _, _, got := send(t, srvOn, http.MethodPost, "/v1/messages", nil, []byte(`{"stream":true}`)); !bytes.Equal(got, full["/v1/messages"]) {
+		t.Errorf("messages: %s", got)
+	}
+}
+
 // Chunks are flushed one by one with Gap between them, after Delay; Hang
 // holds the reply until the request ends; Cut aborts it. Each call records
 // when it ended and whether the caller's going away ended it.

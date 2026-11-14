@@ -39,8 +39,14 @@ type Call struct {
 	Cancelled           bool      // the request's context ended before the reply was complete
 }
 
-// Server is an http.Handler; it is safe for concurrent use.
+// Server is an http.Handler; it is safe for concurrent use. UsageOnRequest
+// is set before the first request: when true, the default chat stream sends
+// its usage chunk only to a body whose stream_options.include_usage is true,
+// as a provider with stream_usage request does (USE-8); when false it sends
+// the chunk unasked, as a native one does.
 type Server struct {
+	UsageOnRequest bool
+
 	mu    sync.Mutex
 	queue []Step
 	calls []Call
@@ -60,7 +66,7 @@ var defaults = map[string]string{
 }
 
 // streams are the replies of an empty queue to a body with "stream": true,
-// by route: OpenAI chat chunks with a usage chunk, sent unasked, and [DONE];
+// by route: OpenAI chat chunks with a usage chunk (see UsageOnRequest) and [DONE];
 // the Anthropic Messages events.
 var streams = map[string][]string{
 	"/chat/completions": {
@@ -122,8 +128,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		var req struct{ Stream bool }
 		if events := streams[r.URL.Path]; json.Unmarshal(body, &req) == nil && req.Stream && events != nil {
+			var asked struct {
+				Options struct {
+					IncludeUsage bool `json:"include_usage"`
+				} `json:"stream_options"`
+			}
+			_ = json.Unmarshal(body, &asked)
 			step = &Step{}
 			for _, e := range events {
+				if s.UsageOnRequest && !asked.Options.IncludeUsage && strings.Contains(e, `"choices":[],"usage":`) {
+					continue
+				}
 				if !strings.HasPrefix(e, "event:") {
 					e = "data: " + e
 				}

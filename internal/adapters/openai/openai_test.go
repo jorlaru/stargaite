@@ -104,7 +104,7 @@ func TestUsageRule(t *testing.T) {
 		if err != nil || got.Usage == nil || !reflect.DeepEqual(*got.Usage, tt.want) {
 			t.Errorf("%s: %+v, error %v", tt.name, got.Usage, err)
 		}
-		s := NewStream(&domain.Target{}, &domain.Provider{})
+		s := NewStream(&domain.Target{}, &domain.Provider{}, false)
 		if err := s.Event("", []byte(`{"choices":[],"usage":`+tt.usage+`}`), func(string, []byte) error { return nil }); err != nil ||
 			!reflect.DeepEqual(*s.Observed().Usage, tt.want) {
 			t.Errorf("%s, streamed: %+v, error %v", tt.name, s.Observed().Usage, err)
@@ -145,7 +145,7 @@ func TestCost(t *testing.T) {
 	if _, _, err := Observe(&domain.Target{}, deep, []byte(`{"x_billing":{"charge":{},"charge":{}}}`)); err == nil {
 		t.Error("a repeated key on the cost path was read")
 	}
-	s := NewStream(&domain.Target{}, openrouter)
+	s := NewStream(&domain.Target{}, openrouter, false)
 	for _, c := range []string{`{"choices":[],"usage":{"cost":0.5}}`, `{"choices":[],"usage":{"cost":null}}`, `{"choices":[],"usage":null}`,
 		`{"choices":[],"usage":{"cost":0.75}}`, `{"choices":[]}`} {
 		if err := s.Event("", []byte(c), func(string, []byte) error { return nil }); err != nil {

@@ -513,13 +513,15 @@ func classify(stream bool, status int, cause error, header http.Header, body []b
 // Every event is written and flushed at once, with the credential replaced
 // in it, and nothing is buffered beyond the event being read and the at most
 // 7 bytes of a think-tag stripper (RSN-12). A failure before the commit is
-// left to the caller (settle); after it, the terminal event is written here:
-// an upstream error already in the client's format (an OpenAI error chunk
-// on chat, an Anthropic error event on messages) is relayed as it is; any
-// other failure is the proxy's own event in the envelope of the endpoint:
-// data: {"error":{...}} with no [DONE] after it on chat, event: error with
-// the Anthropic envelope on messages. A failed write ends the attempt with
-// nothing more to answer: the client is gone.
+// left to the caller (settle); after it, the terminal event is written here,
+// always the proxy's own in the envelope of the endpoint: data: {"error":
+// {...}} with no [DONE] after it on chat, event: error with the Anthropic
+// envelope on messages. An upstream error event never crosses with its text:
+// on messages its type does when Anthropic documents it (else api_error),
+// with a fixed message naming the request id; on chat toward anthropic the
+// fixed message names that type; an OpenAI error chunk gets the fixed
+// message alone. A failed write ends the attempt with nothing more to
+// answer: the client is gone.
 func (h *handler) stream(ctx context.Context, w http.ResponseWriter, rq *request, a *attempt, rl relay, resp *http.Response, idle *time.Timer) {
 	if mt, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mt != "text/event-stream" {
 		settle(ctx, a, true, resp.Header, nil, nil, fmt.Errorf("the answer is %.100q, %w", resp.Header.Get("Content-Type"), errNotStream))
@@ -593,13 +595,22 @@ func (h *handler) stream(ctx context.Context, w http.ResponseWriter, rq *request
 	if rq.ep == domain.EndpointMessages {
 		name = "error"
 	}
-	var chunk *openai.ErrorChunk
+	// After the commit an upstream error's type may cross when Anthropic
+	// documents it (a closed list); the provider's text never does, it stays
+	// in the cause (the owner's decision of 2026-11-14).
+	e := *a.end.err
 	var event *anthropic.ErrorEvent
-	if errors.As(relayErr, &chunk) || errors.As(relayErr, &event) && rq.ep == domain.EndpointMessages {
-		_ = emit(name, ev.Data)
-		return
+	switch {
+	case !errors.As(relayErr, &event):
+	case rq.ep == domain.EndpointMessages:
+		e.Message = "the provider's stream failed; request id " + rq.id
+		if event.Status != 0 {
+			e.Type = event.Type
+		}
+	case event.Status != 0:
+		e.Message = "the provider's stream failed: " + event.Type
 	}
-	data, _ := config.Encode(envelope(rq.ep, a.end.err))
+	data, _ := config.Encode(envelope(rq.ep, &e))
 	_ = write(transport.Event{Name: name, Data: data})
 }
 

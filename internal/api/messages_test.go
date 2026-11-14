@@ -504,16 +504,25 @@ func (s *streamFixture) postTo(t *testing.T, path, body string) (*http.Response,
 // event before anything reached the client is not relayed: 502
 // upstream_error in the Anthropic envelope, its type and documented status
 // in the cause. After the commit an upstream error event, already in the
-// client's format, is relayed with the credential redacted; any other
-// failure ends the stream with the proxy's own error event in the Anthropic
-// envelope. A ping is an event: relayed, and it commits. An event named ":"
-// is refused, as that name stands for a comment in the relay.
+// client's format, crosses only as its type, when Anthropic documents it
+// (else api_error), with a fixed message naming the request id: the
+// provider's text goes only to the attempt's cause, redacted (the owner's
+// decision of 2026-11-14). Any other failure ends the stream with the
+// proxy's own error event in the Anthropic envelope. A ping is an event:
+// relayed, and it commits. An event named ":" is refused, as that name
+// stands for a comment in the relay.
 func TestMessagesStreamFaults(t *testing.T) {
 	s := newStreamFixture(t, messagesConfig)
 	overloaded := `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded ` + planted + `ANTH_KEY"}}`
+	leaked := `{"type":"error","error":{"type":"overloaded_error","message":"` + account + `, key ` + planted + `ANTH_KEY"}}`
+	unknown := `{"type":"error","error":{"type":"a_new_error","message":"` + account + `"}}`
 	start := `{"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","model":"m","content":[],"usage":{"input_tokens":3,"output_tokens":1}}}`
 	own := func(code, message string) string {
 		return ev("error", `{"type":"error","error":{"type":"api_error","message":"`+code+": "+message+`"}}`)
+	}
+	// REQUEST_ID stands for the request's own id, read from its header.
+	upstream := func(typ string) string {
+		return ev("error", `{"type":"error","error":{"type":"`+typ+`","message":"upstream_error: the provider's stream failed; request id REQUEST_ID"}}`)
 	}
 	for _, tc := range []struct {
 		name    string
@@ -535,8 +544,10 @@ func TestMessagesStreamFaults(t *testing.T) {
 			message: "upstream_error: the provider answered 529"},
 		{name: "a ping commits", step: mockprovider.Step{Chunks: events("ping", `{"type":"ping"}`, "message_start", start, "message_stop", messageStop)},
 			status: 200, body: ev("ping", `{"type":"ping"}`, "message_start", start, "message_stop", messageStop)},
-		{name: "an error event after the commit is relayed", step: mockprovider.Step{Chunks: events("message_start", start, "error", overloaded, "message_stop", messageStop)},
-			status: 200, body: ev("message_start", start, "error", strings.Replace(overloaded, planted+"ANTH_KEY", "[redacted]", 1)), cause: "overloaded_error"},
+		{name: "a documented error event after the commit keeps its type", step: mockprovider.Step{Chunks: events("message_start", start, "error", leaked, "message_stop", messageStop)},
+			status: 200, body: ev("message_start", start) + upstream("overloaded_error"), cause: `\"overloaded_error\", status 529: ` + account + `, key [redacted]`},
+		{name: "an unknown error event after the commit is api_error", step: mockprovider.Step{Chunks: events("message_start", start, "error", unknown, "message_stop", messageStop)},
+			status: 200, body: ev("message_start", start) + upstream("api_error"), cause: `\"a_new_error\": ` + account},
 		{name: "cut after the commit", step: mockprovider.Step{Chunks: events("message_start", start), Cut: true},
 			status: 200, body: ev("message_start", start) + own("upstream_error", "the provider's stream failed"), cause: "unexpected EOF"},
 		{name: "ended before message_stop", step: mockprovider.Step{Chunks: events("message_start", start)},
@@ -554,11 +565,12 @@ func TestMessagesStreamFaults(t *testing.T) {
 			s.mock.Script(tc.step)
 			before := len(s.mock.Calls())
 			resp, got := s.postTo(t, "/v1/messages", messagesBody("claude", `,"stream":true`))
-			if resp.StatusCode != tc.status || resp.Header.Get(targetHeader) != "anth/claude-up" || strings.Contains(got, planted) {
+			if resp.StatusCode != tc.status || resp.Header.Get(targetHeader) != "anth/claude-up" || strings.Contains(got, planted) || strings.Contains(got, account) {
 				t.Fatalf("status %d, headers %v: %q", resp.StatusCode, resp.Header, got)
 			}
 			if tc.status == 200 {
-				if resp.Header.Get("Content-Type") != "text/event-stream" || got != tc.body {
+				id := resp.Header.Get(domain.RequestIDHeader)
+				if resp.Header.Get("Content-Type") != "text/event-stream" || id == "" || got != strings.ReplaceAll(tc.body, "REQUEST_ID", id) {
 					t.Errorf("body %q", got)
 				}
 			} else if m := anthropicEnvelope(t, resp.Header, tc.status, "upstream_error", []byte(got)); m != tc.message {

@@ -39,7 +39,8 @@ func NewChatStream(t *domain.Target, _ *domain.Provider, includeUsage bool, now 
 }
 
 // statuses are the HTTP statuses Anthropic documents for its error types,
-// which classify an error event read before the commit (section 15 point 15).
+// which classify an error event read before the commit (section 15 point 15);
+// after it, only a type listed here reaches the client.
 var statuses = map[string]int{
 	"invalid_request_error": 400, "authentication_error": 401, "billing_error": 402, "permission_error": 403, "not_found_error": 404,
 	"conflict_error": 409, "request_too_large": 413, "rate_limit_error": 429, "api_error": 500, "timeout_error": 504, "overloaded_error": 529,
@@ -48,8 +49,9 @@ var statuses = map[string]int{
 // ErrorEvent is an error event of a Messages stream: an event named error,
 // or data with a top-level error member that is not null. ChatStream does
 // not emit it: before the commit it is not relayed, after it the relay
-// writes the terminal event of the inbound format. Message is the
-// provider's text, which may name its account or echo the credential.
+// writes the terminal event of the inbound format, which may name Type when
+// Status is not 0. Message is the provider's text, which may name its
+// account or echo the credential: it goes only to the attempt's cause.
 type ErrorEvent struct {
 	Type, Message string
 	Status        int // the status Anthropic documents for Type; 0 for a type it does not list

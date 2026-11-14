@@ -38,8 +38,9 @@ func NewStream(t *domain.Target, _ *domain.Provider) *Stream {
 
 // ErrorChunk is a chunk with a top-level error member, the in-stream error
 // the OpenAI SDKs read. Event does not emit it: before the commit it is not
-// relayed, after it the relay sends it as the terminal event. Message is the
-// provider's text, which may name its account or echo the credential.
+// relayed, after it the relay writes its own terminal event in its place.
+// Message is the provider's text, which may name its account or echo the
+// credential: it goes only to the attempt's cause.
 type ErrorChunk struct{ Message string }
 
 func (e *ErrorChunk) Error() string { return "the provider's stream reported an error: " + e.Message }

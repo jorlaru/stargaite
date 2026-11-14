@@ -232,6 +232,7 @@ func TestSDKStreamRequests(t *testing.T) {
 func TestChatStreamFaults(t *testing.T) {
 	s := newStreamFixture(t, streamConfig)
 	echo := `{"error":{"message":"bad key ` + planted + `MOCK_KEY","type":"server_error"}}`
+	leaked := `{"error":{"message":"` + account + `, key ` + planted + `MOCK_KEY","type":"server_error"}}`
 	big := `{"x":"` + strings.Repeat("x", 5000) + `"}`
 	first := "data: " + chunk("a") + "\n\n"
 	for _, tc := range []struct {
@@ -275,8 +276,8 @@ func TestChatStreamFaults(t *testing.T) {
 			status: 200, body: first + terminal("the provider's stream failed", "upstream_error"), cause: "the stream ended before its last event"},
 		{name: "silent after the commit", step: mockprovider.Step{Chunks: [][]byte{[]byte(first)}, Hang: true},
 			status: 200, body: first + terminal("the provider did not answer in time: idle timeout", "upstream_timeout"), cause: "idle timeout"},
-		{name: "an error chunk after the commit", step: mockprovider.Step{Chunks: sse(chunk("a"), echo, "[DONE]")},
-			status: 200, body: first + "data: " + strings.Replace(echo, planted+"MOCK_KEY", "[redacted]", 1) + "\n\n", cause: "bad key [redacted]"},
+		{name: "an error chunk after the commit", step: mockprovider.Step{Chunks: sse(chunk("a"), leaked, "[DONE]")},
+			status: 200, body: first + terminal("the provider's stream reported an error", "upstream_error"), cause: account + ", key [redacted]"},
 		{name: "an event over max_response_bytes after the commit", step: mockprovider.Step{Chunks: sse(chunk("a"), big)},
 			status: 200, body: first + terminal("the provider's stream failed", "upstream_error"), cause: "larger than max_response_bytes"},
 		{name: "a chunk that is not JSON", step: mockprovider.Step{Chunks: sse(chunk("a"), "oops")},
@@ -289,7 +290,7 @@ func TestChatStreamFaults(t *testing.T) {
 			s.mock.Script(tc.step)
 			before := len(s.mock.Calls())
 			resp, got := s.post(t, streamBody("plain"))
-			if resp.StatusCode != tc.status || resp.Header.Get(targetHeader) != "mock/up-2" || strings.Contains(got, planted) {
+			if resp.StatusCode != tc.status || resp.Header.Get(targetHeader) != "mock/up-2" || strings.Contains(got, planted) || strings.Contains(got, account) {
 				t.Fatalf("status %d, headers %v: %q", resp.StatusCode, resp.Header, got)
 			}
 			if tc.status == 200 {
@@ -631,12 +632,16 @@ func TestChatAnthropicStream(t *testing.T) {
 // TestChatAnthropicStreamFaults: the commit rule on the translated stream.
 // An error event before anything reached the client is not relayed: 502
 // upstream_error, its type and documented status in the cause; after the
-// commit it ends the stream with the terminal event and no [DONE]. A ping is
-// a comment, dropped before the commit and relayed after it. Events that
-// write nothing, thinking deltas, keep the stream alive past stream_idle_ms.
+// commit it ends the stream with the terminal event and no [DONE], whose
+// fixed message names the error type when Anthropic documents it and never
+// holds the provider's text, which goes only to the cause (the owner's
+// decision of 2026-11-14). A ping is a comment, dropped before the commit
+// and relayed after it. Events that write nothing, thinking deltas, keep the
+// stream alive past stream_idle_ms.
 func TestChatAnthropicStreamFaults(t *testing.T) {
 	s := newStreamFixture(t, anthropicStreamConfig)
 	overloaded := `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded ` + planted + `ANTH_KEY"}}`
+	leaked := `{"type":"error","error":{"type":"overloaded_error","message":"` + account + `, key ` + planted + `ANTH_KEY"}}`
 	role := anthropicChunk(`{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}`)
 	text := func(s string) string {
 		return anthropicChunk(`{"index":0,"delta":{"content":"` + s + `"},"finish_reason":null}`)
@@ -667,8 +672,12 @@ func TestChatAnthropicStreamFaults(t *testing.T) {
 			"content_block_delta", thinking, "content_block_delta", thinking, "content_block_delta", thinking, "content_block_start", textStart,
 			"content_block_delta", textDelta("ok"), "message_stop", messageStop), Gap: 120 * time.Millisecond}, status: 200, body: role + text("ok") + stop},
 		{name: "an error event after the commit", step: mockprovider.Step{Chunks: events("message_start", messageStart, "content_block_start", textStart,
-			"content_block_delta", textDelta("a"), "error", overloaded, "message_stop", messageStop)},
-			status: 200, body: role + text("a") + terminal("the provider's stream reported an error", "upstream_error"), cause: "overloaded_error"},
+			"content_block_delta", textDelta("a"), "error", leaked, "message_stop", messageStop)},
+			status: 200, body: role + text("a") + terminal("the provider's stream failed: overloaded_error", "upstream_error"),
+			cause: `\"overloaded_error\", status 529: ` + account + `, key [redacted]`},
+		{name: "an unknown error event after the commit", step: mockprovider.Step{Chunks: events("message_start", messageStart,
+			"error", `{"type":"error","error":{"type":"a_new_error","message":"`+account+`"}}`)},
+			status: 200, body: role + terminal("the provider's stream reported an error", "upstream_error"), cause: `\"a_new_error\": ` + account},
 		{name: "cut after the commit", step: mockprovider.Step{Chunks: events("message_start", messageStart), Cut: true},
 			status: 200, body: role + terminal("the provider's stream failed", "upstream_error"), cause: "unexpected EOF"},
 		{name: "ended before message_stop", step: mockprovider.Step{Chunks: events("message_start", messageStart)},
@@ -683,7 +692,7 @@ func TestChatAnthropicStreamFaults(t *testing.T) {
 			s.mock.Script(tc.step)
 			before := len(s.mock.Calls())
 			resp, got := s.post(t, streamBody("claude"))
-			if resp.StatusCode != tc.status || resp.Header.Get(targetHeader) != "anth/claude-up" || strings.Contains(got, planted) {
+			if resp.StatusCode != tc.status || resp.Header.Get(targetHeader) != "anth/claude-up" || strings.Contains(got, planted) || strings.Contains(got, account) {
 				t.Fatalf("status %d, headers %v: %q", resp.StatusCode, resp.Header, got)
 			}
 			if tc.status == 200 {

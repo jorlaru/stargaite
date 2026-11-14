@@ -180,7 +180,7 @@ func TestFaultMatrix(t *testing.T) {
 		fault{name: "gap past idle after the commit", stream: true, first: "bad", step: &mockprovider.Step{Chunks: [][]byte{[]byte(first), []byte("data: [DONE]\n\n")}, Gap: 600 * time.Millisecond},
 			status: 200, code: "upstream_timeout", eligible: true, committed: true},
 		fault{name: "an error chunk after the commit", stream: true, first: "bad", step: &mockprovider.Step{Chunks: sse(chunk("a"), `{"error":{"message":"boom"}}`)},
-			status: 200, code: "", committed: true},
+			status: 200, code: "upstream_error", committed: true},
 	)
 
 	wantAttempts, requests := 0, 0
@@ -227,7 +227,7 @@ func TestFaultMatrix(t *testing.T) {
 					}
 				case f.committed:
 					if resp.StatusCode != 200 || goodCalls != 0 || !strings.HasPrefix(got, first) || strings.Contains(got, "[DONE]") ||
-						!strings.Contains(got, `"error":{`) || !strings.Contains(got, `"code":"`+f.code+`"`) && f.code != "" {
+						!strings.Contains(got, `"error":{`) || !strings.Contains(got, `"code":"`+f.code+`"`) {
 						t.Errorf("committed: %d %q, %d calls to good/m", resp.StatusCode, got, goodCalls)
 					}
 				default:

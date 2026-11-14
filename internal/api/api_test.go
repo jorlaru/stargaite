@@ -29,6 +29,10 @@ const (
 	adminKey = "test-admin-key-of-at-least-32-characters"
 	testNow  = 1_790_000_000_000
 	planted  = "sk-PLANTED-credential-of-"
+	// account is provider text that must never reach a client once a stream
+	// is committed, only the attempt's cause (the owner's decision of
+	// 2026-11-14); the organisation is fictitious.
+	account = "the Fictitious Org Ltd account is over its quota"
 )
 
 // logBuffer is a log destination that concurrent requests may share.

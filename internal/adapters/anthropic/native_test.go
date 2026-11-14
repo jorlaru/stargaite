@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/jorlaru/stargaite/internal/domain"
@@ -137,4 +138,41 @@ func FuzzStream(f *testing.F) {
 			t.Fatalf("%d events relayed for %d", len(out), len(in))
 		}
 	})
+}
+
+// TestCost: a provider of this protocol that declares a cost_report has its
+// cost read by every observer, synchronous and streamed, the latest number in
+// a stream winning (USE-6); none declared reads none.
+func TestCost(t *testing.T) {
+	p := &domain.Provider{CostReport: &domain.CostReport{Path: "usage.cost", USDPerUnit: 2}}
+	tg := &domain.Target{}
+	answer := `{"id":"msg_1","type":"message","model":"m","content":[{"type":"text","text":"a"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1,"cost":0.25}}`
+	if _, o, err := Observe(tg, p, []byte(answer)); err != nil || o.Cost == nil || *o.Cost != 0.5 {
+		t.Errorf("Observe: %v, error %v", o.Cost, err)
+	}
+	if _, o, err := ToChat(tg, p, []byte(answer), time.Unix(0, 0)); err != nil || o.Cost == nil || *o.Cost != 0.5 {
+		t.Errorf("ToChat: %v, error %v", o.Cost, err)
+	}
+	if _, o, err := Observe(tg, &domain.Provider{}, []byte(answer)); err != nil || o.Cost != nil {
+		t.Errorf("no cost_report: %v, error %v", o.Cost, err)
+	}
+	events := [][2]string{
+		{"message_start", `{"type":"message_start","message":{"id":"msg_1","model":"m","usage":{"input_tokens":1,"cost":0.1}}}`},
+		{"message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2,"cost":0.25}}`},
+		{"message_delta", `{"type":"message_delta","delta":{},"usage":{"cost":null}}`},
+		{"message_stop", `{"type":"message_stop"}`},
+	}
+	native, chat := NewStream(tg, p), NewChatStream(tg, p, false, func() time.Time { return time.Unix(0, 0) })
+	for _, e := range events {
+		for _, ev := range []func(string, []byte, func(string, []byte) error) error{native.Event, chat.Event} {
+			if err := ev(e[0], []byte(e[1]), func(string, []byte) error { return nil }); err != nil && err != io.EOF {
+				t.Fatalf("%s: %v", e[0], err)
+			}
+		}
+	}
+	for name, o := range map[string]domain.Observed{"native": native.Observed(), "chat": chat.Observed()} {
+		if o.Cost == nil || *o.Cost != 0.5 {
+			t.Errorf("%s stream: %v", name, o.Cost)
+		}
+	}
 }

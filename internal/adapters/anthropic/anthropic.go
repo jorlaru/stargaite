@@ -435,6 +435,15 @@ func str(b *params.Body, path ...string) string {
 	return s
 }
 
+// report is p's cost_report; the zero one, which reads no cost, when p
+// declares none (no preset declares one for this protocol).
+func report(p *domain.Provider) domain.CostReport {
+	if p.CostReport == nil {
+		return domain.CostReport{}
+	}
+	return *p.CostReport
+}
+
 // counts are the token counts of Anthropic usage objects read so far: the
 // latest integer of each field wins, as message_delta repeats them
 // cumulatively (design section 8).
@@ -497,9 +506,10 @@ var finish = map[string]string{
 // Observed keeps the provider's own stop_reason (USE-3). The error says the
 // body is not a Messages answer: not a JSON object, a key repeated in an
 // object read, no id, model or content array, or a malformed text or
-// tool_use block. Phase 2 does not read p (design section 11, point 1).
-func ToChat(t *domain.Target, _ *domain.Provider, body []byte, now time.Time) ([]byte, domain.Observed, error) {
-	b, e := params.Scan(body, params.MessagesReply)
+// tool_use block. Observed also has the cost at p's cost_report path.
+func ToChat(t *domain.Target, p *domain.Provider, body []byte, now time.Time) ([]byte, domain.Observed, error) {
+	cr := report(p)
+	b, e := params.Scan(body, params.Reply(params.MessagesReply, cr.Path))
 	if e != nil {
 		return nil, domain.Observed{}, errors.New(e.Message)
 	}
@@ -507,7 +517,7 @@ func ToChat(t *domain.Target, _ *domain.Provider, body []byte, now time.Time) ([
 	if len(id) == 0 || id[0] != '"' || len(model) == 0 || model[0] != '"' || len(content) == 0 || content[0] != '[' {
 		return nil, domain.Observed{}, errors.New("the answer has no id, model or content array")
 	}
-	o := domain.Observed{ResponseModel: str(b, "model"), FinishReason: str(b, "stop_reason")}
+	o := domain.Observed{ResponseModel: str(b, "model"), FinishReason: str(b, "stop_reason"), Cost: params.Cost(b, cr.Path, cr.USDPerUnit)}
 	var text []byte // the joined text blocks, without their quotes
 	var calls [][]byte
 	hasText := false

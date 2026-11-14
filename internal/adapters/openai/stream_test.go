@@ -32,7 +32,7 @@ func TestStream(t *testing.T) {
 		`{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":2}}`,
 		`{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":7,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":5}}}`,
 	}
-	var s Stream
+	s := NewStream(&domain.Target{}, &domain.Provider{})
 	for _, c := range chunks {
 		if err := s.Event("", []byte(c), emit); err != nil {
 			t.Fatalf("%s: %v", c, err)

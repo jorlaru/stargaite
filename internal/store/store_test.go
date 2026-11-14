@@ -153,7 +153,7 @@ func TestTxLock(t *testing.T) {
 }
 
 // TestSchema compares sqlite_master after the migrations with the golden
-// file; migration 001 is annex A of the kick-off verbatim.
+// file; migrations 001 and 002 are annex A of the kick-off verbatim.
 func TestSchema(t *testing.T) {
 	s := open(t, t.TempDir())
 	rows, err := s.Read().Query("SELECT type, name, tbl_name, coalesce(sql, '') FROM sqlite_master ORDER BY type, name")
@@ -199,6 +199,56 @@ func TestMigrationNames(t *testing.T) {
 		if !strings.HasPrefix(path.Base(name), fmt.Sprintf("%03d_", i+1)) {
 			t.Errorf("migration %d is %s", i+1, name)
 		}
+	}
+}
+
+// TestMigrationFromVersion1 opens a store that the phase 1 and 2 binaries
+// left at version 1, with a budget_totals row: migration 002 keeps the row
+// with since_revision 0 and recreates usage_daily with billing in its key
+// (phase-3 design section 5).
+func TestMigrationFromVersion1(t *testing.T) {
+	dir := t.TempDir()
+	db, err := sql.Open("sqlite", filepath.Join(dir, "stargaite.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := migrations.ReadFile("migrations/001_base.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{string(first), "PRAGMA user_version = 1",
+		"INSERT INTO budget_totals (scope_type, scope_name, cost_usd) VALUES ('key', 'k', 2.5)"} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s := open(t, dir)
+	if v := pragma(t, s.Read(), "user_version"); v != "2" {
+		t.Errorf("user_version %s", v)
+	}
+	var cost float64
+	var since int64
+	if err := s.Read().QueryRow("SELECT cost_usd, since_revision FROM budget_totals WHERE scope_type = 'key' AND scope_name = 'k'").Scan(&cost, &since); err != nil || cost != 2.5 || since != 0 {
+		t.Errorf("budget_totals row: %v %d, error %v", cost, since, err)
+	}
+	err = s.Write(context.Background(), func(tx *sql.Tx) error {
+		for _, billing := range []string{"pay_per_use", "subscription"} {
+			if _, err := tx.Exec("INSERT INTO usage_daily (day, key_name, model, target, billing) VALUES ('2026-11-14', 'k', 'fast', 'p/m', ?)", billing); err != nil {
+				return err
+			}
+		}
+		_, err := tx.Exec("INSERT INTO usage_daily (day, key_name, model, target, billing) VALUES ('2026-11-14', 'k', 'fast', 'p/m', 'subscription')")
+		if err == nil {
+			return errors.New("a row repeating the whole key was inserted")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Errorf("usage_daily by billing: %v", err)
 	}
 }
 

@@ -234,6 +234,24 @@ var commands = []command{
 		{"grace", kindString, "grace", "how long the secret in use stays valid, such as 30m (default 1h)"},
 	}, request: action("/keys", "rotate")},
 	{words: []string{"keys", "revoke"}, args: []string{"name"}, needsYes: func(input) bool { return true }, request: action("/keys", "revoke")},
+	{words: []string{"usage", "show"}, flags: []flagSpec{
+		{"since", kindString, "", "the window: a duration back from now, such as 24h (the default), or an RFC 3339 time"},
+		{"key", kindString, "", "only this key's records"},
+		{"model", kindString, "", "only this alias's records"},
+		{"target", kindString, "", "only this target's records"},
+		{"by", kindString, "", "group by key, model and target, comma-separated, such as key,model"},
+	}, request: func(in input) (string, string, any) {
+		q := url.Values{}
+		for _, name := range []string{"since", "key", "model", "target", "by"} {
+			if in.set[name] {
+				q.Set(name, *in.flags[name])
+			}
+		}
+		if len(q) == 0 {
+			return http.MethodGet, "/usage", nil
+		}
+		return http.MethodGet, "/usage?" + q.Encode(), nil
+	}, render: usageShown},
 	{words: []string{"export"}, request: func(in input) (string, string, any) {
 		if in.json {
 			return http.MethodGet, "/export?format=json", nil

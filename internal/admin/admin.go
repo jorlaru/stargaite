@@ -7,6 +7,7 @@ package admin
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
@@ -24,6 +25,7 @@ import (
 	"github.com/jorlaru/stargaite/internal/auth"
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
+	"github.com/jorlaru/stargaite/internal/usage"
 )
 
 const (
@@ -42,6 +44,7 @@ type server struct {
 	cfg     *config.Service
 	keyHash [32]byte
 	log     *slog.Logger
+	usage   *sql.DB
 
 	mu        sync.Mutex // guards the two fields below
 	refusedAt time.Time  // when the last refusal line was logged
@@ -87,12 +90,20 @@ var routes = []route{
 	{"PATCH /admin/v1/keys/{name}", (*server).setKey},
 	{"POST /admin/v1/keys/{name}/rotate", (*server).rotateKey},
 	{"POST /admin/v1/keys/{name}/revoke", (*server).revokeKey},
+	{"GET /admin/v1/usage", (*server).showUsage},
 }
 
-// Handler returns the admin listener's handler. keyHash is the SHA-256 of the
-// admin key, the only form of it the process keeps.
-func Handler(cfg *config.Service, keyHash [32]byte, log *slog.Logger) http.Handler {
-	s := &server{cfg: cfg, keyHash: keyHash, log: log}
+// Deps is what the admin listener needs from serve.
+type Deps struct {
+	Config  *config.Service
+	KeyHash [32]byte // the SHA-256 of the admin key, the only form of it the process keeps
+	Log     *slog.Logger
+	Usage   *sql.DB // the store's read pool, which usage show reads
+}
+
+// Handler returns the admin listener's handler.
+func Handler(d Deps) http.Handler {
+	s := &server{cfg: d.Config, keyHash: d.KeyHash, log: d.Log, usage: d.Usage}
 	mux := http.NewServeMux()
 	for _, rt := range routes {
 		mux.HandleFunc(rt.pattern, func(w http.ResponseWriter, r *http.Request) { rt.handle(s, w, r) })
@@ -416,4 +427,42 @@ func (s *server) validate(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, struct {
 		Findings []domain.Finding `json:"findings"`
 	}{s.cfg.Check(ctx)})
+}
+
+// showUsage answers usage show (USE-9, phase-3 design section 12) from the
+// store's read pool: since is a positive duration back from now on the
+// service clock, such as 24h (the default), or an RFC 3339 time; key, model
+// and target filter; by groups by key, model and target, comma-separated. A
+// read: not audited.
+func (s *server) showUsage(w http.ResponseWriter, r *http.Request) {
+	q, err := query(r, "since", "key", "model", "target", "by")
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	now := s.cfg.Now()
+	since := now.Add(-24 * time.Hour)
+	if v := q.Get("since"); v != "" {
+		d, errDuration := time.ParseDuration(v)
+		at, errTime := time.Parse(time.RFC3339, v)
+		switch {
+		case errDuration == nil && d > 0:
+			since = now.Add(-d)
+		case errTime == nil:
+			since = at
+		default:
+			s.fail(w, invalid("since must be a positive duration such as 24h, or an RFC 3339 time"))
+			return
+		}
+	}
+	var by []string
+	if v := q.Get("by"); v != "" {
+		by = strings.Split(v, ",")
+	}
+	rep, err := usage.Show(r.Context(), s.usage, usage.Query{Since: since, Key: q.Get("key"), Model: q.Get("model"), Target: q.Get("target"), By: by}, now)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, rep)
 }

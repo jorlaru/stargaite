@@ -140,7 +140,7 @@ func TestSchemas(t *testing.T) {
 		{"ChatReply", ChatReply, [][]string{
 			{"choices", "*"}, {"choices", "*", "message"}, {"choices", "*", "message", "tool_calls", "*"},
 			{"choices", "*", "delta"}, {"choices", "*", "delta", "tool_calls", "*"},
-			{"usage"}, {"usage", "prompt_tokens_details"}, {"usage", "completion_tokens_details"}, {"error"},
+			{"usage"}, {"usage", "prompt_tokens_details"}, {"usage", "prompt_token_details"}, {"usage", "completion_tokens_details"}, {"error"},
 		}},
 		{"MessagesReply", MessagesReply, [][]string{
 			{"content", "*"}, {"usage"}, {"usage", "output_tokens_details"},
@@ -455,5 +455,29 @@ func TestReadWalks(t *testing.T) {
 		if got, ok := b.Get(c.path...); !ok || string(got) != c.want {
 			t.Errorf("%s: Get(%v) = %s, %v", c.body, c.path, got, ok)
 		}
+	}
+}
+
+// TestReply: the objects on the way to a dotted path join a copy of the
+// walk, which is never modified; a path of one member, or none, adds nothing.
+func TestReply(t *testing.T) {
+	walk := slices.Clip([][]string{{"usage"}})
+	if got := Reply(walk, "a.b.c"); !reflect.DeepEqual(got, [][]string{{"usage"}, {"a"}, {"a", "b"}}) || len(walk) != 1 {
+		t.Errorf("Reply = %v, walk %v", got, walk)
+	}
+	for _, path := range []string{"", "cost"} {
+		if got := Reply(walk, path); !reflect.DeepEqual(got, walk) {
+			t.Errorf("Reply(%q) = %v", path, got)
+		}
+	}
+	b, e := Scan([]byte(`{"a":{"b":{"c":1.5}},"cost":3}`), Reply(walk, "a.b.c"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if c := Cost(b, "a.b.c", 2); c == nil || *c != 3 {
+		t.Errorf("Cost = %v", c)
+	}
+	if c := Cost(b, "", 1); c != nil {
+		t.Errorf("Cost of the empty path = %v", *c)
 	}
 }

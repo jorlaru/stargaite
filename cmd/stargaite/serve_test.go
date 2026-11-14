@@ -351,7 +351,9 @@ func seed(t *testing.T, providers map[string]string) (dir, token string) {
 // the stream's terminal event; so does a request whose body is still
 // arriving. A stream whose client stopped reading ends 1 s later, as client
 // gone (499). Every request runs finish and done before the store closes,
-// that last one included, and serve exits 0 with the stop line.
+// that last one included, and serve exits 0 with the stop line. Every
+// request line has its usage records in the store, one per attempt, read
+// after the stop: the writer flushed them before the store closed (AC-23).
 func TestServeDrain(t *testing.T) {
 	shutdownGrace = 1500 * time.Millisecond
 	t.Cleanup(func() { shutdownGrace = 30 * time.Second })
@@ -491,6 +493,71 @@ func TestServeDrain(t *testing.T) {
 		strings.Count(log, `"status":500,"code":"internal_error"`) != 3 || strings.Count(log, `"status":499,"code":"client_gone"`) != 1 ||
 		strings.LastIndex(log, `"msg":"request"`) > stopped ||
 		!strings.Contains(log, `"msg":"requests still running when the grace ended: they are stopped","listener":"data"`) {
+		t.Errorf("exit %d; log %s", code, log)
+	}
+
+	st, err := store.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	records := 0
+	for _, l := range strings.Split(strings.TrimSpace(log), "\n") {
+		var line struct {
+			Msg       string
+			RequestID string `json:"request_id"`
+			Attempts  int
+		}
+		if json.Unmarshal([]byte(l), &line) != nil || line.Msg != "request" {
+			continue
+		}
+		var n int
+		if err := st.Read().QueryRow("SELECT COUNT(*) FROM usage WHERE request_id = ?", line.RequestID).Scan(&n); err != nil || n != line.Attempts {
+			t.Errorf("request %s: %d attempts, %d records, error %v", line.RequestID, line.Attempts, n, err)
+		}
+		records += n
+	}
+	if records != 4 || strings.Contains(log, "usage record not stored") {
+		t.Errorf("%d records; log %s", records, log)
+	}
+}
+
+// TestServeLostRecords is USE-10 and the exit code of section 11 (phase-3
+// design): a record the writer cannot store before flushWait ends is one log
+// line at level CRITICAL, and serve then exits 1. A trigger the test adds
+// after the ready line refuses every usage insert.
+func TestServeLostRecords(t *testing.T) {
+	flushWait = 200 * time.Millisecond
+	t.Cleanup(func() { flushWait = 10 * time.Second })
+	srv := httptest.NewServer(mockprovider.New())
+	t.Cleanup(srv.Close)
+	dir, token := seed(t, map[string]string{"m": srv.URL})
+	ready, stop := start(t, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), "--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0")
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "stargaite.db")+"?_busy_timeout=5000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TRIGGER refuse BEFORE INSERT ON usage BEGIN SELECT RAISE(ABORT, 'refused'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequest(http.MethodPost, "http://"+ready.DataAddr+"/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	if code, log := stop(); code != 1 || strings.Count(log, `"level":"CRITICAL","msg":"usage record not stored"`) != 1 ||
+		!strings.Contains(log, `"msg":"usage records logged instead of stored","records":1`) || strings.Contains(log, `"msg":"stopped"`) {
 		t.Errorf("exit %d; log %s", code, log)
 	}
 }

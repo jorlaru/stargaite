@@ -12,6 +12,7 @@
 				"cache_write": 0,
 				"output": 5
 			},
+			"Cost": null,
 			"VisibleBytes": 9,
 			"ToolCalls": 0,
 			"Stripped": false
@@ -31,6 +32,7 @@
 				"output": 40,
 				"reasoning": 12
 			},
+			"Cost": null,
 			"VisibleBytes": 14,
 			"ToolCalls": 2,
 			"Stripped": false
@@ -49,6 +51,7 @@
 				"cache_write": 0,
 				"output": 5
 			},
+			"Cost": null,
 			"VisibleBytes": 0,
 			"ToolCalls": 1,
 			"Stripped": false
@@ -62,6 +65,7 @@
 			"ResponseModel": "claude-x",
 			"FinishReason": "max_tokens",
 			"Usage": null,
+			"Cost": null,
 			"VisibleBytes": 0,
 			"ToolCalls": 0,
 			"Stripped": false
@@ -80,6 +84,7 @@
 				"cache_write": 0,
 				"output": 5
 			},
+			"Cost": null,
 			"VisibleBytes": 1,
 			"ToolCalls": 0,
 			"Stripped": false
@@ -98,6 +103,7 @@
 				"cache_write": 0,
 				"output": 5
 			},
+			"Cost": null,
 			"VisibleBytes": 1,
 			"ToolCalls": 0,
 			"Stripped": false
@@ -116,6 +122,7 @@
 				"cache_write": 0,
 				"output": 5
 			},
+			"Cost": null,
 			"VisibleBytes": 0,
 			"ToolCalls": 0,
 			"Stripped": false
@@ -134,6 +141,7 @@
 				"cache_write": 0,
 				"output": 5
 			},
+			"Cost": null,
 			"VisibleBytes": 1,
 			"ToolCalls": 0,
 			"Stripped": false
@@ -152,6 +160,7 @@
 				"cache_write": 0,
 				"output": 5
 			},
+			"Cost": null,
 			"VisibleBytes": 17,
 			"ToolCalls": 1,
 			"Stripped": true
@@ -170,6 +179,7 @@
 				"cache_write": 0,
 				"output": 5
 			},
+			"Cost": null,
 			"VisibleBytes": 17,
 			"ToolCalls": 0,
 			"Stripped": false
@@ -188,6 +198,7 @@
 				"cache_write": 0,
 				"output": 5
 			},
+			"Cost": null,
 			"VisibleBytes": 0,
 			"ToolCalls": 0,
 			"Stripped": true

@@ -23,6 +23,7 @@ import (
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/store"
 	"github.com/jorlaru/stargaite/internal/transport"
+	"github.com/jorlaru/stargaite/internal/usage"
 )
 
 const (
@@ -60,6 +61,8 @@ type fixture struct {
 	now         *atomic.Int64 // Unix milliseconds
 	log         *logBuffer
 	flight      *sync.WaitGroup // the data plane's requests in flight
+	st          *store.Store
+	counters    *usage.Counters
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -99,9 +102,12 @@ func newFixture(t *testing.T) *fixture {
 		return nil, errors.New("no name is resolved in tests")
 	}
 	flight := &sync.WaitGroup{}
-	return &fixture{admin.Handler(cfg, sha256.Sum256([]byte(adminKey)), slog.New(slog.NewJSONHandler(log, nil))),
-		Handler(Deps{Config: cfg, Log: slog.New(slog.NewJSONHandler(log, nil)),
-			Clients: [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)}, Flight: flight}), now, log, flight}
+	logger := slog.New(slog.NewJSONHandler(log, nil))
+	records, counters := usage.NewWriter(st.Write, logger), &usage.Counters{}
+	t.Cleanup(func() { records.Close(context.Background()) }) // before the store closes
+	return &fixture{admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(adminKey)), Log: logger, Usage: st.Read()}),
+		Handler(Deps{Config: cfg, Log: logger, Clients: [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)},
+			Flight: flight, Usage: records, Counters: counters, Version: "test-version"}), now, log, flight, st, counters}
 }
 
 // pastWindow moves the service clock past the RES-2 window of 30 s, so the

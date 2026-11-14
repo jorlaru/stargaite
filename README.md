@@ -10,10 +10,11 @@ built-in presets), targets, model aliases, client keys with rotation and revocat
 the `openai` protocol and of the `anthropic` protocol (translated to the Messages API), and `POST /v1/messages`,
 synchronous and streamed, toward providers of the `anthropic` protocol, with the parameter contract and reasoning
 control of the alias, timeouts, fallback across an alias's targets, a circuit breaker per target, cancellation when a
-client goes away and a graceful stop (see [Resilience](#resilience)). Usage records, budgets, limits and telemetry
-arrive in phase 3. The full specification is
-[kick-off.md](kick-off.md); the designs are [docs/design/phase-1.md](docs/design/phase-1.md) and
-[docs/design/phase-2.md](docs/design/phase-2.md).
+client goes away and a graceful stop (see [Resilience](#resilience)). Phase 3 has begun: every provider call leaves a
+usage record with its tokens and cost, and `usage show` sums them (see [Usage](#usage)); budgets, limits, quotas and
+telemetry follow. The full specification is [kick-off.md](kick-off.md); the designs are
+[docs/design/phase-1.md](docs/design/phase-1.md), [docs/design/phase-2.md](docs/design/phase-2.md) and
+[docs/design/phase-3.md](docs/design/phase-3.md).
 
 ## Quick start
 
@@ -25,26 +26,49 @@ go build -o stargaite ./cmd/stargaite
 go run ./tests/mockprovider/cmd/mockprovider &
 ./stargaite serve &
 curl -sS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:4000/health/ready
-./stargaite providers add mock --protocol openai --base-url http://127.0.0.1:4010 --allow-private-network --billing none
+./stargaite providers add mock --protocol openai --base-url http://127.0.0.1:4010 --allow-private-network --billing pay_per_use
 ./stargaite models add fast --target mock/mock
+./stargaite targets set mock/mock --pricing input_per_million=1,output_per_million=2,as_of=2026-11-01
 ./stargaite keys create my-agent --model fast
 ./stargaite models explain fast
 curl -s http://127.0.0.1:4000/v1/models -H "Authorization: Bearer sk-stargaite-..."
 curl -s http://127.0.0.1:4000/v1/chat/completions -H "Authorization: Bearer sk-stargaite-..." -d '{"model":"fast","messages":[{"role":"user","content":"hi"}]}'
+./stargaite usage show --since 1h
 ```
 
 The mock provider listens on `127.0.0.1:4010`; `serve` puts the data plane on `127.0.0.1:4000`, the admin API on
-`127.0.0.1:4001` and the store in `./data`, and the health check waits until it is up. `models add` also creates the
-target `mock/mock`. `keys create` prints the client key once: paste it in place of `sk-stargaite-...` in the last two
-calls. `models explain` shows what the alias would send, without calling the provider: per target, the effort and
-output-cap layers, the list of changes, the URL, the headers without the credential and the body, which for the
-minimal request it explains by default are the bytes the last call sends (`--body <file>` explains a request of your
-own; `--json` gives each body's exact bytes). The first `curl` lists the alias `fast`; the second sends a chat
-completion to it and gets the mock provider's answer, with the response headers `x-stargaite-request-id`,
-`x-stargaite-trace-id` and `x-stargaite-target` (add `-i` to `curl` to see them). Both processes log JSON lines to the
-terminal; `kill %1 %2` stops them.
+`127.0.0.1:4001` and the store in `./data`, and the health check waits until it is up. The mock provider is billed per
+use: `models add` also creates the target `mock/mock` (with a warning that it has no prices yet), and `targets set`
+gives it a price in USD per million input and output tokens. `keys create` prints the client key once: paste it in
+place of `sk-stargaite-...` in the two `curl` calls. `models explain` shows what the alias would send, without calling
+the provider: per target, the effort and output-cap layers, the list of changes, the URL, the headers without the
+credential and the body, which for the minimal request it explains by default are the bytes the chat completion below
+sends (`--body <file>` explains a request of your own; `--json` gives each body's exact bytes). The first `curl` lists
+the alias `fast`; the second sends a chat completion to it and gets the mock provider's answer, with the response
+headers `x-stargaite-request-id`, `x-stargaite-trace-id` and `x-stargaite-target` (add `-i` to `curl` to see them).
+`usage show` then sums the last hour from the store: one request, the tokens the mock provider reported (1 input, 2
+output) and their cost at the target's prices, 0.000005 USD. Both processes log JSON lines to the terminal;
+`kill %1 %2` stops them.
 `./stargaite --help` lists every command, and each one accepts `--json`, never prompts, and exits `0` on success, `1`
 on failure and `2` on wrong usage; `remove`, `keys revoke` and `apply --prune` (unless `--dry-run`) need `--yes`.
+
+## Usage
+
+Every provider call leaves one usage record in the store, whether it succeeded, failed or was cut short, and a request
+that fell back leaves one per attempt: the key, the alias, the target, the model the provider answered with (flagged
+when it is not the one sent), the finish reason, the tokens (input with its cache parts, output with its reasoning
+part), the requested, alias and sent effort and output cap, the parameter changes, the configuration revision and the
+version. Tokens are the provider's own figures; when a `2xx` answer brought none, or was cut, they are estimated from
+the bytes (a quarter of them, rounded up) and marked `estimated`. A provider is billed `pay_per_use`, `subscription`
+or `none`; only `pay_per_use` calls have a cost, read from the response at the provider's `cost_report` path when it
+declares one (OpenRouter and xAI do), else computed from the target's `--pricing`, else left empty and counted as
+unpriced: it is never guessed. Records reach the store in batches within 50 ms; on `SIGTERM` the pending ones are
+written before the store closes, and a record that cannot be stored is written to the log as one `CRITICAL` line
+instead of being lost.
+
+`./stargaite usage show` sums the records of a window (`--since 24h` by default, or an RFC 3339 time) per billing mode,
+filtered with `--key`, `--model` and `--target` and grouped with `--by key,model,target`: requests, errors, each kind
+of token, estimated calls, the cost of `pay_per_use` calls and the unpriced ones. `--json` gives the same as JSON.
 
 ## Anthropic clients
 
@@ -66,9 +90,10 @@ the target that answered. Five such failures of a target within 30 s open its ci
 passed over. A stream that fails after its first event ends with one error event in the format of its endpoint. When
 a client goes away, the provider call is cancelled at once. On `SIGTERM` (or `Ctrl-C`) `serve` stops accepting
 connections and gives the requests in flight up to 30 s to finish; any still running then gets `500 internal_error`
-with the message `server stopping`, as an error answer or as the stream's error event, and `serve` closes the store
-and exits `0`. A supervisor must allow it more than 35 s to stop (the 30 s, then up to 5 s for the requests
-stopped to end) before it kills it: `docker stop` waits 10 s unless given `-t`.
+with the message `server stopping`, as an error answer or as the stream's error event, and `serve` writes the pending
+usage records, then closes the store and exits `0`. A supervisor must allow it more than 50 s to
+stop (the 30 s, up to 5 s for the requests stopped to end, and up to 10 s for the records plus the store's 5 s busy
+timeout for the write in progress) before it kills it: `docker stop` waits 10 s unless given `-t`.
 
 ## The admin key and the data directory
 
@@ -109,7 +134,7 @@ docker run -d --name stargaite --read-only -v stargaite-data:/data -p 127.0.0.1:
   stargaite serve --listen 0.0.0.0:4000 --behind-tls-proxy
 curl -sS --retry 10 --retry-all-errors --retry-delay 1 http://127.0.0.1:4000/health/ready
 docker exec stargaite /stargaite settings show
-docker stop -t 40 stargaite
+docker stop -t 60 stargaite
 ```
 
 Only the data plane leaves the container. The admin API stays on its loopback, and the CLI inside the container

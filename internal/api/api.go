@@ -18,6 +18,7 @@ import (
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/routing"
+	"github.com/jorlaru/stargaite/internal/usage"
 )
 
 // refusalLogEvery rate-limits the log line of a repeated refusal, as on the
@@ -50,8 +51,11 @@ type Deps struct {
 	Log     *slog.Logger
 	Clients [2]*http.Client // [0] public addresses only, [1] allow_private_network (SEC-4)
 	// Flight counts the authenticated inference requests not yet done: serve
-	// waits for it before it closes the store (RES-6).
-	Flight *sync.WaitGroup
+	// waits for it before it closes the usage writer and the store (RES-6).
+	Flight   *sync.WaitGroup
+	Usage    *usage.Writer   // one record per provider call (USE-1)
+	Counters *usage.Counters // OPS-8
+	Version  string          // cli.Version: records carry it (USE-5)
 }
 
 // ErrStopping is the cause serve cancels the server's base context with when

@@ -25,19 +25,22 @@ import (
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/store"
 	"github.com/jorlaru/stargaite/internal/transport"
+	"github.com/jorlaru/stargaite/internal/usage"
 )
 
 // The servers' read and write timeouts (SEC-6). A data-plane request clears
 // its read deadline once its body is read and moves its write deadline per
 // provider call (phase-2 design section 10). On a stop signal, requests in
 // flight get shutdownGrace to finish (RES-6); those still running are then
-// stopped, and drainWait bounds the wait for them to end before the store
-// closes. Tests lower them.
+// stopped, drainWait bounds the wait for them to end, and flushWait the
+// usage writer's flush, before the store closes (phase-3 design section 11).
+// Tests lower them.
 var (
 	serverReadTimeout  = 60 * time.Second
 	serverWriteTimeout = 60 * time.Second
 	shutdownGrace      = 30 * time.Second
 	drainWait          = 5 * time.Second
+	flushWait          = 10 * time.Second
 )
 
 // serve runs the proxy until SIGINT or SIGTERM. Each flag falls back to its
@@ -85,7 +88,12 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 		return 2
 	}
 
-	log := slog.New(slog.NewJSONHandler(stderr, nil))
+	log := slog.New(slog.NewJSONHandler(stderr, &slog.HandlerOptions{ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+		if a.Key == slog.LevelKey && a.Value.Any() == usage.LevelCritical {
+			a.Value = slog.StringValue("CRITICAL")
+		}
+		return a
+	}}))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -137,6 +145,9 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 			"resource", f.Resource, "field", f.Field, "message", f.Message)
 	}
 
+	// Every record goes through one writer on the store's write path, which
+	// config commits share (ADR-003).
+	records := usage.NewWriter(st.Write, log)
 	code := 0
 	// The admin key, under the lock and before the admin listener binds (SEC-3).
 	keyHash, created, err := admin.Key(*dataDir, getenv)
@@ -155,9 +166,10 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 		base, halt := context.WithCancelCause(context.Background())
 		var flight sync.WaitGroup
 		if err := runServers(ctx, base, log, tlsConfig, ready, []listener{
-			{"admin", *adminAddr, admin.Handler(cfg, keyHash, log)},
+			{"admin", *adminAddr, admin.Handler(admin.Deps{Config: cfg, KeyHash: keyHash, Log: log, Usage: st.Read()})},
 			{"data", *dataAddr, api.Handler(api.Deps{Config: cfg, Log: log, Clients: [2]*http.Client{
-				transport.NewClient(false, systemResolver), transport.NewClient(true, systemResolver)}, Flight: &flight})},
+				transport.NewClient(false, systemResolver), transport.NewClient(true, systemResolver)}, Flight: &flight,
+				Usage: records, Counters: &usage.Counters{}, Version: cli.Version})},
 		}); err != nil {
 			log.Error("server failed", "error", err.Error())
 			code = 1
@@ -168,11 +180,20 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 		select {
 		case <-drained:
 		case <-time.After(drainWait):
-			// Their outcome may be lost: the store closes under them.
+			// Their records, added after the flush below, go to the
+			// critical log.
 			log.Error("requests still running after the drain wait", "drain_wait", drainWait.String())
 			code = 1
 		}
 	}
+	// Every finish that ran has added its record: each is stored before the
+	// store closes, or logged at critical level (USE-10).
+	flush, cancel := context.WithTimeout(context.Background(), flushWait)
+	if n := records.Close(flush); n > 0 {
+		log.Error("usage records logged instead of stored", "records", n)
+		code = 1
+	}
+	cancel()
 	if err := st.Close(); err != nil {
 		log.Error("store close failed", "error", err.Error())
 		code = 1

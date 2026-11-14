@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	"github.com/jorlaru/stargaite/internal/plan"
 	"github.com/jorlaru/stargaite/internal/routing"
 	"github.com/jorlaru/stargaite/internal/transport"
+	"github.com/jorlaru/stargaite/internal/usage"
 )
 
 // The PAR-9 headers besides the request id.
@@ -96,7 +99,10 @@ type attempt struct {
 	cause                     error           // what ended it early: a timer, client gone, a transport, read or relay failure; nil otherwise
 	obs                       domain.Observed // design section 11
 	written                   bool            // a byte reached the client: no other answer from here
-	started, firstByte, ended time.Time       // firstByte: when the response headers arrived
+	complete                  bool            // the answer was read to its end: a synchronous body observed, or a stream's last event
+	started, firstByte, ended time.Time       // the service clock; firstByte: when the response headers arrived
+	firstEvent                time.Time       // the first upstream event of a stream (ttft_ms)
+	rec                       usage.Record    // made by finish
 }
 
 // verdict is how an attempt ended (design section 10): whether the next
@@ -160,7 +166,7 @@ func relayFor(ep domain.Endpoint, t *config.Target, c *plan.Client, now func() t
 // forward toward an anthropic target (PAR-14).
 func (h *handler) infer(ep domain.Endpoint) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		rq := &request{id: w.Header().Get(domain.RequestIDHeader), ep: ep, snap: h.Config.Snapshot(), started: time.Now()}
+		rq := &request{id: w.Header().Get(domain.RequestIDHeader), ep: ep, snap: h.Config.Snapshot(), started: h.Config.Now()}
 		if rq.key, rq.traceID = h.authenticate(w, r, rq.snap, ep); rq.key == nil {
 			return
 		}
@@ -318,7 +324,7 @@ func (h *handler) exclude(rq *request, t *config.Target) (gen uint64, code strin
 // attempt, replacing those of an earlier one, go out with the status line.
 // The attempt it returns holds how it ended (settle).
 func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *config.Target, out *plan.Outgoing, n int, gen uint64) *attempt {
-	a := &attempt{n: n, gen: gen, target: t, out: out, started: time.Now()}
+	a := &attempt{n: n, gen: gen, target: t, out: out, started: h.Config.Now()}
 	defer h.finish(rq, a)
 	rl := relayFor(rq.ep, t, rq.client, h.Config.Now)
 	rq.attempts = append(rq.attempts, a)
@@ -381,7 +387,7 @@ func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *c
 	// Closing the body before it ends drops the connection, so the provider
 	// stops sending.
 	defer func() { _ = resp.Body.Close() }()
-	a.status, a.firstByte = resp.StatusCode, time.Now()
+	a.status, a.firstByte = resp.StatusCode, h.Config.Now()
 	if rq.client.Stream && a.status/100 == 2 {
 		h.stream(ctx, w, rq, a, rl, resp, idle)
 		return a
@@ -393,6 +399,7 @@ func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *c
 		if int64(len(body)) > limit {
 			relayErr = fmt.Errorf("the response is larger than max_response_bytes, %d", limit)
 		} else if answer, a.obs, relayErr = rl.sync(body, h.Config.Now()); relayErr == nil {
+			a.complete = true // a write to a gone client below loses nothing of what was observed
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			a.written = true
@@ -564,6 +571,9 @@ func (h *handler) stream(ctx context.Context, w http.ResponseWriter, rq *request
 		if ev, err = events.Next(); err == io.EOF {
 			err = errStreamEnded
 		}
+		if err == nil && !ev.Comment && a.firstEvent.IsZero() {
+			a.firstEvent = h.Config.Now()
+		}
 		// A write blocked on a slow client is the write deadline's to bound,
 		// not the provider's silence; once the context ends, infer's 1 s stays.
 		idle.Stop()
@@ -585,7 +595,7 @@ func (h *handler) stream(ctx context.Context, w http.ResponseWriter, rq *request
 	}
 	a.obs = rl.observed()
 	if relayErr == io.EOF { // the last event was relayed
-		relayErr = nil
+		relayErr, a.complete = nil, true
 	}
 	settle(ctx, a, true, resp.Header, nil, err, relayErr)
 	if !a.written || a.end.err == nil {
@@ -628,12 +638,15 @@ func message(status int, body []byte) string {
 
 // finish ends one provider call (design section 11, point 2) after its last
 // byte, its failure or a panic: the circuit's permit goes back with the
-// call's verdict (None on a panic), and one log line, without the
-// credential. Phase 3 adds the usage record, the counters and the attempt
-// span here.
+// call's verdict (None on a panic), then the usage record (phase-3 design
+// section 4), which the counters count and the writer stores, and one log
+// line, without the credential.
 func (h *handler) finish(rq *request, a *attempt) {
-	a.ended = time.Now()
+	a.ended = h.Config.Now()
 	h.breakers.Release(a.target.ID, a.gen, a.end.breaker)
+	a.rec = usage.NewRecord(h.usageCall(rq, a))
+	h.count(&a.rec)
+	h.Usage.Add(a.rec)
 	attrs := []any{"request_id", rq.id, "trace_id", rq.traceID, "key", rq.key.Name, "alias", rq.alias, "attempt", a.n,
 		"target", a.target.ID, "status", a.status, "duration_ms", a.ended.Sub(a.started).Milliseconds()}
 	if a.cause != nil {
@@ -659,30 +672,93 @@ func (h *handler) finish(rq *request, a *attempt) {
 	h.Log.Info("attempt", append(attrs, "visible_bytes", a.obs.VisibleBytes, "tool_calls", a.obs.ToolCalls, "stripped", a.obs.Stripped)...)
 }
 
+// usageCall is attempt a of rq as the usage record reads it: its error is
+// the section 15 code the attempt ended with, client_gone, or none.
+func (h *handler) usageCall(rq *request, a *attempt) usage.Call {
+	code := ""
+	switch {
+	case a.end.err != nil:
+		code = a.end.err.Code
+	case errors.Is(a.cause, errClientGone):
+		code = "client_gone"
+	}
+	return usage.Call{RequestID: rq.id, TraceID: rq.traceID, Key: rq.key.Name, Model: rq.alias, Version: h.Version,
+		Endpoint: rq.ep, Attempt: a.n, Status: a.status, TargetID: a.target.ID, Target: &a.target.Spec, Provider: &a.target.Provider.Spec,
+		Out: a.out, Stream: rq.client.Stream, Complete: a.complete, ErrorCode: code, Obs: a.obs,
+		Started: a.started, FirstEvent: a.firstEvent, Ended: a.ended, Revision: rq.snap.Revision}
+}
+
+// count adds a record to the OPS-8 counters of its key and alias: tokens by
+// type, cost, length and empty answers, model mismatches, parameter changes
+// by action and unpriced records.
+func (h *handler) count(r *usage.Record) {
+	add := func(name, label string, v float64) {
+		if v != 0 {
+			h.Counters.Add(usage.Counter{Name: name, Key: r.KeyName, Model: r.Model, Label: label}, v)
+		}
+	}
+	reasoning := int64(0)
+	if r.ReasoningTokens != nil {
+		reasoning = *r.ReasoningTokens
+	}
+	for label, n := range map[string]int64{"input": r.InputTokens, "cache_read": r.CacheReadTokens, "cache_write": r.CacheWriteTokens,
+		"output": r.OutputTokens, "reasoning": reasoning} {
+		add("tokens", label, float64(n))
+	}
+	if r.CostUSD != nil {
+		add("cost_usd", "", *r.CostUSD)
+	}
+	if r.Billing == domain.BillingPayPerUse && r.CostUSD == nil {
+		add("unpriced", "", 1)
+	}
+	if usage.Length(r.FinishReason) {
+		add("length", "", 1)
+	}
+	if r.ContentEmpty {
+		add("empty", "", 1)
+	}
+	if r.ModelMismatch {
+		add("model_mismatch", "", 1)
+	}
+	if r.ParamsChanged != "" {
+		for _, c := range strings.Split(r.ParamsChanged, ",") { // name:action
+			add("params_changed", c[strings.LastIndexByte(c, ':')+1:], 1)
+		}
+	}
+}
+
 // done ends one authenticated request (design section 11, point 3) after
-// its last finish: the request line (OPS-9), then Flight. Its status and
-// code are those of the error the client got, also as the terminal event of
-// a committed stream (so 500 internal_error for a request the shutdown
-// stopped); 499 client_gone when the client went away, whatever was written
-// before; else 200. Phase 3 releases the admission slots and ends the
-// request span here.
+// its last finish: the request counter, then the request line (OPS-9), then
+// Flight. Its status and code are those of the error the client got, also as
+// the terminal event of a committed stream (so 500 internal_error for a
+// request the shutdown stopped); 499 client_gone when the client went away,
+// whatever was written before; else 200.
 func (h *handler) done(rq *request) {
 	defer h.Flight.Done()
+	n := len(rq.attempts)
+	status, code := http.StatusOK, ""
+	switch {
+	case rq.err != nil:
+		status, code = rq.err.Status, rq.err.Code
+	case n > 0 && errors.Is(rq.attempts[n-1].cause, errClientGone):
+		status, code = statusClientGone, "client_gone"
+	}
+	// An alias that does not exist is counted under none: a client must not
+	// grow the counters with names of its own.
+	model := ""
+	if rq.model != nil {
+		model = rq.alias
+	}
+	h.Counters.Add(usage.Counter{Name: "requests", Key: rq.key.Name, Model: model, Label: strconv.Itoa(status)}, 1)
 	attrs := []any{"request_id", rq.id, "trace_id", rq.traceID, "key", rq.key.Name}
 	if rq.alias != "" {
 		attrs = append(attrs, "alias", fmt.Sprintf("%.200s", rq.alias)) // an unknown alias is as long as the body allows
 	}
-	n := len(rq.attempts)
-	attrs = append(attrs, "attempts", n)
-	switch {
-	case rq.err != nil:
-		attrs = append(attrs, "status", rq.err.Status, "code", rq.err.Code)
-	case n > 0 && errors.Is(rq.attempts[n-1].cause, errClientGone):
-		attrs = append(attrs, "status", statusClientGone, "code", "client_gone")
-	default:
-		attrs = append(attrs, "status", http.StatusOK)
+	attrs = append(attrs, "attempts", n, "status", status)
+	if code != "" {
+		attrs = append(attrs, "code", code)
 	}
-	h.Log.Info("request", append(attrs, "duration_ms", time.Since(rq.started).Milliseconds())...)
+	h.Log.Info("request", append(attrs, "duration_ms", h.Config.Now().Sub(rq.started).Milliseconds())...)
 }
 
 // unquote is the JSON string v, unescaped; ok is false for any other value.

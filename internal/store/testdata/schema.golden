@@ -1,4 +1,4 @@
--- user_version 1
+-- user_version 2
 
 -- index idx_usage_key_time on usage
 CREATE INDEX idx_usage_key_time   ON usage(key_name, completed_at)
@@ -63,7 +63,7 @@ CREATE TABLE audit (
 CREATE TABLE budget_totals (              -- running totals of `never` budgets; not subject to retention
     scope_type  TEXT NOT NULL,            -- 'global' | 'key' | 'model'
     scope_name  TEXT NOT NULL,
-    cost_usd    REAL NOT NULL DEFAULT 0,
+    cost_usd    REAL NOT NULL DEFAULT 0, since_revision INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (scope_type, scope_name)
 )
 
@@ -182,8 +182,8 @@ CREATE TABLE usage (
 )
 
 -- table usage_daily on usage_daily
-CREATE TABLE usage_daily (                -- updated in the same transaction as `usage`; source of budget counters
-    day                 TEXT NOT NULL,    -- '2026-11-11', UTC
+CREATE TABLE usage_daily (
+    day                 TEXT NOT NULL,
     key_name            TEXT NOT NULL,
     model               TEXT NOT NULL,
     target              TEXT NOT NULL,
@@ -196,5 +196,5 @@ CREATE TABLE usage_daily (                -- updated in the same transaction as 
     output_tokens       INTEGER NOT NULL DEFAULT 0,
     reasoning_tokens    INTEGER NOT NULL DEFAULT 0,
     cost_usd            REAL NOT NULL DEFAULT 0,
-    PRIMARY KEY (day, key_name, model, target)
+    PRIMARY KEY (day, key_name, model, target, billing)   -- a provider whose billing changes keeps its rows apart
 )

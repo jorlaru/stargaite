@@ -24,7 +24,7 @@ type Finding struct {
 const RequestIDHeader = "X-Stargaite-Request-Id"
 
 // Error codes of the error model (kick-off section 15) that the admin API and
-// the data plane answer with. The limits of phase 3 add theirs.
+// the data plane answer with.
 const (
 	CodeInvalidRequest  = "invalid_request"
 	CodeInvalidAPIKey   = "invalid_api_key"
@@ -45,6 +45,12 @@ const (
 	CodeUpstreamAuthError       = "upstream_auth_error"
 	CodeNoTargetAvailable       = "no_target_available"
 	CodeUpstreamTimeout         = "upstream_timeout"
+
+	CodeBudgetExceeded        = "budget_exceeded"
+	CodeRateLimitExceeded     = "rate_limit_exceeded"
+	CodeParallelLimitExceeded = "parallel_limit_exceeded"
+	CodeQuotaExceeded         = "quota_exceeded"
+	CodeUsageStoreUnavailable = "usage_store_unavailable"
 )
 
 // Endpoint is an inference endpoint: the format of the inbound body.
@@ -95,7 +101,11 @@ func NewError(code, message string) *Error {
 		e.Status = http.StatusUnprocessableEntity
 	case CodeUpstreamError, CodeUpstreamAuthError:
 		e.Status, e.Type = http.StatusBadGateway, "api_error"
-	case CodeNoTargetAvailable:
+	case CodeBudgetExceeded:
+		e.Status, e.Type = http.StatusPaymentRequired, "billing_error"
+	case CodeRateLimitExceeded, CodeParallelLimitExceeded, CodeQuotaExceeded:
+		e.Status, e.Type = http.StatusTooManyRequests, "rate_limit_error"
+	case CodeNoTargetAvailable, CodeUsageStoreUnavailable:
 		e.Status, e.Type = http.StatusServiceUnavailable, "overloaded_error"
 	case CodeUpstreamTimeout:
 		e.Status, e.Type = http.StatusGatewayTimeout, "api_error"
@@ -133,12 +143,13 @@ type Usage struct {
 }
 
 // Observed is what the relay read from one provider response, the input of
-// usage accounting (phase 3).
+// usage accounting (phase-3 design section 6).
 type Observed struct {
-	ResponseModel string // USE-4
-	FinishReason  string // the provider's own value (USE-3)
-	Usage         *Usage // nil when none arrived: phase 3 estimates (USE-8)
-	VisibleBytes  int64  // visible text relayed, for the estimate
-	ToolCalls     int    // with VisibleBytes 0: content_empty (USE-9)
-	Stripped      bool   // RSN-12
+	ResponseModel string   // USE-4
+	FinishReason  string   // the provider's own value (USE-3)
+	Usage         *Usage   // nil when none arrived: the record estimates (USE-8)
+	Cost          *float64 // USD at the provider's cost_report path; nil when absent, null, not a number or negative (USE-6)
+	VisibleBytes  int64    // visible text relayed, for the estimate
+	ToolCalls     int      // with VisibleBytes 0: content_empty (USE-9)
+	Stripped      bool     // RSN-12
 }

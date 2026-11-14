@@ -58,7 +58,7 @@ func adminServer(t *testing.T) map[string]string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(admin.Handler(cfg, sha256.Sum256([]byte(testKey)), slog.New(slog.NewJSONHandler(io.Discard, nil))))
+	srv := httptest.NewServer(admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(testKey)), Log: slog.New(slog.NewJSONHandler(io.Discard, nil)), Usage: st.Read()}))
 	t.Cleanup(srv.Close)
 	return map[string]string{"STARGAITE_ADMIN_URL": srv.URL, "STARGAITE_ADMIN_KEY": testKey}
 }
@@ -150,7 +150,11 @@ func TestCommandWalk(t *testing.T) {
 		},
 		"keys rotate": {{[]string{"k@"}, 0}, {[]string{"k@", "--grace", "5m"}, 0}, {[]string{"k@", "--grace", "soon"}, 1}, {[]string{"nope"}, 1}},
 		"keys revoke": {{[]string{"all@", "--yes"}, 0}, {[]string{"all@", "--yes"}, 1}, {[]string{"nope", "--yes"}, 1}},
-		"export":      {{nil, 0}},
+		"usage show": {
+			{nil, 0}, {[]string{"--since", "1h", "--key", "k1", "--model", "fast", "--target", "walk1/up", "--by", "key,model,target"}, 0},
+			{[]string{"--since", "2026-11-01T00:00:00Z"}, 0}, {[]string{"--since", "soon"}, 1}, {[]string{"--by", "colour"}, 1},
+		},
+		"export": {{nil, 0}},
 		"apply": {
 			{[]string{"-f", example, "--dry-run"}, 0}, {[]string{"-f", example}, 0}, {[]string{"-f", invalid}, 1},
 			{[]string{"-f", example, "--prune", "--yes"}, 0}, {[]string{"-f", example, "--prune", "--dry-run"}, 0},

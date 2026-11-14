@@ -268,9 +268,10 @@ type attemptLine struct {
 //     anthropic-version and anthropic-beta replace the ones explain shows,
 //     which has no inbound headers (PAR-14), and the answer is the
 //     provider's, byte for byte;
-//   - the PAR-9 headers and the attempt handed to finish carry the change
-//     list and the effort and cap that explain shows, which equal the values
-//     read from the bytes the provider received (AC-18);
+//   - the PAR-9 headers, the attempt handed to finish and its usage record
+//     carry the change list and the effort and cap that explain shows, which
+//     equal the values read from the bytes the provider received (AC-09,
+//     AC-18);
 //   - the top-level members that differ between the inbound body and the
 //     bytes received are exactly the ones the change list names (AC-09).
 func TestCorpus(t *testing.T) {
@@ -309,6 +310,11 @@ func TestCorpus(t *testing.T) {
 	served, refused, allSkipped, streamed, translatedStreams := map[string]int{}, 0, 0, 0, 0
 	msgServed, msgRefused, msgSkipped, msgStreamed := 0, 0, 0, 0
 	logged := 0
+	type sentValues struct {
+		changes, effort string
+		maxOutput       *int64
+	}
+	recorded := map[string]sentValues{} // by request id: what the record must hold
 	for i := range n {
 		ep, alias := domain.EndpointChat, names[r.IntN(len(names))]
 		if r.Float64() < 0.4 {
@@ -497,6 +503,8 @@ func TestCorpus(t *testing.T) {
 			fail("cap sent %s: attempt %s, explain %s", toJSON(maxOutput), toJSON(line.MaxOutput), toJSON(b.MaxOutput.Sent))
 		}
 
+		recorded[h.Get(domain.RequestIDHeader)] = sentValues{b.Changes, effort, maxOutput}
+
 		// AC-09: what differs is what is listed.
 		check := listed
 		if anthropic && !messages {
@@ -505,6 +513,15 @@ func TestCorpus(t *testing.T) {
 		group := append([]string{reasoning.Inbound(ep)[0]}, domain.DialectKeys[reasoning.Dialect(decl.Reasoning)]...)
 		if err := check(body, got.Body, b.Changes, group, b.Target); err != nil {
 			fail("%v; changes %q; the provider received\n%s", err, b.Changes, got.Body)
+		}
+	}
+
+	// The record of every call holds the same change list and sent values.
+	for _, r := range f.stored(t, len(recorded)) {
+		want, ok := recorded[r.RequestID]
+		if !ok || str(r.ParamsChanged) != want.changes || str(r.EffortSent) != want.effort || !reflect.DeepEqual(r.MaxOutputSent, want.maxOutput) {
+			t.Fatalf("request %s: record changes %q, effort %q, cap %s; want %+v (cap %s)", r.RequestID, str(r.ParamsChanged), str(r.EffortSent),
+				toJSON(r.MaxOutputSent), want, toJSON(want.maxOutput))
 		}
 	}
 

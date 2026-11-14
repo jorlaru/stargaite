@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -86,7 +87,7 @@ func newFixtureEnv(t *testing.T, env func() config.Env) *fixture {
 		t.Fatal(err)
 	}
 	log := &bytes.Buffer{}
-	return &fixture{Handler(cfg, sha256.Sum256([]byte(testKey)), slog.New(slog.NewJSONHandler(log, nil))), cfg, st, log}
+	return &fixture{Handler(Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(testKey)), Log: slog.New(slog.NewJSONHandler(log, nil)), Usage: st.Read()}), cfg, st, log}
 }
 
 // as sends one request with the Authorization header given.
@@ -781,5 +782,58 @@ func TestMergePatch(t *testing.T) {
 		if err != nil || string(got) != tc.want {
 			t.Errorf("%s + %s = %s, %v; want %s", tc.target, tc.patch, got, err, tc.want)
 		}
+	}
+}
+
+// TestUsageShow is GET /admin/v1/usage (phase-3 design section 12): since
+// is a duration back from the service clock, 24h by default, or an RFC 3339
+// time; key, model and target filter, by groups; a malformed since or by, or
+// an unknown or repeated parameter, is a 400. The read is not audited.
+func TestUsageShow(t *testing.T) {
+	f := newFixture(t)
+	insert := func(id, key string, completed int64) {
+		t.Helper()
+		if err := f.st.Write(context.Background(), func(tx *sql.Tx) error {
+			_, err := tx.Exec(`INSERT INTO usage (id, request_id, endpoint, key_name, model, target, billing, status_code, input_tokens,
+				output_tokens, tokens_source, cost_usd, cost_source, started_at, completed_at, config_revision, proxy_version)
+				VALUES (?, ?, 'chat', ?, 'fast', 'p/m', 'pay_per_use', 200, 10, 5, 'provider', 0.5, 'price_table', ?, ?, 1, 'v')`, id, id, key, completed, completed)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert("a", "k1", testNow-60_000)
+	insert("b", "k2", testNow-2*3_600_000)
+	insert("c", "k1", testNow-25*3_600_000)
+	type group struct {
+		Billing, Key string
+		Requests     int64
+		Input        int64   `json:"input_tokens"`
+		CostUSD      float64 `json:"cost_usd"`
+	}
+	for query, want := range map[string][]group{
+		"":                                   {{"pay_per_use", "", 2, 20, 1}},
+		"?since=1h&by=key":                   {{"pay_per_use", "k1", 1, 10, 0.5}},
+		"?since=48h&by=key":                  {{"pay_per_use", "k1", 2, 20, 1}, {"pay_per_use", "k2", 1, 10, 0.5}},
+		"?since=2026-09-21T00:00:00Z&key=k2": {{"pay_per_use", "", 1, 10, 0.5}},
+		"?since=1h&model=deep":               {},
+	} {
+		w := f.as(t, "Bearer "+testKey, http.MethodGet, "/admin/v1/usage"+query, nil)
+		var rep struct {
+			Source string
+			Groups []group
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &rep); err != nil || w.Code != http.StatusOK || rep.Source != "records" || !reflect.DeepEqual(rep.Groups, want) {
+			t.Errorf("%q: %d %s", query, w.Code, w.Body)
+		}
+	}
+	for _, query := range []string{"?since=soon", "?since=-1h", "?since=0s", "?by=effort-sent", "?by=key,key", "?colour=blue", "?key=a&key=b"} {
+		if w := f.as(t, "Bearer "+testKey, http.MethodGet, "/admin/v1/usage"+query, nil); w.Code != http.StatusBadRequest {
+			t.Errorf("%q: %d %s", query, w.Code, w.Body)
+		}
+	}
+	var audited int
+	if err := f.st.Read().QueryRow("SELECT COUNT(*) FROM audit").Scan(&audited); err != nil || audited != 0 {
+		t.Errorf("%d audit rows, error %v", audited, err)
 	}
 }

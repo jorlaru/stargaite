@@ -45,8 +45,9 @@ var (
 // TestQuickStart runs the quick start of README.md with the built binary,
 // then checks what it left: the first answer of the chat completion with its
 // PAR-9 headers and the one call the provider got (AC-04), /v1/models with the
-// new key, a second serve on the same directory refused (AC-42), and the same
-// export and the same key after a restart (RES-9). The guide's commands use
+// new key, usage show with the one request, its tokens and its price_table
+// cost (AC-33), a second serve on the same directory refused (AC-42), and the
+// same export, the same key and the same usage after a restart (RES-9). The guide's commands use
 // the default data directory and addresses; here the environment points them
 // at a temporary directory and at ports the system chose.
 func TestQuickStart(t *testing.T) {
@@ -59,6 +60,7 @@ func TestQuickStart(t *testing.T) {
 		srv      *server
 		token    string
 		answered bool
+		shown    string // what usage show printed
 	)
 	cli := func(args ...string) string {
 		t.Helper()
@@ -87,6 +89,14 @@ func TestQuickStart(t *testing.T) {
 			mockURL = s.URL
 		case fields[0] == "./stargaite" && fields[len(fields)-1] == "&":
 			srv = start(t, bin, env, fields[1:len(fields)-1]...)
+		case fields[0] == "./stargaite" && fields[1] == "usage" && srv != nil:
+			// A record reaches the store within a batch's 50 ms: the line runs
+			// again until it shows the request.
+			for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+				if shown = cli(fields[1:]...); strings.Contains(shown, "pay_per_use") || time.Now().After(deadline) {
+					break
+				}
+			}
 		case fields[0] == "./stargaite" && srv != nil:
 			if m := tokenLine.FindString(cli(fields[1:]...)); m != "" {
 				token = m
@@ -127,9 +137,35 @@ func TestQuickStart(t *testing.T) {
 			t.Fatalf("a quick start line this test does not run: %q", line)
 		}
 	}
-	if srv == nil || mock == nil || token == "" || !answered {
-		t.Fatalf("the quick start did not start the proxy and the mock provider, create a key and get an answer")
+	if srv == nil || mock == nil || token == "" || !answered || shown == "" {
+		t.Fatalf("the quick start did not start the proxy and the mock provider, create a key, get an answer and show the usage")
 	}
+	// The mock's usage, 1 input and 2 output tokens, at 1 and 2 USD per million.
+	if !regexp.MustCompile(`(?m)^pay_per_use +1 +0 +1 +0 +0 +2 +0 +0 +0\.000005 +0 *$`).MatchString(shown) {
+		t.Errorf("usage show printed:\n%s", shown)
+	}
+	usage := func() {
+		t.Helper()
+		var rep struct {
+			Source string
+			Groups []struct {
+				Billing                               string
+				Requests, Errors, Estimated, Unpriced int64
+				Input                                 int64    `json:"input_tokens"`
+				Output                                int64    `json:"output_tokens"`
+				CostUSD                               *float64 `json:"cost_usd"`
+			}
+		}
+		out := cli("usage", "show", "--since", "1h", "--json")
+		if err := json.Unmarshal([]byte(out), &rep); err != nil || rep.Source != "records" || len(rep.Groups) != 1 {
+			t.Fatalf("usage show --json: %s", out)
+		}
+		if g := rep.Groups[0]; g.Billing != "pay_per_use" || g.Requests != 1 || g.Errors != 0 || g.Estimated != 0 || g.Unpriced != 0 ||
+			g.Input != 1 || g.Output != 2 || g.CostUSD == nil || *g.CostUSD != 5e-6 {
+			t.Errorf("usage show --json: %s", out)
+		}
+	}
+	usage()
 
 	models := func() {
 		t.Helper()
@@ -179,6 +215,7 @@ func TestQuickStart(t *testing.T) {
 	}
 	srv = start(t, bin, env, "serve")
 	models()
+	usage()
 	if after := cli("export"); after != before {
 		t.Errorf("export after the restart:\n%s\nbefore:\n%s", after, before)
 	}

@@ -433,8 +433,7 @@ func TestSplitTarget(t *testing.T) {
 	}
 }
 
-// The rows of the error model (kick-off section 15) that phases 1 and 2
-// answer with.
+// Every row of the error model (kick-off section 15).
 func TestNewError(t *testing.T) {
 	tests := []struct {
 		code   string
@@ -459,6 +458,11 @@ func TestNewError(t *testing.T) {
 		{CodeUpstreamAuthError, http.StatusBadGateway, "api_error"},
 		{CodeNoTargetAvailable, http.StatusServiceUnavailable, "overloaded_error"},
 		{CodeUpstreamTimeout, http.StatusGatewayTimeout, "api_error"},
+		{CodeBudgetExceeded, http.StatusPaymentRequired, "billing_error"},
+		{CodeRateLimitExceeded, http.StatusTooManyRequests, "rate_limit_error"},
+		{CodeParallelLimitExceeded, http.StatusTooManyRequests, "rate_limit_error"},
+		{CodeQuotaExceeded, http.StatusTooManyRequests, "rate_limit_error"},
+		{CodeUsageStoreUnavailable, http.StatusServiceUnavailable, "overloaded_error"},
 	}
 	for _, tt := range tests {
 		var err error = NewError(tt.code, "the message")

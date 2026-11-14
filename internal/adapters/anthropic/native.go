@@ -23,14 +23,15 @@ import (
 // (USE-3), the visible bytes of the text blocks, the tool_use blocks and
 // whether a block was removed. The error says the body is not a JSON object,
 // repeats a key in an object it reads, or holds a text block whose text is
-// not a string: a 2xx that is not relayed. Phase 2 does not read p (design
-// section 11, point 1).
-func Observe(t *domain.Target, _ *domain.Provider, body []byte) ([]byte, domain.Observed, error) {
-	b, e := params.Scan(body, params.MessagesReply)
+// not a string: a 2xx that is not relayed. Observed also has the cost at p's
+// cost_report path.
+func Observe(t *domain.Target, p *domain.Provider, body []byte) ([]byte, domain.Observed, error) {
+	cr := report(p)
+	b, e := params.Scan(body, params.Reply(params.MessagesReply, cr.Path))
 	if e != nil {
 		return nil, domain.Observed{}, errors.New(e.Message)
 	}
-	o := domain.Observed{ResponseModel: str(b, "model"), FinishReason: str(b, "stop_reason")}
+	o := domain.Observed{ResponseModel: str(b, "model"), FinishReason: str(b, "stop_reason"), Cost: params.Cost(b, cr.Path, cr.USDPerUnit)}
 	var ops []params.Op
 	for j := 0; ; j++ {
 		at := strconv.Itoa(j)
@@ -71,16 +72,19 @@ func Observe(t *domain.Target, _ *domain.Provider, body []byte) ([]byte, domain.
 // 9, Anthropic native). Use NewStream; it is not safe for concurrent use.
 type Stream struct {
 	think  bool
+	cost   domain.CostReport   // where an event reports the cost
+	walk   [][]string          // params.MessagesReply and the objects that lead to the cost
 	text   *reasoning.Stripper // of the open text block toward a target that declares inline_think_tags; nil otherwise
 	index  []byte              // that block's index, as sent
 	counts counts
 	obs    domain.Observed
 }
 
-// NewStream is the Stream of one attempt toward target t of provider p.
-// Phase 2 does not read p (design section 11, point 1).
-func NewStream(t *domain.Target, _ *domain.Provider) *Stream {
-	return &Stream{think: t.InlineThinkTags}
+// NewStream is the Stream of one attempt toward target t of provider p,
+// which reads the cost at p's cost_report path.
+func NewStream(t *domain.Target, p *domain.Provider) *Stream {
+	cr := report(p)
+	return &Stream{think: t.InlineThinkTags, cost: cr, walk: params.Reply(params.MessagesReply, cr.Path)}
 }
 
 // Event re-emits one event under its own name with its data unchanged, ping
@@ -98,14 +102,18 @@ func NewStream(t *domain.Target, _ *domain.Provider) *Stream {
 // comments, or an event whose name holds a CR, which a client that ends
 // lines at a bare CR would read as further lines; or emit's error. Observed: the response model, the provider's own
 // stop_reason, the usage of message_start updated by each message_delta, the
-// visible text, the tool_use blocks and whether a think block was removed.
+// visible text, the tool_use blocks, whether a think block was removed and
+// the latest cost at the provider's cost_report path.
 func (s *Stream) Event(name string, data []byte, emit func(name string, data []byte) error) error {
 	if name == Comment || strings.ContainsRune(name, '\r') {
 		return errors.New(`an event of the stream: an event named ":" or with a CR in its name`)
 	}
-	b, e := params.Scan(data, params.MessagesReply)
+	b, e := params.Scan(data, s.walk)
 	if e != nil {
 		return errors.New("an event of the stream: " + e.Message)
+	}
+	if c := params.Cost(b, s.cost.Path, s.cost.USDPerUnit); c != nil {
+		s.obs.Cost = c
 	}
 	kind := cmp.Or(name, str(b, "type"))
 	if v, ok := b.Get("error"); kind == "error" || ok && string(v) != "null" {

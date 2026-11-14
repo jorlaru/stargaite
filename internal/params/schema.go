@@ -65,12 +65,13 @@ var (
 
 // ChatReply and MessagesReply are the walks for observing a response, a
 // stream chunk or event, or a provider's error body: model, finish reason,
-// usage, text, tool calls and the error object.
+// usage, text, tool calls and the error object. ChatReply also reaches
+// Mistral's prompt_token_details (phase-3 design section 6).
 var (
 	ChatReply = [][]string{
 		{"choices", "*"}, {"choices", "*", "message"}, {"choices", "*", "message", "tool_calls", "*"},
 		{"choices", "*", "delta"}, {"choices", "*", "delta", "tool_calls", "*"},
-		{"usage"}, {"usage", "prompt_tokens_details"}, {"usage", "completion_tokens_details"}, {"error"},
+		{"usage"}, {"usage", "prompt_tokens_details"}, {"usage", "prompt_token_details"}, {"usage", "completion_tokens_details"}, {"error"},
 	}
 	MessagesReply = [][]string{
 		{"content", "*"}, {"usage"}, {"usage", "output_tokens_details"},

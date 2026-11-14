@@ -222,6 +222,13 @@ func (h *handler) done(rq *request) {
 
 The sync error envelope is still written by `infer` after the last `finish` (phase-2 §11 point 2 says "after its last byte"); nothing in the record depends on it.
 
+Settled in C22:
+
+- **Staging.** `Deps` gains `Usage`, `Counters` and `Version` only; `Admission` joins with C26 and `Spans` with C29, and `request` keeps `traceID string` until C30. `attempt` gains `firstEvent`, `complete` and `rec`; `answer` waits for C31. `finish` runs as written without the admission, budget and quota lines; `done` adds the `requests` counter before its line.
+- **Clocks.** `rq.started`, `a.started`, `a.firstByte`, `a.ended` and `done`'s duration read `h.Config.Now()`; `a.firstEvent` is the first event `transport.EventReader` returns that is not an SSE comment, which carries no content. `a.complete` is set when the synchronous adapter observed the body (before the write to the client) or when the stream's last event was relayed.
+- **Counter keys.** The `requests` counter names the alias only when it exists (`rq.model` set), else `""`: `rq.alias` is the client's text, and a key that sends random unknown aliases would otherwise grow the counters without bound. `finish`'s counters, keyed by the record's key and alias, are `tokens` (labels `input`, `cache_read`, `cache_write`, `output`, `reasoning`), `cost_usd`, `unpriced`, `length` (`usage.Length`), `empty`, `model_mismatch` and `params_changed` (label: the action); a zero is not added.
+- **Error code.** `usage.Call.ErrorCode` is `a.end.err.Code` when the attempt ended with an error, `client_gone` when its cause is the client gone, else empty; a shutdown is `internal_error`.
+
 ## 5. Usage records and the writer
 
 **Migration 002** (`internal/store/migrations/002_usage.sql`; 001 stays as shipped, because `migrate` skips every file at or below `user_version` and data directories made by the phase 1 and 2 binaries are already at 1): `ALTER TABLE budget_totals ADD COLUMN since_revision INTEGER NOT NULL DEFAULT 0`, the revision its counter started at (§8); `usage_daily` is dropped and recreated with primary key `(day, key_name, model, target, billing)`, so a provider whose billing changes keeps its rows apart (nothing wrote it before phase 3). Nothing else changes; no index is added (the quota seed filters on `idx_usage_time`, §9). A test opens a store at version 1 and checks both changes.
@@ -300,6 +307,13 @@ func Show(ctx context.Context, db *sql.DB, q Query, now time.Time, usageDays int
 
 **`usage show` (USE-9).** `Show` reads the read pool. Within `usage_days` it answers from records: one statement over `usage` filtered by window (`completed_at`), key, alias and target, grouped by `billing` and the `--by` columns (`key_name`, `model`, `target`, `effort_sent`). Per group: requests (provider calls), errors (records whose `error_type` is not NULL, the rule the writer applies to `usage_daily`), each token type, estimated calls, cost (`pay_per_use` only; `subscription` and `none` groups show requests and tokens, USE-7), unpriced calls, `length` finishes (`finish_reason` in `length`, `max_tokens`, `model_context_window_exceeded`, the provider's own values that mean it), empty responses, and nearest-rank p50 and p90 of `output_tokens` and `reasoning_tokens` over the `2xx` records with `tokens_source = 'provider'` that reported the value, by `ROW_NUMBER() OVER (PARTITION BY …)`. A window that starts before the retention reads `usage_daily` sums for all of it, without percentiles or `effort-sent`, and says so (`"source": "daily"`). `--compare-previous` runs the same query on the window of equal length before it.
 
+Settled in C22:
+
+- **Close.** `Close` keeps retrying a failed commit, every `retryWait`, while its context allows, and commits the rest of the queue the same way. A batch whose write failed and whose retries the context ended is logged at critical level and counted too: it was handed to `store.Write` but is not stored, and the sentence "only the entries never handed to `store.Write`" would otherwise lose it silently. `Close` returns the count over the writer's life, `Add`'s overflow and late records included, so `serve` exits `1` for any record logged instead of stored; a second `Close` returns the same count.
+- **Failures in C22.** Without `Available` (C23), a failed commit is retried every `retryWait` without bound while records keep queueing; the log gets one `ERROR` line when a run of failures starts (`usage records not committed: retrying`) and one `INFO` line when the batch commits again, not one per retry.
+- **Critical level.** `usage.LevelCritical` is `slog.LevelError + 4`; `serve`'s handler writes it as `"level":"CRITICAL"`. The line is `"msg":"usage record not stored"` with the record under `record`, every column by its annex A name.
+- **Show in C22.** `Show(ctx, db, q, now)` takes no `usageDays` until the daily fallback (C25); `Query` has `Since`, `Key`, `Model`, `Target` and `By` (key, model and target; `effort-sent` is refused until C25), `Group` the sums without `EffortSent`, `Length`, `Empty` and the percentiles, and `Report` no `Previous`. JSON names: `billing`, `key`, `model`, `target` (only when grouped), `requests`, `errors`, `estimated`, `unpriced`, `input_tokens`, `cache_read_tokens`, `cache_write_tokens`, `output_tokens`, `reasoning_tokens` and `cost_usd` (only for a `pay_per_use` group with a priced record).
+
 ## 6. Tokens and cost
 
 **Normalization (USE-3)**, in the adapters' single observation pass:
@@ -331,6 +345,12 @@ func PriceCost(p *domain.Pricing, u domain.Usage) float64 {
 **Injection (USE-8).** `Build`, for chat toward an `openai` target with `stream: true`, `Provider.StreamUsage == request` and `Client.Usage` false, writes `stream_options.include_usage: true` (parents created), listed `stream_options:added` unless the client sent `include_usage: false`, which is listed `stream_options:translated` (§17 point 21); `explain` shows it. `stream_options` is already a key a `forward` rule may not name. `openai.NewStream(t, p, includeUsage)` drops a chunk whose `choices` is empty and whose `usage` is not null, after observing it, only when `p.StreamUsage == request` and `includeUsage` is false, that is, exactly when `Build` injected `include_usage`; toward `native`, `none` or an undeclared `stream_usage` every chunk is relayed as in phase 2, and the golden `openai-stream.down.sse` keeps its usage chunk. The `"usage": null` OpenAI adds to every other chunk is relayed as is (SDKs read the member as optional). An undeclared `stream_usage` injects nothing, as `native` and `none` do. Toward `anthropic`, usage always arrives (phase-2 §9).
 
 **Price shapes not represented.** One price table cannot express cache-write tiers by TTL, long-context tiers, service-tier and residency multipliers, peak hours, per-call tool fees or dated price changes; the guide documents them and prefers `cost_report` where a provider has one (§17 point 11).
+
+Settled in C22:
+
+- **Cost path.** `params.Reply(walk, path)` adds the parents of a dotted `cost_report.path` to a reply walk without modifying it, and `params.Cost(b, path, perUnit)` reads the number there (absent, `null`, a string, any non-number or a negative number is nil); both adapters use them in every observer, and a repeated key on the way to the cost refuses the body like any key the proxy reads. `openai.Stream` now holds that walk, so its zero value is no longer ready: `NewStream` makes it.
+- **Output rule.** A `total_tokens` below `prompt_tokens + completion_tokens` leaves `completion_tokens`; a missing total counts as 0. The Mistral fallback applies only when `prompt_tokens_details.cached_tokens` is not an integer.
+- **Estimates.** A `2xx` stream whose relay failed before any event (not an event stream) and an oversized synchronous `2xx` are estimated like a cut stream: input from the bytes sent, output from the visible bytes, which are 0, so `content_empty` is set.
 
 ## 7. Limits
 
@@ -575,6 +595,12 @@ The exit code is `1` for a drain timeout, records logged instead of stored, or a
 | `POST /admin/v1/keys`, `PATCH /admin/v1/keys/{name}` | `keys create\|set <name> --content <duration>` | `content` member (§10) |
 
 `admin.Handler(admin.Deps{Config, KeyHash, Log, Usage *sql.DB, Admission, Spans})` replaces the three arguments. `telemetry set` without a running server is not offered, as for every command but `serve`, `version` and `validate -f`. The renderer of `usage show` without `--json` is a table per window, one row per group; `telemetry test` prints the kick-off §3.2 line. Validation additions: a `content` duration must be positive; a quota window longer than `usage_days` warns (`quota_beyond_retention`, §17 point 12).
+
+Settled in C22:
+
+- **Admin.** `admin.Deps` is `{Config, KeyHash, Log, Usage}` in C22; `Admission` and `Spans` join with C26 and C29. `GET /admin/v1/usage` takes `since`, `key`, `model`, `target` and `by`, each at most once (`compare_previous` comes with C25); without `since` the window is the last 24 h on the service clock, and a duration that is not positive is a `400`.
+- **CLI.** `usage show` sends only the flags given; without `--json` it prints one table, a header and a row per group, with `-` for a cost that does not apply or is unknown, and `no usage in the window` when there is none.
+- **Stop.** With `flushWait`, a supervisor must allow `serve` more than 50 s to stop: 30 s grace, up to 5 s drain, and the 10 s flush plus the store's 5 s busy timeout, since `Close` waits for the write in progress; the README's `docker stop` example now gives `-t 60`.
 
 ## 13. Interfaces fixed now for phase 4
 

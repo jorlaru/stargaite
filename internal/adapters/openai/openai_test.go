@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"math"
 	"reflect"
 	"testing"
 
@@ -73,3 +74,87 @@ func TestObserveThink(t *testing.T) {
 		}
 	}
 }
+
+// TestUsageRule is USE-3 on the openai protocol (phase-3 design section 6):
+// the output is the larger of completion_tokens and total_tokens minus
+// prompt_tokens, reasoning only an integer the provider reports, and cache
+// reads fall back to Mistral's prompt_token_details.
+func TestUsageRule(t *testing.T) {
+	n := func(v int64) *int64 { return &v }
+	for _, tt := range []struct {
+		name, usage string
+		want        domain.Usage
+	}{
+		{"xAI: reasoning outside completion_tokens", `{"prompt_tokens":32,"completion_tokens":9,"total_tokens":135,"completion_tokens_details":{"reasoning_tokens":94}}`,
+			domain.Usage{Input: 32, Output: 103, Reasoning: n(94)}},
+		{"a plain provider", `{"prompt_tokens":10,"completion_tokens":7,"total_tokens":17,"completion_tokens_details":{"reasoning_tokens":5}}`,
+			domain.Usage{Input: 10, Output: 7, Reasoning: n(5)}},
+		{"no total", `{"prompt_tokens":10,"completion_tokens":7}`, domain.Usage{Input: 10, Output: 7}},
+		{"a total below the parts", `{"prompt_tokens":10,"completion_tokens":7,"total_tokens":12}`, domain.Usage{Input: 10, Output: 7}},
+		{"null reasoning", `{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3,"completion_tokens_details":{"reasoning_tokens":null}}`,
+			domain.Usage{Input: 1, Output: 2}},
+		{"reasoning zero", `{"prompt_tokens":1,"completion_tokens":2,"completion_tokens_details":{"reasoning_tokens":0}}`,
+			domain.Usage{Input: 1, Output: 2, Reasoning: n(0)}},
+		{"Mistral's cache reads", `{"prompt_tokens":100,"completion_tokens":2,"total_tokens":102,"prompt_token_details":{"cached_tokens":60}}`,
+			domain.Usage{Input: 100, CacheRead: 60, Output: 2}},
+		{"OpenAI's wins over Mistral's", `{"prompt_tokens":100,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":0},"prompt_token_details":{"cached_tokens":60}}`,
+			domain.Usage{Input: 100, Output: 2}},
+	} {
+		_, got, err := Observe(&domain.Target{}, &domain.Provider{}, []byte(`{"choices":[],"usage":`+tt.usage+`}`))
+		if err != nil || got.Usage == nil || !reflect.DeepEqual(*got.Usage, tt.want) {
+			t.Errorf("%s: %+v, error %v", tt.name, got.Usage, err)
+		}
+		s := NewStream(&domain.Target{}, &domain.Provider{})
+		if err := s.Event("", []byte(`{"choices":[],"usage":`+tt.usage+`}`), func(string, []byte) error { return nil }); err != nil ||
+			!reflect.DeepEqual(*s.Observed().Usage, tt.want) {
+			t.Errorf("%s, streamed: %+v, error %v", tt.name, s.Observed().Usage, err)
+		}
+	}
+}
+
+// TestCost is the provider's cost (USE-6): the number at cost_report.path
+// times usd_per_unit, nil when absent, null, not a number or negative; in a
+// stream the latest one that is not null wins.
+func TestCost(t *testing.T) {
+	openrouter := &domain.Provider{CostReport: &domain.CostReport{Path: "usage.cost", USDPerUnit: 1}}
+	xai := &domain.Provider{CostReport: &domain.CostReport{Path: "usage.cost_in_usd_ticks", USDPerUnit: 1e-10}}
+	deep := &domain.Provider{CostReport: &domain.CostReport{Path: "x_billing.charge.usd", USDPerUnit: 1}}
+	for _, tt := range []struct {
+		name string
+		p    *domain.Provider
+		body string
+		want *float64
+	}{
+		{"usage.cost", openrouter, `{"usage":{"prompt_tokens":1,"cost":0.0012}}`, ptr(0.0012)},
+		{"ticks", xai, `{"usage":{"cost_in_usd_ticks":125000000}}`, ptr(0.0125)},
+		{"a nested path", deep, `{"x_billing":{"charge":{"usd":2.5}}}`, ptr(2.5)},
+		{"zero", openrouter, `{"usage":{"cost":0}}`, ptr(0.0)},
+		{"absent", openrouter, `{"usage":{"prompt_tokens":1}}`, nil},
+		{"null", openrouter, `{"usage":{"cost":null}}`, nil},
+		{"a string", openrouter, `{"usage":{"cost":"0.1"}}`, nil},
+		{"negative", openrouter, `{"usage":{"cost":-1}}`, nil},
+		{"no cost_report", &domain.Provider{}, `{"usage":{"cost":0.5}}`, nil},
+	} {
+		_, got, err := Observe(&domain.Target{}, tt.p, []byte(tt.body))
+		if err != nil || (got.Cost == nil) != (tt.want == nil) || got.Cost != nil && math.Abs(*got.Cost-*tt.want) > 1e-15 {
+			t.Errorf("%s: %v, error %v", tt.name, got.Cost, err)
+		}
+	}
+	// A repeated key on the way to the cost refuses the body, as anywhere the
+	// proxy reads.
+	if _, _, err := Observe(&domain.Target{}, deep, []byte(`{"x_billing":{"charge":{},"charge":{}}}`)); err == nil {
+		t.Error("a repeated key on the cost path was read")
+	}
+	s := NewStream(&domain.Target{}, openrouter)
+	for _, c := range []string{`{"choices":[],"usage":{"cost":0.5}}`, `{"choices":[],"usage":{"cost":null}}`, `{"choices":[],"usage":null}`,
+		`{"choices":[],"usage":{"cost":0.75}}`, `{"choices":[]}`} {
+		if err := s.Event("", []byte(c), func(string, []byte) error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if c := s.Observed().Cost; c == nil || *c != 0.75 {
+		t.Errorf("streamed cost %v", c)
+	}
+}
+
+func ptr[T any](v T) *T { return &v }

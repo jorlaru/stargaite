@@ -9,14 +9,15 @@ import (
 	"testing"
 )
 
-// TestImports enforces the import rule of design section 3: params,
-// reasoning, the adapters, plan and routing never reach store, transport,
-// config or api, directly or through another package of the module.
+// TestImports enforces the import rule of design section 3, and of phase-3
+// design section 3 for usage: params, reasoning, the adapters, plan, routing
+// and usage never reach store, transport, config or api, directly or through
+// another package of the module.
 func TestImports(t *testing.T) {
 	const module = "github.com/jorlaru/stargaite/"
 	root := filepath.Join("..", "..")
 	forbidden := []string{"internal/store", "internal/transport", "internal/config", "internal/api"}
-	for _, pkg := range []string{"internal/params", "internal/reasoning", "internal/plan", "internal/routing", "internal/adapters/openai", "internal/adapters/anthropic"} {
+	for _, pkg := range []string{"internal/params", "internal/reasoning", "internal/plan", "internal/routing", "internal/adapters/openai", "internal/adapters/anthropic", "internal/usage"} {
 		if _, err := os.Stat(filepath.Join(root, pkg)); err != nil {
 			continue // a package of a later step
 		}

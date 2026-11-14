@@ -22,6 +22,8 @@ const Comment = ":"
 type ChatStream struct {
 	think, usage bool
 	now          func() time.Time
+	cost         domain.CostReport   // where an event reports the cost
+	walk         [][]string          // params.MessagesReply and the objects that lead to the cost
 	frame        string              // the id, object, created and model members of every chunk; "" before message_start
 	tools        map[string]int      // the tool call index of each tool_use block, by content block index
 	text         *reasoning.Stripper // of the open text block toward a target that declares inline_think_tags; nil otherwise
@@ -32,10 +34,12 @@ type ChatStream struct {
 
 // NewChatStream is the ChatStream of one attempt toward target t of provider
 // p. includeUsage is the client's stream_options.include_usage, which asks
-// for the usage chunk; now is the relay's clock, read once for created.
-// Phase 2 does not read p (design section 11, point 1).
-func NewChatStream(t *domain.Target, _ *domain.Provider, includeUsage bool, now func() time.Time) *ChatStream {
-	return &ChatStream{think: t.InlineThinkTags, usage: includeUsage, now: now, tools: map[string]int{}}
+// for the usage chunk; now is the relay's clock, read once for created. It
+// reads the cost at p's cost_report path.
+func NewChatStream(t *domain.Target, p *domain.Provider, includeUsage bool, now func() time.Time) *ChatStream {
+	cr := report(p)
+	return &ChatStream{think: t.InlineThinkTags, usage: includeUsage, now: now, cost: cr,
+		walk: params.Reply(params.MessagesReply, cr.Path), tools: map[string]int{}}
 }
 
 // statuses are the HTTP statuses Anthropic documents for its error types,
@@ -83,11 +87,15 @@ func (e *ErrorEvent) Error() string {
 // reads, lacks a member it needs, or comes before message_start; or emit's
 // error. Observed: the response model, the provider's own stop_reason, the
 // usage of message_start updated by each message_delta, the visible bytes,
-// the tool calls and whether a think block was removed.
+// the tool calls, whether a think block was removed and the latest cost at
+// the provider's cost_report path.
 func (s *ChatStream) Event(name string, data []byte, emit func(name string, data []byte) error) error {
-	b, e := params.Scan(data, params.MessagesReply)
+	b, e := params.Scan(data, s.walk)
 	if e != nil {
 		return errors.New("an event of the stream: " + e.Message)
+	}
+	if c := params.Cost(b, s.cost.Path, s.cost.USDPerUnit); c != nil {
+		s.obs.Cost = c
 	}
 	name = cmp.Or(name, str(b, "type")) // the event field, else the data's type, which Anthropic sends with both
 	if v, ok := b.Get("error"); name == "error" || ok && string(v) != "null" {

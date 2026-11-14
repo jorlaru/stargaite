@@ -17,19 +17,22 @@ import (
 // Stream observes one streamed chat completion on the native path (design
 // section 9) while the relay sends each chunk on unchanged, except the
 // think-tag edits of delta content toward a target that declares
-// inline_think_tags (RSN-12). The zero Stream is ready and edits nothing; it
-// is not safe for concurrent use.
+// inline_think_tags (RSN-12). Use NewStream; it is not safe for concurrent
+// use.
 type Stream struct {
 	obs   domain.Observed
+	cost  domain.CostReport              // where a chunk reports the cost
+	walk  [][]string                     // params.ChatReply and the objects that lead to the cost
 	tools map[string]bool                // "choice/tool call" indexes of the tool calls seen
 	think map[string]*reasoning.Stripper // by choice index; nil when the target declares no inline_think_tags
 	last  *params.Body                   // the last chunk read while think is set: the frame of the chunk released at [DONE]
 }
 
-// NewStream is the Stream of one attempt toward target t of provider p.
-// Phase 2 does not read p (design section 11, point 1).
-func NewStream(t *domain.Target, _ *domain.Provider) *Stream {
-	s := &Stream{}
+// NewStream is the Stream of one attempt toward target t of provider p,
+// which reads the cost at p's cost_report path.
+func NewStream(t *domain.Target, p *domain.Provider) *Stream {
+	cr := report(p)
+	s := &Stream{cost: cr, walk: params.Reply(params.ChatReply, cr.Path)}
 	if t.InlineThinkTags {
 		s.think = map[string]*reasoning.Stripper{}
 	}
@@ -51,9 +54,9 @@ func (e *ErrorChunk) Error() string { return "the provider's stream reported an 
 // object or repeats a key in an object it reads; or emit's error. Observed:
 // the first response model, the finish reason of choice 0, the visible bytes
 // of every delta's content, each tool call once, whether a think block was
-// removed, and the latest usage that is not null, which arrives when the
-// client asked for it (stream_options.include_usage) or the provider sends it
-// unasked.
+// removed, the latest usage that is not null, which arrives when the client
+// asked for it (stream_options.include_usage) or the provider sends it
+// unasked, and the latest cost at the provider's cost_report path.
 //
 // Toward a target that declares inline_think_tags, each choice's delta
 // content goes through its own reasoning.Stripper and is re-encoded only when
@@ -74,7 +77,7 @@ func (s *Stream) Event(_ string, data []byte, emit func(name string, data []byte
 		}
 		return io.EOF
 	}
-	b, e := params.Scan(data, params.ChatReply)
+	b, e := params.Scan(data, s.walk)
 	if e != nil {
 		return errors.New("a chunk of the stream: " + e.Message)
 	}
@@ -133,6 +136,9 @@ func (s *Stream) Event(_ string, data []byte, emit func(name string, data []byte
 	}
 	if u := usage(b); u != nil {
 		s.obs.Usage = u
+	}
+	if c := params.Cost(b, s.cost.Path, s.cost.USDPerUnit); c != nil {
+		s.obs.Cost = c
 	}
 	if s.think != nil {
 		s.last = b

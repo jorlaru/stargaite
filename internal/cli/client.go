@@ -458,3 +458,44 @@ func layer[T string | int64](v *T) string {
 	}
 	return printable(fmt.Sprint(*v))
 }
+
+// usageShown renders the answer of usage show as one table, a row per group:
+// the billing mode, the grouped columns, then the sums; "-" for a cost that
+// does not apply or is unknown (USE-7).
+func usageShown(w io.Writer, answer []byte) error {
+	var v struct {
+		Groups []map[string]jsontext.Value `json:"groups"`
+	}
+	if err := json.Unmarshal(answer, &v); err != nil {
+		return err
+	}
+	if len(v.Groups) == 0 {
+		say(w, "no usage in the window\n")
+		return nil
+	}
+	columns := []string{"billing"}
+	for _, c := range []string{"key", "model", "target"} {
+		if slices.ContainsFunc(v.Groups, func(g map[string]jsontext.Value) bool { _, ok := g[c]; return ok }) {
+			columns = append(columns, c)
+		}
+	}
+	columns = append(columns, "requests", "errors", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens",
+		"reasoning_tokens", "estimated", "cost_usd", "unpriced")
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	header := make([]string, len(columns))
+	for i, c := range columns {
+		header[i] = strings.TrimSuffix(c, "_tokens")
+	}
+	say(tw, "%s\n", strings.Join(header, "\t"))
+	for _, g := range v.Groups {
+		cells := make([]string, len(columns))
+		for i, c := range columns {
+			cells[i] = "-"
+			if value, ok := g[c]; ok {
+				cells[i] = cell(value)
+			}
+		}
+		say(tw, "%s\n", strings.Join(cells, "\t"))
+	}
+	return tw.Flush()
+}

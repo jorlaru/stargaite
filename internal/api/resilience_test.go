@@ -597,7 +597,10 @@ var longTimers = strings.NewReplacer("total_ms: 300", "total_ms: 60000", "first_
 // routes, cancels that call within 1 s, as the mock measures it (Ended and
 // Cancelled). finish and done each run once: the attempt line has the cause
 // "client gone" and the request line status 499 and code client_gone (no
-// client reads them); the target's breaker is told nothing.
+// client reads them); the target's breaker is told nothing. The call leaves
+// its usage record with error_type client_gone and the status as received:
+// none before the answer, with zero tokens from the provider; 200 mid-stream,
+// with tokens estimated (AC-23, phase-3 design section 4).
 func TestClientGone(t *testing.T) {
 	s, _, yaml := newResilience(t)
 	s.apply(t, longTimers.Replace(yaml))
@@ -623,6 +626,15 @@ func TestClientGone(t *testing.T) {
 			if attempts, requests := lines(log); attempts != 1 || requests != 1 || !strings.Contains(log, `"cause":"client gone"`) ||
 				!strings.Contains(log, `"attempts":1,"status":499,"code":"client_gone"`) {
 				t.Errorf("log %s", log)
+			}
+			r := s.stored(t, i+1)[i]
+			status, tokens := 0, "provider"
+			if tc.step.Chunks != nil {
+				status, tokens = 200, "estimated"
+			}
+			if str(r.ErrorType) != "client_gone" || r.Status != status || r.TokensSource != tokens || r.Stream != (tc.step.Chunks != nil) ||
+				status == 0 && r.Input+r.Output != 0 || status == 200 && r.Input == 0 {
+				t.Errorf("record %+v", r)
 			}
 		})
 	}

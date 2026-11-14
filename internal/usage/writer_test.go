@@ -1,0 +1,285 @@
+package usage
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/jorlaru/stargaite/internal/domain"
+	"github.com/jorlaru/stargaite/internal/store"
+)
+
+func openStore(t *testing.T) *store.Store {
+	t.Helper()
+	st, err := store.Open(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	return st
+}
+
+// rec is a stored-ready record of key k on day 2026-11-14 (UTC) unless edited.
+func rec(id string, edit ...func(*Record)) Record {
+	r := Record{ID: id, RequestID: id, TraceID: "t", Attempt: 1, Endpoint: "chat", KeyName: "k", Model: "fast", Target: "p/m",
+		Billing: domain.BillingPayPerUse, StatusCode: 200, InputTokens: 10, CacheReadTokens: 2, OutputTokens: 5, ReasoningTokens: ptr(int64(1)),
+		TokensSource: "provider", CostUSD: ptr(0.25), CostSource: "price_table", StartedAt: 1_794_614_400_000, CompletedAt: 1_794_614_401_000,
+		ConfigRevision: 3, ProxyVersion: "v"}
+	for _, e := range edit {
+		e(&r)
+	}
+	return r
+}
+
+// daily reads usage_daily, and the same sums from usage grouped alike: the
+// two must agree (USE-2).
+func daily(t *testing.T, db *sql.DB) (aggregates, fromRecords string) {
+	t.Helper()
+	read := func(q string) string {
+		rows, err := db.Query(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = rows.Close() }()
+		var b strings.Builder
+		for rows.Next() {
+			var day, key, model, target, billing string
+			var n [7]int64
+			var cost float64
+			if err := rows.Scan(&day, &key, &model, &target, &billing, &n[0], &n[1], &n[2], &n[3], &n[4], &n[5], &n[6], &cost); err != nil {
+				t.Fatal(err)
+			}
+			fmt.Fprintf(&b, "%s %s %s %s %s %v %.6f\n", day, key, model, target, billing, n, cost)
+		}
+		return b.String()
+	}
+	return read(`SELECT day, key_name, model, target, billing, requests, errors, input_tokens, cache_read_tokens, cache_write_tokens,
+			output_tokens, reasoning_tokens, cost_usd FROM usage_daily ORDER BY 1, 2, 3, 4, 5`),
+		read(`SELECT strftime('%Y-%m-%d', completed_at / 1000, 'unixepoch'), key_name, model, target, billing, COUNT(*), COUNT(error_type),
+			SUM(input_tokens), SUM(cache_read_tokens), SUM(cache_write_tokens), SUM(output_tokens), SUM(COALESCE(reasoning_tokens, 0)),
+			SUM(COALESCE(cost_usd, 0)) FROM usage GROUP BY 1, 2, 3, 4, 5 ORDER BY 1, 2, 3, 4, 5`)
+}
+
+func count(t *testing.T, db *sql.DB, q string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(q, args...).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// TestWriterBatches: records reach the store in batches of at most 100,
+// every column as the record holds it, NULL for an empty string or a nil
+// pointer, and usage_daily equals the GROUP BY over usage, per UTC day and
+// per billing mode.
+func TestWriterBatches(t *testing.T) {
+	st := openStore(t)
+	var mu sync.Mutex
+	var sizes []int
+	write := func(ctx context.Context, fn func(*sql.Tx) error) error {
+		return st.Write(ctx, func(tx *sql.Tx) error {
+			var n int
+			if err := tx.QueryRow("SELECT COUNT(*) FROM usage").Scan(&n); err != nil {
+				return err
+			}
+			if err := fn(tx); err != nil {
+				return err
+			}
+			var m int
+			if err := tx.QueryRow("SELECT COUNT(*) FROM usage").Scan(&m); err != nil {
+				return err
+			}
+			mu.Lock()
+			sizes = append(sizes, m-n)
+			mu.Unlock()
+			return nil
+		})
+	}
+	var log bytes.Buffer
+	w := NewWriter(write, slog.New(slog.NewJSONHandler(&log, nil)))
+	for i := range 250 {
+		w.Add(rec(fmt.Sprint(i), func(r *Record) {
+			switch i % 5 {
+			case 1:
+				r.CompletedAt += 86_400_000 // the next UTC day
+			case 2:
+				r.Billing, r.CostUSD, r.CostSource = domain.BillingSubscription, nil, "none"
+			case 3:
+				r.ErrorType, r.StatusCode, r.ReasoningTokens, r.ResponseModel = "upstream_error", 502, nil, ""
+			case 4:
+				r.KeyName, r.TokensSource = "other", "estimated"
+			}
+		}))
+	}
+	if n := w.Close(context.Background()); n != 0 || log.Len() != 0 {
+		t.Fatalf("Close: %d, log %s", n, &log)
+	}
+	total := 0
+	for _, n := range sizes {
+		if n > batchSize {
+			t.Errorf("a batch of %d records", n)
+		}
+		total += n
+	}
+	if total != 250 || len(sizes) < 3 {
+		t.Errorf("batches %v", sizes)
+	}
+	if agg, records := daily(t, st.Read()); agg != records || strings.Count(agg, "\n") != 4 {
+		t.Errorf("usage_daily\n%s\nGROUP BY usage\n%s", agg, records)
+	}
+	var reasoning, responseModel, errorType sql.NullString
+	if err := st.Read().QueryRow("SELECT reasoning_tokens, response_model, error_type FROM usage WHERE id = '3'").Scan(&reasoning, &responseModel, &errorType); err != nil ||
+		reasoning.Valid || responseModel.Valid || errorType.String != "upstream_error" {
+		t.Errorf("record 3: %v %v %v, error %v", reasoning, responseModel, errorType, err)
+	}
+	if n := count(t, st.Read(), `SELECT COUNT(*) FROM usage WHERE id = '0' AND request_id = '0' AND trace_id = 't' AND attempt = 1 AND endpoint = 'chat'
+		AND key_name = 'k' AND model = 'fast' AND target = 'p/m' AND billing = 'pay_per_use' AND response_model IS NULL AND model_mismatch = 0
+		AND status_code = 200 AND error_type IS NULL AND finish_reason IS NULL AND stream = 0 AND input_tokens = 10 AND cache_read_tokens = 2
+		AND cache_write_tokens = 0 AND output_tokens = 5 AND reasoning_tokens = 1 AND tokens_source = 'provider' AND cost_usd = 0.25
+		AND cost_source = 'price_table' AND effort_requested IS NULL AND effort_sent IS NULL AND effort_source IS NULL AND effort_adjusted = 0
+		AND max_output_sent IS NULL AND params_changed IS NULL AND content_empty = 0 AND ttft_ms IS NULL AND started_at = 1794614400000
+		AND completed_at = 1794614401000 AND config_revision = 3 AND proxy_version = 'v'`); n != 1 {
+		t.Error("record 0 is not stored as it was added")
+	}
+}
+
+// TestWriterIdempotent: the same batch committed twice inserts nothing twice
+// and moves no aggregate (USE-2).
+func TestWriterIdempotent(t *testing.T) {
+	st := openStore(t)
+	batch := []Record{rec("a"), rec("b", func(r *Record) { r.ErrorType = "upstream_timeout" })}
+	for range 2 {
+		if err := st.Write(context.Background(), func(tx *sql.Tx) error { return insert(tx, batch) }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	agg, records := daily(t, st.Read())
+	if n := count(t, st.Read(), "SELECT COUNT(*) FROM usage"); n != 2 || agg != records || !strings.Contains(agg, " [2 1 20 4 0 10 2] 0.500000") {
+		t.Errorf("%d records; usage_daily\n%s\nGROUP BY usage\n%s", n, agg, records)
+	}
+}
+
+// TestWriterCloseSlowWrite: a write still running when Close's deadline
+// passes is waited for, and once it commits its batch counts as stored: only
+// the record queued behind it, never handed to the store, is logged at
+// critical level and counted, with every column (design section 5).
+func TestWriterCloseSlowWrite(t *testing.T) {
+	st := openStore(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	write := func(ctx context.Context, fn func(*sql.Tx) error) error {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		return st.Write(ctx, fn)
+	}
+	var log bytes.Buffer
+	w := NewWriter(write, slog.New(slog.NewJSONHandler(&log, nil)))
+	w.Add(rec("slow"))
+	<-entered
+	w.Add(rec("queued", func(r *Record) { r.EffortSent = ptr("high") }))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	closed := make(chan int, 1)
+	go func() { closed <- w.Close(ctx) }()
+	<-ctx.Done()
+	select {
+	case n := <-closed:
+		t.Fatalf("Close returned %d with a write in progress", n)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if n := <-closed; n != 1 {
+		t.Errorf("Close: %d records not stored, want 1", n)
+	}
+	if n := count(t, st.Read(), "SELECT COUNT(*) FROM usage WHERE id = 'slow'"); n != 1 || calls.Load() != 1 {
+		t.Errorf("the slow batch: %d rows, %d writes", n, calls.Load())
+	}
+	var line struct {
+		Level, Msg string
+		Record     Record
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(log.Bytes()), &line); err != nil || line.Level != "ERROR+4" || line.Msg != "usage record not stored" ||
+		line.Record.ID != "queued" || line.Record.EffortSent == nil || *line.Record.EffortSent != "high" || line.Record.ProxyVersion != "v" {
+		t.Errorf("log %s: %+v, error %v", &log, line, err)
+	}
+
+	// After Close, Add logs at once.
+	w.Add(rec("late"))
+	if n := w.Close(context.Background()); n != 2 || strings.Count(log.String(), `"msg":"usage record not stored"`) != 2 {
+		t.Errorf("after Close: %d; log %s", n, &log)
+	}
+}
+
+// TestWriterRetry: a failed commit is retried with the same batch until it
+// commits, logged once when it fails and once when it commits again.
+func TestWriterRetry(t *testing.T) {
+	retryWait = time.Millisecond
+	t.Cleanup(func() { retryWait = 50 * time.Millisecond })
+	st := openStore(t)
+	var calls atomic.Int32
+	write := func(ctx context.Context, fn func(*sql.Tx) error) error {
+		if calls.Add(1) <= 2 {
+			return errors.New("disk I/O error")
+		}
+		return st.Write(ctx, fn)
+	}
+	var log bytes.Buffer
+	w := NewWriter(write, slog.New(slog.NewJSONHandler(&log, nil)))
+	w.Add(rec("a"))
+	w.Add(rec("b"))
+	if n := w.Close(context.Background()); n != 0 || calls.Load() != 3 {
+		t.Errorf("Close: %d, %d writes", n, calls.Load())
+	}
+	if n := count(t, st.Read(), "SELECT COUNT(*) FROM usage"); n != 2 ||
+		!strings.Contains(log.String(), `"msg":"usage records not committed: retrying","records":2,"error":"disk I/O error"`) ||
+		!strings.Contains(log.String(), `"msg":"usage records committed again","failed_commits":2`) {
+		t.Errorf("%d records; log %s", n, &log)
+	}
+
+	// A store that never recovers: Close's deadline ends the retries and the
+	// batch goes to the critical log.
+	failing := func(context.Context, func(*sql.Tx) error) error { return errors.New("disk I/O error") }
+	log.Reset()
+	w = NewWriter(failing, slog.New(slog.NewJSONHandler(&log, nil)))
+	w.Add(rec("c"))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if n := w.Close(ctx); n != 1 || !strings.Contains(log.String(), `"level":"ERROR+4","msg":"usage record not stored","record":{"id":"c"`) {
+		t.Errorf("Close: %d; log %s", n, &log)
+	}
+}
+
+// TestWriterAddRacingClose: Adds racing Close under -race; every record is
+// stored or logged, none lost silently.
+func TestWriterAddRacingClose(t *testing.T) {
+	st := openStore(t)
+	var log bytes.Buffer
+	w := NewWriter(st.Write, slog.New(slog.NewJSONHandler(&log, nil)))
+	var wg sync.WaitGroup
+	for g := range 8 {
+		wg.Go(func() {
+			for i := range 50 {
+				w.Add(rec(fmt.Sprintf("%d-%d", g, i)))
+			}
+		})
+	}
+	w.Close(context.Background())
+	wg.Wait()
+	lost := w.Close(context.Background())
+	if stored := count(t, st.Read(), "SELECT COUNT(*) FROM usage"); stored+lost != 400 || strings.Count(log.String(), "usage record not stored") != lost {
+		t.Errorf("%d stored, %d logged", stored, lost)
+	}
+}

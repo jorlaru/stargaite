@@ -338,3 +338,32 @@ func splice(raw []byte, from, to int, ins []byte) []byte {
 	out := make([]byte, 0, len(raw)-(to-from)+len(ins))
 	return append(append(append(out, raw[:from]...), ins...), raw[to:]...)
 }
+
+// Reply is walk plus the objects that lead to the member at the dotted path,
+// so that Get reaches it: a provider's cost_report.path (USE-6). An empty
+// path, or one of a single member, adds nothing. walk is never modified.
+func Reply(walk [][]string, dotted string) [][]string {
+	steps := strings.Split(dotted, ".")
+	for i := 1; i < len(steps); i++ {
+		walk = append(walk[:len(walk):len(walk)], steps[:i])
+	}
+	return walk
+}
+
+// Cost is the number at the dotted path times perUnit (USE-6); nil when the
+// path is empty or the member is absent, null, not a number or negative.
+func Cost(b *Body, dotted string, perUnit float64) *float64 {
+	if dotted == "" {
+		return nil
+	}
+	v, ok := b.Get(strings.Split(dotted, ".")...)
+	if !ok || v[0] != '-' && (v[0] < '0' || v[0] > '9') {
+		return nil
+	}
+	f, err := strconv.ParseFloat(string(v), 64)
+	if err != nil || f < 0 {
+		return nil
+	}
+	f *= perUnit
+	return &f
+}

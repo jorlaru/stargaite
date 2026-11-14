@@ -402,8 +402,9 @@ func (s *State) Tokens(n int64, at time.Time, scopes ...string)          // tpm,
 // more of the past, §17 point 13).
 type window struct {
 	w, g    time.Duration
-	first   int64   // Unix index of the oldest bucket held
-	buckets []int64 // ring of w/g + 1
+	origin  time.Time // a time's place: origin's Unix time plus t.Sub(origin), monotonic when both carry a reading
+	last    int64     // the newest bucket held
+	buckets []int64   // ring of w/g + 1
 }
 func (x *window) add(at time.Time, n int64)
 func (x *window) sum(now time.Time) int64
@@ -413,6 +414,14 @@ func (x *window) wait(now time.Time, limit float64) time.Duration // until sum <
 **Admit (LIM-5, LIM-6, LIM-7).** Under one mutex, for each scope in order key, alias, instance: in-flight `>= Parallel`, then `rpm.sum >= RPM`, then `tpm.sum >= TPM`. The first refusal answers, with nothing counted anywhere: `429 parallel_limit_exceeded` with `Retry-After: 1`, or `429 rate_limit_exceeded` with the binding window's `wait` (§17 point 13). Otherwise every scope takes a slot and its `rpm` window adds 1 at that instant. The instance scope carries only `settings.max_parallel_requests`; a scope without limits holds no window. `tpm` adds each call's recorded input plus output, reported or estimated, at `finish` (LIM-5). Windows of a scope whose limits are cleared are dropped at the next `Admit`; rpm and tpm are not rebuilt after a restart (RES-9 names budgets and quotas).
 
 **LIM-7.** `config.build` publishes every key with `Spec.MaxParallelRequests = cmp.Or(declared, domain.DefaultKeyMaxParallelRequests)`; `export` keeps the declared value, `keys show` the effective one, and the CLI help "(5 when undeclared)" becomes true. A key cannot then be unlimited, only large (§17 point 16).
+
+Settled in C26:
+
+- **Constructor.** `New(now func() time.Time)` in C26; the `seed` argument joins with C28, which defines `Seed`, so no type ships before its use.
+- **State.** A scope is held while it has a request in flight or a window, and dropped once it has neither, so 10,000 keys with the default parallel limit hold nothing at rest. Every scope counts its requests in flight whether or not it declares `Parallel`, so a limit declared while requests run sees them. `release` gives back the slots of the scopes it took, by reference: a scope with a slot taken is never dropped, so a change of limits, or of configuration, between `Admit` and `release` can neither keep a slot nor free one twice.
+- **Ring.** The ring holds `ceil(w/g) + 1` buckets: `w/g + 1` when `w` is a whole number of buckets (60 s, `5h`, `7d`), one more otherwise, so every bucket the sum counts fits. A time's place is the Unix time of the window's origin (the clock when it was made) plus `t.Sub(origin)`, which Go reads on the monotonic clock when both times carry a reading, as the service clock's `time.Now` values do: a step of the wall clock, back or forward (an NTP step), moves no entry and no look, so the window stays an exact sliding window over elapsed time, within one bucket. While the host sleeps (a suspended VM) the monotonic clock may stop, and held entries then count as if no time had passed: for rpm and tpm, at most one window of extra refusal. With no step a time's place is its own Unix time within microseconds, so the buckets stay aligned to Unix time, and times without a monotonic reading (the tests' clock, the store's records that C28 seeds from) are placed exactly by their Unix time. An entry counted late (tokens at `finish`) keeps its own bucket; one older than the ring counts in no window still to come; a look or an entry placed after a later one moved the ring ahead, which only times without a monotonic reading that went back can give, can lose entries, so such times must not reach a window. C28 inherits two points from the C26 recheck: a quota window seeded from the store and a live one disagree after a sleep or a forward wall step, for as long as it lasted (place quota windows by Unix time, `Round(0)`, or state the bound), and a stored row dated after the seed's now clears older rows still in the window (clamp each row to the seed's now). That the monotonic reading is used cannot be shown by a test (no API steps the wall clock under it); it rests on `time.Time.Sub` as documented.
+- **Messages.** The refusal names the scope kind and the limit, never a figure: `the parallel limit of this key is reached` (or `of model "<alias>"`, `of the instance`), `the rpm_limit of …`, `the tpm_limit of …`. A refusal at admission is answered by `infer` like any error before a target, so its response carries the request and trace ids and no `x-stargaite-target`; the request line has `attempts: 0` and the `requests` counter its `429`.
+- **Calls.** `h.admit(rq)` builds the three scopes from `rq.snap` (`key:<name>`, `model:<alias>`, `global` with `settings.max_parallel_requests` only); `scopeNames(rq)` gives the same names to `finish`, whose `Tokens` call adds `a.rec.InputTokens + a.rec.OutputTokens` at `a.ended` to the scopes holding a tpm window (none for `global`).
 
 ## 8. Budgets
 
@@ -636,6 +645,8 @@ Settled in C25:
 
 - **Admin.** `GET /admin/v1/usage` takes `compare_previous` once, `true` or `false` (a bare or other value is a `400`), and `by` takes `effort-sent`. An RFC 3339 `since` must be before now on the service clock, a duration must be positive, and the window they name must not start before 1970-01-01T00:00:00Z, whichever form named it, as `completed_at` is Unix milliseconds (else `400`; an older one put the previous window out of range), so no window is empty or inverted by construction. The route passes the published `retention.usage_days` to `Show`.
 - **CLI.** `usage show --compare-previous` sends `compare_previous` only when given (`--compare-previous=false` sends `false`). Without `--json` each window prints a line `window <since> to <until>, from the records` (or `from the daily sums, whole UTC days: …`), then its table or `no usage in the window`; the previous window follows after a blank line as `previous window …`. The columns add `effort_sent` when grouped, then `length`, `empty`, `output_p50`, `output_p90`, `reasoning_p50`, `reasoning_p90`; `-` marks a value absent from the answer.
+
+Settled in C26: `admin.Deps` does not gain `Admission` yet, as no route reads it before `usage quota` (C28) and the metrics endpoint (phase 4); it joins with the first route that does.
 
 ## 13. Interfaces fixed now for phase 4
 

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jorlaru/stargaite/internal/admin"
+	"github.com/jorlaru/stargaite/internal/admission"
 	"github.com/jorlaru/stargaite/internal/api"
 	"github.com/jorlaru/stargaite/internal/cli"
 	"github.com/jorlaru/stargaite/internal/config"
@@ -169,7 +170,7 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 			{"admin", *adminAddr, admin.Handler(admin.Deps{Config: cfg, KeyHash: keyHash, Log: log, Usage: st.Read()})},
 			{"data", *dataAddr, api.Handler(api.Deps{Config: cfg, Log: log, Clients: [2]*http.Client{
 				transport.NewClient(false, systemResolver), transport.NewClient(true, systemResolver)}, Flight: &flight,
-				Usage: records, Counters: &usage.Counters{}, Version: cli.Version})},
+				Usage: records, Admission: admission.New(cfg.Now), Counters: &usage.Counters{}, Version: cli.Version})},
 		}); err != nil {
 			log.Error("server failed", "error", err.Error())
 			code = 1

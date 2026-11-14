@@ -19,6 +19,7 @@ import (
 
 	"github.com/jorlaru/stargaite/internal/adapters/anthropic"
 	"github.com/jorlaru/stargaite/internal/adapters/openai"
+	"github.com/jorlaru/stargaite/internal/admission"
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/params"
@@ -73,6 +74,7 @@ type request struct {
 	client      *plan.Client
 	attempts    []*attempt
 	err         *domain.Error // what the client got; nil on success
+	release     func()        // admission's; nil until admitted
 	started     time.Time
 	deadline    sync.Mutex // held by infer's deadline hook and by writeDeadline
 	capped      bool       // the hook ran: the deadlines it set stay
@@ -160,9 +162,10 @@ func relayFor(ep domain.Endpoint, t *config.Target, c *plan.Client, now func() t
 
 // infer serves POST /v1/chat/completions and POST /v1/messages (design
 // sections 4 and 8, steps 1 to 8), synchronous and streamed. done runs on
-// every exit once the key is authenticated, a panic included. Every error is
-// in the envelope of ep; a stream that fails once committed has already
-// written its terminal event, so it gets no envelope. Only /v1/messages
+// every exit once the key is authenticated, a panic included, and gives
+// back the slots admission took. Every error is in the envelope of ep; a
+// stream that fails once committed has already written its terminal event,
+// so it gets no envelope. Only /v1/messages
 // keeps the client's anthropic-version and anthropic-beta, for Build to
 // forward toward an anthropic target (PAR-14).
 func (h *handler) infer(ep domain.Endpoint) http.HandlerFunc {
@@ -204,7 +207,9 @@ func (h *handler) infer(ep domain.Endpoint) http.HandlerFunc {
 			}
 		}
 		if rq.err = h.check(w, r, rq); rq.err == nil {
-			rq.err = h.route(w, r, rq)
+			if rq.err = h.admit(rq); rq.err == nil {
+				rq.err = h.route(w, r, rq)
+			}
 		}
 		if rq.err != nil && (len(rq.attempts) == 0 || !rq.attempts[len(rq.attempts)-1].written) {
 			fail(w, ep, rq.err)
@@ -254,6 +259,25 @@ func (h *handler) check(w http.ResponseWriter, r *http.Request, rq *request) *do
 	var e *domain.Error
 	rq.client, e = plan.Check(rq.ep, rq.body, &rq.model.Spec)
 	return e
+}
+
+// admit is step 4 (phase-3 design section 7): the slots and rate windows of
+// the key, the alias and the instance as rq's snapshot declares them, all or
+// nothing. Once admitted, rq.release gives the slots back in done.
+func (h *handler) admit(rq *request) *domain.Error {
+	k, m, names := &rq.key.Spec, &rq.model.Spec, scopeNames(rq)
+	var e *domain.Error
+	rq.release, e = h.Admission.Admit(
+		admission.Scope{Name: names[0], Parallel: k.MaxParallelRequests, RPM: k.RPMLimit, TPM: k.TPMLimit},
+		admission.Scope{Name: names[1], Parallel: m.MaxParallelRequests, RPM: m.RPMLimit, TPM: m.TPMLimit},
+		admission.Scope{Name: names[2], Parallel: rq.snap.Settings.MaxParallelRequests})
+	return e
+}
+
+// scopeNames are rq's admission scopes in Admit's order: key, alias,
+// instance.
+func scopeNames(rq *request) []string {
+	return []string{"key:" + rq.key.Name, "model:" + rq.alias, "global"}
 }
 
 // route is steps 5 to 8: per target in order, Build (a static Skip), then
@@ -653,12 +677,14 @@ func message(status int, body []byte) string {
 // finish ends one provider call (design section 11, point 2) after its last
 // byte, its failure or a panic: the circuit's permit goes back with the
 // call's verdict (None on a panic), then the usage record (phase-3 design
-// section 4), which the counters count and the writer stores, and one log
-// line, without the credential.
+// section 4), whose input plus output tokens count in tpm (LIM-5), which the
+// counters count and the writer stores, and one log line, without the
+// credential.
 func (h *handler) finish(rq *request, a *attempt) {
 	a.ended = h.Config.Now()
 	h.breakers.Release(a.target.ID, a.gen, a.end.breaker)
 	a.rec = usage.NewRecord(h.usageCall(rq, a))
+	h.Admission.Tokens(a.rec.InputTokens+a.rec.OutputTokens, a.ended, scopeNames(rq)...)
 	h.count(&a.rec)
 	h.Usage.Add(a.rec)
 	attrs := []any{"request_id", rq.id, "trace_id", rq.traceID, "key", rq.key.Name, "alias", rq.alias, "attempt", a.n,
@@ -743,12 +769,16 @@ func (h *handler) count(r *usage.Record) {
 
 // done ends one authenticated request (design section 11, point 3) after
 // its last finish: the request counter, then the request line (OPS-9), then
-// Flight. Its status and code are those of the error the client got, also as
-// the terminal event of a committed stream (so 500 internal_error for a
-// request the shutdown stopped); 499 client_gone when the client went away,
-// whatever was written before; else 200.
+// the slots of an admitted request (LIM-6), also on a panic, then Flight.
+// Its status and code are those of the error the client got, also as the
+// terminal event of a committed stream (so 500 internal_error for a request
+// the shutdown stopped); 499 client_gone when the client went away, whatever
+// was written before; else 200.
 func (h *handler) done(rq *request) {
 	defer h.Flight.Done()
+	if rq.release != nil {
+		defer rq.release() // after every finish, before Flight
+	}
 	n := len(rq.attempts)
 	status, code := http.StatusOK, ""
 	switch {

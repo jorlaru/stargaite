@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"github.com/jorlaru/stargaite/internal/admin"
+	"github.com/jorlaru/stargaite/internal/admission"
 	"github.com/jorlaru/stargaite/internal/api"
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
@@ -97,7 +98,7 @@ func live(t *testing.T) *proxy {
 	t.Cleanup(func() { records.Close(context.Background()) })
 	p.data = api.Handler(api.Deps{Config: cfg, Log: log,
 		Clients: [2]*http.Client{transport.NewClient(false, resolve), transport.NewClient(true, resolve)}, Flight: p.flight,
-		Usage: records, Counters: &usage.Counters{}})
+		Usage: records, Admission: admission.New(cfg.Now), Counters: &usage.Counters{}})
 	// A cap on every alias: the anthropic protocol needs one (PAR-7), and
 	// the budgets of a thinking_budget target must stay below it (RSN-3).
 	// provider_default sends no effort unless the request has one, and is

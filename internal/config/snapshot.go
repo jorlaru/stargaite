@@ -146,6 +146,9 @@ func build(st *State, env Env, findings []domain.Finding) *Snapshot {
 	}
 	views := secretsByKey(st.Secrets)
 	for name, spec := range d.Keys {
+		// LIM-7: a key that declares no parallel limit gets the default at
+		// publish; Doc keeps the declaration for export.
+		spec.MaxParallelRequests = cmp.Or(spec.MaxParallelRequests, domain.DefaultKeyMaxParallelRequests)
 		s.Keys[name] = &Key{Name: name, Spec: spec, Secrets: views[name]}
 	}
 	for _, sec := range st.Secrets {

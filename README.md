@@ -11,8 +11,8 @@ the `openai` protocol and of the `anthropic` protocol (translated to the Message
 synchronous and streamed, toward providers of the `anthropic` protocol, with the parameter contract and reasoning
 control of the alias, timeouts, fallback across an alias's targets, a circuit breaker per target, cancellation when a
 client goes away and a graceful stop (see [Resilience](#resilience)). Phase 3 has begun: every provider call leaves a
-usage record with its tokens and cost, and `usage show` sums them (see [Usage](#usage)); budgets, limits, quotas and
-telemetry follow. The full specification is [kick-off.md](kick-off.md); the designs are
+usage record with its tokens and cost, and `usage show` sums them (see [Usage](#usage)); keys and aliases have rate
+and parallel limits (see [Limits](#limits)); budgets, quotas and telemetry follow. The full specification is [kick-off.md](kick-off.md); the designs are
 [docs/design/phase-1.md](docs/design/phase-1.md), [docs/design/phase-2.md](docs/design/phase-2.md) and
 [docs/design/phase-3.md](docs/design/phase-3.md).
 
@@ -29,7 +29,7 @@ curl -sS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:4000/he
 ./stargaite providers add mock --protocol openai --base-url http://127.0.0.1:4010 --allow-private-network --billing pay_per_use
 ./stargaite models add fast --target mock/mock
 ./stargaite targets set mock/mock --pricing input_per_million=1,output_per_million=2,as_of=2026-11-01
-./stargaite keys create my-agent --model fast
+./stargaite keys create my-agent --model fast --rpm-limit 60
 ./stargaite models explain fast
 curl -s http://127.0.0.1:4000/v1/models -H "Authorization: Bearer sk-stargaite-..."
 curl -s http://127.0.0.1:4000/v1/chat/completions -H "Authorization: Bearer sk-stargaite-..." -d '{"model":"fast","messages":[{"role":"user","content":"hi"}]}'
@@ -39,8 +39,8 @@ curl -s http://127.0.0.1:4000/v1/chat/completions -H "Authorization: Bearer sk-s
 The mock provider listens on `127.0.0.1:4010`; `serve` puts the data plane on `127.0.0.1:4000`, the admin API on
 `127.0.0.1:4001` and the store in `./data`, and the health check waits until it is up. The mock provider is billed per
 use: `models add` also creates the target `mock/mock` (with a warning that it has no prices yet), and `targets set`
-gives it a price in USD per million input and output tokens. `keys create` prints the client key once: paste it in
-place of `sk-stargaite-...` in the two `curl` calls. `models explain` shows what the alias would send, without calling
+gives it a price in USD per million input and output tokens. `keys create` limits the key to 60 requests a minute and
+prints the client key once: paste it in place of `sk-stargaite-...` in the two `curl` calls. `models explain` shows what the alias would send, without calling
 the provider: per target, the effort and output-cap layers, the list of changes, the URL, the headers without the
 credential and the body, which for the minimal request it explains by default are the bytes the chat completion below
 sends (`--body <file>` explains a request of your own; `--json` gives each body's exact bytes). The first `curl` lists
@@ -81,6 +81,22 @@ the records within `usage_days` (90 by default; deleting older ones comes in a l
 earlier is answered from the daily sums, over whole UTC days and without the counts and percentiles they do not hold
 (shown as `-`), and cannot be grouped by effort sent.
 `--json` gives the same as JSON, with each window's `source` (`records` or `daily`), `since` and `until`.
+
+## Limits
+
+A key and an alias can each limit requests per minute (`--rpm-limit`), tokens per minute (`--tpm-limit`: the input
+plus output tokens of the provider calls that ended in the last minute, as recorded) and requests in flight
+(`--max-parallel-requests`), on `keys create|set` and `models add|set`; `settings set --max-parallel-requests` limits
+the requests in flight of the whole instance. Each limit acts on its own. A key that declares no parallel limit gets
+5 when the configuration is published: `keys show` shows the 5 and `export` keeps what was declared, so a key can be
+given a large limit but not none. Nothing else is limited by default.
+
+A request beyond any limit gets `429` before any provider is called: `parallel_limit_exceeded` with `Retry-After: 1`,
+or `rate_limit_exceeded` with `Retry-After` set to the seconds until the minute admits it again. Such a request counts
+in no limit and leaves no usage record; one that passed the limits and failed later counts. A request holds its slots
+until it ends, a stream until its last event, and gives them back on an error, a client gone or a stop alike. Minutes
+are counted in steps of one second, so a window may hold up to a second more than 60 s of traffic, never less, and
+counts start empty after a restart.
 
 ## Anthropic clients
 

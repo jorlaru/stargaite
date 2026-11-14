@@ -46,7 +46,8 @@ var (
 // then checks what it left: the first answer of the chat completion with its
 // PAR-9 headers and the one call the provider got (AC-04), /v1/models with the
 // new key, usage show with the one request, its tokens and its price_table
-// cost (AC-33), a second serve on the same directory refused (AC-42), and the
+// cost (AC-33), the key's parallel limit shown as 5 and exported as declared
+// (LIM-7), a second serve on the same directory refused (AC-42), and the
 // same export, the same key and the same usage after a restart (RES-9). The guide's commands use
 // the default data directory and addresses; here the environment points them
 // at a temporary directory and at ports the system chose.
@@ -223,6 +224,18 @@ func TestQuickStart(t *testing.T) {
 	before := cli("export")
 	if !strings.Contains(before, "my-agent") || strings.Contains(before, token) {
 		t.Errorf("export lacks the key or carries its token:\n%s", before)
+	}
+	// LIM-7: the key's parallel limit is published as 5 and exported as
+	// declared, that is not at all.
+	var shownKey struct {
+		RPMLimit            int64 `json:"rpm_limit"`
+		MaxParallelRequests int64 `json:"max_parallel_requests"`
+	}
+	if out := cli("keys", "show", "my-agent", "--json"); json.Unmarshal([]byte(out), &shownKey) != nil || shownKey.RPMLimit != 60 || shownKey.MaxParallelRequests != 5 {
+		t.Errorf("keys show: %s", out)
+	}
+	if !strings.Contains(before, "rpm_limit: 60") || strings.Contains(before, "max_parallel_requests") {
+		t.Errorf("export of the key's limits:\n%s", before)
 	}
 
 	// A second serve on the same data directory refuses to start (AC-42).

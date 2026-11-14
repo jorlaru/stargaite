@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/jorlaru/stargaite/internal/admin"
+	"github.com/jorlaru/stargaite/internal/admission"
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/store"
@@ -107,7 +108,7 @@ func newFixture(t *testing.T) *fixture {
 	t.Cleanup(func() { records.Close(context.Background()) }) // before the store closes
 	return &fixture{admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(adminKey)), Log: logger, Usage: st.Read()}),
 		Handler(Deps{Config: cfg, Log: logger, Clients: [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)},
-			Flight: flight, Usage: records, Counters: counters, Version: "test-version"}), now, log, flight, st, counters}
+			Flight: flight, Usage: records, Admission: admission.New(cfg.Now), Counters: counters, Version: "test-version"}), now, log, flight, st, counters}
 }
 
 // pastWindow moves the service clock past the RES-2 window of 30 s, so the

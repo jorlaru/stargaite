@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"cmp"
 	"encoding/json"
 	"net/http"
 	"reflect"
@@ -36,9 +37,11 @@ func TestCreateKey(t *testing.T) {
 	if m == nil || len(res.Secrets) != 1 || !slices.Equal(entries(res.Diff), []string{"key my-agent created"}) || res.Revision != 1 {
 		t.Fatalf("answer %+v", res)
 	}
-	want := keyView{"my-agent", domain.Key{Models: []string{"fast"}, RPMLimit: 60, QuotaShare: map[string]float64{"p": 0.5}}, []config.SecretView{{PublicID: m[1]}}}
-	if !reflect.DeepEqual(res.Resource, want) {
-		t.Errorf("resource %+v", res.Resource)
+	// A read shows the parallel limit published (LIM-7); the store keeps none.
+	want := keyView{"my-agent", domain.Key{Models: []string{"fast"}, RPMLimit: 60, MaxParallelRequests: domain.DefaultKeyMaxParallelRequests,
+		QuotaShare: map[string]float64{"p": 0.5}}, []config.SecretView{{PublicID: m[1]}}}
+	if !reflect.DeepEqual(res.Resource, want) || f.cfg.Snapshot().Doc.Keys["my-agent"].MaxParallelRequests != 0 {
+		t.Errorf("resource %+v, stored %+v", res.Resource, f.cfg.Snapshot().Doc.Keys["my-agent"])
 	}
 	// An unknown alias and an unknown provider in quota_share are warnings.
 	if got := codes(res.Findings); !slices.Contains(got, "warning unknown_alias keys/my-agent models") || !slices.Contains(got, "warning unknown_provider keys/my-agent quota_share.p") {
@@ -100,7 +103,9 @@ func TestKeyReads(t *testing.T) {
 	var names []string
 	for _, k := range list.Keys {
 		names = append(names, k.Name)
-		if !reflect.DeepEqual(k.Key, doc.Keys[k.Name]) || len(k.Secrets) != 1 || k.Secrets[0].ValidUntil != 0 {
+		want := doc.Keys[k.Name] // with the parallel limit published (LIM-7)
+		want.MaxParallelRequests = cmp.Or(want.MaxParallelRequests, domain.DefaultKeyMaxParallelRequests)
+		if !reflect.DeepEqual(k.Key, want) || len(k.Secrets) != 1 || k.Secrets[0].ValidUntil != 0 {
 			t.Errorf("key %s: %+v", k.Name, k)
 		}
 	}
@@ -125,7 +130,9 @@ func TestKeyChanges(t *testing.T) {
 	var res keyAnswer
 	decode(t, f.do(t, http.MethodPatch, "/admin/v1/keys/k", []byte(`{"models":["*"],"budget":{"limit_usd":7},"rpm_limit":3}`)), http.StatusOK, &res)
 	want := domain.Key{Models: []string{"*"}, Budget: &domain.Budget{LimitUSD: new(7.0), ResetInterval: "daily"}, RPMLimit: 3}
-	if got := f.cfg.Snapshot().Doc.Keys["k"]; !reflect.DeepEqual(got, want) || !reflect.DeepEqual(res.Resource.Key, want) ||
+	shown := want
+	shown.MaxParallelRequests = domain.DefaultKeyMaxParallelRequests // LIM-7, published only
+	if got := f.cfg.Snapshot().Doc.Keys["k"]; !reflect.DeepEqual(got, want) || !reflect.DeepEqual(res.Resource.Key, shown) ||
 		!reflect.DeepEqual(res.Resource.Secrets, created.Resource.Secrets) || len(res.Secrets) != 0 || !slices.Equal(entries(res.Diff), []string{"key k updated"}) {
 		t.Errorf("stored %+v, answer %+v", got, res)
 	}

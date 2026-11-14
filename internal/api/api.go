@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jorlaru/stargaite/internal/admission"
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/routing"
@@ -52,10 +53,11 @@ type Deps struct {
 	Clients [2]*http.Client // [0] public addresses only, [1] allow_private_network (SEC-4)
 	// Flight counts the authenticated inference requests not yet done: serve
 	// waits for it before it closes the usage writer and the store (RES-6).
-	Flight   *sync.WaitGroup
-	Usage    *usage.Writer   // one record per provider call (USE-1)
-	Counters *usage.Counters // OPS-8
-	Version  string          // cli.Version: records carry it (USE-5)
+	Flight    *sync.WaitGroup
+	Usage     *usage.Writer    // one record per provider call (USE-1)
+	Admission *admission.State // slots and rate windows (LIM-5, LIM-6)
+	Counters  *usage.Counters  // OPS-8
+	Version   string           // cli.Version: records carry it (USE-5)
 }
 
 // ErrStopping is the cause serve cancels the server's base context with when

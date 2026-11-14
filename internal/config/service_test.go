@@ -756,6 +756,14 @@ func TestSnapshotBuild(t *testing.T) {
 		withTelemetry.Doc.Settings.Telemetry.TrustTraceparent != nil {
 		t.Errorf("telemetry %+v", tel)
 	}
+	// LIM-7: a key without a parallel limit is published with 5, a declared
+	// one keeps its own, and the declaration stays as declared.
+	keys := &State{Doc: domain.Document{Keys: map[string]domain.Key{"none": {Models: []string{}}, "own": {Models: []string{}, MaxParallelRequests: 50}}}}
+	pub := build(keys, Env{}, nil).Keys
+	if pub["none"].Spec.MaxParallelRequests != domain.DefaultKeyMaxParallelRequests || pub["own"].Spec.MaxParallelRequests != 50 ||
+		keys.Doc.Keys["none"].MaxParallelRequests != 0 {
+		t.Errorf("keys %+v %+v, declared %+v", pub["none"].Spec, pub["own"].Spec, keys.Doc.Keys["none"])
+	}
 }
 
 // BenchmarkCommitScale18 changes one key of a configuration at the sizes of

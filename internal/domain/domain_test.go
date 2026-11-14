@@ -51,6 +51,7 @@ var annexB = Document{
 			BaseURL:        "https://api.anthropic.com",
 			APIKeyEnv:      "ANTHROPIC_API_KEY",
 			Billing:        BillingPayPerUse,
+			StreamUsage:    StreamUsageNative,
 			GenAIProvider:  "anthropic",
 			TargetDefaults: TargetDefaults{Dialect: DialectAdaptiveEffort},
 		},
@@ -60,9 +61,10 @@ var annexB = Document{
 			APIKeyEnv: "MINIMAX_PLAN_API_KEY",
 			Billing:   BillingSubscription,
 			Quota: []QuotaWindow{
-				{Window: "5h", Requests: 1500},
-				{Window: "7d", Requests: 15000},
+				{Window: "5h", Requests: 1000},
+				{Window: "7d", Requests: 10000},
 			},
+			StreamUsage:    StreamUsageNative,
 			TargetDefaults: TargetDefaults{Dialect: DialectAdaptiveEffort},
 		},
 		"tei-embed": {

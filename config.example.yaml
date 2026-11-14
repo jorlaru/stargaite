@@ -29,6 +29,7 @@ providers:
     base_url: https://api.anthropic.com
     api_key_env: ANTHROPIC_API_KEY
     billing: pay_per_use
+    stream_usage: native
     gen_ai_provider: anthropic
     target_defaults: { dialect: adaptive_effort }
   minimax-plan:                         # a subscription plan: no prices, a quota per window
@@ -37,8 +38,9 @@ providers:
     api_key_env: MINIMAX_PLAN_API_KEY
     billing: subscription
     quota:
-      - { window: 5h, requests: 1500 }
-      - { window: 7d, requests: 15000 }
+      - { window: 5h, requests: 1000 }
+      - { window: 7d, requests: 10000 }
+    stream_usage: native
     target_defaults: { dialect: adaptive_effort }
   tei-embed:                            # self-hosted; one instance serves one model
     protocol: openai

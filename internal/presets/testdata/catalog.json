@@ -5,6 +5,8 @@
 		"base_url": "https://api.openai.com/v1",
 		"api_key_env": "OPENAI_API_KEY",
 		"billing": "pay_per_use",
+		"stream_usage": "request",
+		"gen_ai_provider": "openai",
 		"target_defaults": {
 			"dialect": "reasoning_effort",
 			"output_cap_param": "max_completion_tokens"
@@ -16,6 +18,7 @@
 		"base_url": "https://api.anthropic.com",
 		"api_key_env": "ANTHROPIC_API_KEY",
 		"billing": "pay_per_use",
+		"stream_usage": "native",
 		"gen_ai_provider": "anthropic",
 		"target_defaults": {
 			"dialect": "adaptive_effort"
@@ -43,7 +46,8 @@
 		"protocol": "openai",
 		"base_url": "https://api.deepinfra.com/v1/openai",
 		"api_key_env": "DEEPINFRA_API_KEY",
-		"billing": "pay_per_use"
+		"billing": "pay_per_use",
+		"stream_usage": "native"
 	},
 	{
 		"name": "minimax",
@@ -51,6 +55,7 @@
 		"base_url": "https://api.minimax.io/v1",
 		"api_key_env": "MINIMAX_API_KEY",
 		"billing": "pay_per_use",
+		"stream_usage": "request",
 		"target_defaults": {
 			"output_cap_param": "max_completion_tokens"
 		}
@@ -67,13 +72,16 @@
 		"protocol": "openai",
 		"base_url": "https://api.moonshot.ai/v1",
 		"api_key_env": "MOONSHOT_API_KEY",
-		"billing": "pay_per_use"
+		"billing": "pay_per_use",
+		"stream_usage": "request",
+		"gen_ai_provider": "moonshot_ai"
 	},
 	{
 		"name": "dashscope",
 		"protocol": "openai",
 		"api_key_env": "DASHSCOPE_API_KEY",
 		"billing": "pay_per_use",
+		"stream_usage": "request",
 		"target_defaults": {
 			"output_cap_param": "max_completion_tokens"
 		}
@@ -82,7 +90,9 @@
 		"name": "ollama",
 		"protocol": "openai",
 		"base_url": "http://localhost:11434/v1",
-		"billing": "none"
+		"billing": "none",
+		"stream_usage": "request",
+		"gen_ai_provider": "ollama"
 	},
 	{
 		"name": "tei",
@@ -95,7 +105,9 @@
 		"protocol": "openai",
 		"base_url": "https://api.deepseek.com",
 		"api_key_env": "DEEPSEEK_API_KEY",
-		"billing": "pay_per_use"
+		"billing": "pay_per_use",
+		"stream_usage": "native",
+		"gen_ai_provider": "deepseek"
 	},
 	{
 		"name": "gemini",
@@ -103,7 +115,8 @@
 		"protocol": "openai",
 		"base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
 		"api_key_env": "GEMINI_API_KEY",
-		"billing": "pay_per_use"
+		"billing": "pay_per_use",
+		"gen_ai_provider": "gcp.gemini"
 	},
 	{
 		"name": "xai",
@@ -116,7 +129,8 @@
 			"path": "usage.cost_in_usd_ticks",
 			"usd_per_unit": 1e-10
 		},
-		"stream_usage": "request"
+		"stream_usage": "request",
+		"gen_ai_provider": "x_ai"
 	},
 	{
 		"name": "mistral",
@@ -124,7 +138,9 @@
 		"protocol": "openai",
 		"base_url": "https://api.mistral.ai/v1",
 		"api_key_env": "MISTRAL_API_KEY",
-		"billing": "pay_per_use"
+		"billing": "pay_per_use",
+		"stream_usage": "native",
+		"gen_ai_provider": "mistral"
 	},
 	{
 		"name": "groq",
@@ -133,6 +149,7 @@
 		"base_url": "https://api.groq.com/openai/v1",
 		"api_key_env": "GROQ_API_KEY",
 		"billing": "pay_per_use",
+		"gen_ai_provider": "groq",
 		"target_defaults": {
 			"output_cap_param": "max_completion_tokens"
 		}

@@ -211,7 +211,8 @@ only `false` blocks a request, and only `true` satisfies an alias's `requires`. 
 Provider, alias and key names match `[A-Za-z0-9][A-Za-z0-9._-]*`, up to 64 characters; an upstream model id is any
 text without spaces or control characters. The store keeps what was declared: defaults are applied when the
 configuration is published, so `export` shows declared values and `settings show` the effective ones, and a release
-that changes a default changes it for running instances.
+that changes a default changes it for running instances. The telemetry defaults apply with or without a telemetry
+block.
 
 ## 7. Providers
 
@@ -272,7 +273,12 @@ Before v1 is released, the first ten presets of the table are validated against 
 ship marked `untested` in the catalog, and the mark is removed in a release once a maintainer has run the contract
 suite against them. The table shows only part of each preset's data; the rest (`billing`, `target_defaults`,
 `stream_usage`, `cost_report`, `gen_ai_provider`) is completed from each provider's public documentation before the
-golden test of the catalog is frozen (AC-53).
+golden test of the catalog is frozen (AC-53). `stream_usage` is `request` for `openai`, `minimax`, `moonshot`,
+`dashscope`, `ollama` and `xai`, `native` for `anthropic`, `openrouter`, `deepinfra`, `deepseek` and `mistral`, and
+undeclared where the documentation does not settle it, which asks for nothing (USE-8). `gen_ai_provider` is the
+well-known value of the pinned conventions (TEL-9) where one exists (`openai`, `anthropic`, `deepseek`, `gcp.gemini`,
+`x_ai`, `mistral`, `groq`, `ollama`, `moonshot_ai`), `openrouter` for OpenRouter, and undeclared otherwise, so spans
+carry the provider's name. `deepinfra` declares no `cost_report`: the cost its examples carry is an estimate.
 
 ### 7.3 Billing modes
 
@@ -284,17 +290,18 @@ golden test of the catalog is frozen (AC-53).
 
 A subscription plan is a provider of its own, with its own key, even when it shares a base URL with the pay-per-use
 API of the same vendor. It is added with explicit flags, including the `quota` windows of the tier the operator
-bought; there are no plan presets:
+bought; there are no plan presets. The windows and limits below are illustrative, not those of a plan on sale:
 
 ```console
 $ stargaite providers add minimax-plan --preset minimax --protocol anthropic \
     --base-url https://api.minimax.io/anthropic --api-key-env MINIMAX_PLAN_API_KEY \
-    --target-defaults dialect=adaptive_effort,output_cap_param= \
-    --billing subscription --quota 5h:requests=1500 --quota 7d:requests=15000
+    --target-defaults dialect=adaptive_effort,output_cap_param= --stream-usage native \
+    --billing subscription --quota 5h:requests=1000 --quota 7d:requests=10000
 ```
 
-Some plans' published terms restrict them to the vendor's own tools. Complying with a provider's terms is the
-operator's responsibility (R17).
+Several plans' published terms restrict them to the vendor's own tools or to interactive use, and bar using them
+behind a backend or for non-interactive traffic; the proxy sends its HTTP client's default `User-Agent`, never a
+tool's. Complying with a provider's terms is the operator's responsibility (R17).
 
 ### 7.4 Adding providers, targets and models through the API
 
@@ -382,18 +389,18 @@ usage: that is §11.
 
 | Id | Rule |
 |---|---|
-| TEL-1 | One exporter: OTLP over HTTP with JSON encoding, written with the standard library. No vendor SDK, no native adapter per backend, no second export path. A `2xx` is success for the spans the backend did not reject: the exporter reads `partialSuccess.rejectedSpans` from the response and counts those as rejected, with the backend's message |
+| TEL-1 | One exporter: OTLP over HTTP with JSON encoding, written with the standard library. No vendor SDK, no native adapter per backend, no second export path. A `2xx` is success for the spans the backend did not reject: the exporter reads `partialSuccess.rejectedSpans` from the response and counts those as rejected, with the backend's message. At most 4 MiB of a response is read |
 | TEL-2 | `stargaite telemetry set` configures the exporter: the OTLP endpoint, always given in full (spans go to `<endpoint>/v1/traces`), and the authentication, given as references (`--basic-auth-env USER_VAR:PASSWORD_VAR` or `--header-env NAME=VAR`). Static headers that carry no secret are given with `--header NAME=value`; one named `Authorization`, `Proxy-Authorization`, `Cookie` or `x-api-key` is refused, because a credential is only ever a reference (SEC-5); `--allow-private-network` is needed for a plain-HTTP, loopback or private endpoint (SEC-4). The proxy composes the header; nobody encodes it by hand. `stargaite telemetry test` sends one real span through the exporter of TEL-1 with the stored configuration and reports one of `credential_unresolved`, `unreachable`, `unauthorized`, `not_found`, `rejected` or `accepted`, as defined in §3.2, with the trace id to look up |
 | TEL-3 | `stargaite telemetry status` and the metrics endpoint show spans sent, spans rejected by HTTP status or by the backend, spans dropped and the last error. After ten consecutive failed batches the proxy writes a warning to the log, rate-limited |
 | TEL-4 | The span name and the set of attributes are one versioned schema for every backend (annex D), fixed by a golden test. The key is an attribute of every span, request and attempt spans alike, on successes, streams and errors; the model alias is an attribute of every span whose request body named one (a body that was not read or could not be parsed names none); the target is an attribute of every span for which a target was selected. No setting removes or renames an attribute |
-| TEL-5 | Every authenticated request that tracing keeps (TEL-7) produces exactly one request span, including those rejected before reaching a provider (budget, limits, capability mismatch, unknown parameter). A failure sets the span status, `error.type` and the HTTP status. Unauthenticated requests produce a metric, not a span |
-| TEL-6 | If the request carries a valid W3C `traceparent`, the request span is a child of that trace instead of opening another; a malformed one is ignored, and the setting `trust_traceparent: false` ignores it always. Every request span and every attempt span gets a freshly generated span id. The header `x-session-id` is the only source of `session.id` and `gen_ai.conversation.id`; no body field sets them. Each failed attempt that precedes a fallback is a child span with its own target and error |
+| TEL-5 | Every authenticated request to an inference endpoint that tracing keeps (TEL-7) produces exactly one request span (`GET /v1/models` produces none), including those rejected before reaching a provider (budget, limits, capability mismatch, unknown parameter). A failure sets the span status, `error.type` and the HTTP status. Unauthenticated requests produce a metric, not a span |
+| TEL-6 | If the request carries a valid W3C `traceparent` (Trace Context Level 1, read strictly: exactly one header, its flags ignored), the request span is a child of that trace instead of opening another; a malformed one is ignored, and the setting `trust_traceparent: false` ignores it always. Every request span and every attempt span gets a freshly generated span id. The header `x-session-id` is the only source of `session.id` and `gen_ai.conversation.id`; no body field sets them. Each failed attempt that precedes a fallback is a child span with its own target and error |
 | TEL-7 | Tracing can be sampled or turned off per model alias and per key with `trace_sample_rate` (0 to 1); when both are set the lower one applies. The proxy decides once per request, for the request span and its attempt spans, ignoring the sampled flag of `traceparent`; failed requests are sampled like successful ones. Sampling never changes usage records, budgets, quotas or error counters; a test compares them with and without tracing |
-| TEL-8 | No span carries prompt or response content by default. Content is enabled per key, with an expiry (`stargaite keys set <name> --content 24h`) and an audit record; each content attribute is truncated to `content_max_bytes` (32 KiB by default) and the truncation is flagged. Request attributes are a closed list of scalars. A test plants a fake secret in a prompt and in a header and checks that it is exported nowhere |
-| TEL-9 | Attributes follow the OpenTelemetry GenAI semantic conventions at a version or commit pinned in the schema, plus `stargaite.*` for what they do not cover. `gen_ai.request.model` is the alias the client asked for; `gen_ai.response.model` is the model the provider returned; `stargaite.target` is the target that served. The alias is also emitted as `stargaite.model`, because some backends prefer the response model for their own model field. Effort and output cap appear as separate scalar attributes for requested, alias and sent (RSN-6, PAR-6). Token attributes are the inclusive totals the conventions define (USE-3) |
+| TEL-8 | No span carries prompt or response content by default. Content is enabled per key, with an expiry (`stargaite keys set <name> --content 24h`) and an audit record; each content attribute is a string, not the structured value the conventions now define, truncated to `content_max_bytes` (32 KiB by default) at a UTF-8 boundary, and the truncation is flagged. Request attributes are a closed list of scalars and the conventions' string arrays. A test plants a fake secret in a prompt and in a header and checks that it is exported nowhere |
+| TEL-9 | Attributes follow the OpenTelemetry GenAI semantic conventions of `semantic-conventions-genai` at commit `e6658f14c9d9ea0760825f029cb82e7673f48fab`, plus `stargaite.*` for what they do not cover. The commit is recorded in the schema file and moved only with a new schema version; spans carry no `schemaUrl`, because that repository publishes none. `gen_ai.request.model` is the alias the client asked for; `gen_ai.response.model` is the model the provider returned; `stargaite.target` is the target that served. The alias is also emitted as `stargaite.model`, because some backends prefer the response model for their own model field. Effort and output cap appear as separate scalar attributes for requested, alias and sent (RSN-6, PAR-6). Token attributes are the inclusive totals the conventions define (USE-3) |
 | TEL-10 | The cost goes in `stargaite.cost.usd`, only when it is known (USE-6); the conventions define no cost attribute. Usage and cost attributes sit on exactly one span per provider call, so a backend that adds them up never counts twice |
-| TEL-11 | Nothing in the exporter is specific to a backend. Where a backend only reads a value under a name of its own, that name is added to the one schema as a compatibility attribute, documented with the backend that reads it, in a new schema version (annex D). `--preset` on `telemetry set` is only a shortcut that fills in flags (static headers and the conventional variable names of the credentials) and stores the result; the only one in v1 is `langfuse` |
-| TEL-12 | Export is best effort and never blocks inference: an in-memory queue of 10,000 spans or 32 MB, whichever is reached first, batches every 2 s or 200 spans, three retries with exponential backoff. When the queue is full the oldest spans are dropped and counted |
+| TEL-11 | Nothing in the exporter is specific to a backend. Where a backend only reads a value under a name of its own, that name is added to the one schema as a compatibility attribute, documented with the backend that reads it, in a new schema version once v1 is published (annex D); v1 already carries those Langfuse needs to filter by key, alias and target. `--preset` on `telemetry set` is only a shortcut that fills in flags (static headers and the conventional variable names of the credentials) and stores the result; the only one in v1 is `langfuse` |
+| TEL-12 | Export is best effort and never blocks inference: an in-memory queue of 10,000 spans or 32 MB, whichever is reached first, batches every 2 s or 200 spans, three retries with exponential backoff and jitter, only on `429`, `502`, `503`, `504` and transport failures, honouring a `Retry-After` up to 30 s; any other status rejects the batch. When the queue is full the oldest spans are dropped and counted |
 | TEL-13 | Every span carries the proxy version and the configuration revision that served the request |
 | TEL-14 | The default CI tests the exporter against an in-process OTLP receiver. An integration job outside the default CI sends spans to a self-hosted Langfuse at the version pinned in the job, with and without the ingestion-version header of the preset, and checks that the trace is readable and that key, alias and target can be filtered. It is run before any release that changes the span schema or the exporter |
 
@@ -408,15 +415,15 @@ All `proposed`. The usage store is the official record. It is local, durable and
 |---|---|
 | USE-1 | Every provider call leaves one immutable usage record, whether it succeeded, failed or was aborted. A request that fell back leaves one record per attempt, under the same request id and with its own attempt number. Requests rejected before reaching a provider are counted in metrics and spans, not in usage records |
 | USE-2 | Writing is idempotent: each record has a unique id, it is inserted with insert-or-ignore, and the daily aggregate is updated in the same transaction only for rows actually inserted. Corrections are new records, never updates. Aggregates can be rebuilt from the records for the days still within the usage retention; older aggregates are never rebuilt or overwritten |
-| USE-3 | Tokens are always recorded, with or without a price. `input_tokens` is the total input, cache tokens included; `cache_read_tokens` and `cache_write_tokens` are parts of it. `output_tokens` is the total output the provider bills, reasoning included; `reasoning_tokens` is the part spent on reasoning, empty when the provider does not report it. No total adds a part twice. The provider's `finish_reason` is recorded too |
+| USE-3 | Tokens are always recorded, with or without a price. `input_tokens` is the total input, cache tokens included; `cache_read_tokens` and `cache_write_tokens` are parts of it. `output_tokens` is the total output the provider bills, reasoning included; `reasoning_tokens` is the part spent on reasoning, empty when the provider does not report it. No total adds a part twice. On the `openai` protocol, `output_tokens` is the larger of `completion_tokens` and `total_tokens` minus `prompt_tokens`, because some providers leave reasoning out of `completion_tokens`; `reasoning_tokens` is only what the provider reports. The provider's `finish_reason` is recorded too |
 | USE-4 | Each record carries the key name, the model alias, the target, the upstream model id sent and the `model` the provider returned. A returned model that starts with neither the upstream id nor one of the target's `response_models` is flagged as a mismatch and counted |
 | USE-5 | Each record carries the requested, alias and sent values of effort and output cap, the list of parameter changes, the proxy version and the configuration revision |
-| USE-6 | Cost is in USD and carries its source: `provider` (read from the provider's response at its `cost_report` path) or `price_table` (computed from the target's declared prices and the recorded tokens). The provider's figure wins over the price table; when a response carries no provider figure, the price table is used, also over estimated tokens. Without a report and without prices the cost is empty and the source is `none`: it is never guessed. A separate field says whether the tokens came from the provider or were estimated (USE-8) |
+| USE-6 | Cost is in USD and carries its source: `provider` (read from the provider's response at its `cost_report` path) or `price_table` (computed from the target's declared prices and the recorded tokens; a missing cache price is the input price). The provider's figure wins over the price table; when a response carries no provider figure, the price table is used, also over estimated tokens. Without a report and without prices the cost is empty and the source is `none`: it is never guessed. A separate field says whether the tokens came from the provider or were estimated (USE-8) |
 | USE-7 | Records of `subscription` and `none` providers have no cost. They never enter a USD total or a USD budget, and are reported separately in requests and tokens |
-| USE-8 | In streaming, the usage block is obtained as each provider needs it (`stream_usage`): `request` sets `stream_options.include_usage` in the outgoing body, listed as added, and the proxy consumes the final usage chunk when the client did not ask for it; `native` expects usage without asking; `none` means it is not available. If no usage arrives (for example, the client disconnected), tokens are estimated as the bytes of the input and of the visible output divided by four, rounded up, and the record is marked `tokens_source: estimated` |
+| USE-8 | In streaming, the usage block is obtained as each provider needs it (`stream_usage`): `request` sets `stream_options.include_usage` in the outgoing body, listed as added, or as translated when the client sent `include_usage: false`, and the proxy consumes the final usage chunk when the client did not ask for it; `native` expects usage without asking; `none` means it is not available; undeclared asks for nothing. If a call answered `2xx` and either no usage arrives or its answer did not end cleanly (for example, the client disconnected), tokens are estimated as the bytes of the input the provider received (the translated body on a translated path) and of the visible output divided by four, rounded up; parts the provider did report are kept, the output is the larger of the reported and the estimated one, and the record is marked `tokens_source: estimated`. A call without a `2xx` records zero tokens, with `tokens_source: provider` |
 | USE-9 | `stargaite usage show` answers from the local store alone. It filters by `--key`, `--model` and `--target`, groups by any combination of key, model, target and effort sent (`--by key,model,effort-sent`), over a time window, with `--compare-previous` for the window before it. For each group: requests (provider calls: a request that fell back counts once per attempt), tokens by type, cost, median and 90th percentile of reasoning and output tokens over the successful records that reported them, responses with `finish_reason=length` and responses with empty visible content (no text and no tool call). Percentiles and grouping by effort come from the records, so they exist only within the usage retention; for older windows it returns the sums of the daily aggregates. `stargaite usage quota` shows each subscription window |
-| USE-10 | Records go through a single writer in batches (100 records or 50 ms, whichever comes first), each batch committed with `synchronous = FULL`. After three consecutive failed commits the store is unavailable and the writer retries every 5 s. Meanwhile `pay_per_use` targets are ineligible (`503 usage_store_unavailable` when no other target is left), `subscription` and `none` targets keep serving, quota counters keep counting in memory, and records wait in the writer's bounded queue. A record that cannot wait (the queue is full, or the process is stopping) is written as one structured log line at critical level, with no content: it is never lost silently |
-| USE-11 | Retention is finite by default and enforced by the process itself, once a day, in small batches, with no external scheduler: usage records 90 days, daily aggregates 36 months, audit 24 months. The values are settings: `settings show` prints them, and `export` when they were declared. The running total of a `never` budget is kept in its own counter and is not subject to retention |
+| USE-10 | Records go through a single writer in batches (100 records or 50 ms, whichever comes first), each batch committed with `synchronous = FULL`. After three consecutive failed commits the store is unavailable and the writer retries every 5 s. Meanwhile `pay_per_use` targets are ineligible (`503 usage_store_unavailable` when no other target is left), `subscription` and `none` targets keep serving, quota counters keep counting in memory, and records wait in the writer's bounded queue. A record that cannot wait (the queue is full, or the process is stopping) is written as one structured log line at critical level, with no content: it is never lost silently, but it is absent from the counters rebuilt at start |
+| USE-11 | Retention is finite by default and enforced by the process itself, once a day, in small batches, with no external scheduler: usage records 90 days, daily aggregates 36 months, audit 24 months. Usage records are kept for at least the longest quota window, which the rebuild of LIM-8 reads. The values are settings: `settings show` prints them, and `export` when they were declared. The running total of a `never` budget is kept in its own counter and is not subject to retention |
 | USE-12 | A `pay_per_use` target with neither declared prices nor a provider `cost_report` produces records without cost, which no budget can see. A change is refused when such a target can be reached from a scope that has a budget (the instance, a key or an alias); otherwise `validate` warns. A target priced only by its provider's `cost_report` cannot price a response whose report never arrived (an aborted stream): `validate` warns that it has no prices to fall back on. Every `pay_per_use` record left without a cost is counted in a metric of unpriced requests |
 
 ## 12. Budgets, limits and quotas
@@ -427,13 +434,13 @@ All `proposed`. Three independent mechanisms; a request passes only if none of t
 |---|---|
 | LIM-1 | Budgets are in USD, per key and per model alias, independent of each other, plus an optional global one. There is no limit on the combination of key and alias, and none per end user. Only scopes with a budget are evaluated |
 | LIM-2 | A budget is `limit_usd` and `reset_interval`: `daily` (resets at 00:00 UTC), `monthly` (day 1 at 00:00 UTC) or `never`. The counter of a `daily` or `monthly` budget is the spend of its scope in the current period, whenever the budget was set or changed, so the figure is the same before and after a restart. The counter of a `never` budget starts at zero when it is set, is kept when `limit_usd` changes, and is deleted when the budget is removed or its interval changes |
-| LIM-3 | At 80 % of a budget the proxy writes a warning to the log and raises a metric. At 100 % the `pay_per_use` targets are unavailable to the requests in that budget's scope: the next target of the alias is used, and if none is left the request gets the error RES-10 states, `402 budget_exceeded` when the budget is what excluded the first able target. A USD budget never blocks a `subscription` or `none` target. The error never reveals another key's figures |
+| LIM-3 | At 80 % of a budget the proxy writes a warning to the log and raises a metric. At 100 % the `pay_per_use` targets are unavailable to the requests in that budget's scope: the next target of the alias is used, and if none is left the request gets the error RES-10 states, `402 budget_exceeded`, without `Retry-After`, when the budget is what excluded the first able target. A USD budget never blocks a `subscription` or `none` target. The error never reveals another key's figures |
 | LIM-4 | Spend is charged to in-memory counters when a response ends, before its parallel slot is released; the durable write follows (USE-10). There is no prior reservation: the overshoot of a budget is at most the cost of the requests in flight in its scope when the limit is crossed. That is bounded where the scope has a parallel limit (a key has one by default, LIM-7) and each request's output is bounded by a cap (PAR-6); an alias that needs a hard bound sets both |
-| LIM-5 | Rate limits are per key and per model alias, independent of each other and of budgets. `rpm_limit`: requests that passed admission (step 4 of §14.1) in the last 60 s, a sliding window. Admission is all or nothing: a request refused by any limit of the key, the alias or the instance counts in none of them and takes no slot; one that passed admission and is refused at a later step still counts. `tpm_limit`: the recorded input plus output tokens, reported or estimated, of the provider calls completed in the last 60 s; a request is refused while the sum is at or above the limit. `max_parallel_requests`: requests in flight. A global `max_parallel_requests` protects the process. Exceeding any of them gets `429` with `Retry-After` |
+| LIM-5 | Rate limits are per key and per model alias, independent of each other and of budgets. `rpm_limit`: requests that passed admission (step 4 of §14.1) in the last 60 s, a sliding window. Admission is all or nothing: a request refused by any limit of the key, the alias or the instance counts in none of them and takes no slot; one that passed admission and is refused at a later step still counts. `tpm_limit`: the recorded input plus output tokens, reported or estimated, of the provider calls completed in the last 60 s; a request is refused while the sum is at or above the limit. `max_parallel_requests`: requests in flight. A global `max_parallel_requests` protects the process. Exceeding any of them gets `429` with `Retry-After`: `1` for a parallel limit, and for a rate limit the seconds until the window admits again, rounded up; no `RateLimit` header fields are sent. Sliding windows, here and in LIM-8, are counted in buckets of at least 1 s and a six-hundredth of the window: they may count up to one bucket of older traffic, never less than an exact window |
 | LIM-6 | Parallel slots are always released: on completion, error, client cancellation or panic. The body size is checked against `max_body_bytes` (10 MiB by default) before the body is read in full (`413`) |
-| LIM-7 | A new key gets `max_parallel_requests: 5` unless told otherwise (OQ-7); nothing else is limited by default |
-| LIM-8 | A `subscription` provider declares its `quota` as a list of windows, each with a limit in requests or in tokens (for example `5h` and `7d`). The proxy counts its own traffic per sliding window, the only kind in v1 (OQ-2), and rebuilds the counters from the usage store at start. Each provider call counts when it is sent, whatever its result, and leaves its own usage record (USE-1), which is what the rebuild reads; its tokens count when it ends |
-| LIM-9 | When a window is exhausted the target is unavailable: the next target of the alias is used, and if none is left the request gets the error RES-10 states, `429 quota_exceeded` with `Retry-After` when the quota is what excluded the first able target. At 80 % of a window the proxy logs a warning and raises a metric |
+| LIM-7 | A key that declares no `max_parallel_requests` gets 5 when the configuration is published (§6, OQ-7), so a key can be given a large value but not none; nothing else is limited by default |
+| LIM-8 | A `subscription` provider declares its `quota` as a list of windows, each with a limit in requests or in tokens (for example `5h` and `7d`). The proxy counts its own traffic per sliding window, the only kind in v1 (OQ-2), and rebuilds the counters from the usage store at start; `validate` warns about a window longer than the usage retention (`quota_beyond_retention`). Each provider call counts when it is admitted, at the end of the exclusions of step 5 of §14.1 and atomically with their check, whatever its result, and leaves its own usage record (USE-1), which is what the rebuild reads; its tokens count when it ends |
+| LIM-9 | When a window is exhausted the target is unavailable: the next target of the alias is used, and if none is left the request gets the error RES-10 states, `429 quota_exceeded` with `Retry-After` (the seconds until the exhausted window admits again, rounded up and uncapped) when the quota is what excluded the first able target. At 80 % of a window the proxy logs a warning and raises a metric |
 | LIM-10 | A key may have a `quota_share` per subscription provider: the fraction of each window that key may use. A key that reaches its share is treated as in LIM-9, for that key only. It stops one agent from taking the whole plan |
 
 ## 13. API and CLI
@@ -535,7 +542,7 @@ at least one `--model <alias>` or an explicit `--all-models`: a key never gets a
 | OPS-2 | Nothing ever prompts. Every command accepts `--json` and returns `0` on success, `1` on failure and `2` on wrong usage. A command that deletes or revokes (`remove`, `keys revoke`, `telemetry unset`, and `apply --prune` unless it is a `--dry-run`) fails with `2` unless `--yes` is given. `apply` accepts `--dry-run`: it validates and shows the difference without publishing |
 | OPS-3 | `export` writes the whole configuration as YAML, without secrets. `apply -f` validates the file, shows the difference and publishes it in one step; it creates and updates: a resource named in the file is replaced by the file's declaration as a whole, so a field the file omits returns to its default. What is absent from the file is left untouched unless `--prune` is given: then absent providers, targets and aliases are removed, absent keys are revoked (not deleted) and absent settings return to their defaults. An invalid file leaves the active configuration untouched. A key in the file that does not exist yet is created with a new secret, which `apply` prints once; a key that exists keeps its secret. `export` omits revoked keys, and a file that names a revoked key makes `apply` fail with `409 conflict`: a revoked name is never reused. Exporting from one instance and applying to an empty one therefore reproduces the configuration with new key secrets; cloning an instance with its secrets is what `backup` is for. A resource created by `apply` takes only what the file declares: it does not inherit a provider's `target_defaults` |
 | OPS-4 | Every change publishes a new immutable snapshot atomically and increments the configuration revision. Requests in flight finish with the snapshot they started with. Nothing needs a restart. A change with an empty difference, and the publication at start, keep the revision: only a real difference increments it |
-| OPS-5 | Every change, from a single command or from `apply`, is validated against the whole resulting configuration before it is published. A failed check refuses the change with exit code `1`: unknown providers and targets, aliases without targets, `requires` not met (PAR-5), missing or excessive output caps (PAR-6, PAR-7), `forward` rules that collide with a parameter the proxy writes (PAR-2), reasoning rules (RSN-3, RSN-7), unpriced targets under a budget (USE-12), outbound URLs (SEC-4). Warnings never block: chat targets never verified (RSN-9) or with undeclared reasoning fields (RSN-3), credentials that do not resolve, an effort toward a `none` dialect (RSN-5), targets without prices to fall back on (USE-12), aliases that cannot serve an endpoint, a key that names an unknown alias. `validate` runs the same checks on the active configuration, or on a file with no server running |
+| OPS-5 | Every change, from a single command or from `apply`, is validated against the whole resulting configuration before it is published. A failed check refuses the change with exit code `1`: unknown providers and targets, aliases without targets, `requires` not met (PAR-5), missing or excessive output caps (PAR-6, PAR-7), `forward` rules that collide with a parameter the proxy writes (PAR-2), reasoning rules (RSN-3, RSN-7), unpriced targets under a budget (USE-12), outbound URLs (SEC-4). Warnings never block: chat targets never verified (RSN-9) or with undeclared reasoning fields (RSN-3), credentials that do not resolve, an effort toward a `none` dialect (RSN-5), targets without prices to fall back on (USE-12), aliases that cannot serve an endpoint, a key that names an unknown alias, a quota window longer than the usage retention (LIM-8). `validate` runs the same checks on the active configuration, or on a file with no server running |
 | OPS-6 | Credential references resolve from the process environment first and then from the file given with `--env-file` (no file is read unless the flag is given): plain `NAME=value` lines, no quoting, no interpolation, `#` for comments. They are resolved again on every published change and on `secrets reload`, so a credential added to that file works without a restart; a variable set in the process environment cannot change while the process runs, so a credential meant to rotate without a restart goes in the file. A provider whose credential does not resolve is loaded disabled, with a warning, and does not prevent the proxy from starting |
 | OPS-7 | `stargaite version` prints the version, the same string that spans and usage records carry. Upgrading means replacing the binary: migrations of the embedded store run at start and are tested, and no external database is involved. `backup` writes a copy that a test restores |
 | OPS-8 | The metrics endpoint exposes, by key and model alias: requests by status, tokens by type, cost, spans emitted, responses with `finish_reason=length`, responses with empty visible content, model mismatches, parameter changes by action and unpriced requests; and for the instance: budget and quota usage and the exporter's counters. The counters exist from the feature that produces them; the `metrics` feature adds the endpoint |
@@ -552,7 +559,7 @@ at least one `--model <alias>` or an explicit `--all-models`: a key never gets a
 | 2 | Check the body size (`413`) and parse the body (`400`) |
 | 3 | Resolve the alias in `model` (`404`), check that the key may use it (`403`) and validate the body against the known parameters of the endpoint (PAR-1, PAR-2) |
 | 4 | Admission, for the key and the alias: parallel slots and rate limits; for the instance: parallel slots |
-| 5 | Select a target (RES-10): first by what cannot change between requests (kind and protocol against the endpoint, capabilities, unsupported parameters, output cap), then by what can (circuit closed, credential resolved, quota available, budget available and usage store available for `pay_per_use`) |
+| 5 | Select a target (RES-10): first by what cannot change between requests (kind and protocol against the endpoint, capabilities, unsupported parameters, output cap), then by what can, in the order RES-10 reports it (budget available for `pay_per_use`, quota available, usage store available for `pay_per_use`, credential resolved, circuit closed) |
 | 6 | Build the outgoing request for that target: resolve effort and output cap, translate to the protocol and the dialect, list the changes, read back what will be sent (PAR-8) |
 | 7 | Call the provider and relay the response or the SSE stream. On an eligible failure before anything was sent to the client, go back to step 5 with the next target |
 | 8 | Answer with the proxy's headers (PAR-9) |
@@ -567,7 +574,7 @@ All `proposed`.
 | Id | Rule |
 |---|---|
 | RES-1 | An alias has one primary target and at most two fallbacks. A fallback is tried on a connection error, a timeout, `429` or any `5xx` from the provider, or a stream `error` event whose type the provider documents with one of those statuses, as long as nothing has been sent to the client; a target excluded at step 5 of §14.1 is passed over the same way. Never on a `3xx` or on any `4xx` other than `429`, and never after the first SSE chunk has been sent. There are no automatic retries against the same target |
-| RES-2 | One circuit breaker per target. Only failures eligible for fallback count. Five of them within 30 s open it for 20 s. Then it is half-open: it lets two requests through and treats the target as open for all others; if both succeed it closes, and if either fails it opens for another 20 s. These values are constants in v1 |
+| RES-2 | One circuit breaker per target. Only failures eligible for fallback count. Five of them within 30 s open it for 20 s. Then it is half-open: it lets two requests through and treats the target as open for all others; if both succeed it closes, and if either fails it opens for another 20 s. These values are constants in v1. Failures are classified by status alone: a provider's `429` for an exhausted plan or a spend cap counts like any other, and upstream rate-limit headers are not read in v1 |
 | RES-3 | Timeouts: connection 5 s; first byte 30 s, for streaming requests only; silence between chunks 120 s; total 180 s per provider call for non-streaming requests, which have no first-byte timer. They are settings |
 | RES-4 | The proxy never buffers a streaming response. A non-streaming response is read in full, up to `max_response_bytes`, before anything is sent to the client, so a failure while reading it is still eligible for fallback. When a stream fails after its first chunk was sent, the proxy emits one terminal error event in the format of the inbound endpoint and closes (on chat completions a `data:` object with a top-level `error` and no `[DONE]` after it; on `/v1/messages` an `error` event); the usage record is written with what was observed. When it transforms SSE chunks it preserves valid events, keeps JSON well formed, duplicates nothing and does not reorder tool calls |
 | RES-5 | When the client disconnects, the upstream call is cancelled within 1 s and the usage record is still written |
@@ -582,7 +589,6 @@ All `proposed`.
 | Task | What it does | When |
 |---|---|---|
 | write usage | Commits pending records in one transaction | Every 100 records or 50 ms |
-| reset budgets | Opens a new period for `daily` and `monthly` budgets | 00:00 UTC |
 | enforce retention | Deletes what exceeds USE-11, in small batches | Once a day |
 | export spans | Sends queued spans | Every 2 s or 200 spans |
 | check the store | `PRAGMA quick_check`; a failure is a critical log entry and a metric | In the background, after the proxy is ready |
@@ -843,11 +849,11 @@ Test strategy, `proposed`:
 | R2 | Sent is not applied: the provider ignores the effort or changes its default | Reasoning tokens do not move when the effort sent does | `usage show --by effort-sent` and `targets verify` (USE-9, RSN-9) |
 | R3 | A dialect is declared wrongly; the mock provider checks the body, not the effect | A live provider rejects a level, or reasoning tokens are the same at every level | `targets verify` against the live provider, and the warning for unverified targets |
 | R4 | The observability backend changes its ingestion, or shows attributes elsewhere; an accepted span is not necessarily a visible trace | A trace is accepted and cannot be found or filtered | The integration job (TEL-14), compatibility attributes in the one schema (TEL-11), and the trace id printed by `telemetry test` |
-| R5 | The GenAI semantic conventions are still in development and rename attributes | A backend stops recognising a field | A pinned version in the span schema; a change is a new schema version with its golden test |
+| R5 | The GenAI semantic conventions are still in development and rename attributes | A backend stops recognising a field | A pinned commit in the span schema; a change is a new schema version with its golden test |
 | R6 | Strict rejection breaks existing clients during a migration, and the easy way out is a permissive switch | Requests for a global "drop unsupported" option | Per-alias `forward` and `drop` rules, always listed (PAR-2). No global switch |
 | R7 | Known-parameter schemas fall behind the formats they implement | A new standard parameter gets `400` | Schemas pinned and updated with each release; the `forward` rule as the way through meanwhile |
 | R8 | Budget overshoot from parallel requests | Spend above the limit | Parallel limits and output caps (LIM-4) |
-| R9 | Stale prices | Computed cost drifts from the invoice | Prices carry an `as_of` date; the provider's own figure is preferred (USE-6) |
+| R9 | Stale prices | Computed cost drifts from the invoice | Prices carry an `as_of` date; the provider's own figure is preferred (USE-6); price shapes one table cannot express (cache writes by duration, long-context tiers, service tiers, residency, peak hours, per-call tool fees, dated price changes) are documented in the guide |
 | R10 | The provider does not report usage | Records with `tokens_source: estimated` | Estimates are marked as such (USE-8) |
 | R11 | SSRF through the admin API | A request toward an unexpected host | SEC-4 |
 | R12 | Loss of usage records | Spend and records do not match | ADR-015 and ADR-016 |
@@ -855,7 +861,7 @@ Test strategy, `proposed`:
 | R14 | Streaming saturation | Memory grows without bound | Backpressure and parallel limits |
 | R15 | Two processes or two instances spend the same budget twice | A second replica is deployed | The lock on the data directory (OPS-10); v1 is single-writer and says so (ADR-021) |
 | R16 | Each protocol and each dialect is maintenance surface | Their number grows | A new one needs a real use case and its tests |
-| R17 | A subscription plan's terms forbid the way it is being used | A provider's notice or a blocked key | Stated in §7.3; the operator's responsibility |
+| R17 | A subscription plan's terms forbid the way it is being used, such as behind a backend or for non-interactive traffic | A provider's notice or a blocked key | Stated in §7.3; the operator's responsibility |
 | R18 | Something private slips into the public repository: a name, a secret or a dependency others cannot use | The CI fails on a fork, or a proper name shows up in a file or a commit message | The requirements of §19, checked before each publication |
 
 ## 23. Hypotheses
@@ -918,13 +924,13 @@ published, and it is settled; so is the CI host of OQ-4.
 
 | Id | To decide | Options or proposal |
 |---|---|---|
-| OQ-1 | Which span attributes each backend shows as filterable fields or tags. If key, alias or target cannot be filtered somewhere, a compatibility attribute is added to annex D as a new schema version (TEL-11) | Verified with a real trace while building `telemetry-otlp` |
-| OQ-2 | The unit and the kind of window of each subscription plan's allowance (requests or tokens; sliding or fixed), which fixes the `quota` an operator declares and whether LIM-8 needs fixed windows besides sliding ones | Checked against each provider's published terms |
+| OQ-1 | Which span attributes each backend shows as filterable fields or tags. If key, alias or target cannot be filtered somewhere, a compatibility attribute is added to annex D as a new schema version (TEL-11) | Settled for Langfuse: v1 carries `session.id` and compatibility attributes for key, alias and target on every span (annex D), confirmed by the TEL-14 job; a trace-level form comes in a new schema version if that job shows it is needed. Other backends: verified with a real trace |
+| OQ-2 | The unit and the kind of window of each subscription plan's allowance (requests or tokens; sliding or fixed), which fixes the `quota` an operator declares and whether LIM-8 needs fixed windows besides sliding ones | Settled for v1: sliding windows only. No plan surveyed counts in a purely sliding window; a sliding one never admits more than the provider would, but may refuse for up to one window after the provider resets, and the provider's own `429` stays authoritative |
 | OQ-3 | Success and abandonment thresholds, with a deadline, for the hypotheses of §23 | — |
 | OQ-4 | The CI host and how releases are distributed (binaries, a public image registry), within PUB-5 | Settled for the CI host: GitHub Actions, with a workflow that only calls make targets. Proposal for releases: binaries on the repository's release page and the image at `ghcr.io/jorlaru/stargaite` |
 | OQ-5 | Whether any consumer needs the Responses API | Out of v1 unless confirmed. Evidence so far: some OpenAI models offer tool calling, or some effort levels, only on the Responses API; their targets declare `tools: false` and their real `levels`, so PAR-4 and RSN-4 handle them |
 | OQ-6 | Whether to ship `config-import` for people coming from another gateway | Out of v1 unless confirmed |
-| OQ-7 | The default `max_parallel_requests` of a new key | Proposal: 5 |
+| OQ-7 | The default `max_parallel_requests` of a new key | Settled: 5, applied at publish to every key that declares none (LIM-7) |
 | OQ-8 | Whether the binary, the variable prefix and the key prefix keep the full project name | Proposal: yes |
 | OQ-9 | The identity the project is published under: commit author, copyright holder in the license, hosting namespace in the module path and the image name (PUB-2) | Settled: the commit author is the project identity `StargAIte`, the license names `StargAIte contributors`, and the hosting namespace is `github.com/jorlaru` |
 | OQ-10 | How thinking blocks survive a tool loop on the translated path (chat completions to an `anthropic` target), where the OpenAI format has no field for them | Settled for phase 2: thinking blocks are dropped on the translated path, a chat tool loop with thinking toward an `anthropic` target is unsupported, and `/v1/messages` is the documented path for it. Proposal: return them in an opaque field of the assistant message that the client echoes back, and omit them when it does not; to be settled with the contract suite against a live provider |
@@ -958,8 +964,8 @@ published, and it is settled; so is the CI host of OQ-4.
 Proposed base schema of the store. Configuration resources keep their declaration as validated JSON, so adding a field
 does not need a migration. Times are Unix milliseconds in UTC. Every connection is opened with `journal_mode=WAL`,
 `synchronous=FULL`, `foreign_keys=ON` and `busy_timeout=5000` (ADR-003); those settings are per connection and are
-not part of any migration. Migrations become immutable from the first tagged release; until then a later phase may
-still amend migration 001.
+not part of any migration. A migration is never amended once a data directory may have run it: a later phase adds
+one, as phase 3 adds migration 002.
 
 ```sql
 -- Migration 001: base schema
@@ -1109,6 +1115,35 @@ CREATE TABLE audit (
 );
 ```
 
+```sql
+-- Migration 002: usage accounting
+
+ALTER TABLE budget_totals ADD COLUMN since_revision INTEGER NOT NULL DEFAULT 0;  -- revision the counter started at
+
+DROP TABLE usage_daily;                   -- nothing wrote it before this migration
+CREATE TABLE usage_daily (
+    day                 TEXT NOT NULL,
+    key_name            TEXT NOT NULL,
+    model               TEXT NOT NULL,
+    target              TEXT NOT NULL,
+    billing             TEXT NOT NULL,
+    requests            INTEGER NOT NULL DEFAULT 0,
+    errors              INTEGER NOT NULL DEFAULT 0,
+    input_tokens        INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens       INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens    INTEGER NOT NULL DEFAULT 0,
+    cost_usd            REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, key_name, model, target, billing)   -- a provider whose billing changes keeps its rows apart
+);
+```
+
+A `never` budget declared before migration 002 gets its `budget_totals` row, at the current revision, when the
+configuration is next opened. `usage.error_type` holds the §15 code of the call, or `client_gone`; the error type
+follows from the code. The upstream model id is the part of `target` after its first `/`, and the session goes only
+to spans, so neither has a column.
+
 ## Annex B. Example configuration
 
 What `stargaite export` produces and `stargaite apply -f` accepts; proposed content of `config.example.yaml`.
@@ -1146,6 +1181,7 @@ providers:
     base_url: https://api.anthropic.com
     api_key_env: ANTHROPIC_API_KEY
     billing: pay_per_use
+    stream_usage: native
     gen_ai_provider: anthropic
     target_defaults: { dialect: adaptive_effort }
   minimax-plan:                         # a subscription plan: no prices, a quota per window
@@ -1154,8 +1190,9 @@ providers:
     api_key_env: MINIMAX_PLAN_API_KEY
     billing: subscription
     quota:
-      - { window: 5h, requests: 1500 }
-      - { window: 7d, requests: 15000 }
+      - { window: 5h, requests: 1000 }
+      - { window: 7d, requests: 10000 }
+    stream_usage: native
     target_defaults: { dialect: adaptive_effort }
   tei-embed:                            # self-hosted; one instance serves one model
     protocol: openai
@@ -1279,10 +1316,11 @@ Proposed schema, version 1, the same for every backend. The request span is name
 `chat fast`; when the body could not be parsed it is named `{operation}` and carries no alias. Resource attributes:
 `service.name = stargaite`, `service.version`.
 
-The `gen_ai.*` names are those of the OpenTelemetry GenAI semantic conventions at the version or commit recorded in
-the schema file. They are still in development upstream (R5), and at the time of writing two names need care:
-`gen_ai.request.reasoning.level` exists only in the unreleased conventions, and the cache-write attribute is being
-renamed from `cache_creation` to `cache_write`. The golden test fixes whichever the pinned version defines.
+The `gen_ai.*` names are those of `semantic-conventions-genai` at commit `e6658f14c9d9ea0760825f029cb82e7673f48fab`, recorded in
+the schema file (TEL-9); spans carry no `schemaUrl`. They are still in development upstream (R5); the pinned commit
+defines `gen_ai.request.reasoning.level` and the cache-write name `cache_write`, and the golden test fixes them. The
+request span has kind `SERVER` and an attempt span kind `CLIENT`; v1 emits no `gen_ai.system_instructions`, and
+`GET /v1/models` has no span (TEL-5).
 
 | Attribute | Value | Present |
 |---|---|---|
@@ -1291,6 +1329,7 @@ renamed from `cache_creation` to `cache_write`. The golden test fixes whichever 
 | `stargaite.key` | Key name | Always |
 | `stargaite.model` | Model alias (TEL-9) | When the body named one |
 | `stargaite.target` | `provider/upstream-model` that served, or the last one tried | When a target was selected |
+| `langfuse.observation.metadata.stargaite_key`, `.stargaite_model`, `.stargaite_target` | The key, the alias and the target. Compatibility attributes: Langfuse filters only metadata under these names (TEL-11) | As `stargaite.key`, `stargaite.model` and `stargaite.target` |
 | `stargaite.endpoint` | `chat`, `messages`, `embeddings` or `rerank` | Always |
 | `session.id`, `gen_ai.conversation.id` | From `x-session-id` | When sent |
 | `gen_ai.operation.name` | `chat`, `embeddings`, or the custom value `rerank` | Always |
@@ -1300,19 +1339,19 @@ renamed from `cache_creation` to `cache_write`. The golden test fixes whichever 
 | `stargaite.upstream.model` | The model id sent to the provider | When a provider was called |
 | `stargaite.model_mismatch` | `true` when the returned model is not the expected one | When a provider answered |
 | `gen_ai.usage.input_tokens` | Total input tokens, cache tokens included | When reported or estimated |
-| `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_creation.input_tokens` | The cached parts of the input | When reported |
+| `gen_ai.usage.cache_read.input_tokens`, `gen_ai.usage.cache_write.input_tokens` | The cached parts of the input | When reported and not zero |
 | `gen_ai.usage.output_tokens` | Total output tokens, reasoning included | When reported or estimated |
-| `gen_ai.usage.reasoning.output_tokens` | The reasoning part of the output | When reported |
+| `gen_ai.usage.reasoning.output_tokens` | The reasoning part of the output | When reported and not zero |
 | `stargaite.usage.estimated` | `true` when tokens were estimated | When it happened |
 | `stargaite.cost.usd` | Cost in USD | Only when known (USE-6) |
-| `gen_ai.usage.cost` | The same value. Compatibility attribute: Langfuse reads the cost under this name | Only when known |
+| `gen_ai.usage.cost` | The same value. Compatibility attribute: Langfuse reads the cost under this name. When none is sent, Langfuse infers a cost from its own prices, also for `subscription` and `none` records; the guide documents it, and nothing is sent in its place (PRI-11) | Only when known |
 | `stargaite.cost.source`, `stargaite.billing` | Source of the cost; billing mode | When a provider was called |
-| `gen_ai.response.finish_reasons` | The provider's finish reason | When returned |
+| `gen_ai.response.finish_reasons` | The provider's finish reason, as a one-element string array | When returned |
 | `stargaite.response.empty` | `true` when there is no text and no tool call | When a provider answered |
 | `stargaite.reasoning.effort.requested` | Effort asked by the client | When sent by the client |
 | `stargaite.reasoning.effort.alias` | Effort set by the alias | When set |
 | `stargaite.reasoning.effort.sent` | Effort read from the outgoing body, in the terms of RSN-6 | When a provider was called |
-| `gen_ai.request.reasoning.level` | The same value as the effort sent | When an effort was sent |
+| `gen_ai.request.reasoning.level` | The string of the outgoing body's level member (`reasoning_effort`, `reasoning.effort` or `output_config.effort`) | When the outgoing body holds that member |
 | `stargaite.reasoning.effort.source` | `client`, `alias_default`, `alias_forced` or `provider_default` | When a provider was called |
 | `stargaite.reasoning.effort.adjusted` | `true` when translation changed the level | When a provider was called |
 | `stargaite.reasoning.dialect` | Dialect of the target | When a provider was called |
@@ -1321,12 +1360,12 @@ renamed from `cache_creation` to `cache_write`. The golden test fixes whichever 
 | `gen_ai.request.max_tokens` | The same value as the cap sent | When a cap was sent |
 | `stargaite.params.changed` | List of `name:action` | When not empty |
 | `stargaite.attempts` | Number of provider calls; `0` when the request was rejected before any | Always |
-| `gen_ai.request.stream`, `gen_ai.response.time_to_first_chunk` | Streaming flag; seconds to the first chunk | Always; when streaming |
+| `gen_ai.request.stream`, `gen_ai.response.time_to_first_chunk` | `true`; seconds to the first chunk | When streaming |
 | `error.type`, `http.response.status_code` | Error code of §15; status returned to the client | On errors; always |
-| `server.address` | Host of the provider | When a provider was called |
+| `server.address`, `server.port` | Host and port of the provider, the port 443 or 80 by scheme when the URL has none | When a provider was called |
 | `gen_ai.input.messages`, `gen_ai.output.messages`, `stargaite.content.truncated` | Content; whether it was cut | Only with the opt-in of TEL-8 |
 
 A failed attempt that precedes a fallback is a child span named `attempt {target}` with `stargaite.schema.version`,
-`stargaite.version`, `stargaite.config.revision`, `stargaite.key`, `stargaite.model`, `stargaite.target`, `stargaite.upstream.model`, the effort and cap sent, `error.type` and the
+`stargaite.version`, `stargaite.config.revision`, `stargaite.key`, `stargaite.model`, `stargaite.target`, their compatibility attributes, `session.id`, `stargaite.upstream.model`, the effort and cap sent, `error.type` and the
 provider's status. It carries usage and cost only when that attempt was billed, so no backend counts tokens twice
 (TEL-10).

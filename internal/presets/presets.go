@@ -5,8 +5,11 @@
 // The catalog holds only what kick-off section 7.2 and annex B state. Hosted
 // presets carry billing pay_per_use, and everything else stays undeclared
 // until the data is completed from each provider's public documentation
-// (phase-1 design section 13, point 24; phase-2 design section 15, point 19):
-// deepinfra declares no cost report, because none was found in its documentation.
+// (phase-1 design section 13, point 24; phase-2 design section 15, point 19;
+// phase-3 design section 17, point 9): stream_usage and gen_ai_provider stay
+// undeclared where the documentation does not settle them, and deepinfra
+// declares no cost report, because the cost its examples carry is an estimate,
+// not the billed figure USE-6 trusts.
 // No preset sets allow_private_network.
 package presets
 
@@ -25,43 +28,63 @@ type Preset struct {
 var Catalog = []Preset{
 	{Name: "openai", Provider: domain.Provider{
 		Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.openai.com/v1", APIKeyEnv: "OPENAI_API_KEY", Billing: domain.BillingPayPerUse,
+		StreamUsage: domain.StreamUsageRequest, GenAIProvider: "openai",
 		TargetDefaults: domain.TargetDefaults{Dialect: domain.DialectReasoningEffort, OutputCapParam: "max_completion_tokens"},
 	}},
 	{Name: "anthropic", Provider: domain.Provider{ // annex B
 		Protocol: domain.ProtocolAnthropic, BaseURL: "https://api.anthropic.com", APIKeyEnv: "ANTHROPIC_API_KEY", Billing: domain.BillingPayPerUse,
-		GenAIProvider: "anthropic", TargetDefaults: domain.TargetDefaults{Dialect: domain.DialectAdaptiveEffort},
+		StreamUsage: domain.StreamUsageNative, GenAIProvider: "anthropic", TargetDefaults: domain.TargetDefaults{Dialect: domain.DialectAdaptiveEffort},
 	}},
 	{Name: "openrouter", Provider: domain.Provider{ // annex B; OpenRouter states usage.cost in credits, kept at 1 USD per unit
 		Protocol: domain.ProtocolOpenAI, BaseURL: "https://openrouter.ai/api/v1", APIKeyEnv: "OPENROUTER_API_KEY", Billing: domain.BillingPayPerUse,
 		CostReport: &domain.CostReport{Path: "usage.cost", USDPerUnit: 1}, StreamUsage: domain.StreamUsageNative, GenAIProvider: "openrouter",
 		TargetDefaults: domain.TargetDefaults{Dialect: domain.DialectReasoningObject, OutputCapParam: "max_tokens"},
 	}},
-	{Name: "deepinfra", Provider: domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.deepinfra.com/v1/openai", APIKeyEnv: "DEEPINFRA_API_KEY", Billing: domain.BillingPayPerUse}},
+	{Name: "deepinfra", Provider: domain.Provider{
+		Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.deepinfra.com/v1/openai", APIKeyEnv: "DEEPINFRA_API_KEY", Billing: domain.BillingPayPerUse,
+		StreamUsage: domain.StreamUsageNative,
+	}},
 	{Name: "minimax", Provider: domain.Provider{
 		Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.minimax.io/v1", APIKeyEnv: "MINIMAX_API_KEY", Billing: domain.BillingPayPerUse,
+		StreamUsage:    domain.StreamUsageRequest,
 		TargetDefaults: domain.TargetDefaults{OutputCapParam: "max_completion_tokens"},
 	}},
 	{Name: "zai", Provider: domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.z.ai/api/paas/v4", APIKeyEnv: "ZAI_API_KEY", Billing: domain.BillingPayPerUse}},
-	{Name: "moonshot", Provider: domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.moonshot.ai/v1", APIKeyEnv: "MOONSHOT_API_KEY", Billing: domain.BillingPayPerUse}},
+	{Name: "moonshot", Provider: domain.Provider{
+		Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.moonshot.ai/v1", APIKeyEnv: "MOONSHOT_API_KEY", Billing: domain.BillingPayPerUse,
+		StreamUsage: domain.StreamUsageRequest, GenAIProvider: "moonshot_ai",
+	}},
 	{Name: "dashscope", Provider: domain.Provider{ // the URL depends on the region and the workspace: --base-url
 		Protocol: domain.ProtocolOpenAI, APIKeyEnv: "DASHSCOPE_API_KEY", Billing: domain.BillingPayPerUse,
+		StreamUsage:    domain.StreamUsageRequest,
 		TargetDefaults: domain.TargetDefaults{OutputCapParam: "max_completion_tokens"},
 	}},
 	{Name: "ollama", Provider: domain.Provider{ // plain HTTP on loopback: --allow-private-network
 		Protocol: domain.ProtocolOpenAI, BaseURL: "http://localhost:11434/v1", Billing: domain.BillingNone,
+		StreamUsage: domain.StreamUsageRequest, GenAIProvider: "ollama",
 	}},
 	{Name: "tei", Provider: domain.Provider{ // one instance per model: --base-url
 		Protocol: domain.ProtocolOpenAI, Billing: domain.BillingNone,
 	}},
-	{Name: "deepseek", Untested: true, Provider: domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.deepseek.com", APIKeyEnv: "DEEPSEEK_API_KEY", Billing: domain.BillingPayPerUse}},
-	{Name: "gemini", Untested: true, Provider: domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: "https://generativelanguage.googleapis.com/v1beta/openai", APIKeyEnv: "GEMINI_API_KEY", Billing: domain.BillingPayPerUse}},
+	{Name: "deepseek", Untested: true, Provider: domain.Provider{
+		Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.deepseek.com", APIKeyEnv: "DEEPSEEK_API_KEY", Billing: domain.BillingPayPerUse,
+		StreamUsage: domain.StreamUsageNative, GenAIProvider: "deepseek",
+	}},
+	{Name: "gemini", Untested: true, Provider: domain.Provider{
+		Protocol: domain.ProtocolOpenAI, BaseURL: "https://generativelanguage.googleapis.com/v1beta/openai", APIKeyEnv: "GEMINI_API_KEY", Billing: domain.BillingPayPerUse,
+		GenAIProvider: "gcp.gemini",
+	}},
 	{Name: "xai", Untested: true, Provider: domain.Provider{ // cost in ticks of 1e-10 USD; in streams only with include_usage
 		Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.x.ai/v1", APIKeyEnv: "XAI_API_KEY", Billing: domain.BillingPayPerUse,
-		CostReport: &domain.CostReport{Path: "usage.cost_in_usd_ticks", USDPerUnit: 1e-10}, StreamUsage: domain.StreamUsageRequest,
+		CostReport: &domain.CostReport{Path: "usage.cost_in_usd_ticks", USDPerUnit: 1e-10}, StreamUsage: domain.StreamUsageRequest, GenAIProvider: "x_ai",
 	}},
-	{Name: "mistral", Untested: true, Provider: domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.mistral.ai/v1", APIKeyEnv: "MISTRAL_API_KEY", Billing: domain.BillingPayPerUse}},
+	{Name: "mistral", Untested: true, Provider: domain.Provider{
+		Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.mistral.ai/v1", APIKeyEnv: "MISTRAL_API_KEY", Billing: domain.BillingPayPerUse,
+		StreamUsage: domain.StreamUsageNative, GenAIProvider: "mistral",
+	}},
 	{Name: "groq", Untested: true, Provider: domain.Provider{
 		Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.groq.com/openai/v1", APIKeyEnv: "GROQ_API_KEY", Billing: domain.BillingPayPerUse,
+		GenAIProvider:  "groq",
 		TargetDefaults: domain.TargetDefaults{OutputCapParam: "max_completion_tokens"},
 	}},
 	{Name: "together", Untested: true, Provider: domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.together.ai/v1", APIKeyEnv: "TOGETHER_API_KEY", Billing: domain.BillingPayPerUse}},

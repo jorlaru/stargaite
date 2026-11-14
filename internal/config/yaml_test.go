@@ -463,7 +463,7 @@ func TestYAMLAnnexB(t *testing.T) {
 		"\n      as_of: \"2026-11-01\"\n",
 		"\n      x-langfuse-ingestion-version: \"4\"\n",
 		"\n    trace_sample_rate: 0\n",
-		"\n      - window: 5h\n        requests: 1500\n",
+		"\n      - window: 5h\n        requests: 1000\n",
 		"\n    reasoning:\n      effort: medium\n      mode: default\n",
 	} {
 		if !bytes.Contains(exported, []byte(line)) {

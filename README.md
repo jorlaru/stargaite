@@ -64,7 +64,10 @@ or `none`; only `pay_per_use` calls have a cost, read from the response at the p
 declares one (OpenRouter and xAI do), else computed from the target's `--pricing`, else left empty and counted as
 unpriced: it is never guessed. Records reach the store in batches within 50 ms; on `SIGTERM` the pending ones are
 written before the store closes, and a record that cannot be stored is written to the log as one `CRITICAL` line
-instead of being lost.
+instead of being lost. A crash loses at most the records not yet committed. When the store fails three commits in a
+row it is unavailable: `pay_per_use` targets are passed over (`503 usage_store_unavailable` when the alias has no
+other target), `subscription` and `none` targets keep serving, and records wait in a queue of 10,000 while the
+writer retries every 5 s; a record that finds the queue full goes to the log as one `CRITICAL` line.
 
 `./stargaite usage show` sums the records of a window (`--since 24h` by default, or an RFC 3339 time) per billing mode,
 filtered with `--key`, `--model` and `--target` and grouped with `--by key,model,target`: requests, errors, each kind

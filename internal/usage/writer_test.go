@@ -283,3 +283,196 @@ func TestWriterAddRacingClose(t *testing.T) {
 		t.Errorf("%d stored, %d logged", stored, lost)
 	}
 }
+
+// TestWriterUnavailable is USE-10 and AC-34 with an injected failing write:
+// the third consecutive failed commit makes the store unavailable, the retry
+// then runs every unavailableRetry with the same batch while new records
+// wait in the queue, and the first commit that succeeds makes it available
+// again and stores every record. The log has one line when the failures
+// start, one when the store becomes unavailable and one when it recovers.
+// unavailableRetry is a timer, which never fires early: the gaps after the
+// third failure are at least that long.
+func TestWriterUnavailable(t *testing.T) {
+	batchWait, retryWait, unavailableRetry = time.Millisecond, time.Millisecond, 200*time.Millisecond
+	t.Cleanup(func() {
+		batchWait, retryWait, unavailableRetry = 50*time.Millisecond, 50*time.Millisecond, 5*time.Second
+	})
+	st := openStore(t)
+	var failing atomic.Bool
+	failing.Store(true)
+	var mu sync.Mutex
+	var calls []time.Time
+	ok := 0 // the number of the first write that succeeded
+	write := func(ctx context.Context, fn func(*sql.Tx) error) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls = append(calls, time.Now())
+		if failing.Load() {
+			return errors.New("disk I/O error")
+		}
+		if ok == 0 {
+			ok = len(calls)
+		}
+		return st.Write(ctx, fn)
+	}
+	attempts := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(calls)
+	}
+	wait := func(what string, ok func() bool) {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); !ok(); time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: not within 5 s, %d writes", what, attempts())
+			}
+		}
+	}
+	var log logBuffer
+	w := NewWriter(write, slog.New(slog.NewJSONHandler(&log, nil)))
+	if !w.Available() {
+		t.Fatal("a new writer is unavailable")
+	}
+	w.Add(rec("a"))
+	wait("unavailable", func() bool { return !w.Available() })
+	if n := attempts(); n != unavailableAfter {
+		t.Errorf("unavailable after %d writes", n)
+	}
+	w.Add(rec("b")) // waits in the queue behind the failing batch
+	wait("a retry while unavailable", func() bool { return attempts() > unavailableAfter })
+	if w.Available() {
+		t.Error("a failed retry made the store available")
+	}
+	failing.Store(false)
+	wait("available again", w.Available)
+	if n := w.Close(context.Background()); n != 0 {
+		t.Errorf("Close: %d records logged", n)
+	}
+	if n := count(t, st.Read(), "SELECT COUNT(*) FROM usage"); n != 2 {
+		t.Errorf("%d records stored, want 2", n)
+	}
+	mu.Lock()
+	for i := 1; i < ok; i++ {
+		if gap := calls[i].Sub(calls[i-1]); i >= unavailableAfter && gap < unavailableRetry || i < unavailableAfter && gap >= unavailableRetry {
+			t.Errorf("write %d came %v after write %d", i+1, gap, i)
+		}
+	}
+	mu.Unlock()
+	got := log.String()
+	if strings.Count(got, "\n") != 3 ||
+		!strings.Contains(got, `"level":"ERROR","msg":"usage records not committed: retrying","records":1,"error":"disk I/O error"`) ||
+		!strings.Contains(got, `"level":"ERROR","msg":"usage store unavailable: pay_per_use targets are excluded","failed_commits":3,"retry_every":"200ms","error":"disk I/O error"`) ||
+		!strings.Contains(got, `"level":"INFO","msg":"usage records committed again","failed_commits":`) {
+		t.Errorf("log %s", got)
+	}
+}
+
+// TestWriterUnavailableClose: Close does not wait out unavailableRetry; it
+// retries every retryWait while its context allows, and a store that never
+// recovers sends the batch and the records queued behind it to the critical
+// log.
+func TestWriterUnavailableClose(t *testing.T) {
+	batchWait, retryWait, unavailableRetry = time.Millisecond, time.Millisecond, time.Hour
+	t.Cleanup(func() {
+		batchWait, retryWait, unavailableRetry = 50*time.Millisecond, 50*time.Millisecond, 5*time.Second
+	})
+	st := openStore(t)
+	var failing atomic.Bool
+	failing.Store(true)
+	write := func(ctx context.Context, fn func(*sql.Tx) error) error {
+		if failing.Load() {
+			return errors.New("disk I/O error")
+		}
+		return st.Write(ctx, fn)
+	}
+	var log logBuffer
+	w := NewWriter(write, slog.New(slog.NewJSONHandler(&log, nil)))
+	w.Add(rec("a"))
+	for deadline := time.Now().Add(5 * time.Second); w.Available(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("still available after 5 s of failures")
+		}
+	}
+	w.Add(rec("b"))
+	failing.Store(false)
+	if n := w.Close(context.Background()); n != 0 || count(t, st.Read(), "SELECT COUNT(*) FROM usage") != 2 {
+		t.Errorf("Close during the unavailable wait: %d logged; log %s", n, log.String())
+	}
+
+	failing.Store(true)
+	var lost logBuffer
+	w = NewWriter(write, slog.New(slog.NewJSONHandler(&lost, nil)))
+	w.Add(rec("c"))
+	for deadline := time.Now().Add(5 * time.Second); w.Available(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("still available after 5 s of failures")
+		}
+	}
+	w.Add(rec("d"))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if n := w.Close(ctx); n != 2 || strings.Count(lost.String(), `"level":"ERROR+4","msg":"usage record not stored"`) != 2 {
+		t.Errorf("Close: %d; log %s", n, lost.String())
+	}
+}
+
+// TestWriterOverflow: while a write holds the batch, records fill the queue
+// of 10,000; the one that finds it full is logged at critical level and
+// counted at once, Add never blocks, and every queued record is handed to a
+// write that succeeds once the held one returns (USE-10). The writes after
+// the first commit nothing: 10,000 inserts under -race take seconds, and
+// TestWriterBatches covers the inserts.
+func TestWriterOverflow(t *testing.T) {
+	batchWait = time.Millisecond
+	t.Cleanup(func() { batchWait = 50 * time.Millisecond })
+	entered, release := make(chan struct{}), make(chan struct{})
+	var calls atomic.Int32
+	write := func(context.Context, func(*sql.Tx) error) error {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		return nil
+	}
+	var log logBuffer
+	w := NewWriter(write, slog.New(slog.NewJSONHandler(&log, nil)))
+	w.Add(rec("held"))
+	<-entered
+	for i := range queueSize {
+		w.Add(rec(fmt.Sprint(i)))
+	}
+	if log.String() != "" {
+		t.Fatalf("the queue overflowed early: %s", log.String())
+	}
+	w.Add(rec("over"))
+	var line struct {
+		Level, Msg string
+		Record     Record
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(log.String())), &line); err != nil || line.Level != "ERROR+4" ||
+		line.Msg != "usage record not stored" || line.Record.ID != "over" {
+		t.Errorf("log %s: %+v, error %v", log.String(), line, err)
+	}
+	close(release)
+	if n := w.Close(context.Background()); n != 1 || calls.Load() < 1+queueSize/batchSize {
+		t.Errorf("Close: %d records logged, want 1; %d writes", n, calls.Load())
+	}
+}
+
+// logBuffer is a log destination the writer goroutine and the test share.
+type logBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *logBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *logBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}

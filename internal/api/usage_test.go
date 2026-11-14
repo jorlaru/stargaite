@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"math"
 	"net/http"
@@ -283,5 +285,121 @@ func TestRecordTTFT(t *testing.T) {
 	waitFlight(t, f)
 	if r := f.stored(t, 1)[0]; num(r.TTFT) != 300 {
 		t.Errorf("ttft_ms %d, want 300", num(r.TTFT))
+	}
+}
+
+const storeConfig = `version: 1
+providers:
+  pay: { protocol: openai, base_url: MOCK, api_key_env: MOCK_KEY, billing: pay_per_use, allow_private_network: true }
+  payopen: { protocol: openai, base_url: MOCK, api_key_env: MOCK_KEY, billing: pay_per_use, allow_private_network: true }
+  payoff: { protocol: openai, base_url: MOCK, api_key_env: MISSING_KEY, billing: pay_per_use, allow_private_network: true }
+  free: { protocol: openai, base_url: MOCK, api_key_env: MOCK_KEY, billing: none, allow_private_network: true }
+  freeoff: { protocol: openai, base_url: MOCK, api_key_env: MISSING_KEY, billing: none, allow_private_network: true }
+  sub: { protocol: openai, base_url: MOCK, api_key_env: MOCK_KEY, billing: subscription, allow_private_network: true }
+targets:
+  pay/m: { kind: chat }
+  payopen/m: { kind: chat }
+  payoff/m: { kind: chat }
+  free/m: { kind: chat }
+  free/notools: { kind: chat, capabilities: { tools: false } }
+  freeoff/m: { kind: chat }
+  sub/m: { kind: chat }
+models:
+  pay: { targets: [pay/m] }
+  payopen: { targets: [payopen/m] }
+  pay-free: { targets: [pay/m, free/m] }
+  free: { targets: [free/m] }
+  plan: { targets: [sub/m] }
+  payoff: { targets: [payoff/m] }
+  freeoff-pay: { targets: [freeoff/m, pay/m] }
+  notools-pay: { targets: [free/notools, pay/m] }
+  free-pay: { targets: [free/m, pay/m] }
+keys:
+  agent: { models: ["*"] }
+`
+
+// TestStoreUnavailable is USE-10 and RES-10 with the store (AC-34): a
+// trigger makes every usage insert fail, and from the third failed commit
+// pay_per_use targets are passed over: an alias with only one answers 503
+// usage_store_unavailable without a call, one with a none target after it
+// falls back to it, and subscription and none targets keep serving. RES-10
+// order: the store comes before the credential and the circuit, the first
+// able target's reason is the one answered (a target without credential
+// before a pay_per_use one gives no_target_available, with phase 2's
+// message), a static skip yields to it, and once a provider was called its
+// error wins.
+func TestStoreUnavailable(t *testing.T) {
+	f := newFixture(t)
+	mock := mockprovider.New()
+	srv := httptest.NewServer(mock)
+	t.Cleanup(srv.Close)
+	tokens := f.apply(t, strings.ReplaceAll(storeConfig, "base_url: MOCK", "base_url: "+srv.URL))
+	auth := "Bearer " + tokens["agent"]
+	if w := f.chat(auth, chatBody("pay", "")); w.Code != http.StatusOK {
+		t.Fatalf("pay with the store available: %d %s", w.Code, w.Body)
+	}
+	// Five failures open payopen/m's circuit: the store check must come
+	// before the circuit, or the "payopen" case below gets
+	// no_target_available (and a half-open circuit would lose a trial permit
+	// to a store exclusion). pay/m's circuit stays closed, so the cases on
+	// pay/m still show that the store alone excludes it.
+	for i := 0; i < 5; i++ {
+		mock.Script(mockprovider.Step{Status: 500})
+		if w := f.chat(auth, chatBody("payopen", "")); w.Code != http.StatusBadGateway {
+			t.Fatalf("payopen failure %d: %d %s", i, w.Code, w.Body)
+		}
+	}
+	exec := func(q string) {
+		t.Helper()
+		if err := f.st.Write(context.Background(), func(tx *sql.Tx) error { _, err := tx.Exec(q); return err }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(`CREATE TRIGGER refuse BEFORE INSERT ON usage BEGIN SELECT RAISE(ABORT, 'refused'); END`)
+	// Before the fixture closes the writer, which then stores the waiting records.
+	t.Cleanup(func() { exec(`DROP TRIGGER refuse`) })
+	if w := f.chat(auth, chatBody("free", "")); w.Code != http.StatusOK {
+		t.Fatalf("free: %d %s", w.Code, w.Body)
+	}
+	for deadline := time.Now().Add(5 * time.Second); !strings.Contains(f.log.String(), `"msg":"usage store unavailable`); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the store is still available after 5 s; log %s", f.log.String())
+		}
+	}
+
+	for _, tc := range []struct {
+		alias, extra  string
+		step          *mockprovider.Step
+		status        int
+		code, message string
+		target        string
+		calls         int
+	}{
+		{"pay", "", nil, 503, "usage_store_unavailable", "the usage store is unavailable", "", 0},
+		{"payopen", "", nil, 503, "usage_store_unavailable", "the usage store is unavailable", "", 0},
+		{"pay-free", "", nil, 200, "", "", "free/m", 1},
+		{"plan", "", nil, 200, "", "", "sub/m", 1},
+		{"free", "", nil, 200, "", "", "free/m", 1},
+		{"payoff", "", nil, 503, "usage_store_unavailable", "the usage store is unavailable", "", 0},
+		{"freeoff-pay", "", nil, 503, "no_target_available", `no target of model "freeoff-pay" is available`, "", 0},
+		{"notools-pay", `,"tools":[{"type":"function","function":{"name":"f"}}]`, nil, 503, "usage_store_unavailable", "the usage store is unavailable", "", 0},
+		{"free-pay", "", &mockprovider.Step{Status: 500}, 502, "upstream_error", "the provider answered 500", "free/m", 1},
+	} {
+		t.Run(tc.alias, func(t *testing.T) {
+			if tc.step != nil {
+				mock.Script(*tc.step)
+			}
+			before := len(mock.Calls())
+			w := f.chat(auth, chatBody(tc.alias, tc.extra))
+			var env struct{ Error domain.Error }
+			_ = json.Unmarshal(w.Body.Bytes(), &env)
+			if w.Code != tc.status || env.Error.Code != tc.code || env.Error.Message != tc.message || w.Header().Get(targetHeader) != tc.target ||
+				len(mock.Calls())-before != tc.calls {
+				t.Errorf("%d %s, target %q, %d calls", w.Code, w.Body, w.Header().Get(targetHeader), len(mock.Calls())-before)
+			}
+			if tc.code == "usage_store_unavailable" && env.Error.Type != "overloaded_error" {
+				t.Errorf("type %q", env.Error.Type)
+			}
+		})
 	}
 }

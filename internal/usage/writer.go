@@ -14,16 +14,19 @@ import (
 const LevelCritical = slog.LevelError + 4
 
 // The writer's batches (USE-10): at most batchSize records, committed
-// batchWait after the first; a failed commit is retried after retryWait. The
-// waits are variables that tests lower.
+// batchWait after the first; a failed commit is retried after retryWait, and
+// every unavailableRetry from the unavailableAfter-th consecutive failure,
+// when the store is unavailable. The waits are variables that tests lower.
 var (
-	batchWait = 50 * time.Millisecond
-	retryWait = 50 * time.Millisecond
+	batchWait        = 50 * time.Millisecond
+	retryWait        = 50 * time.Millisecond
+	unavailableRetry = 5 * time.Second
 )
 
 const (
-	batchSize = 100
-	queueSize = 10_000
+	batchSize        = 100
+	queueSize        = 10_000
+	unavailableAfter = 3
 )
 
 // Writer is the one writer of usage records (design section 5): a goroutine
@@ -42,6 +45,7 @@ type Writer struct {
 	ctx     context.Context // Close's: set before closing is closed, read only after
 	done    chan struct{}   // closed when the goroutine has exited
 	lost    atomic.Int64    // records logged instead of stored
+	down    atomic.Bool     // the store is unavailable (Available)
 }
 
 // NewWriter starts the writer on write, the store's write path.
@@ -71,13 +75,20 @@ func (w *Writer) Add(r Record) {
 	}
 }
 
+// Available reports whether the store takes records: false from the third
+// consecutive failed commit until a commit succeeds (USE-10). Meanwhile
+// exclude passes over pay_per_use targets and records wait in the queue.
+func (w *Writer) Available() bool {
+	return !w.down.Load()
+}
+
 // Close stops accepting records and waits for the write in progress, which
 // always ends (within the store's busy timeout and the commit); a committed
 // batch counts as stored. It then commits the rest of the queue while ctx
-// allows, retrying a failed commit, and returns only once the goroutine has
-// exited, so no write starts after it. Every record not stored by then, and
-// every one Add could not queue, has been logged at critical level; Close
-// returns how many, over the writer's life.
+// allows, retrying a failed commit every retryWait, and returns only once
+// the goroutine has exited, so no write starts after it. Every record not
+// stored by then, and every one Add could not queue, has been logged at
+// critical level; Close returns how many, over the writer's life.
 func (w *Writer) Close(ctx context.Context) int {
 	w.mu.Lock()
 	if !w.closed {
@@ -121,24 +132,40 @@ func (w *Writer) run() {
 	}
 }
 
-// commit writes batch in one transaction, retrying a failed commit after
-// retryWait; false when Close's context ended before a write could start.
+// commit writes batch in one transaction, retrying a failed commit with the
+// same batch after retryWait; from the third consecutive failure the store
+// is unavailable and the retry runs every unavailableRetry, until a commit
+// makes it available again (USE-10). A run of failures logs one line when it
+// starts, one when the store becomes unavailable and one when a commit
+// succeeds again, never one per retry. False when Close's context ended
+// before a write could start.
 func (w *Writer) commit(batch []Record) bool {
-	for failures := 0; ; failures++ {
+	for failures := 0; ; {
 		if w.ended() {
 			return false
 		}
 		err := w.write(context.Background(), func(tx *sql.Tx) error { return insert(tx, batch) })
 		if err == nil {
+			w.down.Store(false)
 			if failures > 0 {
 				w.log.Info("usage records committed again", "failed_commits", failures)
 			}
 			return true
 		}
-		if failures == 0 {
+		failures++
+		wait := retryWait
+		switch failures {
+		case 1:
 			w.log.Error("usage records not committed: retrying", "records", len(batch), "error", err.Error())
+		case unavailableAfter:
+			w.down.Store(true)
+			w.log.Error("usage store unavailable: pay_per_use targets are excluded", "failed_commits", failures,
+				"retry_every", unavailableRetry.String(), "error", err.Error())
 		}
-		if !w.sleep(retryWait) {
+		if failures >= unavailableAfter {
+			wait = unavailableRetry
+		}
+		if !w.sleep(wait) {
 			return false
 		}
 	}
@@ -154,7 +181,8 @@ func (w *Writer) ended() bool {
 	}
 }
 
-// sleep waits d; false when Close's context ends first.
+// sleep waits d, or retryWait from the moment Close begins, so the flush
+// never waits out unavailableRetry; false when Close's context ends first.
 func (w *Writer) sleep(d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -163,6 +191,7 @@ func (w *Writer) sleep(d time.Duration) bool {
 		return true
 	case <-w.closing:
 	}
+	t.Reset(retryWait)
 	select {
 	case <-t.C:
 		return true

@@ -261,11 +261,12 @@ func (h *handler) check(w http.ResponseWriter, r *http.Request, rq *request) *do
 // attempt with its own Build, so effort and cap are resolved again for it
 // (RSN-10). With no target left it answers the section 15 error of the last
 // call when a provider was called; else RES-10: the Skip of the first target
-// when every one was skipped statically, otherwise the first dynamic reason
-// (503 no_target_available, as for an alias with no published target).
+// when every one was skipped statically, otherwise the first dynamic error,
+// its message included (503 no_target_available, as for an alias with no
+// published target).
 func (h *handler) route(w http.ResponseWriter, r *http.Request, rq *request) *domain.Error {
 	var static []plan.Skip
-	dynamic := ""
+	var dynamic *domain.Error
 	for i, t := range rq.model.Targets {
 		out, skip := plan.Build(plan.Input{Endpoint: rq.ep, Body: rq.body, Header: rq.header, Model: &rq.model.Spec,
 			Upstream: t.Upstream, Target: &t.Spec, Provider: &t.Provider.Spec, Client: rq.client})
@@ -276,9 +277,9 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request, rq *request) *do
 			static = append(static, *skip)
 			continue
 		}
-		gen, code := h.exclude(rq, t)
-		if code != "" {
-			dynamic = cmp.Or(dynamic, code)
+		gen, e := h.exclude(rq, t)
+		if e != nil {
+			dynamic = cmp.Or(dynamic, e)
 			continue
 		}
 		if a := h.call(w, r, rq, t, out, i+1, gen); a.end.err == nil || a.written || !a.end.eligible {
@@ -288,8 +289,11 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request, rq *request) *do
 	if n := len(rq.attempts); n > 0 {
 		return rq.attempts[n-1].end.err
 	}
-	if dynamic != "" || len(static) == 0 {
-		return domain.NewError(cmp.Or(dynamic, domain.CodeNoTargetAvailable), fmt.Sprintf("no target of model %.200q is available", rq.alias))
+	if dynamic != nil {
+		return dynamic
+	}
+	if len(static) == 0 {
+		return noTarget(rq)
 	}
 	s := static[0]
 	e := domain.NewError(s.Code, fmt.Sprintf("no target of model %.200q can serve this request: %s", rq.alias, s.Code))
@@ -299,19 +303,28 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request, rq *request) *do
 	return e
 }
 
-// exclude is the dynamic exclusion of t (step 6), a RES-10 code or "": a
-// provider whose credential does not resolve, then an open circuit. A
-// circuit's permit, once taken, goes back with its gen in the finish of the
-// call that follows at once. Phase 3 inserts quota, budget and usage-store
-// checks before both, which read rq.
-func (h *handler) exclude(rq *request, t *config.Target) (gen uint64, code string) {
+// noTarget is phase 2's 503 no_target_available for rq's alias.
+func noTarget(rq *request) *domain.Error {
+	return domain.NewError(domain.CodeNoTargetAvailable, fmt.Sprintf("no target of model %.200q is available", rq.alias))
+}
+
+// exclude is the dynamic exclusion of t (step 6) in RES-10 order: the usage
+// store unavailable for a pay_per_use target (USE-10), then a provider whose
+// credential does not resolve, then an open circuit; nil when t may be
+// called. A circuit's permit, once taken, goes back with its gen in the
+// finish of the call that follows at once. The budget (C27) and quota (C28)
+// checks go before the store's, as RES-10 orders them.
+func (h *handler) exclude(rq *request, t *config.Target) (gen uint64, e *domain.Error) {
+	if t.Provider.Spec.Billing == domain.BillingPayPerUse && !h.Usage.Available() {
+		return 0, domain.NewError(domain.CodeUsageStoreUnavailable, "the usage store is unavailable")
+	}
 	if t.Provider.Disabled {
-		return 0, domain.CodeNoTargetAvailable
+		return 0, noTarget(rq)
 	}
 	if gen, ok := h.breakers.Acquire(t.ID); ok {
-		return gen, ""
+		return gen, nil
 	}
-	return 0, domain.CodeNoTargetAvailable
+	return 0, noTarget(rq)
 }
 
 // call is step 7 for one target: the credential header, the RES-3 timers

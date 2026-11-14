@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -37,6 +38,15 @@ import (
 
 // adminKey is an admin key given through STARGAITE_ADMIN_KEY.
 const adminKey = "test-admin-key-of-at-least-32-characters"
+
+// TestMain runs the command in place of the tests when STARGAITE_TEST_RUN is
+// set, so a test can start serve as a process of its own and kill it.
+func TestMain(m *testing.M) {
+	if os.Getenv("STARGAITE_TEST_RUN") != "" {
+		os.Exit(run(os.Args[1:], os.Getenv, os.Stdout, os.Stderr))
+	}
+	os.Exit(m.Run())
+}
 
 func env(vars map[string]string) func(string) string {
 	return func(name string) string { return vars[name] }
@@ -559,6 +569,115 @@ func TestServeLostRecords(t *testing.T) {
 	if code, log := stop(); code != 1 || strings.Count(log, `"level":"CRITICAL","msg":"usage record not stored"`) != 1 ||
 		!strings.Contains(log, `"msg":"usage records logged instead of stored","records":1`) || strings.Contains(log, `"msg":"stopped"`) {
 		t.Errorf("exit %d; log %s", code, log)
+	}
+}
+
+// TestServeKilled is ADR-016 through serve: serve runs as a process of its
+// own, commits the records of three requests, and is killed with SIGKILL;
+// serve then starts again on the same data directory, whose lock the kernel
+// released, and usage show and the store hold the three records.
+func TestServeKilled(t *testing.T) {
+	srv := httptest.NewServer(mockprovider.New())
+	t.Cleanup(srv.Close)
+	dir, token := seed(t, map[string]string{"m": srv.URL})
+	cmd := exec.Command(os.Args[0], "serve", "--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0")
+	logs, stderr := io.Pipe()
+	cmd.Env, cmd.Stderr = []string{"STARGAITE_TEST_RUN=1", "STARGAITE_ADMIN_KEY=" + adminKey}, stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan error, 1)
+	go func() { exited <- cmd.Wait(); _ = stderr.Close() }()
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	addr := make(chan string, 1)
+	go func() {
+		for lines := bufio.NewScanner(logs); lines.Scan(); { // read to the end, so serve never blocks on its log
+			var line struct {
+				Msg      string
+				DataAddr string `json:"data_addr"`
+			}
+			if json.Unmarshal(lines.Bytes(), &line) == nil && line.Msg == "ready" {
+				addr <- line.DataAddr
+			}
+		}
+	}()
+	var data string
+	select {
+	case data = <-addr:
+	case err := <-exited:
+		t.Fatalf("serve exited before it was ready: %v", err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("serve was not ready within 30 s")
+	}
+	for range 3 {
+		req, err := http.NewRequest(http.MethodPost, "http://"+data+"/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+	}
+	// Committed: another connection reads the three rows.
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "stargaite.db")+"?_busy_timeout=5000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		var n int
+		if err := db.QueryRow("SELECT COUNT(*) FROM usage").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n == 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d records committed after 5 s", n)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-exited; err == nil || !strings.Contains(err.Error(), "killed") {
+		t.Fatalf("serve after SIGKILL: %v", err)
+	}
+
+	ready, stop := start(t, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), "--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0")
+	var stdout bytes.Buffer
+	if code := cli.Main([]string{"usage", "show", "--json", "--since", "1h", "--admin-url", "http://" + ready.AdminAddr},
+		env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), &stdout, io.Discard); code != 0 {
+		t.Fatalf("usage show: exit %d", code)
+	}
+	var report struct {
+		Groups []struct {
+			Billing  string
+			Requests int64
+		}
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || len(report.Groups) != 1 || report.Groups[0].Requests != 3 {
+		t.Errorf("usage show after the restart: %s, error %v", &stdout, err)
+	}
+	if code, log := stop(); code != 0 {
+		t.Errorf("exit %d; log %s", code, log)
+	}
+	st, err := store.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	var records, daily int
+	if err := st.Read().QueryRow("SELECT (SELECT COUNT(*) FROM usage), (SELECT SUM(requests) FROM usage_daily)").Scan(&records, &daily); err != nil ||
+		records != 3 || daily != 3 {
+		t.Errorf("%d records, usage_daily counts %d, error %v", records, daily, err)
 	}
 }
 

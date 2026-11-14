@@ -84,13 +84,24 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatal(err)
 	}
 	log := &logBuffer{}
-	noDNS := func(context.Context, string) ([]netip.Addr, error) {
+	// At dial time no name resolves but rebound.test, which validation saw
+	// public and the dial finds on loopback: a DNS rebinding the SEC-4 guard
+	// refuses.
+	noDNS := func(_ context.Context, host string) ([]netip.Addr, error) {
+		if host == "rebound.test" {
+			return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+		}
 		return nil, errors.New("no name is resolved in tests")
 	}
 	return &fixture{admin.Handler(cfg, sha256.Sum256([]byte(adminKey)), slog.New(slog.NewJSONHandler(log, nil))),
 		Handler(Deps{Config: cfg, Log: slog.New(slog.NewJSONHandler(log, nil)),
 			Clients: [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)}}), now, log}
 }
+
+// pastWindow moves the service clock past the RES-2 window of 30 s, so the
+// failures of the cases before never open a circuit: each case of a fault
+// table is one call, and TestBreaker* check the circuit itself.
+func (f *fixture) pastWindow() { f.now.Add(31_000) }
 
 // call sends one request to h with the Authorization header given, if any.
 func call(h http.Handler, authorization, method, target string, body []byte) *httptest.ResponseRecorder {

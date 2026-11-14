@@ -101,8 +101,12 @@ func (r *EventReader) line(n *int64) ([]byte, error) {
 }
 
 // WriteEvent writes e in one call: a comment line, or the event's name and
-// one data line per line of its data, then the blank line that ends it. The
-// caller flushes and moves the write deadline.
+// one data line per line of its data, then the blank line that ends it. A
+// line of data ends at a CRLF, an LF or a bare CR, as a client that follows
+// the SSE standard splits it, and clients join data lines with LF: a bare CR
+// read inside an event's data (the reader splits only at LF) reaches every
+// client as an LF, harmless JSON whitespace, never as a line the relay did
+// not check. The caller flushes and moves the write deadline.
 func WriteEvent(w io.Writer, e Event) error {
 	var b []byte
 	if e.Comment {
@@ -114,7 +118,8 @@ func WriteEvent(w io.Writer, e Event) error {
 		if e.Name != "" {
 			b = append(append([]byte("event: "), e.Name...), '\n')
 		}
-		for line := range bytes.SplitSeq(e.Data, []byte("\n")) {
+		data := bytes.ReplaceAll(bytes.ReplaceAll(e.Data, []byte("\r\n"), []byte("\n")), []byte("\r"), []byte("\n"))
+		for line := range bytes.SplitSeq(data, []byte("\n")) {
 			b = append(append(append(b, "data: "...), line...), '\n')
 		}
 		b = append(b, '\n')

@@ -550,6 +550,7 @@ func TestMessagesStreamFaults(t *testing.T) {
 			status: 200, body: ev("message_start", start) + own("upstream_error", "the provider's stream failed"), cause: "a text without a string"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			s.pastWindow()
 			s.mock.Script(tc.step)
 			before := len(s.mock.Calls())
 			resp, got := s.postTo(t, "/v1/messages", messagesBody("claude", `,"stream":true`))
@@ -575,6 +576,7 @@ func TestMessagesStreamFaults(t *testing.T) {
 	}
 	// Thinking deltas, which the client gets, keep the stream alive.
 	thinking := `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}`
+	s.pastWindow()
 	s.mock.Script(mockprovider.Step{Chunks: events("message_start", start, "content_block_delta", thinking, "content_block_delta", thinking,
 		"content_block_delta", thinking, "message_stop", messageStop), Gap: 120 * time.Millisecond})
 	if resp, got := s.postTo(t, "/v1/messages", messagesBody("claude", `,"stream":true`)); resp.StatusCode != 200 ||

@@ -16,6 +16,7 @@ import (
 
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
+	"github.com/jorlaru/stargaite/internal/routing"
 )
 
 // refusalLogEvery rate-limits the log line of a repeated refusal, as on the
@@ -53,12 +54,14 @@ type handler struct {
 	Deps
 	refused  refusals // failed authentications
 	upstream refusals // a provider refusing the operator's credential (401, 403)
+	breakers *routing.Breakers
 }
 
 // Handler returns the routes of the data-plane listener. Every response
-// carries a request id.
+// carries a request id. The circuit breakers live as long as the handler,
+// on the service clock: every apply keeps them (RES-7).
 func Handler(d Deps) http.Handler {
-	h := &handler{Deps: d}
+	h := &handler{Deps: d, breakers: routing.NewBreakers(d.Config.Now)}
 	mux := http.NewServeMux()
 	// serve binds this listener only once the store is open and the stored
 	// configuration is published (config.Open returned), so whatever answers

@@ -267,6 +267,8 @@ func TestChatStreamFaults(t *testing.T) {
 			[]byte(": d\n\n"), []byte("data: [DONE]\n\n")}, Gap: 150 * time.Millisecond}, status: 200, body: first + ": d\n\ndata: [DONE]\n\n"},
 		{name: "a comment hiding an event behind a bare CR", step: mockprovider.Step{Chunks: [][]byte{[]byte(first),
 			[]byte(": ping\rdata: " + chunk("b") + "\n\n"), []byte("data: [DONE]\n\n")}}, status: 200, body: first + ": ping\n\ndata: [DONE]\n\n"},
+		{name: "a bare CR inside a relayed chunk", step: mockprovider.Step{Chunks: sse(chunk("a"), strings.Replace(chunk("b"), `,"object"`, ",\r\"object\"", 1), "[DONE]")},
+			status: 200, body: first + "data: " + strings.Replace(chunk("b"), `,"object"`, ",\ndata: \"object\"", 1) + "\n\ndata: [DONE]\n\n"},
 		{name: "cut after the commit", step: mockprovider.Step{Chunks: [][]byte{[]byte(first)}, Cut: true},
 			status: 200, body: first + terminal("the provider's stream failed", "upstream_error"), cause: "unexpected EOF"},
 		{name: "ended before [DONE]", step: mockprovider.Step{Chunks: [][]byte{[]byte(first)}},
@@ -283,6 +285,7 @@ func TestChatStreamFaults(t *testing.T) {
 			status: 200, body: "data: " + chunk("[redacted]") + "\n\ndata: [DONE]\n\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			s.pastWindow()
 			s.mock.Script(tc.step)
 			before := len(s.mock.Calls())
 			resp, got := s.post(t, streamBody("plain"))
@@ -724,6 +727,9 @@ func TestChatAnthropicStreamFaults(t *testing.T) {
 			status: 200, body: role + terminal("the provider did not answer in time: idle timeout", "upstream_timeout"), cause: "idle timeout"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			s.pastWindow()
+			// created is the service clock's, which pastWindow moved.
+			want := strings.ReplaceAll(tc.body, `"created":1790000000,`, `"created":`+strconv.FormatInt(s.now.Load()/1000, 10)+",")
 			s.mock.Script(tc.step)
 			before := len(s.mock.Calls())
 			resp, got := s.post(t, streamBody("claude"))
@@ -731,7 +737,7 @@ func TestChatAnthropicStreamFaults(t *testing.T) {
 				t.Fatalf("status %d, headers %v: %q", resp.StatusCode, resp.Header, got)
 			}
 			if tc.status == 200 {
-				if resp.Header.Get("Content-Type") != "text/event-stream" || got != tc.body {
+				if resp.Header.Get("Content-Type") != "text/event-stream" || got != want {
 					t.Errorf("body %q", got)
 				}
 			} else {

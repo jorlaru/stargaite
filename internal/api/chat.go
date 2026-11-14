@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json/jsontext"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"mime"
 	"net/http"
 	"net/http/httptrace"
+	"slices"
 	"time"
 
 	"github.com/jorlaru/stargaite/internal/adapters/anthropic"
@@ -18,6 +20,7 @@ import (
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/params"
 	"github.com/jorlaru/stargaite/internal/plan"
+	"github.com/jorlaru/stargaite/internal/routing"
 	"github.com/jorlaru/stargaite/internal/transport"
 )
 
@@ -33,7 +36,8 @@ const (
 )
 
 // The causes that end an attempt early: the RES-3 timers, a stream that ends
-// before its last event, and a client that went away (RES-5).
+// before its last event, a client that went away (RES-5) and a stream
+// request answered without a stream; timers are the first four.
 var (
 	errConnectTimeout   = errors.New("connect timeout")
 	errTotalTimeout     = errors.New("total timeout")
@@ -41,6 +45,9 @@ var (
 	errIdleTimeout      = errors.New("idle timeout")
 	errStreamEnded      = errors.New("the stream ended before its last event")
 	errClientGone       = errors.New("client gone")
+	errNotStream        = errors.New("not an event stream") // a 2xx answer to a stream request
+
+	timers = []error{errConnectTimeout, errTotalTimeout, errFirstByteTimeout, errIdleTimeout}
 )
 
 // request is one authenticated inference request (design section 4).
@@ -62,13 +69,25 @@ type request struct {
 // attempt is one provider call.
 type attempt struct {
 	n                         int
+	gen                       uint64 // of the breaker permit, for Release
 	target                    *config.Target
 	out                       *plan.Outgoing
 	status                    int             // provider status; 0 when no response arrived
+	end                       verdict         // how it ended (classify)
 	cause                     error           // what ended it early: a timer, client gone, a transport, read or relay failure; nil otherwise
 	obs                       domain.Observed // design section 11
 	written                   bool            // a byte reached the client: no other answer from here
 	started, firstByte, ended time.Time       // firstByte: when the response headers arrived
+}
+
+// verdict is how an attempt ended (design section 10): whether the next
+// target may be tried, what the target's breaker is told, and the section 15
+// error answered when no target is left; nil on success and when the client
+// is gone. The zero verdict is the client gone's.
+type verdict struct {
+	eligible bool            // RES-1 kind of failure: try the next target when nothing was written
+	breaker  routing.Verdict // Pass, Fail, None
+	err      *domain.Error
 }
 
 // relay is how one attempt's answer reaches the client (design section 9),
@@ -186,16 +205,17 @@ func (h *handler) check(w http.ResponseWriter, r *http.Request, rq *request) *do
 	return e
 }
 
-// route is steps 5 to 8: per target in order, Build (a static Skip) and the
-// dynamic exclusion of a provider whose credential does not resolve, then
-// one call. With no target left it answers RES-10: the Skip of the first
-// target when every one was skipped statically, else 503
-// no_target_available, as for an alias with no published target. Fallback
-// and the circuit breaker arrive with step C20, so the first call is the
-// last.
+// route is steps 5 to 8: per target in order, Build (a static Skip), then
+// exclude (a dynamic exclusion), then one call; a failure eligible for
+// fallback with nothing written moves to the next target (RES-1), each
+// attempt with its own Build, so effort and cap are resolved again for it
+// (RSN-10). With no target left it answers the section 15 error of the last
+// call when a provider was called; else RES-10: the Skip of the first target
+// when every one was skipped statically, otherwise the first dynamic reason
+// (503 no_target_available, as for an alias with no published target).
 func (h *handler) route(w http.ResponseWriter, r *http.Request, rq *request) *domain.Error {
 	var static []plan.Skip
-	excluded := false
+	dynamic := ""
 	for i, t := range rq.model.Targets {
 		out, skip := plan.Build(plan.Input{Endpoint: rq.ep, Body: rq.body, Header: rq.header, Model: &rq.model.Spec,
 			Upstream: t.Upstream, Target: &t.Spec, Provider: &t.Provider.Spec, Client: rq.client})
@@ -206,14 +226,20 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request, rq *request) *do
 			static = append(static, *skip)
 			continue
 		}
-		if t.Provider.Disabled {
-			excluded = true
+		gen, code := h.exclude(rq, t)
+		if code != "" {
+			dynamic = cmp.Or(dynamic, code)
 			continue
 		}
-		return h.call(w, r, rq, t, out, i+1)
+		if a := h.call(w, r, rq, t, out, i+1, gen); a.end.err == nil || a.written || !a.end.eligible {
+			return a.end.err
+		}
 	}
-	if excluded || len(static) == 0 {
-		return domain.NewError(domain.CodeNoTargetAvailable, fmt.Sprintf("no target of model %.200q is available", rq.alias))
+	if n := len(rq.attempts); n > 0 {
+		return rq.attempts[n-1].end.err
+	}
+	if dynamic != "" || len(static) == 0 {
+		return domain.NewError(cmp.Or(dynamic, domain.CodeNoTargetAvailable), fmt.Sprintf("no target of model %.200q is available", rq.alias))
 	}
 	s := static[0]
 	e := domain.NewError(s.Code, fmt.Sprintf("no target of model %.200q can serve this request: %s", rq.alias, s.Code))
@@ -223,21 +249,38 @@ func (h *handler) route(w http.ResponseWriter, r *http.Request, rq *request) *do
 	return e
 }
 
+// exclude is the dynamic exclusion of t (step 6), a RES-10 code or "": a
+// provider whose credential does not resolve, then an open circuit. A
+// circuit's permit, once taken, goes back with its gen in the finish of the
+// call that follows at once. Phase 3 inserts quota, budget and usage-store
+// checks before both, which read rq.
+func (h *handler) exclude(rq *request, t *config.Target) (gen uint64, code string) {
+	if t.Provider.Disabled {
+		return 0, domain.CodeNoTargetAvailable
+	}
+	if gen, ok := h.breakers.Acquire(t.ID); ok {
+		return gen, ""
+	}
+	return 0, domain.CodeNoTargetAvailable
+}
+
 // call is step 7 for one target: the credential header, the RES-3 timers
 // (connect, then total for a synchronous call, or first byte and idle for a
 // stream), the write deadline, the call and the answer. A synchronous body is
 // read whole up to max_response_bytes (RES-4) and, for a 2xx the adapter can
 // read, relayed as the adapter maps it: unchanged but for the think-tag edits
 // (RSN-12) on the native paths, translated for chat toward anthropic; a 2xx
-// stream is relayed as it arrives (stream). The PAR-9 headers go out with
-// the status line. It returns the section 15 error of the call, nil once the
-// response is relayed.
-func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *config.Target, out *plan.Outgoing, n int) *domain.Error {
-	a := &attempt{n: n, target: t, out: out, started: time.Now()}
+// stream is relayed as it arrives (stream). The PAR-9 headers of this
+// attempt, replacing those of an earlier one, go out with the status line.
+// The attempt it returns holds how it ended (settle).
+func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *config.Target, out *plan.Outgoing, n int, gen uint64) *attempt {
+	a := &attempt{n: n, gen: gen, target: t, out: out, started: time.Now()}
 	defer h.finish(rq, a)
 	rl := relayFor(rq.ep, t, rq.client, h.Config.Now)
 	rq.attempts = append(rq.attempts, a)
 	w.Header().Set(targetHeader, t.ID)
+	w.Header().Del(effortHeader)
+	w.Header().Del(changedHeader)
 	if out.Effort.Sent != nil {
 		w.Header().Set(effortHeader, *out.Effort.Sent)
 	}
@@ -288,71 +331,129 @@ func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *c
 		resp, err = client.Do(req)
 	}
 	if err != nil {
-		return failed(ctx, a, err)
+		settle(ctx, a, false, nil, nil, err, nil)
+		return a
 	}
 	// Closing the body before it ends drops the connection, so the provider
 	// stops sending.
 	defer func() { _ = resp.Body.Close() }()
 	a.status, a.firstByte = resp.StatusCode, time.Now()
 	if rq.client.Stream && a.status/100 == 2 {
-		return h.stream(ctx, w, rq, a, rl, resp, idle)
+		h.stream(ctx, w, rq, a, rl, resp, idle)
+		return a
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
-	if err == nil && int64(len(body)) > limit && a.status/100 == 2 {
-		err = fmt.Errorf("the response is larger than max_response_bytes, %d", limit)
-	}
-	if err != nil {
-		return failed(ctx, a, err)
-	}
-
-	switch s := a.status; {
-	case s/100 == 2:
-		if body, a.obs, err = rl.sync(body, h.Config.Now()); err != nil {
-			a.cause = err
-			return domain.NewError(domain.CodeUpstreamError, "the provider's answer is not usable")
+	var relayErr error
+	if err == nil && a.status/100 == 2 {
+		var answer []byte
+		if int64(len(body)) > limit {
+			relayErr = fmt.Errorf("the response is larger than max_response_bytes, %d", limit)
+		} else if answer, a.obs, relayErr = rl.sync(body, h.Config.Now()); relayErr == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			a.written = true
+			if _, err = w.Write(answer); err != nil {
+				err = fmt.Errorf("%w: %v", errClientGone, err)
+			}
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		a.written = true
-		if _, err := w.Write(body); err != nil {
-			a.cause = fmt.Errorf("%w: %v", errClientGone, err)
-		}
-		return nil
-	case s == http.StatusUnauthorized || s == http.StatusForbidden:
+	}
+	settle(ctx, a, false, resp.Header, body, err, relayErr)
+	if a.end.err != nil && a.end.err.Code == domain.CodeUpstreamAuthError {
 		// The operator's credential, not the client's: the provider's text
 		// goes only to the log, rate-limited (kick-off section 15).
 		if n, ok := h.upstream.tick(h.Config.Now()); ok {
-			h.Log.Warn("provider refused the credential", "request_id", rq.id, "target", t.ID, "status", s,
-				"message", message(t, s, body), "refusals", n)
+			h.Log.Warn("provider refused the credential", "request_id", rq.id, "target", t.ID, "status", a.status,
+				"message", t.Provider.Credential.Redact(message(a.status, body)), "refusals", n)
 		}
-		return domain.NewError(domain.CodeUpstreamAuthError, "the provider refused the operator's credential")
-	case s == http.StatusBadRequest || s == http.StatusNotFound || s == http.StatusRequestEntityTooLarge ||
-		s == http.StatusUnprocessableEntity:
-		return domain.UpstreamError(s, message(t, s, body), resp.Header.Get("Retry-After"))
-	case s == http.StatusTooManyRequests:
-		// Status and Retry-After only: the provider's text names the
-		// operator's account and limits (kick-off section 15).
-		return domain.UpstreamError(s, "the provider answered 429", resp.Header.Get("Retry-After"))
 	}
-	return domain.UpstreamError(a.status, fmt.Sprintf("the provider answered %d", a.status), "")
+	return a
 }
 
 // ms is a duration in milliseconds, as the settings state them.
 func ms(v int64) time.Duration { return time.Duration(v) * time.Millisecond }
 
-// failed is the section 15 error of a call that got no usable answer: a
-// RES-3 timer is 504 upstream_timeout; a transport failure or a body cut
-// while read is 502 upstream_error. The cause goes to the attempt.
-func failed(ctx context.Context, a *attempt, err error) *domain.Error {
-	if a.cause = err; ctx.Err() != nil {
-		a.cause = context.Cause(ctx)
+// settle records how a ended. err is what failed the call, a read or a
+// write; when the attempt's context had ended, its cause stands instead (a
+// RES-3 timer, or the client gone), except for a failed write to the client:
+// a timer that fired while a slow client stalled the write says nothing of
+// the target. relayErr is what the relay found in a 2xx answer. The cause is
+// err, else relayErr; the verdict is classify's, with the credential
+// replaced in the provider's text it passes on.
+func settle(ctx context.Context, a *attempt, stream bool, header http.Header, body []byte, err, relayErr error) {
+	if err != nil && ctx.Err() != nil && !errors.Is(err, errClientGone) {
+		err = context.Cause(ctx)
 	}
-	for _, timer := range []error{errConnectTimeout, errTotalTimeout, errFirstByteTimeout, errIdleTimeout} {
-		if errors.Is(a.cause, timer) {
-			return domain.NewError(domain.CodeUpstreamTimeout, "the provider did not answer in time: "+a.cause.Error())
+	if errors.Is(err, context.Canceled) || errors.Is(err, errClientGone) {
+		err = errClientGone
+	}
+	a.cause = cmp.Or(err, relayErr)
+	a.end = classify(stream, a.status, a.cause, header, body, relayErr)
+	if a.end.err != nil {
+		a.end.err.Message = a.target.Provider.Credential.Redact(a.end.err.Message)
+	}
+}
+
+// classify is how an attempt ended (design section 10, RES-1, RES-2,
+// kick-off section 15): whether the next target may be tried, what the
+// target's breaker is told and the error answered when no target is left.
+// Nothing else decides them. status is the provider's, 0 without a
+// response; cause what ended the attempt early; header and body the
+// provider's (Retry-After, the error message); relayErr what the relay found
+// in a 2xx answer; stream whether that answer was relayed as a stream,
+// which only words the message. The client gone is no verdict, with nothing
+// to answer. A timer, a failed call, a stream cut, 429 and any 5xx are
+// eligible and fail the breaker: 504 upstream_timeout for a timer, the 429
+// with its Retry-After, else 502. An upstream error event is eligible when
+// Anthropic documents 429 or a 5xx for its type (section 15 point 15); an
+// OpenAI error chunk never is. Everything else passes the breaker and is not
+// eligible: a 2xx the relay cannot use, 400, 404, 413 and 422 with the
+// provider's status and message, 401 and 403 as 502 upstream_auth_error, any
+// other status as 502.
+func classify(stream bool, status int, cause error, header http.Header, body []byte, relayErr error) verdict {
+	fail := func(e *domain.Error) verdict { return verdict{eligible: true, breaker: routing.Fail, err: e} }
+	pass := func(e *domain.Error) verdict { return verdict{breaker: routing.Pass, err: e} }
+	upstream := func(message string) *domain.Error { return domain.NewError(domain.CodeUpstreamError, message) }
+	var chunk *openai.ErrorChunk
+	var event *anthropic.ErrorEvent
+	switch {
+	case errors.Is(cause, errClientGone):
+		return verdict{}
+	case slices.ContainsFunc(timers, func(timer error) bool { return errors.Is(cause, timer) }):
+		return fail(domain.NewError(domain.CodeUpstreamTimeout, "the provider did not answer in time: "+cause.Error()))
+	case errors.As(relayErr, &event):
+		if event.Status == http.StatusTooManyRequests || event.Status/100 == 5 {
+			return fail(upstream("the provider's stream reported an error"))
 		}
+		return pass(upstream("the provider's stream reported an error"))
+	case errors.As(relayErr, &chunk):
+		return pass(upstream("the provider's stream reported an error"))
+	case errors.Is(relayErr, errNotStream):
+		return pass(upstream("the provider's answer is not an event stream"))
+	case relayErr != nil && stream:
+		return pass(upstream("the provider's stream failed"))
+	case relayErr != nil:
+		return pass(upstream("the provider's answer is not usable"))
+	case cause != nil && stream:
+		return fail(upstream("the provider's stream failed"))
+	case cause != nil:
+		return fail(upstream("the provider call failed"))
 	}
-	return domain.NewError(domain.CodeUpstreamError, "the provider call failed")
+	switch s := status; {
+	case s/100 == 2:
+		return pass(nil)
+	case s == http.StatusUnauthorized || s == http.StatusForbidden:
+		return pass(domain.NewError(domain.CodeUpstreamAuthError, "the provider refused the operator's credential"))
+	case s == http.StatusBadRequest || s == http.StatusNotFound || s == http.StatusRequestEntityTooLarge ||
+		s == http.StatusUnprocessableEntity:
+		return pass(domain.UpstreamError(s, message(s, body), header.Get("Retry-After")))
+	case s == http.StatusTooManyRequests:
+		// Status and Retry-After only: the provider's text names the
+		// operator's account and limits (kick-off section 15).
+		return fail(domain.UpstreamError(s, "the provider answered 429", header.Get("Retry-After")))
+	case s/100 == 5:
+		return fail(domain.UpstreamError(s, fmt.Sprintf("the provider answered %d", s), ""))
+	}
+	return pass(domain.UpstreamError(status, fmt.Sprintf("the provider answered %d", status), ""))
 }
 
 // stream sends a 2xx stream to the client as it arrives (design section 9,
@@ -364,19 +465,17 @@ func failed(ctx context.Context, a *attempt, err error) *domain.Error {
 // Every event is written and flushed at once, with the credential replaced
 // in it, and nothing is buffered beyond the event being read and the at most
 // 7 bytes of a think-tag stripper (RSN-12). A failure before the commit is
-// the section 15 error the caller answers, 502 upstream_error for an
-// upstream error event whatever status its type documents, which goes to the
-// cause (section 15 point 15); after it, the terminal event, written here:
+// left to the caller (settle); after it, the terminal event is written here:
 // an upstream error already in the client's format (an OpenAI error chunk
 // on chat, an Anthropic error event on messages) is relayed as it is; any
 // other failure is the proxy's own event in the envelope of the endpoint:
 // data: {"error":{...}} with no [DONE] after it on chat, event: error with
 // the Anthropic envelope on messages. A failed write ends the attempt with
 // nothing more to answer: the client is gone.
-func (h *handler) stream(ctx context.Context, w http.ResponseWriter, rq *request, a *attempt, rl relay, resp *http.Response, idle *time.Timer) *domain.Error {
+func (h *handler) stream(ctx context.Context, w http.ResponseWriter, rq *request, a *attempt, rl relay, resp *http.Response, idle *time.Timer) {
 	if mt, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mt != "text/event-stream" {
-		a.cause = fmt.Errorf("the answer is %.100q, not an event stream", resp.Header.Get("Content-Type"))
-		return domain.NewError(domain.CodeUpstreamError, "the provider's answer is not an event stream")
+		settle(ctx, a, true, resp.Header, nil, nil, fmt.Errorf("the answer is %.100q, %w", resp.Header.Get("Content-Type"), errNotStream))
+		return
 	}
 	rc := http.NewResponseController(w)
 	credential := a.target.Provider.Credential
@@ -404,11 +503,14 @@ func (h *handler) stream(ctx context.Context, w http.ResponseWriter, rq *request
 		return write(transport.Event{Name: name, Data: data, Comment: name == anthropic.Comment})
 	}
 
+	// err is a failed read (a cut) or write (the client gone); relayErr what
+	// the stream holds: an event over max_response_bytes, malformed data, an
+	// upstream error event, or io.EOF once the last event is relayed.
 	events := transport.NewEventReader(resp.Body, rq.snap.Settings.MaxResponseBytes)
 	silence := ms(rq.snap.Settings.Timeouts.StreamIdleMS)
 	var ev transport.Event
-	var err error
-	for err == nil {
+	var err, relayErr error
+	for err == nil && relayErr == nil {
 		if ev, err = events.Next(); err == io.EOF {
 			err = errStreamEnded
 		}
@@ -417,80 +519,64 @@ func (h *handler) stream(ctx context.Context, w http.ResponseWriter, rq *request
 		idle.Stop()
 		_ = rc.SetWriteDeadline(time.Now().Add(silence + 5*time.Second))
 		switch {
+		case errors.Is(err, transport.ErrEventTooLarge):
+			err, relayErr = nil, err
 		case err != nil:
 		case ev.Comment:
 			err = write(ev)
 		default:
-			err = rl.event(ev.Name, ev.Data, emit)
+			if relayErr = rl.event(ev.Name, ev.Data, emit); errors.Is(relayErr, errClientGone) {
+				err, relayErr = relayErr, nil
+			}
 		}
 		idle.Reset(silence)
 	}
 	a.obs = rl.observed()
-	if err == io.EOF { // [DONE] was relayed
-		return nil
+	if relayErr == io.EOF { // the last event was relayed
+		relayErr = nil
 	}
-
-	if a.cause = err; ctx.Err() != nil {
-		a.cause = context.Cause(ctx)
+	settle(ctx, a, true, resp.Header, nil, err, relayErr)
+	if !a.written || a.end.err == nil {
+		return
 	}
-	var e *domain.Error
+	name := ""
+	if rq.ep == domain.EndpointMessages {
+		name = "error"
+	}
 	var chunk *openai.ErrorChunk
 	var event *anthropic.ErrorEvent
-	switch {
-	case errors.Is(a.cause, errClientGone) || errors.Is(a.cause, context.Canceled):
-		a.cause = errClientGone
-		return nil
-	case errors.As(err, &chunk):
-		a.cause = errors.New(credential.Redact(chunk.Error()))
-		e = domain.NewError(domain.CodeUpstreamError, "the provider's stream reported an error")
-		if a.written {
-			_ = emit("", ev.Data)
-		}
-		return e
-	case errors.As(err, &event):
-		a.cause = errors.New(credential.Redact(event.Error()))
-		e = domain.NewError(domain.CodeUpstreamError, "the provider's stream reported an error")
-		if a.written && rq.ep == domain.EndpointMessages {
-			_ = emit("error", ev.Data)
-			return e
-		}
-	case errors.Is(a.cause, errIdleTimeout):
-		e = domain.NewError(domain.CodeUpstreamTimeout, "the provider did not answer in time: "+a.cause.Error())
-	default:
-		e = domain.NewError(domain.CodeUpstreamError, "the provider's stream failed")
+	if errors.As(relayErr, &chunk) || errors.As(relayErr, &event) && rq.ep == domain.EndpointMessages {
+		_ = emit(name, ev.Data)
+		return
 	}
-	if a.written {
-		name := ""
-		if rq.ep == domain.EndpointMessages {
-			name = "error"
-		}
-		data, _ := config.Encode(envelope(rq.ep, e))
-		_ = write(transport.Event{Name: name, Data: data})
-	}
-	return e
+	data, _ := config.Encode(envelope(rq.ep, a.end.err))
+	_ = write(transport.Event{Name: name, Data: data})
 }
 
-// message is the error.message of a provider's error body, without the
-// credential; else a fixed text with the status.
-func message(t *config.Target, status int, body []byte) string {
+// message is the error.message of a provider's error body, else a fixed
+// text with the status. It may hold the credential: the caller redacts it.
+func message(status int, body []byte) string {
 	if b, e := params.Scan(body, [][]string{{"error"}}); e == nil {
 		v, _ := b.Get("error", "message")
 		if s, ok := unquote(v); ok && s != "" {
-			return t.Provider.Credential.Redact(s)
+			return s
 		}
 	}
 	return fmt.Sprintf("the provider answered %d", status)
 }
 
 // finish ends one provider call (design section 11, point 2) after its last
-// byte, its failure or a panic: one log line. Phase 3 adds the usage record,
-// the counters and the attempt span here.
+// byte, its failure or a panic: the circuit's permit goes back with the
+// call's verdict (None on a panic), and one log line, without the
+// credential. Phase 3 adds the usage record, the counters and the attempt
+// span here.
 func (h *handler) finish(rq *request, a *attempt) {
 	a.ended = time.Now()
+	h.breakers.Release(a.target.ID, a.gen, a.end.breaker)
 	attrs := []any{"request_id", rq.id, "trace_id", rq.traceID, "key", rq.key.Name, "alias", rq.alias, "attempt", a.n,
 		"target", a.target.ID, "status", a.status, "duration_ms", a.ended.Sub(a.started).Milliseconds()}
 	if a.cause != nil {
-		attrs = append(attrs, "cause", a.cause.Error())
+		attrs = append(attrs, "cause", a.target.Provider.Credential.Redact(a.cause.Error()))
 	}
 	if !a.firstByte.IsZero() {
 		attrs = append(attrs, "first_byte_ms", a.firstByte.Sub(a.started).Milliseconds())

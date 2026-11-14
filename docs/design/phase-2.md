@@ -164,6 +164,12 @@ Settled in C13:
 - **AC-01 (sync).** `internal/api/testdata/openai-python-*.http` and `openai-node-*.http` are the request bytes, headers included, that the OpenAI Python SDK 3.50.0 and Node SDK 7.56.0 sent for a plain and a tools request, recorded once against a loopback listener; the test replays them with `http.ReadRequest` and checks the answer against the fields the SDK's `ChatCompletion` requires.
 - **Log lines.** `finish` writes `attempt` and `done` writes `request`, with the fields of §11; `usage` is an object with `input`, `cache_read`, `cache_write`, `output` and, when reported, `reasoning`. The request line's `alias` is cut to 200 characters, as the error message cuts it: an unknown alias is as long as `max_body_bytes` allows.
 
+Settled in C20:
+
+- **Target loop.** As written above: `call` returns the attempt, whose `end` is `classify`'s verdict, and the loop stops on success, on a byte written or on a failure that is not eligible. `exclude(rq, t)` checks `Disabled`, then `Acquire`, so a disabled provider never takes a circuit permit; `rq` is unused until phase 3. With no target left, the last attempt's `end.err` when a call was made (the "One call" note of C13 is retired); else the first dynamic code, else the first `Skip`.
+- **Headers.** Each attempt sets `x-stargaite-target` and removes `x-stargaite-reasoning-effort` and `x-stargaite-params-changed` before setting its own, so after a fallback the headers are only the answering attempt's, and with no target left the last attempt's.
+- **Client gone.** A synchronous answer whose write fails, and a call cut by the client's going away, now leave `rq.err` nil as a stream did since C14, also when a timer fired while a slow client stalled the write (`settle` keeps a client-gone write error, so the breaker gets `None`): nothing is written to a client that is gone, and the request line keeps status 200 until C21.
+
 ## 5. Parameter contract
 
 **Schemas (PAR-1).** Go literals in `params`, each with its source and date:
@@ -483,6 +489,8 @@ Settled in C18:
 - **Usage.** `message_start` usage, then each `message_delta` usage, the latest integer of each field winning (a `null` keeps the earlier value); `Observed.Usage` holds it whether or not the client asked for the usage chunk, which is written only with `include_usage` and when some usage arrived. `ToChat` shares the code: `thinking_tokens` is now read only when it is an integer.
 - **Tests.** `internal/api/testdata/anthropic-stream.up.sse` and `.down.sse`, replayed split at every byte offset (the SSE re-chunking); `FuzzChatStream` re-chunks text and tool input into deltas (the translator re-chunking); the SDK stream requests of C14 against an `anthropic` target; the corpus serves streams toward `anthropic`.
 
+Settled in C20: **a bare CR inside data.** The reader splits lines only at LF, so a bare CR inside an event's data (JSON whitespace, which the adapters accept) was relayed verbatim, and a client that ends lines at a bare CR, as the SSE standard allows, read other lines than the relay checked. `WriteEvent` now writes every CRLF, LF or bare CR in data as the end of a data line; clients join data lines with LF, so every client reads the data the relay checked, with each line end an LF. A comment is still cut at its first CR (C14) and an event name with a CR still ends a native Messages stream (C19), since neither can be split without changing what the client reads.
+
 ## 10. Resilience
 
 **Timers (RES-3).** Read from `rq.snap.Settings.Timeouts`, per attempt:
@@ -559,6 +567,13 @@ Five `Fail` within 30 s open the target for 20 s; then half-open lets two reques
 
 **Configuration changes (RES-7, RES-8).** A request keeps the snapshot it loaded at step 1 for every attempt; fallbacks are always within the alias's validated contract (PAR-5).
 
+Settled in C20:
+
+- **`classify`.** `classify(stream bool, status int, cause error, header http.Header, body []byte, relayErr error) verdict`: `stream` only words the messages kept from C13 to C19 ("the provider call failed" for a failed call or a synchronous body cut, "the provider's stream failed" for a stream; "not usable", "not an event stream"). `cause` is the read, write or call error, replaced by the attempt context's cause when that ended (a timer; `context.Canceled` becomes "client gone"); `relayErr` is what the relay found in a `2xx`: the adapter's error, an event over `max_response_bytes`, a body over it, or a non-SSE answer to a stream. A stream cut is a read error, so eligible; an oversized event or malformed data is the `2xx` row, not eligible. The provider's message passed on is redacted after `classify`; the attempt line redacts the cause.
+- **Rows as built.** The client gone is the zero verdict (not eligible, `None`, no error). An Anthropic error event, before or after the commit, is eligible and `Fail` when its documented status is `429` or `5xx` (`rate_limit_error`, `api_error`, `timeout_error`, `overloaded_error`), else `Pass`; an OpenAI error chunk is always `Pass`. A committed stream's cut or idle timeout is `Fail`; its malformed data `Pass`.
+- **Breaker.** `routing.Verdict` is `None` (the zero value, so a panic in `call` returns the permit), `Pass`, `Fail`. `finish` calls `Release` as its first statement, once per call, every call having passed `Acquire` in `exclude`. The ring of five failure times opens the circuit when the oldest is under 30 s old; opening and closing clear it; a `Pass` while closed clears nothing (RES-2 counts failures within 30 s). `Acquire(target) (gen uint64, ok bool)` and `Release(target, gen, v)`: `gen` counts the openings, the attempt keeps it, and while open or half-open a `Release` with an older `gen` changes nothing, so a call admitted before the circuit opened, such as a stream outlasting the 20 s, neither frees a trial permit nor counts as a trial. The clock is `Config.Now`, the injected clock of tests.
+- **Not added.** No log line when a circuit opens or closes (the design names none): an open circuit shows as `503 no_target_available` on the request line and the failures on the attempt lines. `explain` shows no breaker state, as §6 states.
+
 ## 11. Interfaces fixed now for phase 3
 
 Phase 3 attaches at five places, without changing a signature that phase 2 ships:
@@ -633,6 +648,8 @@ Settled in C15: the corpus property and the byte identity run as one seeded test
 `tests/contract` arrives with C19: the per-target cases of §21's test strategy that phase 2 serves (simple, streaming, cancellation, structured output, tools when declared, each declared level, errors), against the mock in CI and against a live target when maintainers set its variables. It is where OQ-10 and the open points on provider behaviour get settled. `make ci` is unchanged; no test needs the network or a secret.
 
 Settled in C19: `tests/contract` runs only against a live provider, and is skipped unless `STARGAITE_CONTRACT_BASE_URL` and `STARGAITE_CONTRACT_API_KEY` are set; `STARGAITE_CONTRACT_MODEL`, `STARGAITE_CONTRACT_PROTOCOL` and `STARGAITE_CONTRACT_TARGET` (the target's declaration, whose levels and capabilities choose the cases) complete it. The mock's side of those cases is already in `internal/api` (SDK fixtures, corpus, faults), where the mock answers as scripted; against the mock the suite would only check the mock. It runs the proxy in-process, prints answers only with the credential redacted and logs nothing. Cancellation joins with C21; OQ-10's translated tool loop is not in it yet, and the `/v1/messages` tool loop with thinking is (AC-02, live); when the first turn holds no thinking block it is skipped, not passed.
+
+Settled in C20: the fault matrix is `TestFaultMatrix` in `internal/api/resilience_test.go`, each fault alone and before an `anthropic` fallback target, so the fallback's own `Build` (a Messages body with the effort translated for it) and the PAR-9 headers of the answering attempt are checked; a synchronous `Delay` and `Hang` run past the total timer. The private dial is a name the test resolver gives validation as public and the dial as loopback, which the SEC-4 guard refuses. `TestClassify` checks `classify` per row of §10; `TestNoTargetLeft` covers the last call's error with later targets excluded, skipped, or failing; `TestBreakerBehaviour` the circuit by behaviour, across an `apply`; `routing`'s unit test the clocked breaker. The fault tables of C14 to C19 move the service clock past the 30 s window before each case (`pastWindow`), so their failures never open a circuit; the expected `created` of translated chunks follows that clock.
 
 ## 13. Ordered changes
 

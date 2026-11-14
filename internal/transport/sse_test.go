@@ -122,6 +122,27 @@ func TestWriteEvent(t *testing.T) {
 	}
 }
 
+// TestWriteEventCR: a CR, a CRLF or an LF inside the data ends a data line,
+// so a client that ends lines at a bare CR, as the SSE standard allows, reads
+// the same event as one that ends them at LF: the data with each line end an
+// LF. Written as it was read, a bare CR would end a line that client reads
+// and the relay never checked.
+func TestWriteEventCR(t *testing.T) {
+	var b bytes.Buffer
+	if err := WriteEvent(&b, Event{Name: "e", Data: []byte("{\r\"a\":\r\n1,\n\r\r\"b\":2}")}); err != nil {
+		t.Fatal(err)
+	}
+	const want = "event: e\ndata: {\ndata: \"a\":\ndata: 1,\ndata: \ndata: \ndata: \"b\":2}\n\n"
+	if b.String() != want {
+		t.Fatalf("%q, want %q", b.String(), want)
+	}
+	// The bytes hold no CR, so every SSE client splits them alike.
+	got, err := NewEventReader(&b, 100).Next()
+	if err != nil || got.Name != "e" || string(got.Data) != "{\n\"a\":\n1,\n\n\n\"b\":2}" {
+		t.Errorf("read back: %+v, %v", got, err)
+	}
+}
+
 type countWriter struct {
 	w io.Writer
 	n int

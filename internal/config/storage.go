@@ -28,7 +28,8 @@ func load(ctx context.Context, db *sql.DB) (*State, error) {
 			Models:    map[string]domain.Model{},
 			Keys:      map[string]domain.Key{},
 		},
-		Revoked: map[string]int64{},
+		Revoked:    map[string]int64{},
+		NeverSince: map[string]int64{},
 	}
 	d := &st.Doc
 	if err := db.QueryRowContext(ctx, "SELECT COALESCE(MAX(revision), 0) FROM revisions").Scan(&st.Revision); err != nil {
@@ -127,6 +128,22 @@ func load(ctx context.Context, db *sql.DB) (*State, error) {
 			k.Models = append(k.Models, model)
 			d.Keys[name] = k
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	err = each(ctx, db, "SELECT scope_type, scope_name, since_revision FROM budget_totals", func(rows *sql.Rows) error {
+		var kind, name string
+		var since int64
+		if err := rows.Scan(&kind, &name, &since); err != nil {
+			return err
+		}
+		scope := kind + ":" + name
+		if kind == "global" {
+			scope = kind
+		}
+		st.NeverSince[scope] = since
 		return nil
 	})
 	if err != nil {
@@ -306,6 +323,23 @@ func writeChange(sqlTx *sql.Tx, ch Change, old, next *State, diff []DiffEntry, a
 		} else {
 			t.exec(`INSERT INTO settings (name, value, updated_at) VALUES (?, ?, ?)
 				ON CONFLICT (name) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`, e.Name, text(e.New), at)
+		}
+	}
+
+	// The rows of never budgets (LIM-2): one removed, or set again at a later
+	// revision, loses its row and its total; one set gets a row at its
+	// revision with a total of 0. The writer's since_revision rule keeps a
+	// record of an earlier revision out of a row set again.
+	for _, scope := range slices.Sorted(maps.Keys(old.NeverSince)) {
+		if since, ok := next.NeverSince[scope]; !ok || since != old.NeverSince[scope] {
+			kind, name := scopeRow(scope)
+			t.exec("DELETE FROM budget_totals WHERE scope_type = ? AND scope_name = ?", kind, name)
+		}
+	}
+	for _, scope := range slices.Sorted(maps.Keys(next.NeverSince)) {
+		if since, ok := old.NeverSince[scope]; !ok || since != next.NeverSince[scope] {
+			kind, name := scopeRow(scope)
+			t.exec("INSERT INTO budget_totals (scope_type, scope_name, cost_usd, since_revision) VALUES (?, ?, 0, ?)", kind, name, next.NeverSince[scope])
 		}
 	}
 

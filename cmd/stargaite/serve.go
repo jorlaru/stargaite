@@ -146,6 +146,16 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 			"resource", f.Resource, "field", f.Field, "message", f.Message)
 	}
 
+	// The budgets' counters are rebuilt from the store before the listeners
+	// bind, so a restart changes no figure (RES-9).
+	limits := admission.New(cfg.Now)
+	if err := usage.Restore(ctx, st.Read(), limits, cfg.Now()); err != nil {
+		log.Error("budgets not restored", "error", err.Error())
+		if err := st.Close(); err != nil {
+			log.Error("store close failed", "error", err.Error())
+		}
+		return 1
+	}
 	// Every record goes through one writer on the store's write path, which
 	// config commits share (ADR-003).
 	records := usage.NewWriter(st.Write, log)
@@ -170,7 +180,7 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 			{"admin", *adminAddr, admin.Handler(admin.Deps{Config: cfg, KeyHash: keyHash, Log: log, Usage: st.Read()})},
 			{"data", *dataAddr, api.Handler(api.Deps{Config: cfg, Log: log, Clients: [2]*http.Client{
 				transport.NewClient(false, systemResolver), transport.NewClient(true, systemResolver)}, Flight: &flight,
-				Usage: records, Admission: admission.New(cfg.Now), Counters: &usage.Counters{}, Version: cli.Version})},
+				Usage: records, Admission: limits, Counters: &usage.Counters{}, Version: cli.Version})},
 		}); err != nil {
 			log.Error("server failed", "error", err.Error())
 			code = 1

@@ -1,6 +1,7 @@
 // Package admission decides step 4 of the hot path (kick-off section 14.1):
 // the parallel slots and the rpm and tpm windows of a key, an alias and the
-// instance, counted in memory on an injected clock (phase-3 design section 7).
+// instance, counted in memory on an injected clock (phase-3 design section 7),
+// and the USD budgets that exclude pay_per_use targets at step 5 (section 8).
 // It reaches no internal package but domain.
 package admission
 
@@ -26,11 +27,13 @@ type Scope struct {
 
 // State holds every scope's requests in flight and, while the scope declares
 // rpm_limit or tpm_limit, its window. A scope with nothing in flight and no
-// window is not held.
+// window is not held. It also holds the spend of every scope charged
+// (budget.go), apart from them: a spend is never dropped at rest.
 type State struct {
 	now    func() time.Time
 	mu     sync.Mutex
 	scopes map[string]*scope
+	spend  map[string]*spend
 }
 
 // scope is the state of one scope name.
@@ -41,7 +44,7 @@ type scope struct {
 
 // New returns an empty State on the clock now, the service's.
 func New(now func() time.Time) *State {
-	return &State{now: now, scopes: map[string]*scope{}}
+	return &State{now: now, scopes: map[string]*scope{}, spend: map[string]*spend{}}
 }
 
 // Admit admits a request into scopes, given in the order key, alias,

@@ -804,3 +804,129 @@ func BenchmarkCommitScale18(b *testing.B) {
 		}
 	}
 }
+
+// neverRows are the budget_totals rows: scope, since, total.
+func neverRows(t *testing.T, st *store.Store) []string {
+	t.Helper()
+	return rows(t, st, "SELECT scope_type || ':' || scope_name, since_revision, cost_usd FROM budget_totals ORDER BY 1")
+}
+
+// TestNeverBudgets is LIM-2 for never budgets across commits: the counter
+// of one set starts at zero at the revision that sets it, with its row and
+// its NeverSince entry; a limit_usd change keeps both and the total; a
+// change of interval, a removal or a revoked key deletes the row; one set
+// again starts at its new revision with a total of 0. A dry run and a
+// change that touches no budget write no row (phase-3 design section 8).
+func TestNeverBudgets(t *testing.T) {
+	s, st := newService(t)
+	limit := func(v float64) *float64 { return &v }
+	commit(t, s, change("seed", func(st *State) {
+		seed(st)
+		st.Doc.Settings.Budget = &domain.Budget{LimitUSD: limit(100), ResetInterval: domain.ResetNever}
+		k := st.Doc.Keys["k"]
+		k.Budget = &domain.Budget{LimitUSD: limit(1), ResetInterval: domain.ResetNever}
+		st.Doc.Keys["k"] = k
+		m := st.Doc.Models["fast"]
+		m.Budget = &domain.Budget{LimitUSD: limit(2), ResetInterval: domain.ResetDaily}
+		st.Doc.Models["fast"] = m
+	}))
+	check := func(step string, want []string, since map[string]int64) {
+		t.Helper()
+		if got := neverRows(t, st); !slices.Equal(got, want) {
+			t.Errorf("%s: rows %q, want %q", step, got, want)
+		}
+		if got := s.Snapshot().NeverSince; fmt.Sprint(got) != fmt.Sprint(since) {
+			t.Errorf("%s: NeverSince %v, want %v", step, got, since)
+		}
+	}
+	check("set", []string{"global: 1 0", "key:k 1 0"}, map[string]int64{"global": 1, "key:k": 1})
+	if err := st.Write(context.Background(), func(tx *sql.Tx) error { // charges by the writer
+		_, err := tx.Exec("UPDATE budget_totals SET cost_usd = 0.5")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	budget := func(f func(*State)) Change { return change("budget", f) }
+	setKey := func(b *domain.Budget) func(*State) {
+		return func(st *State) { k := st.Doc.Keys["k"]; k.Budget = b; st.Doc.Keys["k"] = k }
+	}
+	setModel := func(b *domain.Budget) func(*State) {
+		return func(st *State) { m := st.Doc.Models["fast"]; m.Budget = b; st.Doc.Models["fast"] = m }
+	}
+
+	commit(t, s, budget(setKey(&domain.Budget{LimitUSD: limit(5), ResetInterval: domain.ResetNever})))
+	check("limit_usd changed", []string{"global: 1 0.5", "key:k 1 0.5"}, map[string]int64{"global": 1, "key:k": 1})
+	if res := commit(t, s, Change{Summary: "dry", DryRun: true, Mutate: func(st *State) (map[string]string, error) {
+		setKey(nil)(st)
+		return nil, nil
+	}}); res.Revision != 2 {
+		t.Errorf("dry run revision %d", res.Revision)
+	}
+	commit(t, s, budget(func(st *State) { st.Doc.Settings.MaxBodyBytes = 1 << 20 }))
+	check("no budget touched", []string{"global: 1 0.5", "key:k 1 0.5"}, map[string]int64{"global": 1, "key:k": 1})
+
+	commit(t, s, budget(setKey(&domain.Budget{LimitUSD: limit(5), ResetInterval: domain.ResetMonthly}))) // revision 4
+	check("interval changed", []string{"global: 1 0.5"}, map[string]int64{"global": 1})
+	commit(t, s, budget(setKey(&domain.Budget{LimitUSD: limit(5), ResetInterval: domain.ResetNever}))) // revision 5
+	check("never again", []string{"global: 1 0.5", "key:k 5 0"}, map[string]int64{"global": 1, "key:k": 5})
+	commit(t, s, budget(setModel(&domain.Budget{LimitUSD: limit(2), ResetInterval: domain.ResetNever}))) // revision 6
+	check("alias from daily to never", []string{"global: 1 0.5", "key:k 5 0", "model:fast 6 0"},
+		map[string]int64{"global": 1, "key:k": 5, "model:fast": 6})
+	commit(t, s, budget(func(st *State) { st.Doc.Settings.Budget = nil })) // revision 7
+	check("instance removed", []string{"key:k 5 0", "model:fast 6 0"}, map[string]int64{"key:k": 5, "model:fast": 6})
+	commit(t, s, budget(func(st *State) { delete(st.Doc.Keys, "k"); st.Secrets = nil; st.Revoked["k"] = testNow })) // revision 8
+	check("key revoked", []string{"model:fast 6 0"}, map[string]int64{"model:fast": 6})
+	commit(t, s, budget(func(st *State) { delete(st.Doc.Models, "fast") })) // revision 9
+	check("alias removed", nil, map[string]int64{})
+}
+
+// TestOpenWritesNeverRows: a never budget stored without its budget_totals
+// row, as the phase 1 and 2 binaries stored them, gets one at the current
+// revision with a total of 0 when the configuration is opened, before the
+// first publish; a row already there, and its total, are kept on the next
+// open.
+func TestOpenWritesNeverRows(t *testing.T) {
+	dir := t.TempDir()
+	st := openStore(t, dir)
+	s := openService(t, st, testEnv(t, nil))
+	limit := 3.0
+	commit(t, s, change("seed", func(st *State) {
+		seed(st)
+		k := st.Doc.Keys["k"]
+		k.Budget = &domain.Budget{LimitUSD: &limit, ResetInterval: domain.ResetNever}
+		st.Doc.Keys["k"] = k
+	}))
+	commit(t, s, change("other", func(st *State) { st.Doc.Settings.MaxBodyBytes = 1 << 20 }))
+	if err := st.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec("DELETE FROM budget_totals")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st = openStore(t, dir)
+	s = openService(t, st, testEnv(t, nil))
+	if got := neverRows(t, st); !slices.Equal(got, []string{"key:k 2 0"}) {
+		t.Errorf("rows %q", got)
+	}
+	if got := s.Snapshot().NeverSince; len(got) != 1 || got["key:k"] != 2 {
+		t.Errorf("NeverSince %v", got)
+	}
+	if err := st.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec("UPDATE budget_totals SET cost_usd = 1.5")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st = openStore(t, dir)
+	s = openService(t, st, testEnv(t, nil))
+	if got := neverRows(t, st); !slices.Equal(got, []string{"key:k 2 1.5"}) || s.Snapshot().NeverSince["key:k"] != 2 {
+		t.Errorf("after a second open: rows %q, NeverSince %v", got, s.Snapshot().NeverSince)
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jorlaru/stargaite/internal/admission"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/store"
 )
@@ -159,7 +160,7 @@ func TestWriterIdempotent(t *testing.T) {
 	st := openStore(t)
 	batch := []Record{rec("a"), rec("b", func(r *Record) { r.ErrorType = "upstream_timeout" })}
 	for range 2 {
-		if err := st.Write(context.Background(), func(tx *sql.Tx) error { return insert(tx, batch) }); err != nil {
+		if err := st.Write(context.Background(), func(tx *sql.Tx) error { return insert(tx, entries(batch)) }); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -475,4 +476,152 @@ func (l *logBuffer) String() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.b.String()
+}
+
+// entries are the queue entries of records rs.
+func entries(rs []Record) []entry {
+	es := make([]entry, len(rs))
+	for i, r := range rs {
+		es[i] = entry{rec: r}
+	}
+	return es
+}
+
+// TestWriterBudgets: an inserted pay_per_use record with a cost adds it to
+// the budget_totals rows of the instance, its key and its alias whose
+// since_revision is at or before its config_revision; a record without a
+// cost, of another billing, or already stored adds nothing; an audit row is
+// inserted once by its id, also when its batch is committed twice (phase-3
+// design sections 5 and 8).
+func TestWriterBudgets(t *testing.T) {
+	st := openStore(t)
+	if err := st.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO budget_totals (scope_type, scope_name, cost_usd, since_revision) VALUES
+			('global', '', 0, 2), ('key', 'k', 0, 4), ('model', 'fast', 1, 3), ('key', 'other', 0, 1)`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	at := time.UnixMilli(1_794_614_401_000)
+	warn := admission.Warning{Event: "budget_warning", Scope: "key:k", Period: "d:2026-11-14", At: at}
+	batch := entries([]Record{
+		rec("a"), // revision 3: global and fast
+		rec("b", func(r *Record) { r.ConfigRevision = 5 }),                                                          // all three
+		rec("c", func(r *Record) { r.CostUSD = nil; r.CostSource = "none" }),                                        // unpriced
+		rec("d", func(r *Record) { r.Billing = domain.BillingSubscription; r.CostUSD = nil; r.ConfigRevision = 9 }), // no USD
+	})
+	batch = append(batch, entry{warn: &warn})
+	for range 2 {
+		if err := st.Write(context.Background(), func(tx *sql.Tx) error { return insert(tx, batch) }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows, err := st.Read().Query("SELECT scope_type || ':' || scope_name, since_revision, cost_usd FROM budget_totals ORDER BY 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var got []string
+	for rows.Next() {
+		var scope string
+		var since int64
+		var usd float64
+		if err := rows.Scan(&scope, &since, &usd); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, fmt.Sprintf("%s %d %.2f", scope, since, usd))
+	}
+	if want := []string{"global: 2 0.50", "key:k 4 0.25", "key:other 1 0.00", "model:fast 3 1.50"}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("budget_totals %v, want %v", got, want)
+	}
+	if n := count(t, st.Read(), `SELECT COUNT(*) FROM audit WHERE id = 'budget_warning:key:k:d:2026-11-14' AND actor = 'system'
+		AND action = 'budget_warning' AND resource_type = 'budget' AND resource_name = 'key:k' AND previous_value IS NULL
+		AND new_value IS NULL AND result = 'warning' AND revision IS NULL AND created_at = 1794614401000`); n != 1 {
+		t.Error("the audit row is not stored once as the warning gives it")
+	}
+	if n := count(t, st.Read(), "SELECT COUNT(*) FROM audit"); n != 1 {
+		t.Errorf("%d audit rows", n)
+	}
+}
+
+// TestWriterAuditLost: an audit row that cannot be queued is logged at
+// critical level, with its id, and is not counted as a usage record.
+func TestWriterAuditLost(t *testing.T) {
+	var log logBuffer
+	w := NewWriter(func(context.Context, func(*sql.Tx) error) error { return nil }, slog.New(slog.NewJSONHandler(&log, nil)))
+	if n := w.Close(context.Background()); n != 0 {
+		t.Fatalf("Close: %d", n)
+	}
+	w.Audit(admission.Warning{Event: "budget_exhausted", Scope: "global", Period: "m:2026-11", At: time.UnixMilli(5)})
+	if l := log.String(); !strings.Contains(l, `"level":"ERROR+4","msg":"audit row not stored","id":"budget_exhausted:global:m:2026-11"`) {
+		t.Errorf("log %s", l)
+	}
+	if n := w.Close(context.Background()); n != 0 {
+		t.Errorf("Close counts %d", n)
+	}
+}
+
+// TestRestore: this month's pay_per_use spend per day, from usage_daily, and
+// every never total, from budget_totals, seed the counters a fresh State
+// reads, for the instance, the key and the alias; a day after today counts
+// as today; other months and other billing modes count nowhere (RES-9).
+func TestRestore(t *testing.T) {
+	st := openStore(t)
+	day := func(d string, edit ...func(*Record)) func(*Record) {
+		return func(r *Record) {
+			at, err := time.Parse(time.DateOnly, d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.CompletedAt = at.Add(time.Hour).UnixMilli()
+			for _, e := range edit {
+				e(r)
+			}
+		}
+	}
+	batch := []Record{
+		rec("a", day("2026-11-14")), // today, 0.25
+		rec("b", day("2026-11-14", func(r *Record) { r.KeyName = "j"; r.Model = "slow" })),
+		rec("c", day("2026-11-02")), // this month
+		rec("d", day("2026-10-31")), // last month
+		rec("e", day("2026-11-15")), // after today: counts as today
+		rec("f", day("2026-11-14", func(r *Record) { r.Billing = domain.BillingNone; r.CostUSD = nil })), // no cost
+	}
+	if err := st.Write(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`INSERT INTO budget_totals (scope_type, scope_name, cost_usd, since_revision) VALUES
+			('global', '', 7, 2), ('model', 'fast', 3, 6)`); err != nil {
+			return err
+		}
+		return insert(tx, entries(batch))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 14, 23, 0, 0, 0, time.UTC)
+	a := admission.New(func() time.Time { return now })
+	if err := Restore(context.Background(), st.Read(), a, now); err != nil {
+		t.Fatal(err)
+	}
+	budget := func(scope, interval string, since int64) admission.Budget {
+		return admission.Budget{Scope: scope, Spec: domain.Budget{LimitUSD: ptr(100.0), ResetInterval: interval}, Since: since}
+	}
+	for _, tc := range []struct {
+		b    admission.Budget
+		want float64
+	}{
+		{budget("global", "daily", 0), 0.75},
+		{budget("global", "monthly", 0), 1.0},
+		{budget("key:k", "daily", 0), 0.5},
+		{budget("key:k", "monthly", 0), 0.75},
+		{budget("key:j", "daily", 0), 0.25},
+		{budget("model:fast", "monthly", 0), 0.75},
+		{budget("model:slow", "monthly", 0), 0.25},
+		{budget("global", "never", 2), 8.25},  // 7 and the five priced records of revision 3
+		{budget("model:fast", "never", 6), 3}, // none of revision 6 or later
+		{budget("model:fast", "never", 7), 0}, // set again since: starts at zero
+		{budget("key:k", "never", 3), 0},      // no row
+	} {
+		if got := a.Spent(tc.b); got < tc.want-1e-9 || got > tc.want+1e-9 {
+			t.Errorf("%+v: %v, want %v", tc.b, got, tc.want)
+		}
+	}
 }

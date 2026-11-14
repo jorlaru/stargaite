@@ -40,7 +40,7 @@ func ranked(g Group, p ...int64) Group {
 // seed stores batch as the writer does, usage_daily included.
 func seed(t *testing.T, st *store.Store, batch []Record) {
 	t.Helper()
-	if err := st.Write(context.Background(), func(tx *sql.Tx) error { return insert(tx, batch) }); err != nil {
+	if err := st.Write(context.Background(), func(tx *sql.Tx) error { return insert(tx, entries(batch)) }); err != nil {
 		t.Fatal(err)
 	}
 }

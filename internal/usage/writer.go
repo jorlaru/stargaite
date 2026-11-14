@@ -3,10 +3,15 @@ package usage
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/jorlaru/stargaite/internal/admission"
+	"github.com/jorlaru/stargaite/internal/domain"
 )
 
 // LevelCritical is the level of the log line of a record the writer could
@@ -32,15 +37,16 @@ const (
 // Writer is the one writer of usage records (design section 5): a goroutine
 // that commits them in batches through the store's write path, each batch in
 // one transaction, each record inserted or ignored by its id and the daily
-// aggregate moved only for a row inserted (USE-2). It is safe for concurrent
-// use.
+// aggregate and the never budgets' totals moved only for a row inserted
+// (USE-2). The audit rows of budget warnings share its queue and batches.
+// It is safe for concurrent use.
 type Writer struct {
 	write func(context.Context, func(*sql.Tx) error) error
 	log   *slog.Logger
 
 	mu      sync.RWMutex // held for reading while Add queues, so Close never closes the queue under it
 	closed  bool
-	queue   chan Record
+	queue   chan entry
 	closing chan struct{}   // closed by Close
 	ctx     context.Context // Close's: set before closing is closed, read only after
 	done    chan struct{}   // closed when the goroutine has exited
@@ -50,7 +56,7 @@ type Writer struct {
 
 // NewWriter starts the writer on write, the store's write path.
 func NewWriter(write func(context.Context, func(*sql.Tx) error) error, log *slog.Logger) *Writer {
-	w := &Writer{write: write, log: log, queue: make(chan Record, queueSize), closing: make(chan struct{}), done: make(chan struct{})}
+	w := &Writer{write: write, log: log, queue: make(chan entry, queueSize), closing: make(chan struct{}), done: make(chan struct{})}
 	go w.run()
 	return w
 }
@@ -59,19 +65,34 @@ func NewWriter(write func(context.Context, func(*sql.Tx) error) error, log *slog
 // or once Close has begun, r is written as one log line at critical level
 // and counted instead, never lost silently and never rate-limited (USE-10,
 // OPS-9).
-func (w *Writer) Add(r Record) {
+func (w *Writer) Add(r Record) { w.enqueue(entry{rec: r}) }
+
+// Audit queues the audit row of warning a for the next batch (kick-off
+// section 10): id <event>:<scope>:<period>, inserted or ignored, so a retried
+// batch or a second crossing in the period adds no row twice. Like Add it
+// never blocks: a row that cannot be queued is logged at critical level, but
+// not counted by Close, which counts usage records.
+func (w *Writer) Audit(a admission.Warning) { w.enqueue(entry{warn: &a}) }
+
+// entry is one item of the queue: a usage record, or the audit row of warn.
+type entry struct {
+	rec  Record
+	warn *admission.Warning
+}
+
+func (w *Writer) enqueue(e entry) {
 	w.mu.RLock()
 	queued := false
 	if !w.closed {
 		select {
-		case w.queue <- r:
+		case w.queue <- e:
 			queued = true
 		default:
 		}
 	}
 	w.mu.RUnlock()
 	if !queued {
-		w.lose(r)
+		w.lose(e)
 	}
 }
 
@@ -107,7 +128,7 @@ func (w *Writer) Close(ctx context.Context) int {
 func (w *Writer) run() {
 	defer close(w.done)
 	for r := range w.queue {
-		batch := []Record{r}
+		batch := []entry{r}
 		wait := time.NewTimer(batchWait)
 	fill:
 		for len(batch) < batchSize {
@@ -139,7 +160,7 @@ func (w *Writer) run() {
 // starts, one when the store becomes unavailable and one when a commit
 // succeeds again, never one per retry. False when Close's context ended
 // before a write could start.
-func (w *Writer) commit(batch []Record) bool {
+func (w *Writer) commit(batch []entry) bool {
 	for failures := 0; ; {
 		if w.ended() {
 			return false
@@ -200,11 +221,17 @@ func (w *Writer) sleep(d time.Duration) bool {
 	}
 }
 
-// lose writes each record as one log line at critical level and counts it.
-func (w *Writer) lose(rs ...Record) {
-	for _, r := range rs {
+// lose writes each entry as one log line at critical level, and counts the
+// records.
+func (w *Writer) lose(es ...entry) {
+	for _, e := range es {
+		if a := e.warn; a != nil {
+			w.log.Log(context.Background(), LevelCritical, "audit row not stored", "id", a.Event+":"+a.Scope+":"+a.Period,
+				"action", a.Event, "resource_name", a.Scope, "created_at", a.At.UnixMilli())
+			continue
+		}
 		w.lost.Add(1)
-		w.log.Log(context.Background(), LevelCritical, "usage record not stored", "record", r)
+		w.log.Log(context.Background(), LevelCritical, "usage record not stored", "record", e.rec)
 	}
 }
 
@@ -223,12 +250,32 @@ ON CONFLICT (day, key_name, model, target, billing) DO UPDATE SET requests = req
 	cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens, output_tokens = output_tokens + excluded.output_tokens,
 	reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens, cost_usd = cost_usd + excluded.cost_usd`
 
+const chargeNever = `UPDATE budget_totals SET cost_usd = cost_usd + ?
+WHERE scope_type = ? AND scope_name = ? AND since_revision <= ?`
+
+const insertWarning = `INSERT OR IGNORE INTO audit (id, actor, action, resource_type, resource_name, result, created_at)
+VALUES (?, 'system', ?, ?, ?, 'warning', ?)`
+
 // insert inserts each record or ignores it when its id is stored already;
 // only an inserted row moves usage_daily, for the UTC day of completed_at
 // (USE-2): one request, one error when error_type is set, each token count
-// and the cost, a NULL counting as 0.
-func insert(tx *sql.Tx, batch []Record) error {
-	for _, r := range batch {
+// and the cost, a NULL counting as 0; and, for a pay_per_use record with a
+// cost, the total of each never budget of the instance, its key and its
+// alias whose counter started at or before the record's revision (phase-3
+// design section 8). An audit row is inserted or ignored by its id.
+func insert(tx *sql.Tx, batch []entry) error {
+	for _, e := range batch {
+		if a := e.warn; a != nil {
+			kind := "quota"
+			if strings.HasPrefix(a.Event, "budget_") {
+				kind = "budget"
+			}
+			if _, err := tx.Exec(insertWarning, a.Event+":"+a.Scope+":"+a.Period, a.Event, kind, a.Scope, a.At.UnixMilli()); err != nil {
+				return err
+			}
+			continue
+		}
+		r := e.rec
 		res, err := tx.Exec(insertUsage, r.ID, r.RequestID, r.TraceID, r.Attempt, r.Endpoint, r.KeyName, r.Model, r.Target, r.Billing,
 			null(r.ResponseModel), r.ModelMismatch, r.StatusCode, null(r.ErrorType), null(r.FinishReason), r.Stream, r.InputTokens,
 			r.CacheReadTokens, r.CacheWriteTokens, r.OutputTokens, r.ReasoningTokens, r.TokensSource, r.CostUSD, r.CostSource,
@@ -262,8 +309,69 @@ func insert(tx *sql.Tx, batch []Record) error {
 			r.CacheWriteTokens, r.OutputTokens, reasoning, cost); err != nil {
 			return err
 		}
+		if r.Billing != domain.BillingPayPerUse || r.CostUSD == nil {
+			continue
+		}
+		for _, scope := range [][2]string{{"global", ""}, {"key", r.KeyName}, {"model", r.Model}} {
+			if _, err := tx.Exec(chargeNever, cost, scope[0], scope[1], r.ConfigRevision); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
+}
+
+// Restore seeds a's budget counters from the store before the listeners
+// bind (RES-9): this month's pay_per_use spend from usage_daily, per day, for
+// the instance, the key and the alias of each row, and every never budget's
+// total from budget_totals. A day after today on now, which only a clock
+// set back gives, counts as today, so no spend is left out. Records written
+// to the critical log are in neither (phase-3 design section 17, point 15).
+func Restore(ctx context.Context, db *sql.DB, a *admission.State, now time.Time) error {
+	today := now.UTC().Format(time.DateOnly)
+	rows, err := db.QueryContext(ctx, `SELECT key_name, model, day, SUM(cost_usd) FROM usage_daily
+		WHERE billing = 'pay_per_use' AND day >= ? GROUP BY 1, 2, 3`, today[:8]+"01")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var key, model, day string
+		var usd float64
+		if err := rows.Scan(&key, &model, &day, &usd); err != nil {
+			return err
+		}
+		if len(day) != len(today) {
+			return fmt.Errorf("usage_daily holds the day %q", day)
+		}
+		day = min(day, today)
+		for _, scope := range []string{"global", "key:" + key, "model:" + model} {
+			a.SeedSpend(scope, "d:"+day, usd)
+			a.SeedSpend(scope, "m:"+day[:7], usd)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	totals, err := db.QueryContext(ctx, "SELECT scope_type, scope_name, since_revision, cost_usd FROM budget_totals")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = totals.Close() }()
+	for totals.Next() {
+		var kind, name string
+		var since int64
+		var usd float64
+		if err := totals.Scan(&kind, &name, &since, &usd); err != nil {
+			return err
+		}
+		scope := kind + ":" + name
+		if kind == "global" {
+			scope = kind
+		}
+		a.SeedNever(scope, since, usd)
+	}
+	return totals.Err()
 }
 
 // null is s, or NULL when s is empty.

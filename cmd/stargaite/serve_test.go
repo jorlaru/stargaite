@@ -572,14 +572,48 @@ func TestServeLostRecords(t *testing.T) {
 	}
 }
 
-// TestServeKilled is ADR-016 through serve: serve runs as a process of its
-// own, commits the records of three requests, and is killed with SIGKILL;
-// serve then starts again on the same data directory, whose lock the kernel
-// released, and usage show and the store hold the three records.
+// TestServeKilled is ADR-016 and RES-9 through serve: serve runs as a
+// process of its own, commits the records of three priced requests, which
+// exhaust the key's never budget and the alias's monthly one, and is killed
+// with SIGKILL; serve then starts again on the same data directory, whose
+// lock the kernel released: the key still gets 402, and once its budget is
+// removed the alias's still answers 402, before any provider call; usage
+// show and the store hold the three records.
 func TestServeKilled(t *testing.T) {
-	srv := httptest.NewServer(mockprovider.New())
+	mock := mockprovider.New()
+	srv := httptest.NewServer(mock)
 	t.Cleanup(srv.Close)
 	dir, token := seed(t, map[string]string{"m": srv.URL})
+	{
+		st, err := store.Open(context.Background(), dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := config.Open(context.Background(), st, func() config.Env { return config.Env{Lookup: func(string) (string, bool) { return "", false }} }, time.Now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Each call costs 0.03 USD: the mock's 1 input and 2 output tokens.
+		price, limit := 10000.0, 0.08
+		if _, err := cfg.Commit(context.Background(), config.Change{Summary: "budgets", Mutate: func(s *config.State) (map[string]string, error) {
+			p := s.Doc.Providers["m"]
+			p.Billing = domain.BillingPayPerUse
+			s.Doc.Providers["m"] = p
+			s.Doc.Targets["m/m"] = domain.Target{Kind: domain.KindChat, Pricing: &domain.Pricing{InputPerMillion: &price, OutputPerMillion: &price, AsOf: "2026-11-01"}}
+			k := s.Doc.Keys["agent"]
+			k.Budget = &domain.Budget{LimitUSD: &limit, ResetInterval: domain.ResetNever}
+			s.Doc.Keys["agent"] = k
+			m := s.Doc.Models["m"]
+			m.Budget = &domain.Budget{LimitUSD: &limit, ResetInterval: domain.ResetMonthly}
+			s.Doc.Models["m"] = m
+			return nil, nil
+		}}); err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
 	cmd := exec.Command(os.Args[0], "serve", "--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0")
 	logs, stderr := io.Pipe()
 	cmd.Env, cmd.Stderr = []string{"STARGAITE_TEST_RUN=1", "STARGAITE_ADMIN_KEY=" + adminKey}, stderr
@@ -652,6 +686,32 @@ func TestServeKilled(t *testing.T) {
 	}
 
 	ready, stop := start(t, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), "--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0")
+	refused := func(message string) {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, "http://"+ready.DataAddr+"/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusPaymentRequired || !strings.Contains(string(body), `"code":"budget_exceeded"`) || !strings.Contains(string(body), message) {
+			t.Errorf("after the restart: %d %s, want 402 %s", resp.StatusCode, body, message)
+		}
+	}
+	refused("the budget of this key is exhausted")
+	if code := cli.Main([]string{"keys", "set", "agent", "--budget=", "--admin-url", "http://" + ready.AdminAddr},
+		env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), io.Discard, io.Discard); code != 0 {
+		t.Fatalf("keys set: exit %d", code)
+	}
+	refused(`the budget of model \"m\" is exhausted`)
+	if n := len(mock.Calls()); n != 3 {
+		t.Errorf("the mock got %d calls, want 3", n)
+	}
 	var stdout bytes.Buffer
 	if code := cli.Main([]string{"usage", "show", "--json", "--since", "1h", "--admin-url", "http://" + ready.AdminAddr},
 		env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), &stdout, io.Discard); code != 0 {
@@ -804,6 +864,36 @@ func TestServeExitCodes(t *testing.T) {
 	if code, _ := stop(); code != 0 {
 		t.Errorf("exit %d", code)
 	}
+}
+
+// TestServeRestoreFails: budgets that cannot be restored from the store stop
+// serve with exit 1 before the listeners bind (RES-9, phase-3 design section
+// 11), and the store is closed, so its lock is released.
+func TestServeRestoreFails(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec("INSERT INTO usage_daily (day, key_name, model, target, billing, cost_usd) VALUES ('9999-99', 'k', 'm', 'p/m', 'pay_per_use', 1)")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if code := serve([]string{"--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0"}, env(nil), io.Discard, &stderr); code != 1 ||
+		!strings.Contains(stderr.String(), `"level":"ERROR","msg":"budgets not restored"`) || strings.Contains(stderr.String(), `"msg":"ready"`) {
+		t.Fatalf("exit %d; log %s", code, &stderr)
+	}
+	st, err = store.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("the lock is still held: %v", err)
+	}
+	_ = st.Close()
 }
 
 // TestCheckListener is the listener table of SEC-6 and AC-45.

@@ -22,7 +22,10 @@ type Snapshot struct {
 	Models    map[string]*Model
 	Keys      map[string]*Key  // by name; revoked keys are absent
 	Findings  []domain.Finding // the findings of the published configuration
-	secrets   map[string]secret
+	// NeverSince is, by scope, the revision the counter of a never budget
+	// started at (State.NeverSince): admission.Budget.Since.
+	NeverSince map[string]int64
+	secrets    map[string]secret
 }
 
 // Provider is a provider as published. Credential is set when api_key_env
@@ -102,15 +105,16 @@ type secret struct {
 func build(st *State, env Env, findings []domain.Finding) *Snapshot {
 	d := &st.Doc
 	s := &Snapshot{
-		Revision:  st.Revision,
-		Doc:       d,
-		Settings:  WithDefaults(d.Settings),
-		Providers: make(map[string]*Provider, len(d.Providers)),
-		Targets:   make(map[string]*Target, len(d.Targets)),
-		Models:    make(map[string]*Model, len(d.Models)),
-		Keys:      make(map[string]*Key, len(d.Keys)),
-		Findings:  findings,
-		secrets:   make(map[string]secret, len(st.Secrets)),
+		Revision:   st.Revision,
+		Doc:        d,
+		Settings:   WithDefaults(d.Settings),
+		Providers:  make(map[string]*Provider, len(d.Providers)),
+		Targets:    make(map[string]*Target, len(d.Targets)),
+		Models:     make(map[string]*Model, len(d.Models)),
+		Keys:       make(map[string]*Key, len(d.Keys)),
+		Findings:   findings,
+		NeverSince: st.NeverSince,
+		secrets:    make(map[string]secret, len(st.Secrets)),
 	}
 	for name, spec := range d.Providers {
 		p := &Provider{Name: name, Spec: spec}

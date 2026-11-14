@@ -280,6 +280,20 @@ func scopeNames(rq *request) []string {
 	return []string{"key:" + rq.key.Name, "model:" + rq.alias, "global"}
 }
 
+// budgets are the budgets of rq's key, alias and instance, in that order,
+// as rq's snapshot declares them, each with the revision its never counter
+// started at (phase-3 design section 8).
+func budgets(rq *request) []admission.Budget {
+	names := scopeNames(rq)
+	var bs []admission.Budget
+	for i, b := range []*domain.Budget{rq.key.Spec.Budget, rq.model.Spec.Budget, rq.snap.Settings.Budget} {
+		if b != nil {
+			bs = append(bs, admission.Budget{Scope: names[i], Spec: *b, Since: rq.snap.NeverSince[names[i]]})
+		}
+	}
+	return bs
+}
+
 // route is steps 5 to 8: per target in order, Build (a static Skip), then
 // exclude (a dynamic exclusion), then one call; a failure eligible for
 // fallback with nothing written moves to the next target (RES-1), each
@@ -333,15 +347,21 @@ func noTarget(rq *request) *domain.Error {
 	return domain.NewError(domain.CodeNoTargetAvailable, fmt.Sprintf("no target of model %.200q is available", rq.alias))
 }
 
-// exclude is the dynamic exclusion of t (step 6) in RES-10 order: the usage
-// store unavailable for a pay_per_use target (USE-10), then a provider whose
-// credential does not resolve, then an open circuit; nil when t may be
-// called. A circuit's permit, once taken, goes back with its gen in the
-// finish of the call that follows at once. The budget (C27) and quota (C28)
-// checks go before the store's, as RES-10 orders them.
+// exclude is the dynamic exclusion of t (step 6) in RES-10 order: for a
+// pay_per_use target, an exhausted budget of the key, the alias or the
+// instance (LIM-3), then the usage store unavailable (USE-10); then a
+// provider whose credential does not resolve, then an open circuit; nil when
+// t may be called. A circuit's permit, once taken, goes back with its gen in
+// the finish of the call that follows at once. The quota check (C28) goes
+// between the budget's and the store's, as RES-10 orders them.
 func (h *handler) exclude(rq *request, t *config.Target) (gen uint64, e *domain.Error) {
-	if t.Provider.Spec.Billing == domain.BillingPayPerUse && !h.Usage.Available() {
-		return 0, domain.NewError(domain.CodeUsageStoreUnavailable, "the usage store is unavailable")
+	if t.Provider.Spec.Billing == domain.BillingPayPerUse {
+		if e := h.Admission.Exhausted(budgets(rq)...); e != nil {
+			return 0, e
+		}
+		if !h.Usage.Available() {
+			return 0, domain.NewError(domain.CodeUsageStoreUnavailable, "the usage store is unavailable")
+		}
 	}
 	if t.Provider.Disabled {
 		return 0, noTarget(rq)
@@ -677,14 +697,18 @@ func message(status int, body []byte) string {
 // finish ends one provider call (design section 11, point 2) after its last
 // byte, its failure or a panic: the circuit's permit goes back with the
 // call's verdict (None on a panic), then the usage record (phase-3 design
-// section 4), whose input plus output tokens count in tpm (LIM-5), which the
-// counters count and the writer stores, and one log line, without the
-// credential.
+// section 4), whose input plus output tokens count in tpm (LIM-5) and whose
+// cost, for a pay_per_use call, is charged to the budgets before done
+// releases the slot (LIM-4), which the counters count and the writer stores,
+// and one log line, without the credential.
 func (h *handler) finish(rq *request, a *attempt) {
 	a.ended = h.Config.Now()
 	h.breakers.Release(a.target.ID, a.gen, a.end.breaker)
 	a.rec = usage.NewRecord(h.usageCall(rq, a))
 	h.Admission.Tokens(a.rec.InputTokens+a.rec.OutputTokens, a.ended, scopeNames(rq)...)
+	if a.rec.Billing == domain.BillingPayPerUse && a.rec.CostUSD != nil {
+		h.warn(rq, h.Admission.Spend(*a.rec.CostUSD, a.ended, scopeNames(rq), budgets(rq)))
+	}
 	h.count(&a.rec)
 	h.Usage.Add(a.rec)
 	attrs := []any{"request_id", rq.id, "trace_id", rq.traceID, "key", rq.key.Name, "alias", rq.alias, "attempt", a.n,
@@ -710,6 +734,23 @@ func (h *handler) finish(rq *request, a *attempt) {
 		attrs = append(attrs, "usage", a.obs.Usage)
 	}
 	h.Log.Info("attempt", append(attrs, "visible_bytes", a.obs.VisibleBytes, "tool_calls", a.obs.ToolCalls, "stripped", a.obs.Stripped)...)
+}
+
+// warn sends each crossing of a budget to the log, as one WARN line, to the
+// audit, as a row through the writer, and to the counters (kick-off section
+// 10, LIM-3), keyed by the key or the alias it is about.
+func (h *handler) warn(rq *request, ws []admission.Warning) {
+	for _, w := range ws {
+		h.Log.Warn(strings.ReplaceAll(w.Event, "_", " "), "request_id", rq.id, "scope", w.Scope, "period", w.Period)
+		h.Usage.Audit(w)
+		c := usage.Counter{Name: w.Event}
+		if name, ok := strings.CutPrefix(w.Scope, "key:"); ok {
+			c.Key = name
+		} else if alias, ok := strings.CutPrefix(w.Scope, "model:"); ok {
+			c.Model = alias
+		}
+		h.Counters.Add(c, 1)
+	}
 }
 
 // usageCall is attempt a of rq as the usage record reads it: its error is

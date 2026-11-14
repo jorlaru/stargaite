@@ -39,14 +39,27 @@ const (
 
 // logBuffer is a log destination that concurrent requests may share.
 type logBuffer struct {
-	mu sync.Mutex
-	b  bytes.Buffer
+	mu   sync.Mutex
+	b    bytes.Buffer
+	hook func(line []byte) // when set, sees each line as it is written
 }
 
 func (l *logBuffer) Write(p []byte) (int, error) {
 	l.mu.Lock()
+	hook := l.hook
+	n, err := l.b.Write(p)
+	l.mu.Unlock()
+	if hook != nil {
+		hook(p)
+	}
+	return n, err
+}
+
+// setHook sets the hook.
+func (l *logBuffer) setHook(hook func(line []byte)) {
+	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.b.Write(p)
+	l.hook = hook
 }
 
 func (l *logBuffer) String() string {
@@ -64,6 +77,8 @@ type fixture struct {
 	flight      *sync.WaitGroup // the data plane's requests in flight
 	st          *store.Store
 	counters    *usage.Counters
+	limits      *admission.State
+	cfg         *config.Service
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -104,11 +119,11 @@ func newFixture(t *testing.T) *fixture {
 	}
 	flight := &sync.WaitGroup{}
 	logger := slog.New(slog.NewJSONHandler(log, nil))
-	records, counters := usage.NewWriter(st.Write, logger), &usage.Counters{}
+	records, counters, limits := usage.NewWriter(st.Write, logger), &usage.Counters{}, admission.New(cfg.Now)
 	t.Cleanup(func() { records.Close(context.Background()) }) // before the store closes
 	return &fixture{admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(adminKey)), Log: logger, Usage: st.Read()}),
 		Handler(Deps{Config: cfg, Log: logger, Clients: [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)},
-			Flight: flight, Usage: records, Admission: admission.New(cfg.Now), Counters: counters, Version: "test-version"}), now, log, flight, st, counters}
+			Flight: flight, Usage: records, Admission: limits, Counters: counters, Version: "test-version"}), now, log, flight, st, counters, limits, cfg}
 }
 
 // pastWindow moves the service clock past the RES-2 window of 30 s, so the

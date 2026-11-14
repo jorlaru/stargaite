@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,6 +28,10 @@ type State struct {
 	Secrets  []KeySecret      // the secrets of the keys in Doc
 	Revoked  map[string]int64 // key name -> revoked_at, in Unix milliseconds
 	Revision int64
+	// NeverSince is, for every scope ("global", "key:<name>",
+	// "model:<alias>") whose budget is never, the revision its counter
+	// started at: its budget_totals row (LIM-2). Only Commit sets it.
+	NeverSince map[string]int64
 }
 
 // KeySecret is one secret of a key: the SHA-256 of the full token, never the
@@ -88,10 +93,39 @@ type Service struct {
 // read or a row that cannot be decoded is an error. Start-up resolves the
 // credentials through env but no host name: SEC-4 resolves only what a change
 // sets, and dial time is the authority.
+//
+// A never budget declared before migration 002 has no budget_totals row:
+// before the first publish, Open writes one at the current revision with a
+// total of 0 for each, so every published never budget has a row and a
+// NeverSince entry (phase-3 design section 8).
 func Open(ctx context.Context, st *store.Store, env func() Env, now func() time.Time) (*Service, error) {
 	state, err := load(ctx, st.Read())
 	if err != nil {
 		return nil, fmt.Errorf("load the configuration: %w", err)
+	}
+	var missing []string
+	for _, scope := range neverScopes(&state.Doc) {
+		if _, ok := state.NeverSince[scope]; !ok {
+			missing = append(missing, scope)
+		}
+	}
+	if len(missing) > 0 {
+		err := st.Write(ctx, func(tx *sql.Tx) error {
+			for _, scope := range missing {
+				kind, name := scopeRow(scope)
+				if _, err := tx.Exec("INSERT OR IGNORE INTO budget_totals (scope_type, scope_name, cost_usd, since_revision) VALUES (?, ?, 0, ?)",
+					kind, name, state.Revision); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, fmt.Errorf("write the rows of never budgets: %w", err)
+		}
+		for _, scope := range missing {
+			state.NeverSince[scope] = state.Revision
+		}
 	}
 	e := env()
 	findings := append(Validate(&state.Doc), CheckResolved(ctx, &state.Doc, nil, e)...)
@@ -159,6 +193,7 @@ func (s *Service) Commit(ctx context.Context, ch Change) (Result, error) {
 	// between the commit and the publication.
 	if res.Changed {
 		next.Revision++
+		next.NeverSince = neverSince(old, next)
 	}
 	snap := build(next, env, findings)
 
@@ -182,6 +217,55 @@ func (s *Service) Commit(ctx context.Context, ch Change) (Result, error) {
 		res.Secrets = issued
 	}
 	return res, nil
+}
+
+// neverSince is the NeverSince of next, committed after old at its new
+// revision (LIM-2): a scope whose budget stays never keeps its revision, so
+// a limit_usd change keeps the counter; one whose budget becomes never, new
+// or from another interval, starts at next's revision; one whose never
+// budget is removed or changes interval has none.
+func neverSince(old, next *State) map[string]int64 {
+	was := map[string]bool{}
+	for _, scope := range neverScopes(&old.Doc) {
+		was[scope] = true
+	}
+	m := map[string]int64{}
+	for _, scope := range neverScopes(&next.Doc) {
+		since, ok := old.NeverSince[scope]
+		if !ok || !was[scope] {
+			since = next.Revision
+		}
+		m[scope] = since
+	}
+	return m
+}
+
+// neverScopes are the scopes of d whose budget is never, sorted.
+func neverScopes(d *domain.Document) []string {
+	never := func(b *domain.Budget) bool { return b != nil && b.ResetInterval == domain.ResetNever }
+	var scopes []string
+	if never(d.Settings.Budget) {
+		scopes = append(scopes, "global")
+	}
+	for name, k := range d.Keys {
+		if never(k.Budget) {
+			scopes = append(scopes, "key:"+name)
+		}
+	}
+	for name, m := range d.Models {
+		if never(m.Budget) {
+			scopes = append(scopes, "model:"+name)
+		}
+	}
+	slices.Sort(scopes)
+	return scopes
+}
+
+// scopeRow is the scope_type and scope_name of a budget_totals row for
+// scope: "global" and "", "key" and the key's name, "model" and the alias.
+func scopeRow(scope string) (kind, name string) {
+	kind, name, _ = strings.Cut(scope, ":")
+	return kind, name
 }
 
 // refuse writes the audit row of a refused change, unless it is a dry run,

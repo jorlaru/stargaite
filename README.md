@@ -12,7 +12,7 @@ synchronous and streamed, toward providers of the `anthropic` protocol, with the
 control of the alias, timeouts, fallback across an alias's targets, a circuit breaker per target, cancellation when a
 client goes away and a graceful stop (see [Resilience](#resilience)). Phase 3 has begun: every provider call leaves a
 usage record with its tokens and cost, and `usage show` sums them (see [Usage](#usage)); keys and aliases have rate
-and parallel limits (see [Limits](#limits)); budgets, quotas and telemetry follow. The full specification is [kick-off.md](kick-off.md); the designs are
+and parallel limits (see [Limits](#limits)) and USD budgets (see [Budgets](#budgets)); quotas and telemetry follow. The full specification is [kick-off.md](kick-off.md); the designs are
 [docs/design/phase-1.md](docs/design/phase-1.md), [docs/design/phase-2.md](docs/design/phase-2.md) and
 [docs/design/phase-3.md](docs/design/phase-3.md).
 
@@ -97,6 +97,20 @@ in no limit and leaves no usage record; one that passed the limits and failed la
 until it ends, a stream until its last event, and gives them back on an error, a client gone or a stop alike. Minutes
 are counted in steps of one second, so a window may hold up to a second more than 60 s of traffic, never less, and
 counts start empty after a restart.
+
+## Budgets
+
+A key, an alias and the instance can each have a USD budget: `--budget limit_usd=5,reset_interval=daily` on
+`keys create|set`, `models add|set` and `settings set` (`daily` and `monthly` start again at 00:00 UTC, on day 1 for
+`monthly`; `never` keeps a running total). Budgets count only `pay_per_use` calls with a cost. Once a budget's spend
+reaches its limit, the `pay_per_use` targets of the requests in its scope are passed over: the alias's next target of
+another billing serves, and with none left the request gets `402 budget_exceeded`, naming only the kind of budget,
+before any provider is called. A budget never blocks a `subscription` or `none` target. Spend is charged when a call
+ends, so the calls in flight when a limit is crossed may pass it by their cost: at most the cost of the calls in flight
+in the budget's scope; for a key, its parallel slots (5 by default) times one capped answer; an alias or the instance
+is bounded only when it sets `max_parallel_requests` and its targets cap output. Reaching 80 % and 100 % of a budget writes one `WARN` log line, one audit row and one counter
+each per period. Spend survives a restart, as it is rebuilt from the stored records; a `never` budget's total starts
+at zero when it is set or its interval changes, and is kept when only its limit changes.
 
 ## Anthropic clients
 

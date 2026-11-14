@@ -714,6 +714,68 @@ func TestShutdown(t *testing.T) {
 	uncounted(t, s)
 }
 
+// TestHalfOpenCut is RES-2 for a trial cut by the client or by the shutdown
+// (design section 10): the cut tells the breaker nothing, so its permit comes
+// back and the circuit stays half-open. Both trials of a half-open bad/m are
+// cut while a third request is refused; then a passing and a failing request
+// are both admitted as trials, and the failure reopens the circuit. A cut
+// counted as a pass would have closed it, one counted as a failure reopened it.
+func TestHalfOpenCut(t *testing.T) {
+	for _, stopping := range []bool{false, true} {
+		t.Run(map[bool]string{false: "client gone", true: "shutdown"}[stopping], func(t *testing.T) {
+			s, _, yaml := newResilience(t)
+			s.apply(t, longTimers.Replace(yaml))
+			base, halt := context.WithCancelCause(context.Background())
+			defer halt(nil)
+			srv := httptest.NewUnstartedServer(s.data)
+			srv.Config.BaseContext = func(net.Listener) context.Context { return base }
+			srv.Start()
+			t.Cleanup(srv.Close)
+			ask := func(why string, want int) {
+				t.Helper()
+				before := len(s.mock.Calls())
+				resp, got := s.post(t, chatBody("bad-one", ""))
+				if calls := len(s.mock.Calls()) - before; resp.StatusCode != want || calls != map[bool]int{true: 0, false: 1}[want == 503] {
+					t.Fatalf("%s: %d %s, %d calls", why, resp.StatusCode, got, calls)
+				}
+			}
+			for range 5 {
+				s.mock.Script(mockprovider.Step{Status: 500})
+				ask("a failure", 502)
+			}
+			ask("five failures", 503)
+			s.now.Add(20_000)
+			trials := make([]*inflight, 2)
+			for i := range trials {
+				s.mock.Script(mockprovider.Step{Delay: time.Minute})
+				trials[i] = send(t, srv.URL, s.token, "/v1/chat/completions", chatBody("bad-one", ""))
+				reached(t, s.mock, 6+i)
+			}
+			ask("both trials out", 503)
+			if stopping {
+				halt(ErrStopping)
+			} else {
+				for _, f := range trials {
+					f.cancel()
+				}
+			}
+			for i, f := range trials {
+				if c := ended(t, s.mock, 5+i); !c.Cancelled {
+					t.Fatalf("trial %d was not cancelled", i+1)
+				}
+				if a := <-f.answer; stopping && a.status != 500 || !stopping && a.err == nil {
+					t.Fatalf("trial %d: %d %q %v", i+1, a.status, a.body, a.err)
+				}
+			}
+			waitFlight(t, s.fixture)
+			ask("a trial after the cuts", 200)
+			s.mock.Script(mockprovider.Step{Status: 500})
+			ask("a failing trial", 502)
+			ask("reopened", 503)
+		})
+	}
+}
+
 // stalledWriter is a client that stops reading once stall is closed: from
 // then on a write blocks until its write deadline passes, as on a socket
 // whose buffers are full. wrote is closed by the first write.

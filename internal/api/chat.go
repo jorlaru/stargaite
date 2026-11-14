@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/jorlaru/stargaite/internal/adapters/anthropic"
@@ -70,6 +71,18 @@ type request struct {
 	attempts    []*attempt
 	err         *domain.Error // what the client got; nil on success
 	started     time.Time
+	deadline    sync.Mutex // held by infer's deadline hook and by writeDeadline
+	capped      bool       // the hook ran: the deadlines it set stay
+}
+
+// writeDeadline moves the write deadline of w to d unless infer's hook has
+// capped it, which the mutex makes atomic with the hook (design section 10).
+func (rq *request) writeDeadline(w http.ResponseWriter, d time.Time) {
+	rq.deadline.Lock()
+	defer rq.deadline.Unlock()
+	if !rq.capped {
+		_ = http.NewResponseController(w).SetWriteDeadline(d)
+	}
 }
 
 // attempt is one provider call.
@@ -158,10 +171,14 @@ func (h *handler) infer(ep domain.Endpoint) http.HandlerFunc {
 		// client gone), the read stops at once and a write gets 1 s, so the
 		// request ends within the drain wait (design section 10). The
 		// handler waits for a started f: on HTTP/2 the writer must not be
-		// touched once the handler has returned.
+		// touched once the handler has returned. No later move of the write
+		// deadline undoes the 1 s (writeDeadline).
 		fired := make(chan struct{})
 		stop := context.AfterFunc(r.Context(), func() {
 			defer close(fired)
+			rq.deadline.Lock()
+			defer rq.deadline.Unlock()
+			rq.capped = true
 			rc := http.NewResponseController(w)
 			_ = rc.SetReadDeadline(time.Now())
 			_ = rc.SetWriteDeadline(time.Now().Add(time.Second))
@@ -339,7 +356,7 @@ func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *c
 	defer timer.Stop()
 	// The server's WriteTimeout would otherwise cut an answer that comes later
 	// than it (design section 10); a stream moves it again per event.
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(wait + 5*time.Second))
+	rq.writeDeadline(w, time.Now().Add(wait+5*time.Second))
 
 	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodPost, out.URL, bytes.NewReader(out.Body))
 	var resp *http.Response
@@ -549,7 +566,7 @@ func (h *handler) stream(ctx context.Context, w http.ResponseWriter, rq *request
 		// not the provider's silence; once the context ends, infer's 1 s stays.
 		idle.Stop()
 		if ctx.Err() == nil {
-			_ = rc.SetWriteDeadline(time.Now().Add(silence + 5*time.Second))
+			rq.writeDeadline(w, time.Now().Add(silence+5*time.Second))
 		}
 		switch {
 		case errors.Is(err, transport.ErrEventTooLarge):

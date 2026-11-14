@@ -431,11 +431,18 @@ func (s *server) validate(w http.ResponseWriter, r *http.Request) {
 
 // showUsage answers usage show (USE-9, phase-3 design section 12) from the
 // store's read pool: since is a positive duration back from now on the
-// service clock, such as 24h (the default), or an RFC 3339 time; key, model
-// and target filter; by groups by key, model and target, comma-separated. A
+// service clock, such as 24h (the default), or an RFC 3339 time before now
+// and not before 1970 (completed_at is Unix milliseconds); key, model and target filter; by groups by key, model, target and
+// effort-sent, comma-separated; compare_previous adds the window before.
+// The published retention.usage_days decides where each window is read. A
 // read: not audited.
 func (s *server) showUsage(w http.ResponseWriter, r *http.Request) {
-	q, err := query(r, "since", "key", "model", "target", "by")
+	q, err := query(r, "since", "key", "model", "target", "by", "compare_previous")
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	compare, err := boolean(q, "compare_previous")
 	if err != nil {
 		s.fail(w, err)
 		return
@@ -448,10 +455,15 @@ func (s *server) showUsage(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case errDuration == nil && d > 0:
 			since = now.Add(-d)
-		case errTime == nil:
+		case errTime == nil && at.Before(now):
 			since = at
 		default:
-			s.fail(w, invalid("since must be a positive duration such as 24h, or an RFC 3339 time"))
+			since = time.Time{}
+		}
+		// completed_at is Unix milliseconds: a window cannot start before 1970,
+		// whichever form named it.
+		if since.Before(time.Unix(0, 0)) {
+			s.fail(w, invalid("since must be a positive duration such as 24h, or an RFC 3339 time before now, and not before 1970"))
 			return
 		}
 	}
@@ -459,7 +471,8 @@ func (s *server) showUsage(w http.ResponseWriter, r *http.Request) {
 	if v := q.Get("by"); v != "" {
 		by = strings.Split(v, ",")
 	}
-	rep, err := usage.Show(r.Context(), s.usage, usage.Query{Since: since, Key: q.Get("key"), Model: q.Get("model"), Target: q.Get("target"), By: by}, now)
+	rep, err := usage.Show(r.Context(), s.usage, usage.Query{Since: since, Key: q.Get("key"), Model: q.Get("model"), Target: q.Get("target"), By: by,
+		ComparePrevious: compare}, now, s.cfg.Snapshot().Settings.Retention.UsageDays)
 	if err != nil {
 		s.fail(w, err)
 		return

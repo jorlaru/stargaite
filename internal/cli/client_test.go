@@ -153,6 +153,8 @@ func TestCommandWalk(t *testing.T) {
 		"usage show": {
 			{nil, 0}, {[]string{"--since", "1h", "--key", "k1", "--model", "fast", "--target", "walk1/up", "--by", "key,model,target"}, 0},
 			{[]string{"--since", "2026-11-01T00:00:00Z"}, 0}, {[]string{"--since", "soon"}, 1}, {[]string{"--by", "colour"}, 1},
+			{[]string{"--by", "key,model,effort-sent", "--compare-previous"}, 0}, {[]string{"--compare-previous=false"}, 0},
+			{[]string{"--since", "2400h", "--by", "effort-sent"}, 1},
 		},
 		"export": {{nil, 0}},
 		"apply": {
@@ -239,6 +241,9 @@ func TestRequests(t *testing.T) {
 		{[]string{"apply", "--prune", "-f", file, "--dry-run"}, "POST", "/admin/v1/apply?dry_run=true&prune=true", "version: 1\n"},
 		{[]string{"apply", "--prune", "-f", file, "--yes"}, "POST", "/admin/v1/apply?dry_run=false&prune=true", "version: 1\n"},
 		{[]string{"validate"}, "GET", "/admin/v1/validate", ""},
+		{[]string{"usage", "show"}, "GET", "/admin/v1/usage", ""},
+		{[]string{"usage", "show", "--by", "key,effort-sent", "--compare-previous"}, "GET", "/admin/v1/usage?by=key%2Ceffort-sent&compare_previous=true", ""},
+		{[]string{"usage", "show", "--compare-previous=false", "--since", "1h"}, "GET", "/admin/v1/usage?compare_previous=false&since=1h", ""},
 		{[]string{"providers", "presets"}, "GET", "/admin/v1/presets", ""},
 		{[]string{"providers", "list"}, "GET", "/admin/v1/providers", ""},
 		{[]string{"providers", "add", "openrouter"}, "POST", "/admin/v1/providers", `{"name":"openrouter"}`},
@@ -548,6 +553,38 @@ body        {}
 `
 	if r.code != 0 || r.stdout != want {
 		t.Errorf("exit %d, stderr %q, stdout\n%s\nwant\n%s", r.code, r.stderr, r.stdout, want)
+	}
+}
+
+// TestUsageRender: usage show prints a table per window, each after a line
+// with its span and source; "-" for what does not apply or is unknown, such
+// as the counts and percentiles a daily window does not hold; text from the
+// server never reaches the terminal raw.
+func TestUsageRender(t *testing.T) {
+	_, vars := recorder(t, http.StatusOK, `{"source":"records","since":"2026-11-13T12:00:00Z","until":"2026-11-14T12:00:00Z","groups":[`+
+		`{"billing":"pay_per_use","key":"a","effort_sent":"low","requests":12,"errors":1,"estimated":1,"unpriced":0,"length":0,"empty":0,"input_tokens":120,`+
+		`"cache_read_tokens":24,"cache_write_tokens":0,"output_tokens":1055,"reasoning_tokens":451,"cost_usd":3,"output_tokens_p50":5,"output_tokens_p90":9,`+
+		`"reasoning_tokens_p50":50,"reasoning_tokens_p90":90},`+
+		`{"billing":"subscription","key":"b\u001b","effort_sent":"-","requests":1,"errors":0,"estimated":0,"unpriced":0,"length":1,"empty":1,"input_tokens":10,`+
+		`"cache_read_tokens":0,"cache_write_tokens":0,"output_tokens":7,"reasoning_tokens":0,"output_tokens_p50":7,"output_tokens_p90":7}],`+
+		`"previous":{"source":"daily","since":"2026-11-12T00:00:00Z","until":"2026-11-13T00:00:00Z","groups":[`+
+		`{"billing":"pay_per_use","requests":3,"errors":0,"input_tokens":30,"cache_read_tokens":0,"cache_write_tokens":0,"output_tokens":15,"reasoning_tokens":0,"cost_usd":0.75}]}}`+"\n")
+	r := runMain(vars, "usage", "show", "--compare-previous")
+	want := `window 2026-11-13T12:00:00Z to 2026-11-14T12:00:00Z, from the records
+billing       key      effort_sent  requests  errors  input  cache_read  cache_write  output  reasoning  estimated  cost_usd  unpriced  length  empty  output_p50  output_p90  reasoning_p50  reasoning_p90
+pay_per_use   a        low          12        1       120    24          0            1055    451        1          3         0         0       0      5           9           50             90
+subscription  "b\x1b"  -            1         0       10     0           0            7       0          0          -         0         1       1      7           7           -              -
+
+previous window 2026-11-12T00:00:00Z to 2026-11-13T00:00:00Z, from the daily sums, whole UTC days: no estimated, unpriced, length, empty or percentiles
+billing      requests  errors  input  cache_read  cache_write  output  reasoning  estimated  cost_usd  unpriced  length  empty  output_p50  output_p90  reasoning_p50  reasoning_p90
+pay_per_use  3         0       30     0           0            15      0          -          0.75      -         -       -      -           -           -              -
+`
+	if r.code != 0 || r.stdout != want {
+		t.Errorf("exit %d, stderr %q, stdout\n%s\nwant\n%s", r.code, r.stderr, r.stdout, want)
+	}
+	_, vars = recorder(t, http.StatusOK, `{"source":"records","since":"2026-11-13T12:00:00Z","until":"2026-11-14T12:00:00Z","groups":[]}`+"\n")
+	if r := runMain(vars, "usage", "show"); r.code != 0 || r.stdout != "window 2026-11-13T12:00:00Z to 2026-11-14T12:00:00Z, from the records\nno usage in the window\n" {
+		t.Errorf("an empty window: exit %d, stdout %q", r.code, r.stdout)
 	}
 }
 

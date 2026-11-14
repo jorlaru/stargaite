@@ -140,8 +140,10 @@ func TestQuickStart(t *testing.T) {
 	if srv == nil || mock == nil || token == "" || !answered || shown == "" {
 		t.Fatalf("the quick start did not start the proxy and the mock provider, create a key, get an answer and show the usage")
 	}
-	// The mock's usage, 1 input and 2 output tokens, at 1 and 2 USD per million.
-	if !regexp.MustCompile(`(?m)^pay_per_use +1 +0 +1 +0 +0 +2 +0 +0 +0\.000005 +0 *$`).MatchString(shown) {
+	// The mock's usage, 1 input and 2 output tokens, at 1 and 2 USD per million;
+	// no length finish, no empty answer, an output median and p90 of 2 and no
+	// reasoning reported.
+	if !regexp.MustCompile(`(?m)\Awindow \S+ to \S+, from the records\n.*\npay_per_use +1 +0 +1 +0 +0 +2 +0 +0 +0\.000005 +0 +0 +0 +2 +2 +- +- *$`).MatchString(shown) {
 		t.Errorf("usage show printed:\n%s", shown)
 	}
 	usage := func() {
@@ -163,6 +165,29 @@ func TestQuickStart(t *testing.T) {
 		if g := rep.Groups[0]; g.Billing != "pay_per_use" || g.Requests != 1 || g.Errors != 0 || g.Estimated != 0 || g.Unpriced != 0 ||
 			g.Input != 1 || g.Output != 2 || g.CostUSD == nil || *g.CostUSD != 5e-6 {
 			t.Errorf("usage show --json: %s", out)
+		}
+		// AC-35: the medians of two windows, by key, alias and effort sent,
+		// from the local store alone.
+		type window struct {
+			Source string `json:"source"`
+			Groups []struct {
+				Key        string `json:"key"`
+				Model      string `json:"model"`
+				EffortSent string `json:"effort_sent"`
+				OutputP50  *int64 `json:"output_tokens_p50"`
+			} `json:"groups"`
+		}
+		var compared struct {
+			window
+			Previous *window `json:"previous"`
+		}
+		out = cli("usage", "show", "--since", "1h", "--by", "key,model,effort-sent", "--compare-previous", "--json")
+		if err := json.Unmarshal([]byte(out), &compared); err != nil || compared.Source != "records" || len(compared.Groups) != 1 ||
+			compared.Previous == nil || compared.Previous.Source != "records" || len(compared.Previous.Groups) != 0 {
+			t.Fatalf("usage show --compare-previous --json: %s", out)
+		}
+		if g := compared.Groups[0]; g.Key != "my-agent" || g.Model != "fast" || g.EffortSent != "-" || g.OutputP50 == nil || *g.OutputP50 != 2 {
+			t.Errorf("usage show --compare-previous --json: %s", out)
 		}
 	}
 	usage()

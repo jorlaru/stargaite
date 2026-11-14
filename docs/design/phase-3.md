@@ -324,6 +324,18 @@ Settled in C23:
 - **Close while unavailable.** Once `Close` begins, a retry waits `retryWait` from that moment instead of the rest of `unavailableRetry`, so the 10 s flush tries more than twice; otherwise `Close` is as settled in C22.
 - **Queue.** `queueSize` stays a constant of 10,000; the overflow test holds the first write, fills the queue and checks that the next `Add` is logged at critical level at once.
 
+Settled in C25:
+
+- **Report.** `Report` is `{Source, Since, Until, Groups, Previous *Report}`: each window carries its own source and the span `[since, until)` it read, so a previous window read from `usage_daily` is labelled apart from a current one read from records; `Previous []Group` could not say so. JSON adds `since`, `until` (RFC 3339, UTC) and `previous` (only with `--compare-previous`).
+- **Group.** `Group` gains `EffortSent` (`effort_sent`, only when grouped), `Length` (`length`), `Empty` (`empty`) and `OutputP50`, `OutputP90`, `ReasoningP50`, `ReasoningP90` (`output_tokens_p50`, `output_tokens_p90`, `reasoning_tokens_p50`, `reasoning_tokens_p90`). `Estimated`, `Unpriced`, `Length` and `Empty` are pointers: a records window always sets them, `0` included; a daily window leaves them out, because `usage_daily` does not hold them, and a figure it does not hold is absent, never `0`. A percentile is absent when no `2xx` record of the group with `tokens_source = 'provider'` reported the value (`reasoning_tokens` NULL is not reported; `output_tokens` always is).
+- **Percentiles.** Nearest rank: the value at rank `ceil(p·n/100)` of the group's ascending values, `(n + 1) / 2` for p50 and `(9n + 9) / 10` for p90 in integer arithmetic, ranked by `ROW_NUMBER() OVER (PARTITION BY <group>, ok ORDER BY …)` in the same statement as the sums.
+- **No effort sent.** Grouped by `effort-sent`, records whose `effort_sent` is NULL form the group `-`, as `models explain` writes an absent layer; `none` stays the value sent to turn reasoning off.
+- **Retention boundary.** A window is read from records when it starts at or after `now − usage_days` (calendar days, UTC), the published `retention.usage_days`; otherwise all of it is read from `usage_daily`. Retention itself is phase 4 (USE-11); the boundary is applied now so that answers do not change when it arrives.
+- **Whole days.** A daily window covers whole UTC days: from 00:00 of the day it starts, through today when it ends now (today's row so far), else up to 00:00 of the day it ends. `since` and `until` in the answer show the span read; a daily previous window therefore ends where a daily current window begins, and never overlaps it. A previous window that lies within one UTC day (possible only with a `usage_days` of 1) reads no day, and says so with `since` equal to `until`.
+- **Previous across the boundary.** `--compare-previous` reads the window `[since − (now − since), since)`; when it starts before the retention it is read from `usage_daily` as above and labelled `source: daily`, while the current window may still be records; no window is split between the two sources, which would join figures of different kinds.
+- **Effort-sent in the daily fallback.** `--by effort-sent` is refused (`400 invalid_request`, naming `usage_days`) when the current window, or with `--compare-previous` the previous one, would be read from `usage_daily`, rather than silently grouping without it; AC-35 holds for windows within the retention.
+- **Daily cost.** `usage_daily.cost_usd` adds a NULL cost as `0`, so a daily `pay_per_use` group whose sum is `0` shows no cost: it may be unpriced calls, and `0` would be an invented figure. A positive sum is shown; as in a records window, unpriced calls are not in it, and a daily window cannot count them.
+
 ## 6. Tokens and cost
 
 **Normalization (USE-3)**, in the adapters' single observation pass:
@@ -619,6 +631,11 @@ Settled in C22:
 - **Admin.** `admin.Deps` is `{Config, KeyHash, Log, Usage}` in C22; `Admission` and `Spans` join with C26 and C29. `GET /admin/v1/usage` takes `since`, `key`, `model`, `target` and `by`, each at most once (`compare_previous` comes with C25); without `since` the window is the last 24 h on the service clock, and a duration that is not positive is a `400`.
 - **CLI.** `usage show` sends only the flags given; without `--json` it prints one table, a header and a row per group, with `-` for a cost that does not apply or is unknown, and `no usage in the window` when there is none.
 - **Stop.** With `flushWait`, a supervisor must allow `serve` more than 50 s to stop: 30 s grace, up to 5 s drain, and the 10 s flush plus the store's 5 s busy timeout, since `Close` waits for the write in progress; the README's `docker stop` example now gives `-t 60`.
+
+Settled in C25:
+
+- **Admin.** `GET /admin/v1/usage` takes `compare_previous` once, `true` or `false` (a bare or other value is a `400`), and `by` takes `effort-sent`. An RFC 3339 `since` must be before now on the service clock, a duration must be positive, and the window they name must not start before 1970-01-01T00:00:00Z, whichever form named it, as `completed_at` is Unix milliseconds (else `400`; an older one put the previous window out of range), so no window is empty or inverted by construction. The route passes the published `retention.usage_days` to `Show`.
+- **CLI.** `usage show --compare-previous` sends `compare_previous` only when given (`--compare-previous=false` sends `false`). Without `--json` each window prints a line `window <since> to <until>, from the records` (or `from the daily sums, whole UTC days: …`), then its table or `no usage in the window`; the previous window follows after a blank line as `previous window …`. The columns add `effort_sent` when grouped, then `length`, `empty`, `output_p50`, `output_p90`, `reasoning_p50`, `reasoning_p90`; `-` marks a value absent from the answer.
 
 ## 13. Interfaces fixed now for phase 4
 

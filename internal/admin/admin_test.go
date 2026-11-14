@@ -787,8 +787,10 @@ func TestMergePatch(t *testing.T) {
 
 // TestUsageShow is GET /admin/v1/usage (phase-3 design section 12): since
 // is a duration back from the service clock, 24h by default, or an RFC 3339
-// time; key, model and target filter, by groups; a malformed since or by, or
-// an unknown or repeated parameter, is a 400. The read is not audited.
+// time before now and not before 1970; key, model and target filter, by groups, compare_previous
+// adds the window before; a malformed since, by or compare_previous, an
+// effort-sent grouping of a window older than usage_days, or an unknown or
+// repeated parameter, is a 400. The read is not audited.
 func TestUsageShow(t *testing.T) {
 	f := newFixture(t)
 	insert := func(id, key string, completed int64) {
@@ -827,7 +829,32 @@ func TestUsageShow(t *testing.T) {
 			t.Errorf("%q: %d %s", query, w.Code, w.Body)
 		}
 	}
-	for _, query := range []string{"?since=soon", "?since=-1h", "?since=0s", "?by=effort-sent", "?by=key,key", "?colour=blue", "?key=a&key=b"} {
+	// compare_previous adds the window before, with its own source and span; a
+	// window older than usage_days (90 by default) is read from usage_daily.
+	if err := f.st.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO usage_daily (day, key_name, model, target, billing, requests, input_tokens) VALUES ('2026-07-01', 'k1', 'fast', 'p/m', 'pay_per_use', 3, 30)`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	grouped := func(key string) string {
+		return `{"billing":"pay_per_use","key":"` + key + `","effort_sent":"-","requests":1,"errors":0,"estimated":0,"unpriced":0,"length":0,"empty":0,` +
+			`"input_tokens":10,"cache_read_tokens":0,"cache_write_tokens":0,"output_tokens":5,"reasoning_tokens":0,"cost_usd":0.5,"output_tokens_p50":5,"output_tokens_p90":5}`
+	}
+	for query, want := range map[string]string{
+		"?since=1h&by=key,effort-sent&compare_previous=true": `{"source":"records","since":"2026-09-21T13:13:20Z","until":"2026-09-21T14:13:20Z","groups":[` + grouped("k1") +
+			`],"previous":{"source":"records","since":"2026-09-21T12:13:20Z","until":"2026-09-21T13:13:20Z","groups":[` + grouped("k2") + `]}}`,
+		"?since=2400h&compare_previous=false": `{"source":"daily","since":"2026-06-13T00:00:00Z","until":"2026-09-21T14:13:20Z","groups":[` +
+			`{"billing":"pay_per_use","requests":3,"errors":0,"input_tokens":30,"cache_read_tokens":0,"cache_write_tokens":0,"output_tokens":0,"reasoning_tokens":0}]}`,
+	} {
+		w := f.as(t, "Bearer "+testKey, http.MethodGet, "/admin/v1/usage"+query, nil)
+		if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != want {
+			t.Errorf("%q: %d %s\nwant %s", query, w.Code, w.Body, want)
+		}
+	}
+	for _, query := range []string{"?since=soon", "?since=-1h", "?since=0s", "?since=2026-09-21T14:13:20Z", "?by=effort", "?by=key,key", "?colour=blue",
+		"?key=a&key=b", "?compare_previous=maybe", "?compare_previous", "?since=2400h&by=effort-sent", "?since=1500h&by=effort-sent&compare_previous=true",
+		"?since=1969-12-31T23:59:59Z", "?since=0100-01-01T00:00:00Z&compare_previous=true", "?since=600000h", "?since=2562047h&compare_previous=true"} {
 		if w := f.as(t, "Bearer "+testKey, http.MethodGet, "/admin/v1/usage"+query, nil); w.Code != http.StatusBadRequest {
 			t.Errorf("%q: %d %s", query, w.Code, w.Body)
 		}
@@ -835,5 +862,15 @@ func TestUsageShow(t *testing.T) {
 	var audited int
 	if err := f.st.Read().QueryRow("SELECT COUNT(*) FROM audit").Scan(&audited); err != nil || audited != 0 {
 		t.Errorf("%d audit rows, error %v", audited, err)
+	}
+	// The published usage_days decides the source: with 1, a 48h window is
+	// read from usage_daily.
+	if w := f.do(t, http.MethodPatch, "/admin/v1/settings", []byte(`{"retention":{"usage_days":1}}`)); w.Code != http.StatusOK {
+		t.Fatalf("usage_days 1: %d %s", w.Code, w.Body)
+	}
+	w := f.do(t, http.MethodGet, "/admin/v1/usage?since=48h", nil)
+	var rep struct{ Source, Since string }
+	if err := json.Unmarshal(w.Body.Bytes(), &rep); err != nil || w.Code != http.StatusOK || rep.Source != "daily" || rep.Since != "2026-09-19T00:00:00Z" {
+		t.Errorf("since=48h with usage_days 1: %d %s", w.Code, w.Body)
 	}
 }

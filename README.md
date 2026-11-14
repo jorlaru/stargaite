@@ -72,8 +72,15 @@ other target), `subscription` and `none` targets keep serving, and records wait 
 writer retries every 5 s; a record that finds the queue full goes to the log as one `CRITICAL` line.
 
 `./stargaite usage show` sums the records of a window (`--since 24h` by default, or an RFC 3339 time) per billing mode,
-filtered with `--key`, `--model` and `--target` and grouped with `--by key,model,target`: requests, errors, each kind
-of token, estimated calls, the cost of `pay_per_use` calls and the unpriced ones. `--json` gives the same as JSON.
+filtered with `--key`, `--model` and `--target` and grouped with `--by key,model,target,effort-sent`: requests,
+errors, each kind of token, estimated calls, the cost of `pay_per_use` calls and the unpriced ones, answers cut at a
+limit (`finish_reason` `length` or the like), empty answers, and the median and 90th percentile of output and
+reasoning tokens over the successful calls whose provider reported them. `--compare-previous` adds the window of the
+same length before it; `--by effort-sent` with it shows whether reasoning tokens move with the effort sent. It reads
+the records within `usage_days` (90 by default; deleting older ones comes in a later phase): a window that starts
+earlier is answered from the daily sums, over whole UTC days and without the counts and percentiles they do not hold
+(shown as `-`), and cannot be grouped by effort sent.
+`--json` gives the same as JSON, with each window's `source` (`records` or `daily`), `since` and `until`.
 
 ## Anthropic clients
 

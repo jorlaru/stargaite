@@ -239,13 +239,17 @@ var commands = []command{
 		{"key", kindString, "", "only this key's records"},
 		{"model", kindString, "", "only this alias's records"},
 		{"target", kindString, "", "only this target's records"},
-		{"by", kindString, "", "group by key, model and target, comma-separated, such as key,model"},
+		{"by", kindString, "", "group by key, model, target and effort-sent, comma-separated, such as key,model,effort-sent"},
+		{"compare-previous", kindBool, "", "also show the window of equal length before it"},
 	}, request: func(in input) (string, string, any) {
 		q := url.Values{}
 		for _, name := range []string{"since", "key", "model", "target", "by"} {
 			if in.set[name] {
 				q.Set(name, *in.flags[name])
 			}
+		}
+		if in.set["compare-previous"] {
+			q.Set("compare_previous", strconv.FormatBool(*in.bools["compare-previous"]))
 		}
 		if len(q) == 0 {
 			return http.MethodGet, "/usage", nil

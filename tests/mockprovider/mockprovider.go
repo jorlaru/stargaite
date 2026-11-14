@@ -28,11 +28,15 @@ type Step struct {
 	Cut    bool          // after the body or the chunks, abort the connection
 }
 
-// Call is one request as received: the body holds its exact bytes.
+// Call is one request as received: the body holds its exact bytes. Ended
+// and Cancelled are set when the handler returns, so a test can measure when
+// the caller's side of a call ended (RES-5).
 type Call struct {
 	Method, Path, Query string // Query is the raw query, without "?"
 	Header              http.Header
 	Body                []byte
+	Ended               time.Time // when the handler returned; zero while it runs
+	Cancelled           bool      // the request's context ended before the reply was complete
 }
 
 // Server is an http.Handler; it is safe for concurrent use.
@@ -90,6 +94,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	s.mu.Lock()
 	s.calls = append(s.calls, Call{Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery, Header: r.Header.Clone(), Body: body})
+	i := len(s.calls) - 1
+	cancelled := false
+	// Also on a Cut, which aborts the handler with a panic.
+	defer func() {
+		s.mu.Lock()
+		s.calls[i].Ended, s.calls[i].Cancelled = time.Now(), cancelled
+		s.mu.Unlock()
+	}()
 	def, known := defaults[r.URL.Path]
 	var step *Step
 	if err == nil && known && r.Method == http.MethodPost && len(s.queue) > 0 {
@@ -106,7 +118,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	case step != nil:
-		reply(w, r, step)
+		reply(w, r, step, &cancelled)
 	default:
 		var req struct{ Stream bool }
 		if events := streams[r.URL.Path]; json.Unmarshal(body, &req) == nil && req.Stream && events != nil {
@@ -117,7 +129,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				step.Chunks = append(step.Chunks, []byte(e+"\n\n"))
 			}
-			reply(w, r, step)
+			reply(w, r, step, &cancelled)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -127,8 +139,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // reply answers with step. A step with Chunks defaults its Content-Type to
 // text/event-stream. A wait ends early, and the reply with it, when the
-// request's context ends.
-func reply(w http.ResponseWriter, r *http.Request, step *Step) {
+// request's context ends, and so does a Hang: either sets cancelled.
+func reply(w http.ResponseWriter, r *http.Request, step *Step, cancelled *bool) {
 	maps.Copy(w.Header(), step.Header)
 	if step.Chunks != nil && w.Header().Get("Content-Type") == "" {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -144,6 +156,7 @@ func reply(w http.ResponseWriter, r *http.Request, step *Step) {
 		case <-t.C:
 			return true
 		case <-r.Context().Done():
+			*cancelled = true
 			return false
 		}
 	}
@@ -166,6 +179,7 @@ func reply(w http.ResponseWriter, r *http.Request, step *Step) {
 	}
 	if step.Hang {
 		<-r.Context().Done()
+		*cancelled = true
 	}
 	if step.Cut {
 		panic(http.ErrAbortHandler)

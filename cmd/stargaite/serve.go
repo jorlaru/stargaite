@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -26,15 +27,17 @@ import (
 	"github.com/jorlaru/stargaite/internal/transport"
 )
 
-// shutdownGrace bounds how long in-flight requests may take to finish on a stop signal.
-const shutdownGrace = 30 * time.Second
-
 // The servers' read and write timeouts (SEC-6). A data-plane request clears
 // its read deadline once its body is read and moves its write deadline per
-// provider call (phase-2 design section 10); tests lower both.
+// provider call (phase-2 design section 10). On a stop signal, requests in
+// flight get shutdownGrace to finish (RES-6); those still running are then
+// stopped, and drainWait bounds the wait for them to end before the store
+// closes. Tests lower them.
 var (
 	serverReadTimeout  = 60 * time.Second
 	serverWriteTimeout = 60 * time.Second
+	shutdownGrace      = 30 * time.Second
+	drainWait          = 5 * time.Second
 )
 
 // serve runs the proxy until SIGINT or SIGTERM. Each flag falls back to its
@@ -146,12 +149,27 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 	}
 	ready := []any{"data_dir", *dataDir, "tls", tlsConfig != nil, "version", cli.Version, "revision", snap.Revision}
 	if code == 0 {
-		if err := runServers(ctx, log, tlsConfig, ready, []listener{
+		// Every request context derives from base: cancelling it stops the
+		// requests still running when the grace ends, and flight counts the
+		// inference requests whose done has not run yet.
+		base, halt := context.WithCancelCause(context.Background())
+		var flight sync.WaitGroup
+		if err := runServers(ctx, base, log, tlsConfig, ready, []listener{
 			{"admin", *adminAddr, admin.Handler(cfg, keyHash, log)},
 			{"data", *dataAddr, api.Handler(api.Deps{Config: cfg, Log: log, Clients: [2]*http.Client{
-				transport.NewClient(false, systemResolver), transport.NewClient(true, systemResolver)}})},
+				transport.NewClient(false, systemResolver), transport.NewClient(true, systemResolver)}, Flight: &flight})},
 		}); err != nil {
 			log.Error("server failed", "error", err.Error())
+			code = 1
+		}
+		halt(api.ErrStopping)
+		drained := make(chan struct{})
+		go func() { flight.Wait(); close(drained) }()
+		select {
+		case <-drained:
+		case <-time.After(drainWait):
+			// Their outcome may be lost: the store closes under them.
+			log.Error("requests still running after the drain wait", "drain_wait", drainWait.String())
 			code = 1
 		}
 	}
@@ -192,8 +210,11 @@ type listener struct {
 
 // runServers binds the listeners in order, logs the ready line with the
 // attributes of ready and the bound addresses, and serves until ctx is done or
-// a server fails; then it shuts every server down within shutdownGrace.
-func runServers(ctx context.Context, log *slog.Logger, tlsConfig *tls.Config, ready []any, ls []listener) error {
+// a server fails; then it shuts every server down: the listeners close at
+// once and requests in flight get shutdownGrace to finish. Every request
+// context derives from base. A grace that ends with requests still running
+// is logged, not an error: the caller stops them by cancelling base.
+func runServers(ctx, base context.Context, log *slog.Logger, tlsConfig *tls.Config, ready []any, ls []listener) error {
 	lns := make([]net.Listener, 0, len(ls))
 	defer func() {
 		for _, ln := range lns {
@@ -221,6 +242,7 @@ func runServers(ctx context.Context, log *slog.Logger, tlsConfig *tls.Config, re
 			IdleTimeout:       120 * time.Second,
 			MaxHeaderBytes:    64 << 10,
 			ErrorLog:          slog.NewLogLogger(log.With("listener", l.name).Handler(), slog.LevelWarn),
+			BaseContext:       func(net.Listener) context.Context { return base },
 		}
 		go func() {
 			var err error
@@ -242,8 +264,15 @@ func runServers(ctx context.Context, log *slog.Logger, tlsConfig *tls.Config, re
 	grace, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
 	done := make(chan error, len(srvs))
-	for _, srv := range srvs {
-		go func() { done <- srv.Shutdown(grace) }()
+	for i, srv := range srvs {
+		go func() {
+			err := srv.Shutdown(grace)
+			if errors.Is(err, context.DeadlineExceeded) {
+				log.Warn("requests still running when the grace ended: they are stopped", "listener", ls[i].name, "grace", shutdownGrace.String())
+				err = nil
+			}
+			done <- err
+		}()
 	}
 	for range srvs {
 		err = errors.Join(err, <-done)

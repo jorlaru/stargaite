@@ -4,12 +4,14 @@ An inference proxy for LLM providers: one OpenAI-compatible endpoint in front of
 client keys, budgets and limits, all held in an embedded store and changed through an admin API. One static binary,
 one data directory. MIT licensed.
 
-**Status: phase 2 in progress.** What works today: the store, the admin API and the CLI, providers (with eighteen
+**Status: phase 2 complete.** What works today: the store, the admin API and the CLI, providers (with eighteen
 built-in presets), targets, model aliases, client keys with rotation and revocation, `export`/`apply`/`validate`,
 `models explain`, `GET /v1/models`, and `POST /v1/chat/completions`, synchronous and streamed, toward providers of
 the `openai` protocol and of the `anthropic` protocol (translated to the Messages API), and `POST /v1/messages`,
 synchronous and streamed, toward providers of the `anthropic` protocol, with the parameter contract and reasoning
-control of the alias. Fallback arrives in the next steps of phase 2. The full specification is
+control of the alias, timeouts, fallback across an alias's targets, a circuit breaker per target, cancellation when a
+client goes away and a graceful stop (see [Resilience](#resilience)). Usage records, budgets, limits and telemetry
+arrive in phase 3. The full specification is
 [kick-off.md](kick-off.md); the designs are [docs/design/phase-1.md](docs/design/phase-1.md) and
 [docs/design/phase-2.md](docs/design/phase-2.md).
 
@@ -56,6 +58,18 @@ use the Anthropic envelope, `{"type":"error","error":{"type":...,"message":"<cod
 the `x-stargaite-error-code` header. A target of the `openai` protocol is skipped, so an alias with no other answers
 `422 endpoint_not_supported`. `./stargaite models explain <alias> --endpoint messages` shows the bytes it would send.
 
+## Resilience
+
+An alias lists up to three targets. A connection failure, a timeout, a `429` or a `5xx` from the provider moves the
+request to the next target, as long as nothing was sent to the client yet; the `x-stargaite-*` headers then describe
+the target that answered. Five such failures of a target within 30 s open its circuit for 20 s, during which it is
+passed over. A stream that fails after its first event ends with one error event in the format of its endpoint. When
+a client goes away, the provider call is cancelled at once. On `SIGTERM` (or `Ctrl-C`) `serve` stops accepting
+connections and gives the requests in flight up to 30 s to finish; any still running then gets `500 internal_error`
+with the message `server stopping`, as an error answer or as the stream's error event, and `serve` closes the store
+and exits `0`. A supervisor must allow it more than 35 s to stop (the 30 s, then up to 5 s for the requests
+stopped to end) before it kills it: `docker stop` waits 10 s unless given `-t`.
+
 ## The admin key and the data directory
 
 `serve` keeps everything in its data directory (`--data-dir`, else `STARGAITE_DATA_DIR`, else `./data`): the store,
@@ -95,7 +109,7 @@ docker run -d --name stargaite --read-only -v stargaite-data:/data -p 127.0.0.1:
   stargaite serve --listen 0.0.0.0:4000 --behind-tls-proxy
 curl -sS --retry 10 --retry-all-errors --retry-delay 1 http://127.0.0.1:4000/health/ready
 docker exec stargaite /stargaite settings show
-docker stop stargaite
+docker stop -t 40 stargaite
 ```
 
 Only the data plane leaves the container. The admin API stays on its loopback, and the CLI inside the container

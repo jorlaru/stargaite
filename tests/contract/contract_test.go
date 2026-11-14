@@ -1,8 +1,8 @@
 // Package contract runs the per-target cases of phase 2 against a live
 // provider through the proxy: a simple request, a stream, structured output
 // and tools when the target declares them, each declared level, a provider
-// error and, toward the anthropic protocol, /v1/messages with a thinking tool
-// loop (AC-02). It runs only when STARGAITE_CONTRACT_BASE_URL and
+// error, a client that goes away mid-stream (RES-5) and, toward the anthropic
+// protocol, /v1/messages with a thinking tool loop (AC-02). It runs only when STARGAITE_CONTRACT_BASE_URL and
 // STARGAITE_CONTRACT_API_KEY are set, so make ci and a fork with no secret
 // skip it (PUB-4, PUB-5); it costs tokens. The variables:
 //
@@ -17,6 +17,7 @@
 package contract
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -28,6 +29,7 @@ import (
 	"net/netip"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,6 +50,7 @@ type proxy struct {
 	token, key  string // the client token; the provider's credential, kept out of every message
 	doc         domain.Document
 	target      string
+	flight      *sync.WaitGroup // the data plane's requests in flight
 }
 
 func live(t *testing.T) *proxy {
@@ -87,10 +90,10 @@ func live(t *testing.T) *proxy {
 	log := slog.New(slog.DiscardHandler) // a provider's message may be logged; the test shows only redacted answers
 	p := &proxy{
 		admin: admin.Handler(cfg, sha256.Sum256([]byte(adminKey)), log),
-		data: api.Handler(api.Deps{Config: cfg, Log: log,
-			Clients: [2]*http.Client{transport.NewClient(false, resolve), transport.NewClient(true, resolve)}}),
-		key: key, target: "live/" + model,
+		key:   key, target: "live/" + model, flight: &sync.WaitGroup{},
 	}
+	p.data = api.Handler(api.Deps{Config: cfg, Log: log,
+		Clients: [2]*http.Client{transport.NewClient(false, resolve), transport.NewClient(true, resolve)}, Flight: p.flight})
 	// A cap on every alias: the anthropic protocol needs one (PAR-7), and
 	// the budgets of a thinking_budget target must stay below it (RSN-3).
 	// provider_default sends no effort unless the request has one, and is
@@ -226,6 +229,37 @@ func TestChat(t *testing.T) {
 	if status != http.StatusBadRequest && status != http.StatusNotFound && status != http.StatusUnprocessableEntity || !strings.Contains(string(body), `"code":"upstream_error"`) ||
 		h.Get("X-Stargaite-Target") != "live/stargaite-contract-no-such-model" {
 		t.Errorf("unknown upstream model: %d %s", status, p.show(body))
+	}
+}
+
+// TestCancel is RES-5 against the live provider: a client that goes away
+// after the first line of a stream ends the proxy's provider call, its
+// finish and done included, within 1 s; the request in flight is the only
+// one of this proxy.
+func TestCancel(t *testing.T) {
+	p := live(t)
+	srv := httptest.NewServer(p.data) // a real listener, so the client can go away
+	defer srv.Close()
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"live","stream":true,"messages":[{"role":"user","content":"Count from 1 to 500, one number per line."}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+p.token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if line, err := bufio.NewReader(resp.Body).ReadString('\n'); resp.StatusCode != http.StatusOK || err != nil {
+		t.Fatalf("stream: %d %s: %v", resp.StatusCode, p.show([]byte(line)), err)
+	}
+	_ = resp.Body.Close() // before the end of the body: the connection closes
+	ended := make(chan struct{})
+	go func() { p.flight.Wait(); close(ended) }()
+	select {
+	case <-ended:
+	case <-time.After(time.Second):
+		t.Fatal("the provider call did not end within 1 s of the client going away")
 	}
 }
 

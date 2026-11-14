@@ -5,6 +5,7 @@ package api
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"maps"
@@ -48,7 +49,17 @@ type Deps struct {
 	Config  *config.Service
 	Log     *slog.Logger
 	Clients [2]*http.Client // [0] public addresses only, [1] allow_private_network (SEC-4)
+	// Flight counts the authenticated inference requests not yet done: serve
+	// waits for it before it closes the store (RES-6).
+	Flight *sync.WaitGroup
 }
+
+// ErrStopping is the cause serve cancels the server's base context with when
+// the shutdown grace ends (RES-6): every provider call still running ends
+// with it and its request gets 500 internal_error "server stopping", as an
+// envelope or, on a committed stream, as the terminal event. A base context
+// cancelled with another cause is a client gone.
+var ErrStopping = errors.New("server stopping")
 
 type handler struct {
 	Deps

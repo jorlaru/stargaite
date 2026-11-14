@@ -394,56 +394,6 @@ func TestChatStreamSlowClient(t *testing.T) {
 	}
 }
 
-// TestChatStreamClientGone (RES-5, the part of step C14): a client that goes
-// away mid-stream ends the provider's request, so neither its body nor a
-// goroutine is left, and finish and done each run once.
-func TestChatStreamClientGone(t *testing.T) {
-	released := make(chan struct{}, 1)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.Copy(io.Discard, r.Body)
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, "data: "+chunk("a")+"\n\n")
-		w.(http.Flusher).Flush()
-		<-r.Context().Done()
-		released <- struct{}{}
-	}))
-	t.Cleanup(upstream.Close)
-	yaml := strings.Replace(streamConfig, "stream_idle_ms: 300", "stream_idle_ms: 60000", 1)
-	s := newStreamFixture(t, yaml)
-	s.apply(t, strings.Replace(yaml, "MOCK", upstream.URL, 1))
-
-	req, err := http.NewRequest(http.MethodPost, s.url+"/v1/chat/completions", strings.NewReader(streamBody("plain")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer "+s.token)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	line, err := bufio.NewReader(resp.Body).ReadString('\n')
-	if err != nil || line != "data: "+chunk("a")+"\n" {
-		t.Fatalf("first line %q: %v", line, err)
-	}
-	gone := time.Now()
-	_ = resp.Body.Close()
-	select {
-	case <-released:
-	case <-time.After(time.Second):
-		t.Fatal("the provider's request did not end within 1 s of the client going away")
-	}
-	for !strings.Contains(s.log.String(), `"msg":"request"`) {
-		if time.Since(gone) > 2*time.Second {
-			t.Fatalf("no request line: %s", s.log.String())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	log := s.log.String()
-	if strings.Count(log, `"msg":"attempt"`) != 1 || strings.Count(log, `"msg":"request"`) != 1 || !strings.Contains(log, `"cause":"client gone"`) {
-		t.Errorf("log %s", log)
-	}
-}
-
 // TestChatStreamAcrossApply is AC-05 and RES-7: a stream open while an apply
 // moves its alias to another target and removes the first finishes on its
 // snapshot; the next request goes to the new target.

@@ -121,7 +121,8 @@ func TestDefaultStreams(t *testing.T) {
 }
 
 // Chunks are flushed one by one with Gap between them, after Delay; Hang
-// holds the reply until the request ends; Cut aborts it.
+// holds the reply until the request ends; Cut aborts it. Each call records
+// when it ended and whether the caller's going away ended it.
 func TestStreamSteps(t *testing.T) {
 	m := New()
 	srv := httptest.NewServer(m)
@@ -167,8 +168,35 @@ func TestStreamSteps(t *testing.T) {
 		t.Errorf("hang: %q %v", buf[:n], err)
 	}
 	cancel()
+	gone := time.Now()
 	if _, err := io.ReadAll(resp.Body); err == nil {
 		t.Error("the held reply ended without an error")
 	}
 	_ = resp.Body.Close()
+
+	// A Delay the caller does not wait out ends early too.
+	m.Script(Step{Delay: time.Minute})
+	ctx, cancel = context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	req, _ = http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/chat/completions", nil)
+	if _, err := srv.Client().Do(req); err == nil {
+		t.Error("the delayed reply came")
+	}
+
+	// Ended is set when the handler returns, a Cut included; Cancelled only
+	// when the caller's going away ended the reply.
+	var calls []Call
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(5 * time.Millisecond) {
+		if calls = m.Calls(); len(calls) == 4 && !calls[2].Ended.IsZero() && !calls[3].Ended.IsZero() {
+			break
+		}
+	}
+	for i, want := range []bool{false, false, true, true} {
+		if calls[i].Ended.IsZero() || calls[i].Cancelled != want {
+			t.Errorf("call %d: ended %v, cancelled %v", i, calls[i].Ended, calls[i].Cancelled)
+		}
+	}
+	if d := calls[2].Ended.Sub(gone); d > time.Second || calls[2].Ended.Before(calls[1].Ended) {
+		t.Errorf("the held reply ended %v after the caller went away", d)
+	}
 }

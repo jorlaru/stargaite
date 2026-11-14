@@ -55,6 +55,7 @@ type fixture struct {
 	admin, data http.Handler
 	now         *atomic.Int64 // Unix milliseconds
 	log         *logBuffer
+	flight      *sync.WaitGroup // the data plane's requests in flight
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -93,9 +94,10 @@ func newFixture(t *testing.T) *fixture {
 		}
 		return nil, errors.New("no name is resolved in tests")
 	}
+	flight := &sync.WaitGroup{}
 	return &fixture{admin.Handler(cfg, sha256.Sum256([]byte(adminKey)), slog.New(slog.NewJSONHandler(log, nil))),
 		Handler(Deps{Config: cfg, Log: slog.New(slog.NewJSONHandler(log, nil)),
-			Clients: [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)}}), now, log}
+			Clients: [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)}, Flight: flight}), now, log, flight}
 }
 
 // pastWindow moves the service clock past the RES-2 window of 30 s, so the

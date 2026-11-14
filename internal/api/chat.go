@@ -37,7 +37,8 @@ const (
 
 // The causes that end an attempt early: the RES-3 timers, a stream that ends
 // before its last event, a client that went away (RES-5) and a stream
-// request answered without a stream; timers are the first four.
+// request answered without a stream; timers are the first four. ErrStopping
+// is the other (RES-6).
 var (
 	errConnectTimeout   = errors.New("connect timeout")
 	errTotalTimeout     = errors.New("total timeout")
@@ -49,6 +50,11 @@ var (
 
 	timers = []error{errConnectTimeout, errTotalTimeout, errFirstByteTimeout, errIdleTimeout}
 )
+
+// statusClientGone is the request line's status for a client that went away
+// (RES-5), the one nginx logs for a request its client closed; no client
+// ever reads it.
+const statusClientGone = 499
 
 // request is one authenticated inference request (design section 4).
 type request struct {
@@ -145,7 +151,26 @@ func (h *handler) infer(ep domain.Endpoint) http.HandlerFunc {
 		if rq.key, rq.traceID = h.authenticate(w, r, rq.snap, ep); rq.key == nil {
 			return
 		}
+		h.Flight.Add(1)
 		defer h.done(rq)
+		// A body read, or a write to a client that stopped reading, does not
+		// end with the request's context: once that ends (the shutdown, or the
+		// client gone), the read stops at once and a write gets 1 s, so the
+		// request ends within the drain wait (design section 10). The
+		// handler waits for a started f: on HTTP/2 the writer must not be
+		// touched once the handler has returned.
+		fired := make(chan struct{})
+		stop := context.AfterFunc(r.Context(), func() {
+			defer close(fired)
+			rc := http.NewResponseController(w)
+			_ = rc.SetReadDeadline(time.Now())
+			_ = rc.SetWriteDeadline(time.Now().Add(time.Second))
+		})
+		defer func() {
+			if !stop() {
+				<-fired
+			}
+		}()
 		if ep == domain.EndpointMessages {
 			rq.header = http.Header{}
 			for _, name := range []string{"Anthropic-Version", "Anthropic-Beta"} {
@@ -169,6 +194,8 @@ func (h *handler) check(w http.ResponseWriter, r *http.Request, rq *request) *do
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, rq.snap.Settings.MaxBodyBytes))
 	if tooLarge := new(http.MaxBytesError); errors.As(err, &tooLarge) {
 		return domain.NewError(domain.CodeRequestTooLarge, fmt.Sprintf("the body is larger than max_body_bytes, %d", tooLarge.Limit))
+	} else if err != nil && errors.Is(context.Cause(r.Context()), ErrStopping) {
+		return domain.NewError(domain.CodeInternalError, ErrStopping.Error())
 	} else if err != nil {
 		return domain.NewError(domain.CodeInvalidRequest, "the request body could not be read")
 	}
@@ -374,11 +401,11 @@ func ms(v int64) time.Duration { return time.Duration(v) * time.Millisecond }
 
 // settle records how a ended. err is what failed the call, a read or a
 // write; when the attempt's context had ended, its cause stands instead (a
-// RES-3 timer, or the client gone), except for a failed write to the client:
-// a timer that fired while a slow client stalled the write says nothing of
-// the target. relayErr is what the relay found in a 2xx answer. The cause is
-// err, else relayErr; the verdict is classify's, with the credential
-// replaced in the provider's text it passes on.
+// RES-3 timer, the shutdown, or the client gone), except for a failed write
+// to the client: a timer that fired while a slow client stalled the write
+// says nothing of the target. relayErr is what the relay found in a 2xx
+// answer. The cause is err, else relayErr; the verdict is classify's, with
+// the credential replaced in the provider's text it passes on.
 func settle(ctx context.Context, a *attempt, stream bool, header http.Header, body []byte, err, relayErr error) {
 	if err != nil && ctx.Err() != nil && !errors.Is(err, errClientGone) {
 		err = context.Cause(ctx)
@@ -401,7 +428,9 @@ func settle(ctx context.Context, a *attempt, stream bool, header http.Header, bo
 // provider's (Retry-After, the error message); relayErr what the relay found
 // in a 2xx answer; stream whether that answer was relayed as a stream,
 // which only words the message. The client gone is no verdict, with nothing
-// to answer. A timer, a failed call, a stream cut, 429 and any 5xx are
+// to answer; the shutdown neither tries the next target nor tells the
+// breaker, and answers 500 internal_error "server stopping" (RES-6, section
+// 15 point 15). A timer, a failed call, a stream cut, 429 and any 5xx are
 // eligible and fail the breaker: 504 upstream_timeout for a timer, the 429
 // with its Retry-After, else 502. An upstream error event is eligible when
 // Anthropic documents 429 or a 5xx for its type (section 15 point 15); an
@@ -418,6 +447,8 @@ func classify(stream bool, status int, cause error, header http.Header, body []b
 	switch {
 	case errors.Is(cause, errClientGone):
 		return verdict{}
+	case errors.Is(cause, ErrStopping):
+		return verdict{err: domain.NewError(domain.CodeInternalError, ErrStopping.Error())}
 	case slices.ContainsFunc(timers, func(timer error) bool { return errors.Is(cause, timer) }):
 		return fail(domain.NewError(domain.CodeUpstreamTimeout, "the provider did not answer in time: "+cause.Error()))
 	case errors.As(relayErr, &event):
@@ -515,9 +546,11 @@ func (h *handler) stream(ctx context.Context, w http.ResponseWriter, rq *request
 			err = errStreamEnded
 		}
 		// A write blocked on a slow client is the write deadline's to bound,
-		// not the provider's silence.
+		// not the provider's silence; once the context ends, infer's 1 s stays.
 		idle.Stop()
-		_ = rc.SetWriteDeadline(time.Now().Add(silence + 5*time.Second))
+		if ctx.Err() == nil {
+			_ = rc.SetWriteDeadline(time.Now().Add(silence + 5*time.Second))
+		}
 		switch {
 		case errors.Is(err, transport.ErrEventTooLarge):
 			err, relayErr = nil, err
@@ -599,17 +632,26 @@ func (h *handler) finish(rq *request, a *attempt) {
 }
 
 // done ends one authenticated request (design section 11, point 3) after
-// its last finish: the request line (OPS-9). Phase 3 releases the admission
-// slots and ends the request span here.
+// its last finish: the request line (OPS-9), then Flight. Its status and
+// code are those of the error the client got, also as the terminal event of
+// a committed stream (so 500 internal_error for a request the shutdown
+// stopped); 499 client_gone when the client went away, whatever was written
+// before; else 200. Phase 3 releases the admission slots and ends the
+// request span here.
 func (h *handler) done(rq *request) {
+	defer h.Flight.Done()
 	attrs := []any{"request_id", rq.id, "trace_id", rq.traceID, "key", rq.key.Name}
 	if rq.alias != "" {
 		attrs = append(attrs, "alias", fmt.Sprintf("%.200s", rq.alias)) // an unknown alias is as long as the body allows
 	}
-	attrs = append(attrs, "attempts", len(rq.attempts))
-	if rq.err != nil {
+	n := len(rq.attempts)
+	attrs = append(attrs, "attempts", n)
+	switch {
+	case rq.err != nil:
 		attrs = append(attrs, "status", rq.err.Status, "code", rq.err.Code)
-	} else {
+	case n > 0 && errors.Is(rq.attempts[n-1].cause, errClientGone):
+		attrs = append(attrs, "status", statusClientGone, "code", "client_gone")
+	default:
 		attrs = append(attrs, "status", http.StatusOK)
 	}
 	h.Log.Info("request", append(attrs, "duration_ms", time.Since(rq.started).Milliseconds())...)

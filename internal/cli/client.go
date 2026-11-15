@@ -113,6 +113,25 @@ func fill(body map[string]any, f flagSpec, v string) error {
 			return fmt.Errorf("%q is not <window>:<unit>=<number>", v)
 		}
 		appendTo(body, path, map[string]any{"window": window, unit: jsontext.Value(n)})
+	case kindPair:
+		name, value, ok := strings.Cut(v, "=")
+		if !ok || name == "" {
+			return fmt.Errorf("%q is not name=value", v)
+		}
+		if prev, set := parent(body, path)[path[len(path)-1]]; set && prev == nil {
+			return fmt.Errorf("a pair cannot follow the empty value, which clears the whole block")
+		}
+		var typed any = value
+		if value == "" {
+			typed = nil
+		}
+		put(body, append(path, name), typed)
+	case kindTwo:
+		a, b, ok := strings.Cut(v, ":")
+		if !ok || a == "" || b == "" {
+			return fmt.Errorf("%q is not <first>:<second>", v)
+		}
+		put(body, path, []any{a, b})
 	case kindList:
 		appendTo(body, path, v)
 	case kindRaw:
@@ -259,11 +278,13 @@ func failed(name string, in input, e *domain.Error, stdout, stderr io.Writer) in
 func show(name string, in input, resp *http.Response, answer []byte, rowRender func(io.Writer, []byte) error, stdout, stderr io.Writer) int {
 	var findings struct {
 		Findings []domain.Finding `json:"findings"`
+		Outcome  string           `json:"outcome"` // of telemetry test
 	}
-	_ = json.Unmarshal(answer, &findings) // only the findings of a success matter here
+	_ = json.Unmarshal(answer, &findings) // only the findings and outcome of a success matter here
 	ok := resp.StatusCode/100 == 2
 	code := exitOK
-	if !ok || slices.ContainsFunc(findings.Findings, func(f domain.Finding) bool { return f.Severity == domain.SeverityError }) {
+	if !ok || slices.ContainsFunc(findings.Findings, func(f domain.Finding) bool { return f.Severity == domain.SeverityError }) ||
+		findings.Outcome != "" && findings.Outcome != "accepted" {
 		code = exitFailure
 	}
 
@@ -521,6 +542,42 @@ func usageShown(w io.Writer, answer []byte) error {
 			return err
 		}
 	}
+	return nil
+}
+
+// tested renders the answer of telemetry test as the line of kick-off section
+// 3.2, as far as the test got: each step it passed, then the one that failed
+// with the cause (TEL-2).
+func tested(w io.Writer, answer []byte) error {
+	var v struct {
+		Outcome string `json:"outcome"`
+		Status  int    `json:"status"`
+		Message string `json:"message"`
+		TraceID string `json:"trace_id"`
+	}
+	if err := json.Unmarshal(answer, &v); err != nil {
+		return err
+	}
+	steps := []string{"credentials: resolved", "reachable: yes", "authorized: yes"}
+	switch v.Outcome {
+	case "credential_unresolved":
+		steps = []string{"credentials: unresolved"}
+	case "unreachable":
+		steps = append(steps[:1], "reachable: no")
+	case "unauthorized":
+		steps = append(steps[:2], fmt.Sprintf("authorized: no (%d)", v.Status))
+	case "not_found":
+		steps = append(steps[:2], fmt.Sprintf("span: not_found (%d)", v.Status))
+	default:
+		steps = append(steps, fmt.Sprintf("span: %s (%d)", printable(v.Outcome), v.Status))
+	}
+	if v.TraceID != "" {
+		steps = append(steps, "trace_id="+printable(v.TraceID))
+	}
+	if v.Message != "" {
+		steps = append(steps, printable(v.Message))
+	}
+	say(w, "%s\n", strings.Join(steps, " · "))
 	return nil
 }
 

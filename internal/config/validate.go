@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
 	"net/netip"
 	"net/url"
 	"regexp"
@@ -252,6 +253,24 @@ func validateSettings(r *report, s domain.Settings) {
 		if !headerName.MatchString(h) {
 			r.fail("TEL-2", "invalid_value", res, "telemetry.header_env", "telemetry.header_env %.64q is not a valid header name", h)
 		}
+	}
+	// Spans go to <otlp_endpoint>/v1/traces (TEL-2), which a query would end up in.
+	if strings.Contains(t.OTLPEndpoint, "?") {
+		r.fail("TEL-2", "invalid_value", res, "telemetry.otlp_endpoint", "telemetry.otlp_endpoint must not have a query: spans go to <otlp_endpoint>/v1/traces")
+	}
+	// One value per header: the exporter would otherwise send whichever it set last.
+	names := map[string]bool{}
+	if t.BasicAuthEnv != nil {
+		names["Authorization"] = true
+	}
+	for _, h := range slices.Concat(slices.Sorted(maps.Keys(t.HeaderEnv)), slices.Sorted(maps.Keys(t.Headers))) {
+		if _, static := t.Headers[h]; static && slices.ContainsFunc(reservedHeaders, func(n string) bool { return strings.EqualFold(n, h) }) {
+			continue // refused below as reserved
+		}
+		if names[http.CanonicalHeaderKey(h)] {
+			r.fail("TEL-2", "invalid_value", res, "telemetry", "header %.64q is set more than once across basic_auth_env, header_env and headers", h)
+		}
+		names[http.CanonicalHeaderKey(h)] = true
 	}
 	for _, h := range slices.Sorted(maps.Keys(t.Headers)) {
 		field := "telemetry.headers." + h

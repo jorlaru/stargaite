@@ -23,6 +23,8 @@ import (
 	"github.com/jorlaru/stargaite/internal/admission"
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/store"
+	"github.com/jorlaru/stargaite/internal/telemetry"
+	"github.com/jorlaru/stargaite/internal/transport"
 	records "github.com/jorlaru/stargaite/internal/usage"
 )
 
@@ -61,8 +63,20 @@ func adminServer(t *testing.T) map[string]string {
 		t.Fatal(err)
 	}
 	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	// The exporter dials loopback for every name, which SEC-4 refuses without
+	// allow_private_network: telemetry test never leaves the host.
+	loopback := func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	spans := telemetry.NewExporter(func() *config.Exporter { return cfg.Snapshot().Exporter },
+		[2]*http.Client{transport.NewClient(false, loopback), transport.NewClient(true, loopback)}, "test", log)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		spans.Close(ctx)
+	})
 	srv := httptest.NewServer(admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(testKey)), Log: log, Usage: st.Read(),
-		Admission: admission.New(cfg.Now, records.Seeder(st.Read(), log))}))
+		Admission: admission.New(cfg.Now, records.Seeder(st.Read(), log)), Spans: spans}))
 	t.Cleanup(srv.Close)
 	return map[string]string{"STARGAITE_ADMIN_URL": srv.URL, "STARGAITE_ADMIN_KEY": testKey}
 }
@@ -161,7 +175,14 @@ func TestCommandWalk(t *testing.T) {
 			{[]string{"--since", "2400h", "--by", "effort-sent"}, 1},
 		},
 		"usage quota": {{nil, 0}},
-		"export":      {{nil, 0}},
+		"telemetry set": {
+			{[]string{"--preset", "langfuse", "--otlp-endpoint", "https://langfuse.example.com/api/public/otel", "--header", "x-tag=a,b"}, 0},
+			{[]string{"--header", "Authorization=Bearer x"}, 1}, {[]string{"--otlp-endpoint", "http://127.0.0.1:4318"}, 1}, {[]string{"--preset", "nope"}, 1},
+		},
+		"telemetry status": {{nil, 0}},
+		"telemetry test":   {{nil, 1}}, // the walk's loopback dial is refused: unreachable, and once unset, no exporter
+		"telemetry unset":  {{[]string{"--yes"}, 0}},
+		"export":           {{nil, 0}},
 		"apply": {
 			{[]string{"-f", example, "--dry-run"}, 0}, {[]string{"-f", example}, 0}, {[]string{"-f", invalid}, 1},
 			{[]string{"-f", example, "--prune", "--yes"}, 0}, {[]string{"-f", example, "--prune", "--dry-run"}, 0},
@@ -250,6 +271,17 @@ func TestRequests(t *testing.T) {
 		{[]string{"usage", "show", "--by", "key,effort-sent", "--compare-previous"}, "GET", "/admin/v1/usage?by=key%2Ceffort-sent&compare_previous=true", ""},
 		{[]string{"usage", "show", "--compare-previous=false", "--since", "1h"}, "GET", "/admin/v1/usage?compare_previous=false&since=1h", ""},
 		{[]string{"usage", "quota"}, "GET", "/admin/v1/usage/quota", ""},
+		{
+			[]string{"telemetry", "set", "--preset", "langfuse", "--otlp-endpoint", "https://h/api/public/otel", "--basic-auth-env", "U:P", "--header-env", "x-token=TOK",
+				"--header", "x-tag=a,b", "--header", "x-two=c=d", "--allow-private-network", "--trust-traceparent=false", "--content-max-bytes", "100"},
+			"PATCH", "/admin/v1/telemetry",
+			`{"allow_private_network":true,"basic_auth_env":["U","P"],"content_max_bytes":100,"header_env":{"x-token":"TOK"},` +
+				`"headers":{"x-tag":"a,b","x-two":"c=d"},"otlp_endpoint":"https://h/api/public/otel","preset":"langfuse","trust_traceparent":false}`,
+		},
+		{[]string{"telemetry", "set", "--header", "x-tag=", "--basic-auth-env=", "--header-env="}, "PATCH", "/admin/v1/telemetry", `{"basic_auth_env":null,"header_env":null,"headers":{"x-tag":null}}`},
+		{[]string{"telemetry", "unset", "--yes"}, "DELETE", "/admin/v1/telemetry", ""},
+		{[]string{"telemetry", "test"}, "POST", "/admin/v1/telemetry/test", ""},
+		{[]string{"telemetry", "status"}, "GET", "/admin/v1/telemetry", ""},
 		{[]string{"providers", "presets"}, "GET", "/admin/v1/presets", ""},
 		{[]string{"providers", "list"}, "GET", "/admin/v1/providers", ""},
 		{[]string{"providers", "add", "openrouter"}, "POST", "/admin/v1/providers", `{"name":"openrouter"}`},
@@ -408,6 +440,16 @@ func TestUsage(t *testing.T) {
 		{"keys", "rotate", "k", "--model", "fast"},
 		{"keys", "revoke", "k"},
 		{"keys", "revoke", "k", "--json"},
+		{"telemetry", "set", "--basic-auth-env", "USER"},
+		{"telemetry", "set", "--basic-auth-env", ":PASSWORD"},
+		{"telemetry", "set", "--basic-auth-env", "USER:"},
+		{"telemetry", "set", "--header", "x-tag"},
+		{"telemetry", "set", "--header-env", "=VAR"},
+		{"telemetry", "set", "--content-max-bytes", "32k"},
+		{"telemetry", "unset"},
+		{"telemetry", "unset", "--json"},
+		{"telemetry", "test", "extra"},
+		{"telemetry", "set", "--header=", "--header", "x-tag=a"},
 		// A merge patch cannot clear a block and set one of its entries.
 		{"targets", "set", "p/m", "--capabilities=", "--capabilities", "tools=true"},
 		{"keys", "set", "k", "--budget=", "--budget", "limit_usd=1"},
@@ -615,6 +657,37 @@ plan      "a\x1b"  0.4    5h      requests  1     2      50        -
 	_, vars = recorder(t, http.StatusOK, `{"note":"counts this proxy's traffic only","windows":[]}`+"\n")
 	if r := runMain(vars, "usage", "quota"); r.code != 0 || r.stdout != "quota windows: counts this proxy's traffic only\nno quota window is declared\n" {
 		t.Errorf("no window: exit %d, stdout %q", r.code, r.stdout)
+	}
+}
+
+// TestTestRender: telemetry test prints the line of kick-off section 3.2 as
+// far as the test got, and exits 1 for any outcome but accepted, with --json
+// too (TEL-2).
+func TestTestRender(t *testing.T) {
+	for _, tc := range []struct {
+		answer, want string
+		code         int
+	}{
+		{`{"outcome":"accepted","status":200,"trace_id":"4f0c9a00000000000000000000000001"}`,
+			"credentials: resolved · reachable: yes · authorized: yes · span: accepted (200) · trace_id=4f0c9a00000000000000000000000001\n", 0},
+		{`{"outcome":"credential_unresolved","message":"credential_unresolved: OTLP_TOKEN does not resolve"}`,
+			"credentials: unresolved · credential_unresolved: OTLP_TOKEN does not resolve\n", 1},
+		{`{"outcome":"unreachable","message":"dial tcp 127.0.0.1:1: connection refused"}`,
+			"credentials: resolved · reachable: no · dial tcp 127.0.0.1:1: connection refused\n", 1},
+		{`{"outcome":"unauthorized","status":401,"message":"bad key\u001b"}`,
+			"credentials: resolved · reachable: yes · authorized: no (401) · \"bad key\\x1b\"\n", 1},
+		{`{"outcome":"not_found","status":404}`, "credentials: resolved · reachable: yes · span: not_found (404)\n", 1},
+		{`{"outcome":"rejected","status":200,"message":"bad span"}`,
+			"credentials: resolved · reachable: yes · authorized: yes · span: rejected (200) · bad span\n", 1},
+		{`{"outcome":"rejected","status":500}`, "credentials: resolved · reachable: yes · authorized: yes · span: rejected (500)\n", 1},
+	} {
+		_, vars := recorder(t, http.StatusOK, tc.answer+"\n")
+		if r := runMain(vars, "telemetry", "test"); r.code != tc.code || r.stdout != tc.want {
+			t.Errorf("%s: exit %d, stdout %q, want %q", tc.answer, r.code, r.stdout, tc.want)
+		}
+		if r := runMain(vars, "telemetry", "test", "--json"); r.code != tc.code || r.stdout != tc.answer+"\n" {
+			t.Errorf("%s --json: exit %d, stdout %q", tc.answer, r.code, r.stdout)
+		}
 	}
 }
 

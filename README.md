@@ -13,7 +13,8 @@ control of the alias, timeouts, fallback across an alias's targets, a circuit br
 client goes away and a graceful stop (see [Resilience](#resilience)). Phase 3 has begun: every provider call leaves a
 usage record with its tokens and cost, and `usage show` sums them (see [Usage](#usage)); keys and aliases have rate
 and parallel limits (see [Limits](#limits)), USD budgets (see [Budgets](#budgets)) and subscription quotas (see
-[Quotas](#quotas)); telemetry follows. The full specification is [kick-off.md](kick-off.md); the designs are
+[Quotas](#quotas)); the OTLP exporter is configured and tested (see [Telemetry](#telemetry)), and spans of
+traffic follow. The full specification is [kick-off.md](kick-off.md); the designs are
 [docs/design/phase-1.md](docs/design/phase-1.md), [docs/design/phase-2.md](docs/design/phase-2.md) and
 [docs/design/phase-3.md](docs/design/phase-3.md).
 
@@ -32,6 +33,8 @@ curl -sS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:4000/he
 ./stargaite targets set mock/mock --pricing input_per_million=1,output_per_million=2,as_of=2026-11-01
 ./stargaite keys create my-agent --model fast --rpm-limit 60
 ./stargaite models explain fast
+./stargaite telemetry set --otlp-endpoint http://127.0.0.1:4010 --allow-private-network
+./stargaite telemetry test
 curl -s http://127.0.0.1:4000/v1/models -H "Authorization: Bearer sk-stargaite-..."
 curl -s http://127.0.0.1:4000/v1/chat/completions -H "Authorization: Bearer sk-stargaite-..." -d '{"model":"fast","messages":[{"role":"user","content":"hi"}]}'
 ./stargaite usage show --since 1h
@@ -44,7 +47,10 @@ gives it a price in USD per million input and output tokens. `keys create` limit
 prints the client key once: paste it in place of `sk-stargaite-...` in the two `curl` calls. `models explain` shows what the alias would send, without calling
 the provider: per target, the effort and output-cap layers, the list of changes, the URL, the headers without the
 credential and the body, which for the minimal request it explains by default are the bytes the chat completion below
-sends (`--body <file>` explains a request of your own; `--json` gives each body's exact bytes). The first `curl` lists
+sends (`--body <file>` explains a request of your own; `--json` gives each body's exact bytes). `telemetry set` points
+the OTLP exporter at the mock provider, which also accepts trace exports, and `telemetry test` sends it one span and
+prints `credentials: resolved · reachable: yes · authorized: yes · span: accepted (200) · trace_id=…` (see
+[Telemetry](#telemetry)). The first `curl` lists
 the alias `fast`; the second sends a chat completion to it and gets the mock provider's answer, with the response
 headers `x-stargaite-request-id`, `x-stargaite-trace-id` and `x-stargaite-target` (add `-i` to `curl` to see them).
 `usage show` then sums the last hour from the store: one request, the tokens the mock provider reported (1 input, 2
@@ -134,6 +140,32 @@ traffic only: a plan also used by other clients, or whose provider resets on a c
 provider's own `429` authoritative, and that `429` moves the request to the next target like any other. `validate` warns
 when a window is longer than `retention.usage_days`, whose records the rebuild reads.
 
+## Telemetry
+
+stargaite exports spans over OTLP/HTTP with the JSON encoding to any backend that accepts it; there is no vendor SDK
+and no second export path. `./stargaite telemetry set --otlp-endpoint <url>` sets the endpoint, always in full: spans go
+to `<url>/v1/traces`. Credentials are references, never values: `--basic-auth-env USER_VAR:PASSWORD_VAR` composes the
+`Authorization: Basic` header from two variables and `--header-env NAME=VAR` sends a header read from a variable, both
+resolved by `serve` like provider credentials (see [Provider credentials](#provider-credentials)); `--header NAME=value`
+sends a static header that carries no secret, and `Authorization`, `Proxy-Authorization`, `Cookie` and `x-api-key` are
+refused there. A plain HTTP, loopback or private endpoint needs `--allow-private-network`; the address is checked again
+at every connection and redirects are never followed. `--preset langfuse` fills in
+`--basic-auth-env LANGFUSE_PUBLIC_KEY:LANGFUSE_SECRET_KEY` and the header `x-langfuse-ingestion-version: 4`, which
+explicit flags override; give the endpoint as `https://<host>/api/public/otel`.
+
+`./stargaite telemetry test` sends one span, `stargaite telemetry test` under the reserved key `_telemetry`, and names
+the first thing that failed: `credential_unresolved` (a referenced variable is not visible to `serve`; nothing is
+sent), `unreachable`, `unauthorized` (401 or 403), `not_found` (404: the path is wrong) or `rejected` (any other status,
+or a span refused inside a `2xx`, with the backend's message), else `accepted` with the trace id to look up; it exits
+`1` unless the span was accepted. `./stargaite telemetry status` shows the effective block, the references that do not
+resolve, and the spans sent, rejected by HTTP status and by the backend, dropped and queued, with the last error.
+`./stargaite telemetry unset --yes` removes the exporter. Export never slows inference: spans wait in a queue of 10,000
+spans or 32 MB, whichever comes first (the oldest are dropped and counted), and go in batches every 2 s or of 200;
+`429`, `502`, `503`, `504` and connection failures are retried three times, honouring a `Retry-After` up to 30 s, and
+any other status rejects the batch. Ten failed batches in a row write one `WARN` line, at most once a minute. On
+`SIGTERM` queued spans get 5 s to leave after the store closes; any left are dropped and logged, without changing the
+exit code. No usage record, budget or quota ever reads telemetry.
+
 ## Anthropic clients
 
 `POST /v1/messages` is the Anthropic Messages API, served by targets of the `anthropic` protocol: an Anthropic SDK
@@ -155,9 +187,10 @@ passed over. A stream that fails after its first event ends with one error event
 a client goes away, the provider call is cancelled at once. On `SIGTERM` (or `Ctrl-C`) `serve` stops accepting
 connections and gives the requests in flight up to 30 s to finish; any still running then gets `500 internal_error`
 with the message `server stopping`, as an error answer or as the stream's error event, and `serve` writes the pending
-usage records, then closes the store and exits `0`. A supervisor must allow it more than 50 s to
-stop (the 30 s, up to 5 s for the requests stopped to end, and up to 10 s for the records plus the store's 5 s busy
-timeout for the write in progress) before it kills it: `docker stop` waits 10 s unless given `-t`.
+usage records, then closes the store, gives queued spans up to 5 s to leave and exits `0`. A supervisor must allow it
+more than 55 s to stop (the 30 s, up to 5 s for the requests stopped to end, up to 10 s for the records plus the store's
+5 s busy timeout for the write in progress, and the 5 s of the spans) before it kills it: `docker stop` waits 10 s
+unless given `-t`.
 
 ## The admin key and the data directory
 

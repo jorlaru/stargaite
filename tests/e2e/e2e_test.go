@@ -40,13 +40,16 @@ var (
 	curlHeader = regexp.MustCompile(`-H "([^"]+)"`)
 	curlData   = regexp.MustCompile(`-d '([^']*)'`)
 	traceID    = regexp.MustCompile(`^[0-9a-f]{32}$`)
+	// The line of kick-off section 3.2 for an accepted test span.
+	acceptedLine = regexp.MustCompile(`^credentials: resolved · reachable: yes · authorized: yes · span: accepted \(200\) · trace_id=([0-9a-f]{32})\n$`)
 )
 
 // TestQuickStart runs the quick start of README.md with the built binary,
 // then checks what it left: the first answer of the chat completion with its
 // PAR-9 headers and the one call the provider got (AC-04), /v1/models with the
 // new key, usage show with the one request, its tokens and its price_table
-// cost (AC-33), the key's parallel limit shown as 5 and exported as declared
+// cost (AC-33), telemetry test accepted by the mock as OTLP receiver, which
+// got the test span and nothing else (AC-24), the key's parallel limit shown as 5 and exported as declared
 // (LIM-7), a second serve on the same directory refused (AC-42), and the
 // same export, the same key and the same usage after a restart (RES-9). The guide's commands use
 // the default data directory and addresses; here the environment points them
@@ -62,6 +65,7 @@ func TestQuickStart(t *testing.T) {
 		token    string
 		answered bool
 		shown    string // what usage show printed
+		tested   string // what telemetry test printed
 	)
 	cli := func(args ...string) string {
 		t.Helper()
@@ -97,6 +101,11 @@ func TestQuickStart(t *testing.T) {
 				if shown = cli(fields[1:]...); strings.Contains(shown, "pay_per_use") || time.Now().After(deadline) {
 					break
 				}
+			}
+		case fields[0] == "./stargaite" && fields[1] == "telemetry" && fields[2] == "test" && srv != nil:
+			// AC-24: the mock, as OTLP receiver, accepts the test span.
+			if tested = cli(fields[1:]...); !acceptedLine.MatchString(tested) {
+				t.Errorf("%s printed %q", line, tested)
 			}
 		case fields[0] == "./stargaite" && srv != nil:
 			if m := tokenLine.FindString(cli(fields[1:]...)); m != "" {
@@ -138,8 +147,8 @@ func TestQuickStart(t *testing.T) {
 			t.Fatalf("a quick start line this test does not run: %q", line)
 		}
 	}
-	if srv == nil || mock == nil || token == "" || !answered || shown == "" {
-		t.Fatalf("the quick start did not start the proxy and the mock provider, create a key, get an answer and show the usage")
+	if srv == nil || mock == nil || token == "" || !answered || shown == "" || tested == "" {
+		t.Fatalf("the quick start did not start the proxy and the mock provider, create a key, test the exporter, get an answer and show the usage")
 	}
 	// The mock's usage, 1 input and 2 output tokens, at 1 and 2 USD per million;
 	// no length finish, no empty answer, an output median and p90 of 2 and no
@@ -205,12 +214,28 @@ func TestQuickStart(t *testing.T) {
 		}
 	}
 	models()
-	// The one call of the quick start, with the upstream model id and no
-	// credential: the mock provider declares none.
-	calls := mock.Calls()
+	// The one chat call of the quick start, with the upstream model id and no
+	// credential: the mock provider declares none. The mock is also the OTLP
+	// receiver: telemetry test sent it one export, the test span alone.
+	var calls, exports []mockprovider.Call
+	for _, c := range mock.Calls() {
+		if c.Path == "/v1/traces" {
+			exports = append(exports, c)
+		} else {
+			calls = append(calls, c)
+		}
+	}
 	if len(calls) != 1 || calls[0].Path != "/chat/completions" ||
 		string(calls[0].Body) != `{"model":"mock","messages":[{"role":"user","content":"hi"}]}` || calls[0].Header.Values("Authorization") != nil {
 		t.Fatalf("the mock received %+v", calls)
+	}
+	if len(exports) != 1 || exports[0].Header.Get("Content-Type") != "application/json" || !json.Valid(exports[0].Body) ||
+		!strings.Contains(string(exports[0].Body), `"name":"stargaite telemetry test"`) || !strings.Contains(string(exports[0].Body), `{"stringValue":"_telemetry"}`) ||
+		!strings.Contains(string(exports[0].Body), `"traceId":"`+acceptedLine.FindStringSubmatch(tested)[1]+`"`) {
+		t.Fatalf("the receiver got %+v", exports)
+	}
+	if status := cli("telemetry", "status"); !strings.Contains(status, "exporter.sent: 1\n") || !strings.Contains(status, "telemetry.otlp_endpoint: "+mockURL+"\n") {
+		t.Errorf("telemetry status:\n%s", status)
 	}
 	// models explain, run above without a call, shows the bytes the provider
 	// received for the same request (AC-17).

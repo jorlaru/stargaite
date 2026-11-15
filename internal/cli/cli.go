@@ -50,6 +50,8 @@ const (
 	kindRaw                         // one JSON value, sent verbatim at path
 	kindAll                         // given without a value: appends "*" to the list at path
 	kindFile                        // a file path: the file's content, sent as a JSON string at path
+	kindPair                        // one name=value, repeated: the value whole, commas included, as a string under path, "name=" as null
+	kindTwo                         // <a>:<b>: the list [a, b] at path
 )
 
 // flagSpec is one flag of a command. A one-letter name is the short form the
@@ -161,6 +163,19 @@ var keyFlags = []flagSpec{
 	{"trace-sample-rate", kindNumber, "trace_sample_rate", "the share of requests traced, 0 to 1"},
 }
 
+// telemetryFlags are the fields of settings.telemetry (TEL-2) and the preset
+// that fills some of them first (TEL-11).
+var telemetryFlags = []flagSpec{
+	{"preset", kindString, "preset", "langfuse: the conventional credential variables and the ingestion-version header; explicit flags win"},
+	{"otlp-endpoint", kindString, "otlp_endpoint", "the OTLP endpoint in full; spans go to <endpoint>/v1/traces"},
+	{"basic-auth-env", kindTwo, "basic_auth_env", "USER_VAR:PASSWORD_VAR: the variables Basic authentication is composed from, never their values"},
+	{"header-env", kindPair, "header_env", "NAME=VAR, repeated: a header whose value is read from the variable VAR"},
+	{"header", kindPair, "headers", "NAME=value, repeated: a static header that carries no secret"},
+	{"allow-private-network", kindBool, "allow_private_network", "allow plain HTTP, loopback and private addresses"},
+	{"trust-traceparent", kindBool, "trust_traceparent", "continue a client's valid traceparent (default true)"},
+	{"content-max-bytes", kindNumber, "content_max_bytes", "the bytes of content a span may carry under the opt-in (default 32768)"},
+}
+
 // add is the request of a command that creates the resource its positional
 // argument names: the body flags given, plus that argument as member key.
 func add(collection, key string) func(input) (string, string, any) {
@@ -257,6 +272,16 @@ var commands = []command{
 		return http.MethodGet, "/usage?" + q.Encode(), nil
 	}, render: usageShown},
 	{words: []string{"usage", "quota"}, request: get("/usage/quota"), render: quotaShown},
+	{words: []string{"telemetry", "set"}, flags: telemetryFlags, request: func(in input) (string, string, any) {
+		return http.MethodPatch, "/telemetry", in.body
+	}},
+	{words: []string{"telemetry", "unset"}, needsYes: func(input) bool { return true }, request: func(input) (string, string, any) {
+		return http.MethodDelete, "/telemetry", nil
+	}},
+	{words: []string{"telemetry", "test"}, request: func(input) (string, string, any) {
+		return http.MethodPost, "/telemetry/test", nil
+	}, render: tested},
+	{words: []string{"telemetry", "status"}, request: get("/telemetry")},
 	{words: []string{"export"}, request: func(in input) (string, string, any) {
 		if in.json {
 			return http.MethodGet, "/export?format=json", nil

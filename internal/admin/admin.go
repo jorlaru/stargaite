@@ -27,6 +27,7 @@ import (
 	"github.com/jorlaru/stargaite/internal/auth"
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
+	"github.com/jorlaru/stargaite/internal/telemetry"
 	"github.com/jorlaru/stargaite/internal/usage"
 )
 
@@ -48,6 +49,7 @@ type server struct {
 	log     *slog.Logger
 	usage   *sql.DB
 	limits  *admission.State
+	spans   *telemetry.Exporter
 
 	mu        sync.Mutex // guards the two fields below
 	refusedAt time.Time  // when the last refusal line was logged
@@ -95,6 +97,10 @@ var routes = []route{
 	{"POST /admin/v1/keys/{name}/revoke", (*server).revokeKey},
 	{"GET /admin/v1/usage", (*server).showUsage},
 	{"GET /admin/v1/usage/quota", (*server).showQuota},
+	{"GET /admin/v1/telemetry", (*server).showTelemetry},
+	{"PATCH /admin/v1/telemetry", (*server).setTelemetry},
+	{"DELETE /admin/v1/telemetry", (*server).unsetTelemetry},
+	{"POST /admin/v1/telemetry/test", (*server).testTelemetry},
 }
 
 // Deps is what the admin listener needs from serve.
@@ -102,13 +108,14 @@ type Deps struct {
 	Config    *config.Service
 	KeyHash   [32]byte // the SHA-256 of the admin key, the only form of it the process keeps
 	Log       *slog.Logger
-	Usage     *sql.DB          // the store's read pool, which usage show reads
-	Admission *admission.State // the data plane's, whose quota windows usage quota shows
+	Usage     *sql.DB             // the store's read pool, which usage show reads
+	Admission *admission.State    // the data plane's, whose quota windows usage quota shows
+	Spans     *telemetry.Exporter // the exporter telemetry test sends through and telemetry status reads
 }
 
 // Handler returns the admin listener's handler.
 func Handler(d Deps) http.Handler {
-	s := &server{cfg: d.Config, keyHash: d.KeyHash, log: d.Log, usage: d.Usage, limits: d.Admission}
+	s := &server{cfg: d.Config, keyHash: d.KeyHash, log: d.Log, usage: d.Usage, limits: d.Admission, spans: d.Spans}
 	mux := http.NewServeMux()
 	for _, rt := range routes {
 		mux.HandleFunc(rt.pattern, func(w http.ResponseWriter, r *http.Request) { rt.handle(s, w, r) })

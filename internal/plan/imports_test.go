@@ -10,16 +10,19 @@ import (
 )
 
 // TestImports enforces the import rule of design section 3, and of phase-3
-// design section 3 for usage and admission: params, reasoning, the adapters,
-// plan, routing and usage never reach store, transport, config or api, and
-// admission reaches no package of the module but domain, directly or through
-// another package of the module.
+// design section 3 for usage, admission and telemetry: params, reasoning, the
+// adapters, plan, routing and usage never reach store, transport, config or
+// api; admission reaches no package of the module but domain; telemetry never
+// reaches api, admin or cli; directly or through another package of the module.
 func TestImports(t *testing.T) {
 	forbidden := []string{"internal/store", "internal/transport", "internal/config", "internal/api"}
 	for _, pkg := range []string{"internal/params", "internal/reasoning", "internal/plan", "internal/routing", "internal/adapters/openai", "internal/adapters/anthropic", "internal/usage"} {
 		reach(t, pkg, func(rel string) bool { return slices.Contains(forbidden, rel) })
 	}
 	reach(t, "internal/admission", func(rel string) bool { return rel != "internal/domain" })
+	reach(t, "internal/telemetry", func(rel string) bool {
+		return slices.Contains([]string{"internal/api", "internal/admin", "internal/cli"}, rel)
+	})
 }
 
 // reach reports every package of the module that pkg reaches, directly or

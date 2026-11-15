@@ -27,6 +27,8 @@ import (
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/store"
+	"github.com/jorlaru/stargaite/internal/telemetry"
+	"github.com/jorlaru/stargaite/internal/transport"
 	"github.com/jorlaru/stargaite/internal/usage"
 )
 
@@ -90,8 +92,20 @@ func newFixtureEnv(t *testing.T, env func() config.Env) *fixture {
 	}
 	log := &bytes.Buffer{}
 	logger := slog.New(slog.NewJSONHandler(log, nil))
+	// The exporter's clients resolve every name to loopback: a name that set
+	// time resolved to a public address resolves private at dial time (AC-43).
+	dial := func(context.Context, string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	spans := telemetry.NewExporter(func() *config.Exporter { return cfg.Snapshot().Exporter },
+		[2]*http.Client{transport.NewClient(false, dial), transport.NewClient(true, dial)}, "test", logger)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		spans.Close(ctx)
+	})
 	return &fixture{Handler(Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(testKey)), Log: logger, Usage: st.Read(),
-		Admission: admission.New(cfg.Now, usage.Seeder(st.Read(), logger))}), cfg, st, log}
+		Admission: admission.New(cfg.Now, usage.Seeder(st.Read(), logger)), Spans: spans}), cfg, st, log}
 }
 
 // as sends one request with the Authorization header given.

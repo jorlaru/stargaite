@@ -25,6 +25,7 @@ import (
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/store"
+	"github.com/jorlaru/stargaite/internal/telemetry"
 	"github.com/jorlaru/stargaite/internal/transport"
 	"github.com/jorlaru/stargaite/internal/usage"
 )
@@ -34,14 +35,15 @@ import (
 // provider call (phase-2 design section 10). On a stop signal, requests in
 // flight get shutdownGrace to finish (RES-6); those still running are then
 // stopped, drainWait bounds the wait for them to end, and flushWait the
-// usage writer's flush, before the store closes (phase-3 design section 11).
-// Tests lower them.
+// usage writer's flush, before the store closes, and exportWait the
+// exporter's last sends (phase-3 design section 11). Tests lower them.
 var (
 	serverReadTimeout  = 60 * time.Second
 	serverWriteTimeout = 60 * time.Second
 	shutdownGrace      = 30 * time.Second
 	drainWait          = 5 * time.Second
 	flushWait          = 10 * time.Second
+	exportWait         = 5 * time.Second
 )
 
 // serve runs the proxy until SIGINT or SIGTERM. Each flag falls back to its
@@ -168,6 +170,10 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 	// Every record goes through one writer on the store's write path, which
 	// config commits share (ADR-003).
 	records := usage.NewWriter(st.Write, log)
+	// Both outbound clients apply SEC-4 at dial time; the exporter reads the
+	// published exporter per batch (phase-3 design section 10).
+	clients := [2]*http.Client{transport.NewClient(false, systemResolver), transport.NewClient(true, systemResolver)}
+	spans := telemetry.NewExporter(func() *config.Exporter { return cfg.Snapshot().Exporter }, clients, cli.Version, log)
 	code := 0
 	// The admin key, under the lock and before the admin listener binds (SEC-3).
 	keyHash, created, err := admin.Key(*dataDir, getenv)
@@ -186,10 +192,8 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 		base, halt := context.WithCancelCause(context.Background())
 		var flight sync.WaitGroup
 		if err := runServers(ctx, base, log, tlsConfig, ready, []listener{
-			{"admin", *adminAddr, admin.Handler(admin.Deps{Config: cfg, KeyHash: keyHash, Log: log, Usage: st.Read(), Admission: limits})},
-			{"data", *dataAddr, api.Handler(api.Deps{Config: cfg, Log: log, Clients: [2]*http.Client{
-				transport.NewClient(false, systemResolver), transport.NewClient(true, systemResolver)}, Flight: &flight,
-				Usage: records, Admission: limits, Counters: &usage.Counters{}, Version: cli.Version})},
+			{"admin", *adminAddr, admin.Handler(admin.Deps{Config: cfg, KeyHash: keyHash, Log: log, Usage: st.Read(), Admission: limits, Spans: spans})},
+			{"data", *dataAddr, api.Handler(api.Deps{Config: cfg, Log: log, Clients: clients, Flight: &flight, Usage: records, Admission: limits, Counters: &usage.Counters{}, Version: cli.Version})},
 		}); err != nil {
 			log.Error("server failed", "error", err.Error())
 			code = 1
@@ -218,6 +222,12 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 		log.Error("store close failed", "error", err.Error())
 		code = 1
 	}
+	// Spans are best effort (TEL-12): those dropped only log.
+	export, cancel := context.WithTimeout(context.Background(), exportWait)
+	if n := spans.Close(export); n > 0 {
+		log.Warn("spans dropped at the stop", "spans", n)
+	}
+	cancel()
 	if code == 0 {
 		log.Info("stopped")
 	}

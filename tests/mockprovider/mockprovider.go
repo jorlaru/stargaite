@@ -53,7 +53,8 @@ type Server struct {
 }
 
 // defaults are the replies of an empty queue, by route: OpenAI chat
-// completions and embeddings, and Anthropic messages.
+// completions and embeddings, Anthropic messages, and an OTLP/HTTP trace
+// export, so the mock is also the in-process OTLP receiver of TEL-14.
 var defaults = map[string]string{
 	"/chat/completions": `{"id":"chatcmpl-mock","object":"chat.completion","created":0,"model":"mock",` +
 		`"choices":[{"index":0,"message":{"role":"assistant","content":"mock reply"},"finish_reason":"stop"}],` +
@@ -63,6 +64,7 @@ var defaults = map[string]string{
 	"/v1/messages": `{"id":"msg_mock","type":"message","role":"assistant","model":"mock",` +
 		`"content":[{"type":"text","text":"mock reply"}],"stop_reason":"end_turn","stop_sequence":null,` +
 		`"usage":{"input_tokens":1,"output_tokens":2}}`,
+	"/v1/traces": `{}`,
 }
 
 // streams are the replies of an empty queue to a body with "stream": true,
@@ -93,7 +95,7 @@ var streams = map[string][]string{
 func New() *Server { return &Server{} }
 
 // ServeHTTP records the request, then answers POST /chat/completions,
-// /embeddings and /v1/messages; any other route gets 404 or 405 and leaves the
+// /embeddings, /v1/messages and /v1/traces; any other route gets 404 or 405 and leaves the
 // script untouched. With an empty queue, a body with "stream": true gets the
 // route's default stream, if it has one.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {

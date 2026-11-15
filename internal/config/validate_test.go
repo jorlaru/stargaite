@@ -92,6 +92,7 @@ func TestValidate(t *testing.T) {
 			d.Settings.Telemetry.Headers["Proxy-Authorization"] = pastedKey
 		}, []string{"error TEL-2 reserved_header settings telemetry.headers.Cookie", "error TEL-2 reserved_header settings telemetry.headers.Proxy-Authorization"}},
 		{"TEL-2 a credential header by reference is fine", func(d *domain.Document) {
+			d.Settings.Telemetry.BasicAuthEnv = nil // which would compose Authorization too
 			d.Settings.Telemetry.HeaderEnv = map[string]string{"Authorization": "OTLP_AUTH"}
 		}, nil},
 		{"TEL-2 header name with a space", func(d *domain.Document) { d.Settings.Telemetry.Headers["a b"] = "x" },
@@ -100,6 +101,17 @@ func TestValidate(t *testing.T) {
 			[]string{"error TEL-2 invalid_value settings telemetry.headers.x-tag"}},
 		{"TEL-2 header_env name with a colon", func(d *domain.Document) { d.Settings.Telemetry.HeaderEnv = map[string]string{"x:y": "VAR"} },
 			[]string{"error TEL-2 invalid_value settings telemetry.header_env"}},
+		{"TEL-2 header_env Authorization beside basic_auth_env", func(d *domain.Document) {
+			d.Settings.Telemetry.HeaderEnv = map[string]string{"authorization": "OTLP_AUTH"}
+		}, []string{"error TEL-2 invalid_value settings telemetry"}},
+		{"TEL-2 a static header also set by header_env, in another case", func(d *domain.Document) {
+			d.Settings.Telemetry.HeaderEnv = map[string]string{"X-Langfuse-Ingestion-Version": "OTLP_VERSION"}
+		}, []string{"error TEL-2 invalid_value settings telemetry"}},
+		{"TEL-2 two static headers differing in case", func(d *domain.Document) { d.Settings.Telemetry.Headers["X-LANGFUSE-INGESTION-VERSION"] = "3" },
+			[]string{"error TEL-2 invalid_value settings telemetry"}},
+		{"TEL-2 an endpoint with a query", func(d *domain.Document) {
+			d.Settings.Telemetry.OTLPEndpoint = "https://langfuse.example.com/api/public/otel?project=1"
+		}, []string{"error TEL-2 invalid_value settings telemetry.otlp_endpoint"}},
 
 		// Credential references.
 		{"SEC-5 api_key_env holding a pasted credential", func(d *domain.Document) {

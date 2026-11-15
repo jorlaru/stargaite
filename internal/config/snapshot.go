@@ -3,7 +3,11 @@ package config
 import (
 	"cmp"
 	"crypto/sha256"
+	"encoding/base64"
+	"maps"
+	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jorlaru/stargaite/internal/auth"
@@ -25,7 +29,76 @@ type Snapshot struct {
 	// NeverSince is, by scope, the revision the counter of a never budget
 	// started at (State.NeverSince): admission.Budget.Since.
 	NeverSince map[string]int64
-	secrets    map[string]secret
+	// Exporter is the OTLP exporter as published, nil without an
+	// otlp_endpoint; the exporter reads it per batch (phase-3 design section 10).
+	Exporter *Exporter
+	secrets  map[string]secret
+}
+
+// Exporter is the telemetry exporter as published: credentials re-resolve on
+// every publish, like provider ones (OPS-6, SEC-5).
+type Exporter struct {
+	URL      string      // otlp_endpoint + "/v1/traces" (TEL-2)
+	Header   http.Header // the static headers
+	Revision int64       // the revision that published it, which a test span carries (TEL-13)
+	// Secrets are by canonical header name: Authorization "Basic
+	// base64(user:password)" from basic_auth_env, and each header_env.
+	Secrets map[string]transport.Secret
+	// Redact holds every secret value, longest first: each of Secrets and the
+	// parts of the composed Authorization a backend's message may echo on
+	// their own (the base64 text, the user and the password). Longest first,
+	// a secret that contains another is never left half redacted (SEC-5).
+	Redact       []transport.Secret
+	AllowPrivate bool
+	Unresolved   []string // the references that do not resolve, by name, sorted
+}
+
+// exporter composes the Exporter of t. A reference resolves as for a
+// provider (the test of CheckResolved); one that does not is listed in
+// Unresolved and sets no header.
+func exporter(t *domain.Telemetry, env Env, revision int64) *Exporter {
+	if t == nil || t.OTLPEndpoint == "" {
+		return nil
+	}
+	e := &Exporter{URL: strings.TrimSuffix(t.OTLPEndpoint, "/") + "/v1/traces", Header: http.Header{}, Revision: revision,
+		Secrets: map[string]transport.Secret{}, AllowPrivate: t.AllowPrivateNetwork}
+	for name, v := range t.Headers {
+		e.Header.Set(name, v)
+	}
+	lookup := func(ref string) (string, bool) {
+		v, ok := "", false
+		if validReference(ref) {
+			v, ok = env.Lookup(ref)
+		}
+		if !ok || v == "" {
+			e.Unresolved = append(e.Unresolved, ref)
+			return "", false
+		}
+		return v, true
+	}
+	var values []string
+	if len(t.BasicAuthEnv) == 2 {
+		user, okUser := lookup(t.BasicAuthEnv[0])
+		password, okPassword := lookup(t.BasicAuthEnv[1])
+		if okUser && okPassword {
+			encoded := base64.StdEncoding.EncodeToString([]byte(user + ":" + password))
+			e.Secrets["Authorization"] = transport.NewSecret("Basic " + encoded)
+			values = append(values, "Basic "+encoded, encoded, user, password)
+		}
+	}
+	for _, name := range slices.Sorted(maps.Keys(t.HeaderEnv)) {
+		if v, ok := lookup(t.HeaderEnv[name]); ok {
+			e.Secrets[http.CanonicalHeaderKey(name)] = transport.NewSecret(v)
+			values = append(values, v)
+		}
+	}
+	slices.SortStableFunc(values, func(a, b string) int { return cmp.Compare(len(b), len(a)) })
+	for _, v := range values {
+		e.Redact = append(e.Redact, transport.NewSecret(v))
+	}
+	slices.Sort(e.Unresolved)
+	e.Unresolved = slices.Compact(e.Unresolved)
+	return e
 }
 
 // Provider is a provider as published. Credential is set when api_key_env
@@ -114,6 +187,7 @@ func build(st *State, env Env, findings []domain.Finding) *Snapshot {
 		Keys:       make(map[string]*Key, len(d.Keys)),
 		Findings:   findings,
 		NeverSince: st.NeverSince,
+		Exporter:   exporter(d.Settings.Telemetry, env, st.Revision),
 		secrets:    make(map[string]secret, len(st.Secrets)),
 	}
 	for name, spec := range d.Providers {
@@ -164,8 +238,9 @@ func build(st *State, env Env, findings []domain.Finding) *Snapshot {
 }
 
 // WithDefaults gives every undeclared setting that has a default its default
-// (design section 13, point 15). A declaration is never changed: export
-// reads Doc.
+// (design section 13, point 15), the telemetry ones with or without a block
+// (phase-3 design section 2). A declaration is never changed: export reads
+// Doc.
 func WithDefaults(s domain.Settings) domain.Settings {
 	s.MaxBodyBytes = cmp.Or(s.MaxBodyBytes, domain.DefaultMaxBodyBytes)
 	s.MaxResponseBytes = cmp.Or(s.MaxResponseBytes, domain.DefaultMaxResponseBytes)
@@ -182,13 +257,11 @@ func WithDefaults(s domain.Settings) domain.Settings {
 		UsageDailyMonths: cmp.Or(r.UsageDailyMonths, domain.DefaultUsageDailyMonths),
 		AuditMonths:      cmp.Or(r.AuditMonths, domain.DefaultAuditMonths),
 	}
-	if s.Telemetry != nil {
-		t := *s.Telemetry
-		if t.TrustTraceparent == nil {
-			t.TrustTraceparent = new(domain.DefaultTrustTraceparent)
-		}
-		t.ContentMaxBytes = cmp.Or(t.ContentMaxBytes, domain.DefaultContentMaxBytes)
-		s.Telemetry = &t
+	tel := *cmp.Or(s.Telemetry, &domain.Telemetry{})
+	if tel.TrustTraceparent == nil {
+		tel.TrustTraceparent = new(domain.DefaultTrustTraceparent)
 	}
+	tel.ContentMaxBytes = cmp.Or(tel.ContentMaxBytes, domain.DefaultContentMaxBytes)
+	s.Telemetry = &tel
 	return s
 }

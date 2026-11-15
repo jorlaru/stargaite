@@ -54,11 +54,15 @@ func TestRecordsExactBytes(t *testing.T) {
 	}
 }
 
-// An empty queue answers each route with well-formed JSON.
+// An empty queue answers each route with well-formed JSON, an OTLP export
+// with 200 {} (phase-3 design section 14).
 func TestDefaults(t *testing.T) {
 	srv := httptest.NewServer(New())
 	defer srv.Close()
-	for _, path := range []string{"/chat/completions", "/embeddings", "/v1/messages"} {
+	if _, _, body := send(t, srv, http.MethodPost, "/v1/traces", nil, []byte(`{"resourceSpans":[]}`)); string(body) != "{}" {
+		t.Errorf("/v1/traces: %s", body)
+	}
+	for _, path := range []string{"/chat/completions", "/embeddings", "/v1/messages", "/v1/traces"} {
 		status, header, body := send(t, srv, http.MethodPost, path, nil, []byte(`{}`))
 		if status != http.StatusOK || header.Get("Content-Type") != "application/json" || !json.Valid(body) {
 			t.Errorf("%s: %d %q %s", path, status, header.Get("Content-Type"), body)

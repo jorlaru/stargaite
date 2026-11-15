@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -747,8 +748,14 @@ func TestSnapshotBuild(t *testing.T) {
 	empty := build(&State{}, Env{}, nil).Settings
 	if empty.MaxBodyBytes != domain.DefaultMaxBodyBytes || empty.MaxResponseBytes != domain.DefaultMaxResponseBytes ||
 		*empty.Timeouts != (domain.Timeouts{ConnectMS: domain.DefaultConnectMS, FirstByteMS: domain.DefaultFirstByteMS, StreamIdleMS: domain.DefaultStreamIdleMS, TotalMS: domain.DefaultTotalMS}) ||
-		*empty.Retention != (domain.Retention{UsageDays: domain.DefaultUsageDays, UsageDailyMonths: domain.DefaultUsageDailyMonths, AuditMonths: domain.DefaultAuditMonths}) || empty.Telemetry != nil {
+		*empty.Retention != (domain.Retention{UsageDays: domain.DefaultUsageDays, UsageDailyMonths: domain.DefaultUsageDailyMonths, AuditMonths: domain.DefaultAuditMonths}) {
 		t.Errorf("defaults %+v", empty)
+	}
+	// The telemetry defaults apply without a block too (phase-3 design
+	// section 2), and no exporter is published without an endpoint.
+	if tel := empty.Telemetry; tel == nil || tel.TrustTraceparent == nil || !*tel.TrustTraceparent || tel.ContentMaxBytes != domain.DefaultContentMaxBytes ||
+		tel.OTLPEndpoint != "" || build(&State{}, Env{}, nil).Exporter != nil {
+		t.Errorf("telemetry defaults without a block %+v", tel)
 	}
 	withTelemetry := &State{Doc: domain.Document{Settings: domain.Settings{Telemetry: &domain.Telemetry{OTLPEndpoint: "https://otel.example.com"}}}}
 	tel := build(withTelemetry, Env{}, nil).Settings.Telemetry
@@ -763,6 +770,62 @@ func TestSnapshotBuild(t *testing.T) {
 	if pub["none"].Spec.MaxParallelRequests != domain.DefaultKeyMaxParallelRequests || pub["own"].Spec.MaxParallelRequests != 50 ||
 		keys.Doc.Keys["none"].MaxParallelRequests != 0 {
 		t.Errorf("keys %+v %+v, declared %+v", pub["none"].Spec, pub["own"].Spec, keys.Doc.Keys["none"])
+	}
+}
+
+// TestExporter: build composes Snapshot.Exporter from settings.telemetry:
+// the URL, the static headers, the Basic header from basic_auth_env and each
+// header_env as secrets, and the references that do not resolve, by name;
+// none without an otlp_endpoint (phase-3 design section 10).
+func TestExporter(t *testing.T) {
+	env := Env{Lookup: func(n string) (string, bool) {
+		v, ok := map[string]string{"OTLP_USER": "pk-1", "OTLP_PASSWORD": "sk-2", "OTLP_TOKEN": "tok", "EMPTY": ""}[n]
+		return v, ok
+	}}
+	tel := &domain.Telemetry{OTLPEndpoint: "https://otel.example.com/api/public/otel/", BasicAuthEnv: []string{"OTLP_USER", "OTLP_PASSWORD"},
+		HeaderEnv: map[string]string{"x-token": "OTLP_TOKEN"}, Headers: map[string]string{"x-langfuse-ingestion-version": "4"}, AllowPrivateNetwork: true}
+	st := &State{Revision: 4, Doc: domain.Document{Settings: domain.Settings{Telemetry: tel}}}
+	e := build(st, env, nil).Exporter
+	want := http.Header{}
+	for name, s := range e.Secrets {
+		s.SetHeader(want, name, "")
+	}
+	if e.URL != "https://otel.example.com/api/public/otel/v1/traces" || e.Header.Get("X-Langfuse-Ingestion-Version") != "4" || len(e.Header) != 1 ||
+		!e.AllowPrivate || e.Revision != 4 || len(e.Unresolved) != 0 || len(e.Secrets) != 2 || len(e.Redact) != 5 ||
+		want.Get("Authorization") != "Basic "+base64.StdEncoding.EncodeToString([]byte("pk-1:sk-2")) || want.Get("X-Token") != "tok" {
+		t.Errorf("exporter %+v, secret headers %v", e, want)
+	}
+	if text := fmt.Sprintf("%v %+v %#v", e, e, e); strings.Contains(text, "sk-2") || strings.Contains(text, "tok\"") {
+		t.Errorf("the exporter prints a secret: %s", text)
+	}
+
+	// Redact holds every secret value longest first, so a secret that
+	// contains another, a password holding the user or one header_env value
+	// holding another, is redacted whole (SEC-5).
+	env.Lookup = func(n string) (string, bool) {
+		v, ok := map[string]string{"OTLP_USER": "bob", "OTLP_PASSWORD": "bob-very-secret-password", "A": "tok", "B": "tok-very-secret-token"}[n]
+		return v, ok
+	}
+	tel.HeaderEnv = map[string]string{"x-a": "A", "x-b": "B"}
+	text := "bob-very-secret-password / tok-very-secret-token / Basic " + base64.StdEncoding.EncodeToString([]byte("bob:bob-very-secret-password"))
+	for _, s := range build(st, env, nil).Exporter.Redact {
+		text = s.Redact(text)
+	}
+	if text != "[redacted] / [redacted] / [redacted]" {
+		t.Errorf("redacted %q", text)
+	}
+
+	// A reference that is unset, empty or not a valid name does not resolve
+	// and composes no header.
+	tel.BasicAuthEnv = []string{"OTLP_USER", "EMPTY"}
+	tel.HeaderEnv = map[string]string{"x-token": "MISSING", "x-other": "STARGAITE_ADMIN_KEY"}
+	e = build(st, env, nil).Exporter
+	if !slices.Equal(e.Unresolved, []string{"EMPTY", "MISSING", "STARGAITE_ADMIN_KEY"}) || len(e.Secrets) != 0 || len(e.Redact) != 0 {
+		t.Errorf("unresolved %+v", e)
+	}
+	tel.OTLPEndpoint = ""
+	if e := build(st, env, nil).Exporter; e != nil {
+		t.Errorf("an exporter without an endpoint: %+v", e)
 	}
 }
 

@@ -89,6 +89,7 @@ func newResilience(t *testing.T) (s *streamFixture, good *mockprovider.Server, y
 	yaml = strings.NewReplacer("base_url: BAD,", "base_url: "+badSrv.URL+",", "base_url: GOOD,", "base_url: "+goodSrv.URL+",",
 		"base_url: REFUSED,", "base_url: http://"+refused+",",
 		"base_url: REBOUND,", "base_url: https://rebound.test:"+badSrv.URL[strings.LastIndex(badSrv.URL, ":")+1:]+",").Replace(resilienceConfig)
+	yaml = f.traced(yaml)
 	tokens := f.apply(t, yaml)
 	data := httptest.NewServer(f.data)
 	t.Cleanup(data.Close)
@@ -183,6 +184,12 @@ func TestFaultMatrix(t *testing.T) {
 			status: 200, code: "upstream_error", committed: true},
 	)
 
+	type spanWant struct {
+		fellBack    bool
+		first, code string
+		status      int
+	}
+	wants := map[string]spanWant{} // by trace id
 	wantAttempts, requests := 0, 0
 	for _, f := range faults {
 		for _, alias := range []string{f.first + "-one", f.first + "-two"} {
@@ -201,6 +208,8 @@ func TestFaultMatrix(t *testing.T) {
 				requests++
 				fellBack := strings.HasSuffix(alias, "-two") && f.eligible && !f.committed
 				h := resp.Header
+				// The request line's status: once committed, the terminal event's.
+				wants[h.Get(traceHeader)] = spanWant{fellBack, f.first + "/m", f.code, map[bool]int{false: resp.StatusCode, true: domain.NewError(f.code, "").Status}[f.committed]}
 				badCalls, goodCalls := len(s.mock.Calls())-badBefore, len(good.Calls())-goodBefore
 				if want := map[bool]int{true: 1}[f.step != nil]; badCalls != want {
 					t.Errorf("%d calls to the failing provider", badCalls)
@@ -250,6 +259,46 @@ func TestFaultMatrix(t *testing.T) {
 	// The private dial is the SEC-4 guard's refusal, not a failed lookup.
 	if !strings.Contains(log, `"target":"rebound/m","status":0`) || !strings.Contains(log, "rebound.test: ") || strings.Contains(log, planted) {
 		t.Errorf("log %s", log)
+	}
+	// AC-21: a failed attempt before a fallback is a child span of the
+	// request's trace with its own target and error; a request that did not
+	// fall back has its request span alone, with the error the client got.
+	byTrace := map[string][]otlpSpan{}
+	for _, sp := range s.exported(t) {
+		byTrace[sp.TraceID] = append(byTrace[sp.TraceID], sp)
+	}
+	if len(byTrace) != len(wants) {
+		t.Errorf("%d traces for %d requests", len(byTrace), len(wants))
+	}
+	for trace, want := range wants {
+		spans := byTrace[trace]
+		switch {
+		case len(spans) != 1+map[bool]int{true: 1}[want.fellBack] || spans[0].Kind != 2:
+			t.Errorf("%+v: spans %+v", want, spans)
+		case want.fellBack:
+			req, a := spans[0], spans[1]
+			if req.Status != nil || req.attrs["stargaite.target"] != "good/m" || req.attrs["stargaite.attempts"] != int64(2) ||
+				a.Kind != 3 || a.Name != "attempt "+want.first || a.ParentSpanID != req.SpanID || a.attrs["stargaite.target"] != want.first ||
+				a.Status == nil || a.Status.Code != 2 || a.Status.Message == "" || a.attrs["error.type"] != want.code {
+				t.Errorf("%+v: request span %+v, attempt span %+v", want, req, a)
+			}
+			// AC-18: each span's sent effort, level and cap are those its
+			// provider got (the bodies checked above), translated again for
+			// good/m.
+			req.has(t, map[string]any{"stargaite.reasoning.effort.sent": "high", "gen_ai.request.reasoning.level": "high",
+				"stargaite.reasoning.dialect": "adaptive_effort", "stargaite.max_output_tokens.sent": int64(500)})
+			if want.first == "bad/m" {
+				a.has(t, map[string]any{"stargaite.reasoning.effort.sent": "high", "gen_ai.request.reasoning.level": "high",
+					"stargaite.reasoning.dialect": "reasoning_effort", "stargaite.max_output_tokens.sent": int64(500),
+					"stargaite.params.changed": "max_tokens:added,reasoning_effort:added"})
+			}
+		default:
+			s := spans[0]
+			if s.attrs["stargaite.target"] != want.first || s.Status == nil || s.Status.Code != 2 || s.attrs["error.type"] != want.code ||
+				s.attrs["http.response.status_code"] != int64(want.status) {
+				t.Errorf("%+v: span %+v", want, s)
+			}
+		}
 	}
 }
 
@@ -600,7 +649,8 @@ var longTimers = strings.NewReplacer("total_ms: 300", "total_ms: 60000", "first_
 // client reads them); the target's breaker is told nothing. The call leaves
 // its usage record with error_type client_gone and the status as received:
 // none before the answer, with zero tokens from the provider; 200 mid-stream,
-// with tokens estimated (AC-23, phase-3 design section 4).
+// with tokens estimated (AC-23, phase-3 design section 4); its request span
+// has error status "client gone", error.type client_gone and status 499.
 func TestClientGone(t *testing.T) {
 	s, _, yaml := newResilience(t)
 	s.apply(t, longTimers.Replace(yaml))
@@ -639,6 +689,17 @@ func TestClientGone(t *testing.T) {
 		})
 	}
 	uncounted(t, s)
+	// Each cut request's span, sent first, is a failure: 499 client_gone.
+	spans := s.exported(t)
+	if len(spans) != len(cutCases())+8 {
+		t.Fatalf("%d spans", len(spans))
+	}
+	for _, sp := range spans[:len(cutCases())] {
+		if sp.Kind != 2 {
+			t.Errorf("span %+v", sp)
+		}
+		sp.failed(t, "client_gone", 499, "client gone")
+	}
 }
 
 // uncounted checks that the cut calls, two on bad/m and three on badanth/m

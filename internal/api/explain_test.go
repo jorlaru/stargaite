@@ -283,7 +283,7 @@ func TestCorpus(t *testing.T) {
 	srv := httptest.NewServer(mock)
 	t.Cleanup(srv.Close)
 	aliases, names := corpusAliases()
-	tokens := f.apply(t, strings.Replace(strings.ReplaceAll(corpusConfig, "base_url: MOCK", "base_url: "+srv.URL), "TARGETS", aliases, 1))
+	tokens := f.apply(t, f.traced(strings.Replace(strings.ReplaceAll(corpusConfig, "base_url: MOCK", "base_url: "+srv.URL), "TARGETS", aliases, 1)))
 	var doc domain.Document
 	if w := call(f.admin, "Bearer "+adminKey, http.MethodGet, "/admin/v1/export?format=json", nil); json.Unmarshal(w.Body.Bytes(), &doc) != nil {
 		t.Fatalf("export: %s", w.Body)
@@ -316,8 +316,10 @@ func TestCorpus(t *testing.T) {
 	type sentValues struct {
 		changes, effort string
 		maxOutput       *int64
+		level, alias    string // what the span holds besides
 	}
 	recorded := map[string]sentValues{} // by request id: what the record must hold
+	spanned := map[int]sentValues{}     // by body: what its request span must hold
 	for i := range n {
 		ep, alias := domain.EndpointChat, names[r.IntN(len(names))]
 		if r.Float64() < 0.4 {
@@ -506,7 +508,8 @@ func TestCorpus(t *testing.T) {
 			fail("cap sent %s: attempt %s, explain %s", toJSON(maxOutput), toJSON(line.MaxOutput), toJSON(b.MaxOutput.Sent))
 		}
 
-		recorded[h.Get(domain.RequestIDHeader)] = sentValues{b.Changes, effort, maxOutput}
+		recorded[h.Get(domain.RequestIDHeader)] = sentValues{b.Changes, effort, maxOutput, reasoning.Level(rb, decl.Reasoning), alias}
+		spanned[i] = recorded[h.Get(domain.RequestIDHeader)]
 		for _, a := range []string{"added", "translated"} {
 			if strings.Contains(b.Changes, "stream_options:"+a) {
 				injected[a]++
@@ -530,6 +533,30 @@ func TestCorpus(t *testing.T) {
 		if !ok || str(r.ParamsChanged) != want.changes || str(r.EffortSent) != want.effort || !reflect.DeepEqual(r.MaxOutputSent, want.maxOutput) {
 			t.Fatalf("request %s: record changes %q, effort %q, cap %s; want %+v (cap %s)", r.RequestID, str(r.ParamsChanged), str(r.EffortSent),
 				toJSON(r.MaxOutputSent), want, toJSON(want.maxOutput))
+		}
+	}
+
+	// The request span of every call holds them too (AC-09, AC-18): the
+	// requests ran one after the other, so their spans are in their order.
+	var requestSpans []otlpSpan
+	for _, s := range f.exported(t) {
+		if s.Kind == 2 {
+			requestSpans = append(requestSpans, s)
+		}
+	}
+	if len(requestSpans) != n {
+		t.Fatalf("%d request spans for %d requests", len(requestSpans), n)
+	}
+	for i, want := range spanned {
+		s, capSent := requestSpans[i], any(nil)
+		if want.maxOutput != nil {
+			capSent = *want.maxOutput
+		}
+		for name, v := range map[string]any{"stargaite.model": want.alias, "stargaite.params.changed": want.changes, "stargaite.reasoning.effort.sent": want.effort,
+			"gen_ai.request.reasoning.level": want.level, "stargaite.max_output_tokens.sent": capSent, "gen_ai.request.max_tokens": capSent} {
+			if got, ok := s.attrs[name]; (v == "" || v == nil) == ok || ok && got != v {
+				t.Fatalf("body %d: span %s = %v, want %v", i, name, got, v)
+			}
 		}
 	}
 

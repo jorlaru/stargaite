@@ -19,6 +19,7 @@ import (
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/routing"
+	"github.com/jorlaru/stargaite/internal/telemetry"
 	"github.com/jorlaru/stargaite/internal/usage"
 )
 
@@ -57,7 +58,10 @@ type Deps struct {
 	Usage     *usage.Writer    // one record per provider call (USE-1)
 	Admission *admission.State // slots and rate windows (LIM-5, LIM-6)
 	Counters  *usage.Counters  // OPS-8
-	Version   string           // cli.Version: records carry it (USE-5)
+	// Spans is the exporter done hands the spans of a sampled request to,
+	// when an exporter is published (phase-3 design section 10).
+	Spans   *telemetry.Exporter
+	Version string // cli.Version: records and spans carry it (USE-5, TEL-13)
 }
 
 // ErrStopping is the cause serve cancels the server's base context with when
@@ -96,14 +100,16 @@ func Handler(d Deps) http.Handler {
 }
 
 // authenticate returns the key of the client token (step 1), checked
-// against snap, and the trace id it sets on the response (PAR-9). The token
+// against snap, and the trace context, whose trace id it sets on the
+// response (PAR-9): the client's valid traceparent when trust_traceparent
+// holds, else a new trace (TEL-6, telemetry.Parse). The token
 // is in Authorization: Bearer or, on /v1/messages, in x-api-key (ACT-1);
 // when both are sent, Authorization wins. The admin key never has the shape
 // of a client key, so it is refused like any other wrong token (SEC-2). A
 // failure answers 401 invalid_api_key in the envelope of ep and is logged
 // rate-limited, never with the token, so a flood of wrong tokens cannot grow
 // the log (OPS-9).
-func (h *handler) authenticate(w http.ResponseWriter, r *http.Request, snap *config.Snapshot, ep domain.Endpoint) (*config.Key, string) {
+func (h *handler) authenticate(w http.ResponseWriter, r *http.Request, snap *config.Snapshot, ep domain.Endpoint) (*config.Key, telemetry.Context) {
 	now := h.Config.Now()
 	var key *config.Key
 	want := "a valid client key is required: Authorization: Bearer sk-stargaite-..."
@@ -124,13 +130,15 @@ func (h *handler) authenticate(w http.ResponseWriter, r *http.Request, snap *con
 			h.Log.Warn("authentication failed", "request_id", w.Header().Get(domain.RequestIDHeader), "method", r.Method, "path", r.URL.Path,
 				"status", http.StatusUnauthorized, "remote", r.RemoteAddr, "failures", n)
 		}
-		return nil, ""
+		return nil, telemetry.Context{}
 	}
-	var b [16]byte
-	_, _ = rand.Read(b[:]) // never fails
-	trace := hex.EncodeToString(b[:])
-	w.Header().Set(traceHeader, trace)
-	return key, trace
+	tel := snap.Settings.Telemetry // WithDefaults sets it and its trust_traceparent
+	tc, ok := telemetry.Parse(r.Header.Values("Traceparent"))
+	if !ok || tel == nil || tel.TrustTraceparent == nil || !*tel.TrustTraceparent {
+		tc = telemetry.NewContext()
+	}
+	w.Header().Set(traceHeader, hex.EncodeToString(tc.Trace[:]))
+	return key, tc
 }
 
 func ok(w http.ResponseWriter, _ *http.Request) {
@@ -153,7 +161,7 @@ type model struct {
 // the key, never the token (OPS-9).
 func (h *handler) models(w http.ResponseWriter, r *http.Request) {
 	snap := h.Config.Snapshot()
-	key, trace := h.authenticate(w, r, snap, domain.EndpointChat)
+	key, _ := h.authenticate(w, r, snap, domain.EndpointChat) // no span (TEL-5)
 	if key == nil {
 		return
 	}
@@ -167,8 +175,8 @@ func (h *handler) models(w http.ResponseWriter, r *http.Request) {
 		Object string  `json:"object"`
 		Data   []model `json:"data"`
 	}{"list", list})
-	h.Log.Info("request", "request_id", w.Header().Get(domain.RequestIDHeader), "trace_id", trace, "method", r.Method, "path", r.URL.Path,
-		"status", http.StatusOK, "key", key.Name)
+	h.Log.Info("request", "request_id", w.Header().Get(domain.RequestIDHeader), "trace_id", w.Header().Get(traceHeader), "method", r.Method,
+		"path", r.URL.Path, "status", http.StatusOK, "key", key.Name)
 }
 
 // fail writes e in the envelope of ep (kick-off section 15), with its

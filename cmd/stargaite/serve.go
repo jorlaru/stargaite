@@ -193,7 +193,7 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 		var flight sync.WaitGroup
 		if err := runServers(ctx, base, log, tlsConfig, ready, []listener{
 			{"admin", *adminAddr, admin.Handler(admin.Deps{Config: cfg, KeyHash: keyHash, Log: log, Usage: st.Read(), Admission: limits, Spans: spans})},
-			{"data", *dataAddr, api.Handler(api.Deps{Config: cfg, Log: log, Clients: clients, Flight: &flight, Usage: records, Admission: limits, Counters: &usage.Counters{}, Version: cli.Version})},
+			{"data", *dataAddr, api.Handler(api.Deps{Config: cfg, Log: log, Clients: clients, Flight: &flight, Usage: records, Admission: limits, Counters: &usage.Counters{}, Spans: spans, Version: cli.Version})},
 		}); err != nil {
 			log.Error("server failed", "error", err.Error())
 			code = 1

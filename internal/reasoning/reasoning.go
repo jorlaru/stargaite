@@ -363,6 +363,17 @@ func present(out *params.Body, f map[string]json.RawMessage) bool {
 	return len(f) > 0
 }
 
+// Level is the string of the level member of the dialect r declares in out,
+// the final outgoing body scanned with an Out walk (PAR-8): reasoning_effort,
+// reasoning.effort or output_config.effort; "" when out does not hold it as a
+// string, and for every other dialect (gen_ai.request.reasoning.level).
+func Level(out *params.Body, r *domain.Reasoning) string {
+	if path := forms[Dialect(r)].level; path != nil {
+		return str(out, path...)
+	}
+	return ""
+}
+
 // Sent reads the effort sent from out, the final outgoing body scanned with
 // an Out walk (RSN-6, PAR-8), in the terms of the dialect r declares: the
 // level; "on" for an on/off dialect; "budget:<N>" for thinking_budget; "none"

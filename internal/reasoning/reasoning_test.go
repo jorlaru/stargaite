@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/jorlaru/stargaite/internal/domain"
+	"github.com/jorlaru/stargaite/internal/params"
 )
 
 // TestResolve is RSN-5: the alias's mode against the client's effort.
@@ -54,6 +55,36 @@ func TestTranslate(t *testing.T) {
 	} {
 		if got := translate(tt.l, tt.d, &tt.r); got != tt.want {
 			t.Errorf("translate(%s, %s, %+v) = %s, want %s", tt.l, tt.d, tt.r, got, tt.want)
+		}
+	}
+}
+
+// Level is the string of the dialect's level member in the outgoing body,
+// for gen_ai.request.reasoning.level: reasoning_effort, reasoning.effort or
+// output_config.effort; none for a dialect without one, a number or an
+// absent member.
+func TestLevel(t *testing.T) {
+	for _, tt := range []struct {
+		dialect, body, want string
+	}{
+		{"reasoning_effort", `{"reasoning_effort":"high"}`, "high"},
+		{"reasoning_effort", `{"reasoning_effort":"none"}`, "none"},
+		{"reasoning_effort", `{}`, ""},
+		{"reasoning_object", `{"reasoning":{"effort":"xhigh"}}`, "xhigh"},
+		{"reasoning_object", `{"reasoning":{"enabled":false}}`, ""},
+		{"adaptive_effort", `{"thinking":{"type":"adaptive"},"output_config":{"effort":"medium"}}`, "medium"},
+		{"adaptive_effort", `{"thinking":{"type":"disabled"}}`, ""},
+		{"thinking_budget", `{"thinking":{"type":"enabled","budget_tokens":2048}}`, ""},
+		{"thinking_toggle", `{"thinking":{"type":"enabled"}}`, ""},
+		{"enable_thinking", `{"enable_thinking":true,"reasoning_effort":"high"}`, ""},
+		{"none", `{"reasoning_effort":"high"}`, ""},
+	} {
+		out, e := params.ReadBack([]byte(tt.body), params.ChatOut)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if got := Level(out, &domain.Reasoning{Dialect: tt.dialect}); got != tt.want {
+			t.Errorf("Level(%s, %s) = %q, want %q", tt.dialect, tt.body, got, tt.want)
 		}
 	}
 }

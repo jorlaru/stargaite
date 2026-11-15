@@ -49,7 +49,8 @@ var (
 // PAR-9 headers and the one call the provider got (AC-04), /v1/models with the
 // new key, usage show with the one request, its tokens and its price_table
 // cost (AC-33), telemetry test accepted by the mock as OTLP receiver, which
-// got the test span and nothing else (AC-24), the key's parallel limit shown as 5 and exported as declared
+// got the test span (AC-24), then the request span of the chat completion
+// with the key my-agent (AC-25), and nothing else, the key's parallel limit shown as 5 and exported as declared
 // (LIM-7), a second serve on the same directory refused (AC-42), and the
 // same export, the same key and the same usage after a restart (RES-9). The guide's commands use
 // the default data directory and addresses; here the environment points them
@@ -66,6 +67,7 @@ func TestQuickStart(t *testing.T) {
 		answered bool
 		shown    string // what usage show printed
 		tested   string // what telemetry test printed
+		trace    string // the trace id of the chat completion
 	)
 	cli := func(args ...string) string {
 		t.Helper()
@@ -131,7 +133,7 @@ func TestQuickStart(t *testing.T) {
 				t.Fatalf("%s: status %d: %s", line, status, body)
 			}
 			if method == http.MethodPost {
-				answered = true
+				answered, trace = true, h.Get("X-Stargaite-Trace-Id")
 				var completion struct {
 					Choices []struct{ Message struct{ Content string } }
 				}
@@ -216,25 +218,34 @@ func TestQuickStart(t *testing.T) {
 	models()
 	// The one chat call of the quick start, with the upstream model id and no
 	// credential: the mock provider declares none. The mock is also the OTLP
-	// receiver: telemetry test sent it one export, the test span alone.
+	// receiver: telemetry test sent it one export, the test span alone, and
+	// the chat completion's request span follows in the next batch, within
+	// the 2 s of a batch.
 	var calls, exports []mockprovider.Call
-	for _, c := range mock.Calls() {
-		if c.Path == "/v1/traces" {
-			exports = append(exports, c)
-		} else {
-			calls = append(calls, c)
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		calls, exports = nil, nil
+		for _, c := range mock.Calls() {
+			if c.Path == "/v1/traces" {
+				exports = append(exports, c)
+			} else {
+				calls = append(calls, c)
+			}
+		}
+		if len(exports) >= 2 || time.Now().After(deadline) {
+			break
 		}
 	}
 	if len(calls) != 1 || calls[0].Path != "/chat/completions" ||
 		string(calls[0].Body) != `{"model":"mock","messages":[{"role":"user","content":"hi"}]}` || calls[0].Header.Values("Authorization") != nil {
 		t.Fatalf("the mock received %+v", calls)
 	}
-	if len(exports) != 1 || exports[0].Header.Get("Content-Type") != "application/json" || !json.Valid(exports[0].Body) ||
+	if len(exports) != 2 || exports[0].Header.Get("Content-Type") != "application/json" || !json.Valid(exports[0].Body) ||
 		!strings.Contains(string(exports[0].Body), `"name":"stargaite telemetry test"`) || !strings.Contains(string(exports[0].Body), `{"stringValue":"_telemetry"}`) ||
 		!strings.Contains(string(exports[0].Body), `"traceId":"`+acceptedLine.FindStringSubmatch(tested)[1]+`"`) {
 		t.Fatalf("the receiver got %+v", exports)
 	}
-	if status := cli("telemetry", "status"); !strings.Contains(status, "exporter.sent: 1\n") || !strings.Contains(status, "telemetry.otlp_endpoint: "+mockURL+"\n") {
+	requestSpan(t, exports[1].Body, trace)
+	if status := cli("telemetry", "status"); !strings.Contains(status, "exporter.sent: 2\n") || !strings.Contains(status, "telemetry.otlp_endpoint: "+mockURL+"\n") {
 		t.Errorf("telemetry status:\n%s", status)
 	}
 	// models explain, run above without a call, shows the bytes the provider
@@ -272,6 +283,10 @@ func TestQuickStart(t *testing.T) {
 	if code != 0 || !strings.Contains(log, `"msg":"stopped"`) {
 		t.Fatalf("stop: exit %d, log:\n%s", code, log)
 	}
+	// The stop flushes the exporter: nothing was left to send.
+	if n := len(mock.Calls()); n != len(calls)+len(exports) {
+		t.Errorf("%d calls to the mock after the stop, %d before", n, len(calls)+len(exports))
+	}
 	// OPS-9: the provider call and the request each logged once, with the key and the alias.
 	if strings.Count(log, `"msg":"attempt"`) != 1 || !strings.Contains(log, `"key":"my-agent","alias":"fast","attempts":1,"status":200`) {
 		t.Errorf("log:\n%s", log)
@@ -296,6 +311,50 @@ func TestQuickStart(t *testing.T) {
 		if !json.Valid([]byte(line)) || strings.Contains(line, strings.TrimSpace(string(adminKey))) || strings.Contains(line, token) {
 			t.Errorf("log line is not JSON or carries a key: %q", line)
 		}
+	}
+}
+
+// requestSpan checks that an export holds the request span of the quick
+// start's chat completion alone: SERVER, named after the alias, in the trace
+// the response named, with the key my-agent, its compatibility attribute,
+// the target and the tokens the mock reported (AC-25, kick-off annex D).
+func requestSpan(t *testing.T, export []byte, trace string) {
+	t.Helper()
+	var req struct {
+		ResourceSpans []struct {
+			ScopeSpans []struct {
+				Spans []struct {
+					TraceID    string `json:"traceId"`
+					Name       string
+					Kind       int
+					Attributes []struct {
+						Key   string
+						Value map[string]any
+					}
+				}
+			}
+		}
+	}
+	if err := json.Unmarshal(export, &req); err != nil || len(req.ResourceSpans) != 1 || len(req.ResourceSpans[0].ScopeSpans) != 1 ||
+		len(req.ResourceSpans[0].ScopeSpans[0].Spans) != 1 {
+		t.Fatalf("the export %s", export)
+	}
+	s := req.ResourceSpans[0].ScopeSpans[0].Spans[0]
+	attrs := map[string]any{}
+	for _, a := range s.Attributes {
+		for _, v := range a.Value {
+			attrs[a.Key] = v
+		}
+	}
+	want := map[string]any{"stargaite.key": "my-agent", "langfuse.observation.metadata.stargaite_key": "my-agent", "stargaite.model": "fast",
+		"stargaite.target": "mock/mock", "gen_ai.usage.input_tokens": "1", "gen_ai.usage.output_tokens": "2", "http.response.status_code": "200"}
+	for k, v := range want {
+		if attrs[k] != v {
+			t.Errorf("the request span's %s is %v, want %v: %s", k, attrs[k], v, export)
+		}
+	}
+	if s.TraceID != trace || s.Name != "chat fast" || s.Kind != 2 {
+		t.Errorf("the request span %s, the trace %s", export, trace)
 	}
 }
 

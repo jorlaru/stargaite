@@ -23,8 +23,10 @@ import (
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/store"
+	"github.com/jorlaru/stargaite/internal/telemetry"
 	"github.com/jorlaru/stargaite/internal/transport"
 	"github.com/jorlaru/stargaite/internal/usage"
+	"github.com/jorlaru/stargaite/tests/mockprovider"
 )
 
 const (
@@ -80,6 +82,9 @@ type fixture struct {
 	limits      *admission.State
 	cfg         *config.Service
 	tick        *atomic.Pointer[func()] // when set, run at every read of the clock
+	spans       *telemetry.Exporter     // toward receiver once a configuration sets it (traced)
+	receiver    *mockprovider.Server    // the OTLP receiver, apart from any provider mock
+	receiverURL string
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -128,9 +133,19 @@ func newFixture(t *testing.T) *fixture {
 	logger := slog.New(slog.NewJSONHandler(log, nil))
 	records, counters, limits := usage.NewWriter(st.Write, logger), &usage.Counters{}, admission.New(cfg.Now, usage.Seeder(st.Read(), logger))
 	t.Cleanup(func() { records.Close(context.Background()) }) // before the store closes
-	return &fixture{admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(adminKey)), Log: logger, Usage: st.Read(), Admission: limits}),
-		Handler(Deps{Config: cfg, Log: logger, Clients: [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)},
-			Flight: flight, Usage: records, Admission: limits, Counters: counters, Version: "test-version"}), now, log, flight, st, counters, limits, cfg, tick}
+	clients := [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)}
+	receiver := mockprovider.New()
+	rsrv := httptest.NewServer(receiver)
+	t.Cleanup(rsrv.Close)
+	spans := telemetry.NewExporter(func() *config.Exporter { return cfg.Snapshot().Exporter }, clients, "test-version", logger)
+	t.Cleanup(func() { // before the receiver closes
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		spans.Close(ctx)
+	})
+	return &fixture{admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(adminKey)), Log: logger, Usage: st.Read(), Admission: limits, Spans: spans}),
+		Handler(Deps{Config: cfg, Log: logger, Clients: clients, Flight: flight, Usage: records, Admission: limits, Counters: counters, Spans: spans,
+			Version: "test-version"}), now, log, flight, st, counters, limits, cfg, tick, spans, receiver, rsrv.URL}
 }
 
 // pastWindow moves the service clock past the RES-2 window of 30 s, so the

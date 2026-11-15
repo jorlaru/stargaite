@@ -241,6 +241,7 @@ type Outgoing struct {
 	Effort         Layers[string]
 	EffortSource   string // client, alias_default, alias_forced, provider_default (RSN-6)
 	EffortAdjusted bool
+	Level          string // the body's level member, as Level reads it back (gen_ai.request.reasoning.level)
 	MaxOutput      Layers[int64]
 }
 
@@ -397,7 +398,7 @@ func Build(in Input) (*Outgoing, *Skip) {
 
 	sent := reasoning.Sent(rb, t.Reasoning)
 	out.Effort = Layers[string]{Requested: opt(choice.Requested), Alias: opt(choice.Alias), Sent: opt(sent)}
-	out.EffortSource, out.EffortAdjusted = choice.Source, edit.Adjusted
+	out.EffortSource, out.EffortAdjusted, out.Level = choice.Source, edit.Adjusted, reasoning.Level(rb, t.Reasoning)
 	if sent == "" {
 		out.EffortSource = reasoning.SourceProviderDefault
 	}

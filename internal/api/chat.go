@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json/jsontext"
 	"errors"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"mime"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -24,7 +27,9 @@ import (
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/params"
 	"github.com/jorlaru/stargaite/internal/plan"
+	"github.com/jorlaru/stargaite/internal/reasoning"
 	"github.com/jorlaru/stargaite/internal/routing"
+	"github.com/jorlaru/stargaite/internal/telemetry"
 	"github.com/jorlaru/stargaite/internal/transport"
 	"github.com/jorlaru/stargaite/internal/usage"
 )
@@ -63,9 +68,12 @@ const statusClientGone = 499
 
 // request is one authenticated inference request (design section 4).
 type request struct {
-	id, traceID string           // traceID: 16 random bytes in hex until phase 3 reads traceparent
-	ep          domain.Endpoint  // chat or messages
-	snap        *config.Snapshot // loaded once (RES-7)
+	id, traceID string            // traceID: trace.Trace in hex, as x-stargaite-trace-id carries it
+	trace       telemetry.Context // set by authenticate (TEL-6)
+	session     string            // x-session-id when valid, else ""
+	sample      uint64            // the crypto/rand draw sampling compares, taken once after authenticate (TEL-7)
+	ep          domain.Endpoint   // chat or messages
+	snap        *config.Snapshot  // loaded once (RES-7)
 	key         *config.Key
 	alias       string // the body's "model" string, set before the lookup; "" when the body named none
 	model       *config.Model
@@ -171,9 +179,13 @@ func relayFor(ep domain.Endpoint, t *config.Target, c *plan.Client, now func() t
 func (h *handler) infer(ep domain.Endpoint) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rq := &request{id: w.Header().Get(domain.RequestIDHeader), ep: ep, snap: h.Config.Snapshot(), started: h.Config.Now()}
-		if rq.key, rq.traceID = h.authenticate(w, r, rq.snap, ep); rq.key == nil {
+		if rq.key, rq.trace = h.authenticate(w, r, rq.snap, ep); rq.key == nil {
 			return
 		}
+		rq.traceID, rq.session = w.Header().Get(traceHeader), session(r.Header.Values("X-Session-Id"))
+		var draw [8]byte
+		_, _ = rand.Read(draw[:]) // never fails
+		rq.sample = binary.LittleEndian.Uint64(draw[:])
 		h.Flight.Add(1)
 		defer h.done(rq)
 		// A body read, or a write to a client that stopped reading, does not
@@ -215,6 +227,21 @@ func (h *handler) infer(ep domain.Endpoint) http.HandlerFunc {
 			fail(w, ep, rq.err)
 		}
 	}
+}
+
+// session is the x-session-id of a request when it has one value of 1 to
+// 128 bytes of printable ASCII, else "": the header is then ignored like any
+// unknown one (TEL-6). No body member sets it.
+func session(values []string) string {
+	if len(values) != 1 || len(values[0]) == 0 || len(values[0]) > 128 {
+		return ""
+	}
+	for _, c := range []byte(values[0]) {
+		if c < 0x20 || c > 0x7e {
+			return ""
+		}
+	}
+	return values[0]
 }
 
 // check is steps 2 and 3: the bounded read of the body (LIM-6), the scan
@@ -847,8 +874,10 @@ func (h *handler) count(r *usage.Record) {
 }
 
 // done ends one authenticated request (design section 11, point 3) after
-// its last finish: the request counter, then the request line (OPS-9), then
-// the slots of an admitted request (LIM-6), also on a panic, then Flight.
+// its last finish: the request counter, then the spans of a sampled request
+// when an exporter is published (phase-3 design section 10), then the
+// request line (OPS-9), then the slots of an admitted request (LIM-6), also
+// on a panic, then Flight. Nothing but the spans reads the sampling draw.
 // Its status and code are those of the error the client got, also as the
 // terminal event of a committed stream (so 500 internal_error for a request
 // the shutdown stopped); 499 client_gone when the client went away, whatever
@@ -873,6 +902,10 @@ func (h *handler) done(rq *request) {
 		model = rq.alias
 	}
 	h.Counters.Add(usage.Counter{Name: "requests", Key: rq.key.Name, Model: model, Label: strconv.Itoa(status)}, 1)
+	ended := h.Config.Now()
+	if rq.snap.Exporter != nil && telemetry.Sampled(rq.sample, sampleRate(rq)) {
+		h.Spans.Enqueue(telemetry.Build(spanRequest(rq, status, code, h.Version, ended))...)
+	}
 	attrs := []any{"request_id", rq.id, "trace_id", rq.traceID, "key", rq.key.Name}
 	if rq.alias != "" {
 		attrs = append(attrs, "alias", fmt.Sprintf("%.200s", rq.alias)) // an unknown alias is as long as the body allows
@@ -881,7 +914,66 @@ func (h *handler) done(rq *request) {
 	if code != "" {
 		attrs = append(attrs, "code", code)
 	}
-	h.Log.Info("request", append(attrs, "duration_ms", h.Config.Now().Sub(rq.started).Milliseconds())...)
+	h.Log.Info("request", append(attrs, "duration_ms", ended.Sub(rq.started).Milliseconds())...)
+}
+
+// sampleRate is the trace_sample_rate of rq (TEL-7): the lower of the key's
+// and the alias's declared rates, the key's alone before the alias is known,
+// 1 when neither declares one.
+func sampleRate(rq *request) float64 {
+	rate := 1.0
+	if r := rq.key.Spec.TraceSampleRate; r != nil {
+		rate = *r
+	}
+	if rq.model != nil && rq.model.Spec.TraceSampleRate != nil {
+		rate = min(rate, *rq.model.Spec.TraceSampleRate)
+	}
+	return rate
+}
+
+// spanRequest is rq as telemetry.Build reads it, with the status and code
+// of its request line, ending at ended: each attempt's record, and what the
+// record does not hold. An alias the body named is cut to 200 characters,
+// as in the request line: one that does not exist is as long as the body
+// allows. A client gone is a failure with the message "client gone". The
+// provider's own text, which 400, 404, 413 and 422 pass to the client and
+// which may quote the prompt, becomes its status alone (TEL-8).
+func spanRequest(rq *request, status int, code, version string, ended time.Time) telemetry.Request {
+	r := telemetry.Request{Context: rq.trace, Key: rq.key.Name, Alias: fmt.Sprintf("%.200s", rq.alias), Session: rq.session, Endpoint: rq.ep,
+		Stream: rq.client != nil && rq.client.Stream, Version: version, Revision: rq.snap.Revision, Status: status, Code: code,
+		Started: rq.started, Ended: ended}
+	message := func(e *domain.Error) string {
+		if e.Code == domain.CodeUpstreamError && slices.Contains([]int{400, 404, 413, 422}, e.Status) {
+			return fmt.Sprintf("the provider answered %d", e.Status)
+		}
+		return e.Message
+	}
+	switch {
+	case rq.err != nil:
+		r.Message = message(rq.err)
+	case code != "":
+		r.Message = errClientGone.Error()
+	}
+	for _, a := range rq.attempts {
+		p := a.target.Provider
+		s := telemetry.Attempt{Record: a.rec, Provider: cmp.Or(p.Spec.GenAIProvider, p.Name), Dialect: reasoning.Dialect(a.target.Spec.Reasoning),
+			Stripped: a.obs.Stripped, Level: a.out.Level, Started: a.started, Ended: a.ended}
+		if u, err := url.Parse(p.Spec.BaseURL); err == nil {
+			s.Host = u.Hostname()
+			s.Port, _ = strconv.ParseInt(u.Port(), 10, 64)
+			if u.Port() == "" {
+				s.Port = map[string]int64{"https": 443, "http": 80}[u.Scheme]
+			}
+		}
+		switch {
+		case a.end.err != nil:
+			s.Message = message(a.end.err)
+		case errors.Is(a.cause, errClientGone):
+			s.Message = errClientGone.Error()
+		}
+		r.Attempts = append(r.Attempts, s)
+	}
+	return r
 }
 
 // unquote is the JSON string v, unescaped; ok is false for any other value.

@@ -13,8 +13,7 @@ control of the alias, timeouts, fallback across an alias's targets, a circuit br
 client goes away and a graceful stop (see [Resilience](#resilience)). Phase 3 has begun: every provider call leaves a
 usage record with its tokens and cost, and `usage show` sums them (see [Usage](#usage)); keys and aliases have rate
 and parallel limits (see [Limits](#limits)), USD budgets (see [Budgets](#budgets)) and subscription quotas (see
-[Quotas](#quotas)); the OTLP exporter is configured and tested (see [Telemetry](#telemetry)), and spans of
-traffic follow. The full specification is [kick-off.md](kick-off.md); the designs are
+[Quotas](#quotas)); every request a key sends leaves spans in the configured OTLP backend (see [Telemetry](#telemetry)). The full specification is [kick-off.md](kick-off.md); the designs are
 [docs/design/phase-1.md](docs/design/phase-1.md), [docs/design/phase-2.md](docs/design/phase-2.md) and
 [docs/design/phase-3.md](docs/design/phase-3.md).
 
@@ -52,7 +51,8 @@ the OTLP exporter at the mock provider, which also accepts trace exports, and `t
 prints `credentials: resolved · reachable: yes · authorized: yes · span: accepted (200) · trace_id=…` (see
 [Telemetry](#telemetry)). The first `curl` lists
 the alias `fast`; the second sends a chat completion to it and gets the mock provider's answer, with the response
-headers `x-stargaite-request-id`, `x-stargaite-trace-id` and `x-stargaite-target` (add `-i` to `curl` to see them).
+headers `x-stargaite-request-id`, `x-stargaite-trace-id` and `x-stargaite-target` (add `-i` to `curl` to see them),
+and its span reaches the mock provider within the 2 s of a batch.
 `usage show` then sums the last hour from the store: one request, the tokens the mock provider reported (1 input, 2
 output) and their cost at the target's prices, 0.000005 USD. Both processes log JSON lines to the terminal;
 `kill %1 %2` stops them.
@@ -165,6 +165,19 @@ spans or 32 MB, whichever comes first (the oldest are dropped and counted), and 
 any other status rejects the batch. Ten failed batches in a row write one `WARN` line, at most once a minute. On
 `SIGTERM` queued spans get 5 s to leave after the store closes; any left are dropped and logged, without changing the
 exit code. No usage record, budget or quota ever reads telemetry.
+
+Every request to `/v1/chat/completions` or `/v1/messages` with a valid key leaves one request span (kind `SERVER`,
+named `chat <alias>`), refusals included, and each provider call that failed before a fallback leaves a child span
+`attempt <target>` (kind `CLIENT`) with its error; a failed authentication and `GET /v1/models` leave none. The
+attributes are schema v1 of [kick-off.md](kick-off.md) annex D: the OpenTelemetry GenAI names of
+`semantic-conventions-genai` at commit `e6658f14c9d9ea0760825f029cb82e7673f48fab`, the `stargaite.*` ones (key, alias,
+target, efforts and caps requested, set by the alias and sent, the change list, billing, cost when known, version and
+configuration revision), and `langfuse.observation.metadata.stargaite_key`, `_model` and `_target`, under which
+Langfuse filters. Tokens and cost sit on one span per provider call. A request with a valid W3C `traceparent` joins the
+client's trace (`telemetry set --trust-traceparent=false` turns that off); `x-session-id`, 1 to 128 printable ASCII
+bytes, sets `session.id`. `--trace-sample-rate` on a key or an alias (0 to 1; the lower one applies) keeps that share of
+requests, decided once per request; it never changes records, budgets, quotas or counters. Spans carry no prompt, answer or
+header value other than `x-session-id`.
 
 ## Anthropic clients
 

@@ -1,0 +1,1504 @@
+{
+  "conventions": "semantic-conventions-genai@e6658f14c9d9ea0760825f029cb82e7673f48fab",
+  "schema_version": 1,
+  "cases": [
+    {
+      "case": "success",
+      "spans": [
+        {
+          "traceId": "0af7000000000000000000000000009c",
+          "spanId": "ee00000000000001",
+          "parentSpanId": "b700000000000031",
+          "flags": 769,
+          "name": "chat fast",
+          "kind": 2,
+          "startTimeUnixNano": "1790000000000000000",
+          "endTimeUnixNano": "1790000001000000000",
+          "attributes": [
+            {
+              "key": "stargaite.schema.version",
+              "value": {
+                "intValue": "1"
+              }
+            },
+            {
+              "key": "stargaite.version",
+              "value": {
+                "stringValue": "v1.2.3"
+              }
+            },
+            {
+              "key": "stargaite.config.revision",
+              "value": {
+                "intValue": "7"
+              }
+            },
+            {
+              "key": "stargaite.key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "stargaite.endpoint",
+              "value": {
+                "stringValue": "chat"
+              }
+            },
+            {
+              "key": "gen_ai.operation.name",
+              "value": {
+                "stringValue": "chat"
+              }
+            },
+            {
+              "key": "stargaite.model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "gen_ai.request.model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "stargaite.target",
+              "value": {
+                "stringValue": "pay/up-1"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_target",
+              "value": {
+                "stringValue": "pay/up-1"
+              }
+            },
+            {
+              "key": "session.id",
+              "value": {
+                "stringValue": "conv-42"
+              }
+            },
+            {
+              "key": "gen_ai.conversation.id",
+              "value": {
+                "stringValue": "conv-42"
+              }
+            },
+            {
+              "key": "gen_ai.provider.name",
+              "value": {
+                "stringValue": "openai"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "api.example.com"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "443"
+              }
+            },
+            {
+              "key": "stargaite.upstream.model",
+              "value": {
+                "stringValue": "up-1"
+              }
+            },
+            {
+              "key": "stargaite.billing",
+              "value": {
+                "stringValue": "pay_per_use"
+              }
+            },
+            {
+              "key": "stargaite.cost.source",
+              "value": {
+                "stringValue": "price_table"
+              }
+            },
+            {
+              "key": "gen_ai.response.model",
+              "value": {
+                "stringValue": "up-1-2026"
+              }
+            },
+            {
+              "key": "stargaite.model_mismatch",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "stargaite.response.empty",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "gen_ai.response.finish_reasons",
+              "value": {
+                "arrayValue": {
+                  "values": [
+                    {
+                      "stringValue": "stop"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "key": "gen_ai.usage.input_tokens",
+              "value": {
+                "intValue": "10"
+              }
+            },
+            {
+              "key": "gen_ai.usage.output_tokens",
+              "value": {
+                "intValue": "20"
+              }
+            },
+            {
+              "key": "stargaite.cost.usd",
+              "value": {
+                "doubleValue": 0.00005
+              }
+            },
+            {
+              "key": "gen_ai.usage.cost",
+              "value": {
+                "doubleValue": 0.00005
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.requested",
+              "value": {
+                "stringValue": "high"
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.sent",
+              "value": {
+                "stringValue": "high"
+              }
+            },
+            {
+              "key": "gen_ai.request.reasoning.level",
+              "value": {
+                "stringValue": "high"
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.source",
+              "value": {
+                "stringValue": "client"
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.adjusted",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "stargaite.reasoning.dialect",
+              "value": {
+                "stringValue": "reasoning_effort"
+              }
+            },
+            {
+              "key": "stargaite.max_output_tokens.requested",
+              "value": {
+                "intValue": "100"
+              }
+            },
+            {
+              "key": "stargaite.max_output_tokens.alias",
+              "value": {
+                "intValue": "500"
+              }
+            },
+            {
+              "key": "stargaite.max_output_tokens.sent",
+              "value": {
+                "intValue": "100"
+              }
+            },
+            {
+              "key": "gen_ai.request.max_tokens",
+              "value": {
+                "intValue": "100"
+              }
+            },
+            {
+              "key": "stargaite.params.changed",
+              "value": {
+                "stringValue": "max_tokens:translated"
+              }
+            },
+            {
+              "key": "stargaite.attempts",
+              "value": {
+                "intValue": "1"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "case": "stream",
+      "spans": [
+        {
+          "traceId": "11000000000000000000000000000022",
+          "spanId": "ee00000000000001",
+          "flags": 257,
+          "name": "chat claude",
+          "kind": 2,
+          "startTimeUnixNano": "1790000000000000000",
+          "endTimeUnixNano": "1790000001000000000",
+          "attributes": [
+            {
+              "key": "stargaite.schema.version",
+              "value": {
+                "intValue": "1"
+              }
+            },
+            {
+              "key": "stargaite.version",
+              "value": {
+                "stringValue": "v1.2.3"
+              }
+            },
+            {
+              "key": "stargaite.config.revision",
+              "value": {
+                "intValue": "7"
+              }
+            },
+            {
+              "key": "stargaite.key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "stargaite.endpoint",
+              "value": {
+                "stringValue": "messages"
+              }
+            },
+            {
+              "key": "gen_ai.operation.name",
+              "value": {
+                "stringValue": "chat"
+              }
+            },
+            {
+              "key": "stargaite.model",
+              "value": {
+                "stringValue": "claude"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_model",
+              "value": {
+                "stringValue": "claude"
+              }
+            },
+            {
+              "key": "gen_ai.request.model",
+              "value": {
+                "stringValue": "claude"
+              }
+            },
+            {
+              "key": "stargaite.target",
+              "value": {
+                "stringValue": "sub/claude"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_target",
+              "value": {
+                "stringValue": "sub/claude"
+              }
+            },
+            {
+              "key": "gen_ai.request.stream",
+              "value": {
+                "boolValue": true
+              }
+            },
+            {
+              "key": "gen_ai.provider.name",
+              "value": {
+                "stringValue": "anthropic"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "127.0.0.1"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "8080"
+              }
+            },
+            {
+              "key": "stargaite.upstream.model",
+              "value": {
+                "stringValue": "claude"
+              }
+            },
+            {
+              "key": "stargaite.billing",
+              "value": {
+                "stringValue": "subscription"
+              }
+            },
+            {
+              "key": "stargaite.cost.source",
+              "value": {
+                "stringValue": "none"
+              }
+            },
+            {
+              "key": "gen_ai.response.model",
+              "value": {
+                "stringValue": "claude"
+              }
+            },
+            {
+              "key": "stargaite.model_mismatch",
+              "value": {
+                "boolValue": true
+              }
+            },
+            {
+              "key": "stargaite.response.empty",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "gen_ai.response.finish_reasons",
+              "value": {
+                "arrayValue": {
+                  "values": [
+                    {
+                      "stringValue": "end_turn"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "key": "gen_ai.usage.input_tokens",
+              "value": {
+                "intValue": "100"
+              }
+            },
+            {
+              "key": "gen_ai.usage.cache_read.input_tokens",
+              "value": {
+                "intValue": "40"
+              }
+            },
+            {
+              "key": "gen_ai.usage.cache_write.input_tokens",
+              "value": {
+                "intValue": "10"
+              }
+            },
+            {
+              "key": "gen_ai.usage.output_tokens",
+              "value": {
+                "intValue": "30"
+              }
+            },
+            {
+              "key": "gen_ai.usage.reasoning.output_tokens",
+              "value": {
+                "intValue": "12"
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.alias",
+              "value": {
+                "stringValue": "medium"
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.sent",
+              "value": {
+                "stringValue": "budget:2048"
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.source",
+              "value": {
+                "stringValue": "alias_default"
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.adjusted",
+              "value": {
+                "boolValue": true
+              }
+            },
+            {
+              "key": "stargaite.reasoning.dialect",
+              "value": {
+                "stringValue": "thinking_budget"
+              }
+            },
+            {
+              "key": "stargaite.reasoning.stripped",
+              "value": {
+                "boolValue": true
+              }
+            },
+            {
+              "key": "stargaite.max_output_tokens.sent",
+              "value": {
+                "intValue": "4096"
+              }
+            },
+            {
+              "key": "gen_ai.request.max_tokens",
+              "value": {
+                "intValue": "4096"
+              }
+            },
+            {
+              "key": "stargaite.params.changed",
+              "value": {
+                "stringValue": "thinking:added"
+              }
+            },
+            {
+              "key": "gen_ai.response.time_to_first_chunk",
+              "value": {
+                "doubleValue": 0.125
+              }
+            },
+            {
+              "key": "stargaite.attempts",
+              "value": {
+                "intValue": "1"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "case": "error",
+      "spans": [
+        {
+          "traceId": "11000000000000000000000000000022",
+          "spanId": "ee00000000000001",
+          "flags": 257,
+          "name": "chat fast",
+          "kind": 2,
+          "startTimeUnixNano": "1790000000000000000",
+          "endTimeUnixNano": "1790000001000000000",
+          "attributes": [
+            {
+              "key": "stargaite.schema.version",
+              "value": {
+                "intValue": "1"
+              }
+            },
+            {
+              "key": "stargaite.version",
+              "value": {
+                "stringValue": "v1.2.3"
+              }
+            },
+            {
+              "key": "stargaite.config.revision",
+              "value": {
+                "intValue": "7"
+              }
+            },
+            {
+              "key": "stargaite.key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "stargaite.endpoint",
+              "value": {
+                "stringValue": "chat"
+              }
+            },
+            {
+              "key": "gen_ai.operation.name",
+              "value": {
+                "stringValue": "chat"
+              }
+            },
+            {
+              "key": "stargaite.model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "gen_ai.request.model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "stargaite.target",
+              "value": {
+                "stringValue": "pay/up-1"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_target",
+              "value": {
+                "stringValue": "pay/up-1"
+              }
+            },
+            {
+              "key": "gen_ai.provider.name",
+              "value": {
+                "stringValue": "pay"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "api.example.com"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "443"
+              }
+            },
+            {
+              "key": "stargaite.upstream.model",
+              "value": {
+                "stringValue": "up-1"
+              }
+            },
+            {
+              "key": "stargaite.billing",
+              "value": {
+                "stringValue": "pay_per_use"
+              }
+            },
+            {
+              "key": "stargaite.cost.source",
+              "value": {
+                "stringValue": "price_table"
+              }
+            },
+            {
+              "key": "stargaite.model_mismatch",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "stargaite.response.empty",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.source",
+              "value": {
+                "stringValue": "provider_default"
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.adjusted",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "stargaite.reasoning.dialect",
+              "value": {
+                "stringValue": "none"
+              }
+            },
+            {
+              "key": "stargaite.attempts",
+              "value": {
+                "intValue": "1"
+              }
+            },
+            {
+              "key": "error.type",
+              "value": {
+                "stringValue": "upstream_error"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "502"
+              }
+            }
+          ],
+          "status": {
+            "message": "the provider answered 500",
+            "code": 2
+          }
+        }
+      ]
+    },
+    {
+      "case": "refusal",
+      "spans": [
+        {
+          "traceId": "11000000000000000000000000000022",
+          "spanId": "ee00000000000001",
+          "flags": 257,
+          "name": "chat fast",
+          "kind": 2,
+          "startTimeUnixNano": "1790000000000000000",
+          "endTimeUnixNano": "1790000001000000000",
+          "attributes": [
+            {
+              "key": "stargaite.schema.version",
+              "value": {
+                "intValue": "1"
+              }
+            },
+            {
+              "key": "stargaite.version",
+              "value": {
+                "stringValue": "v1.2.3"
+              }
+            },
+            {
+              "key": "stargaite.config.revision",
+              "value": {
+                "intValue": "7"
+              }
+            },
+            {
+              "key": "stargaite.key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "stargaite.endpoint",
+              "value": {
+                "stringValue": "chat"
+              }
+            },
+            {
+              "key": "gen_ai.operation.name",
+              "value": {
+                "stringValue": "chat"
+              }
+            },
+            {
+              "key": "stargaite.model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "gen_ai.request.model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "session.id",
+              "value": {
+                "stringValue": "conv-42"
+              }
+            },
+            {
+              "key": "gen_ai.conversation.id",
+              "value": {
+                "stringValue": "conv-42"
+              }
+            },
+            {
+              "key": "gen_ai.request.stream",
+              "value": {
+                "boolValue": true
+              }
+            },
+            {
+              "key": "stargaite.attempts",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "error.type",
+              "value": {
+                "stringValue": "rate_limit_exceeded"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "429"
+              }
+            }
+          ],
+          "status": {
+            "message": "the rpm limit of key agent is reached",
+            "code": 2
+          }
+        }
+      ]
+    },
+    {
+      "case": "refusal without an alias",
+      "spans": [
+        {
+          "traceId": "11000000000000000000000000000022",
+          "spanId": "ee00000000000001",
+          "flags": 257,
+          "name": "chat",
+          "kind": 2,
+          "startTimeUnixNano": "1790000000000000000",
+          "endTimeUnixNano": "1790000001000000000",
+          "attributes": [
+            {
+              "key": "stargaite.schema.version",
+              "value": {
+                "intValue": "1"
+              }
+            },
+            {
+              "key": "stargaite.version",
+              "value": {
+                "stringValue": "v1.2.3"
+              }
+            },
+            {
+              "key": "stargaite.config.revision",
+              "value": {
+                "intValue": "7"
+              }
+            },
+            {
+              "key": "stargaite.key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "stargaite.endpoint",
+              "value": {
+                "stringValue": "chat"
+              }
+            },
+            {
+              "key": "gen_ai.operation.name",
+              "value": {
+                "stringValue": "chat"
+              }
+            },
+            {
+              "key": "stargaite.attempts",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "error.type",
+              "value": {
+                "stringValue": "invalid_request"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "400"
+              }
+            }
+          ],
+          "status": {
+            "message": "the request body is not valid JSON",
+            "code": 2
+          }
+        }
+      ]
+    },
+    {
+      "case": "attempt",
+      "spans": [
+        {
+          "traceId": "0af7000000000000000000000000009c",
+          "spanId": "ee00000000000001",
+          "parentSpanId": "b700000000000031",
+          "flags": 769,
+          "name": "chat fast",
+          "kind": 2,
+          "startTimeUnixNano": "1790000000003200000",
+          "endTimeUnixNano": "1790000001000000000",
+          "attributes": [
+            {
+              "key": "stargaite.schema.version",
+              "value": {
+                "intValue": "1"
+              }
+            },
+            {
+              "key": "stargaite.version",
+              "value": {
+                "stringValue": "v1.2.3"
+              }
+            },
+            {
+              "key": "stargaite.config.revision",
+              "value": {
+                "intValue": "7"
+              }
+            },
+            {
+              "key": "stargaite.key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "stargaite.endpoint",
+              "value": {
+                "stringValue": "chat"
+              }
+            },
+            {
+              "key": "gen_ai.operation.name",
+              "value": {
+                "stringValue": "chat"
+              }
+            },
+            {
+              "key": "stargaite.model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "gen_ai.request.model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "stargaite.target",
+              "value": {
+                "stringValue": "anth/claude"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_target",
+              "value": {
+                "stringValue": "anth/claude"
+              }
+            },
+            {
+              "key": "gen_ai.request.stream",
+              "value": {
+                "boolValue": true
+              }
+            },
+            {
+              "key": "gen_ai.provider.name",
+              "value": {
+                "stringValue": "anthropic"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "api.anthropic.com"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "443"
+              }
+            },
+            {
+              "key": "stargaite.upstream.model",
+              "value": {
+                "stringValue": "claude"
+              }
+            },
+            {
+              "key": "stargaite.billing",
+              "value": {
+                "stringValue": "none"
+              }
+            },
+            {
+              "key": "stargaite.cost.source",
+              "value": {
+                "stringValue": "none"
+              }
+            },
+            {
+              "key": "gen_ai.response.model",
+              "value": {
+                "stringValue": "claude-x"
+              }
+            },
+            {
+              "key": "stargaite.model_mismatch",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "stargaite.response.empty",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "gen_ai.response.finish_reasons",
+              "value": {
+                "arrayValue": {
+                  "values": [
+                    {
+                      "stringValue": "end_turn"
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "key": "gen_ai.usage.input_tokens",
+              "value": {
+                "intValue": "9"
+              }
+            },
+            {
+              "key": "gen_ai.usage.output_tokens",
+              "value": {
+                "intValue": "4"
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.sent",
+              "value": {
+                "stringValue": "high"
+              }
+            },
+            {
+              "key": "gen_ai.request.reasoning.level",
+              "value": {
+                "stringValue": "high"
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.source",
+              "value": {
+                "stringValue": "client"
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.adjusted",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "stargaite.reasoning.dialect",
+              "value": {
+                "stringValue": "adaptive_effort"
+              }
+            },
+            {
+              "key": "stargaite.params.changed",
+              "value": {
+                "stringValue": "protocol:translated,output_config.effort:added"
+              }
+            },
+            {
+              "key": "gen_ai.response.time_to_first_chunk",
+              "value": {
+                "doubleValue": 0.108
+              }
+            },
+            {
+              "key": "stargaite.attempts",
+              "value": {
+                "intValue": "3"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            }
+          ]
+        },
+        {
+          "traceId": "0af7000000000000000000000000009c",
+          "spanId": "ee00000000000002",
+          "parentSpanId": "ee00000000000001",
+          "flags": 257,
+          "name": "attempt pay/up-1",
+          "kind": 3,
+          "startTimeUnixNano": "1790000000003400000",
+          "endTimeUnixNano": "1790000000040600000",
+          "attributes": [
+            {
+              "key": "stargaite.schema.version",
+              "value": {
+                "intValue": "1"
+              }
+            },
+            {
+              "key": "stargaite.version",
+              "value": {
+                "stringValue": "v1.2.3"
+              }
+            },
+            {
+              "key": "stargaite.config.revision",
+              "value": {
+                "intValue": "7"
+              }
+            },
+            {
+              "key": "stargaite.key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "stargaite.endpoint",
+              "value": {
+                "stringValue": "chat"
+              }
+            },
+            {
+              "key": "gen_ai.operation.name",
+              "value": {
+                "stringValue": "chat"
+              }
+            },
+            {
+              "key": "stargaite.model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "gen_ai.request.model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "stargaite.target",
+              "value": {
+                "stringValue": "pay/up-1"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_target",
+              "value": {
+                "stringValue": "pay/up-1"
+              }
+            },
+            {
+              "key": "gen_ai.provider.name",
+              "value": {
+                "stringValue": "pay"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "api.example.com"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "443"
+              }
+            },
+            {
+              "key": "stargaite.upstream.model",
+              "value": {
+                "stringValue": "up-1"
+              }
+            },
+            {
+              "key": "stargaite.billing",
+              "value": {
+                "stringValue": "pay_per_use"
+              }
+            },
+            {
+              "key": "stargaite.cost.source",
+              "value": {
+                "stringValue": "price_table"
+              }
+            },
+            {
+              "key": "stargaite.model_mismatch",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "stargaite.response.empty",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.source",
+              "value": {
+                "stringValue": "provider_default"
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.adjusted",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "stargaite.reasoning.dialect",
+              "value": {
+                "stringValue": "none"
+              }
+            },
+            {
+              "key": "error.type",
+              "value": {
+                "stringValue": "upstream_error"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "500"
+              }
+            }
+          ],
+          "status": {
+            "message": "the provider answered 500",
+            "code": 2
+          }
+        },
+        {
+          "traceId": "0af7000000000000000000000000009c",
+          "spanId": "ee00000000000003",
+          "parentSpanId": "ee00000000000001",
+          "flags": 257,
+          "name": "attempt pay/free",
+          "kind": 3,
+          "startTimeUnixNano": "1790000000041300000",
+          "endTimeUnixNano": "1790000000080500000",
+          "attributes": [
+            {
+              "key": "stargaite.schema.version",
+              "value": {
+                "intValue": "1"
+              }
+            },
+            {
+              "key": "stargaite.version",
+              "value": {
+                "stringValue": "v1.2.3"
+              }
+            },
+            {
+              "key": "stargaite.config.revision",
+              "value": {
+                "intValue": "7"
+              }
+            },
+            {
+              "key": "stargaite.key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "stargaite.endpoint",
+              "value": {
+                "stringValue": "chat"
+              }
+            },
+            {
+              "key": "gen_ai.operation.name",
+              "value": {
+                "stringValue": "chat"
+              }
+            },
+            {
+              "key": "stargaite.model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "gen_ai.request.model",
+              "value": {
+                "stringValue": "fast"
+              }
+            },
+            {
+              "key": "stargaite.target",
+              "value": {
+                "stringValue": "pay/free"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_target",
+              "value": {
+                "stringValue": "pay/free"
+              }
+            },
+            {
+              "key": "gen_ai.provider.name",
+              "value": {
+                "stringValue": "pay"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "api.example.com"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "443"
+              }
+            },
+            {
+              "key": "stargaite.upstream.model",
+              "value": {
+                "stringValue": "free"
+              }
+            },
+            {
+              "key": "stargaite.billing",
+              "value": {
+                "stringValue": "pay_per_use"
+              }
+            },
+            {
+              "key": "stargaite.cost.source",
+              "value": {
+                "stringValue": "none"
+              }
+            },
+            {
+              "key": "stargaite.model_mismatch",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "stargaite.response.empty",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "gen_ai.usage.input_tokens",
+              "value": {
+                "intValue": "7"
+              }
+            },
+            {
+              "key": "gen_ai.usage.output_tokens",
+              "value": {
+                "intValue": "3"
+              }
+            },
+            {
+              "key": "stargaite.usage.estimated",
+              "value": {
+                "boolValue": true
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.sent",
+              "value": {
+                "stringValue": "none"
+              }
+            },
+            {
+              "key": "gen_ai.request.reasoning.level",
+              "value": {
+                "stringValue": "none"
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.source",
+              "value": {
+                "stringValue": "client"
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.adjusted",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "stargaite.reasoning.dialect",
+              "value": {
+                "stringValue": "reasoning_effort"
+              }
+            },
+            {
+              "key": "gen_ai.response.time_to_first_chunk",
+              "value": {
+                "doubleValue": 0.015
+              }
+            },
+            {
+              "key": "error.type",
+              "value": {
+                "stringValue": "upstream_error"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            }
+          ],
+          "status": {
+            "message": "the provider's stream failed",
+            "code": 2
+          }
+        }
+      ]
+    }
+  ]
+}

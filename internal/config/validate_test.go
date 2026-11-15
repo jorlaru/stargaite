@@ -640,6 +640,10 @@ func TestValidate(t *testing.T) {
 				if f.Message == "" || strings.Contains(f.Message, pastedKey) {
 					t.Errorf("message %q is empty or carries the pastedKey credential", f.Message)
 				}
+				// Retention keeps the longest window (phase-4 design section 8).
+				if f.Code == "quota_beyond_retention" && !strings.HasSuffix(f.Message, ": records of this window are kept beyond retention.usage_days") {
+					t.Errorf("message %q", f.Message)
+				}
 			}
 		})
 	}

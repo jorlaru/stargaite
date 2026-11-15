@@ -170,7 +170,7 @@ func (s *State) hold(p Plan, h [2]holder, ws [2][]quota) error {
 					miss[i] = append(miss[i], w)
 					// A window counts up to one bucket more of the past
 					// than its span: the seed reads that bucket too.
-					longest = max(longest, w.span+bucket(w.span))
+					longest = max(longest, SeedSpan(w.span))
 				}
 			}
 		}

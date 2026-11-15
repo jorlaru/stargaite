@@ -86,9 +86,9 @@ errors, each kind of token, estimated calls, the cost of `pay_per_use` calls and
 limit (`finish_reason` `length` or the like), empty answers, and the median and 90th percentile of output and
 reasoning tokens over the successful calls whose provider reported them. `--compare-previous` adds the window of the
 same length before it; `--by effort-sent` with it shows whether reasoning tokens move with the effort sent. It reads
-the records within `usage_days` (90 by default; deleting older ones comes in a later phase): a window that starts
-earlier is answered from the daily sums, over whole UTC days and without the counts and percentiles they do not hold
-(shown as `-`), and cannot be grouped by effort sent.
+the records within `usage_days` (90 by default; `serve` deletes older ones once a day, keeping those the longest quota
+window reads): a window that starts earlier is answered from the daily sums, over whole UTC days and without the
+counts and percentiles they do not hold (shown as `-`), and cannot be grouped by effort sent.
 `--json` gives the same as JSON, with each window's `source` (`records` or `daily`), `since` and `until`.
 
 ## Limits

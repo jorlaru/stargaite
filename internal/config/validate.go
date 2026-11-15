@@ -306,9 +306,10 @@ func validateProvider(r *report, name string, p domain.Provider, usageDays int64
 			r.fail("LIM-8", "invalid_value", res, "quota", "quota window %.64q needs a positive limit in requests or tokens", q.Window)
 		}
 		// The seed of a window reads the records of its span (phase-3 design
-		// section 9), which retention keeps for usage_days only.
+		// section 9), which retention keeps beyond usage_days (phase-4
+		// design section 8); LIM-8 still asks for the warning.
 		if span, ok := domain.QuotaSpan(q.Window); ok && quotaWindow.MatchString(q.Window) && span.Hours()/24 > float64(usageDays) {
-			r.warn("LIM-8", "quota_beyond_retention", res, "quota", "quota window %s is longer than retention.usage_days (%d days): its count after a restart can only read the records kept", q.Window, usageDays)
+			r.warn("LIM-8", "quota_beyond_retention", res, "quota", "quota window %s is longer than retention.usage_days (%d days): records of this window are kept beyond retention.usage_days", q.Window, usageDays)
 		}
 	}
 	if c := p.CostReport; c != nil {

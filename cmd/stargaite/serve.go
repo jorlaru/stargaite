@@ -46,6 +46,15 @@ var (
 	exportWait         = 5 * time.Second
 )
 
+// Retention runs retainRun retainFirst after the ready line, then every
+// retainEvery (USE-11, phase-4 design section 8). Tests lower the intervals
+// and replace retainRun to hold a run across the stop.
+var (
+	retainFirst = time.Minute
+	retainEvery = 24 * time.Hour
+	retainRun   = usage.Retain
+)
+
 // serve runs the proxy until SIGINT or SIGTERM. Each flag falls back to its
 // STARGAITE_<FLAG> variable; the flag wins. Logs are JSON lines on stderr.
 func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) int {
@@ -184,16 +193,25 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 	case created:
 		log.Info("admin key created", "path", filepath.Join(*dataDir, admin.KeyFile))
 	}
-	ready := []any{"data_dir", *dataDir, "tls", tlsConfig != nil, "version", cli.Version, "revision", snap.Revision}
+	attrs := []any{"data_dir", *dataDir, "tls", tlsConfig != nil, "version", cli.Version, "revision", snap.Revision}
+	// The data plane's OPS-8 counters, which the store check shares.
+	counters := &usage.Counters{}
 	if code == 0 {
 		// Every request context derives from base: cancelling it stops the
 		// requests still running when the grace ends, and flight counts the
-		// inference requests whose done has not run yet.
+		// inference requests whose done has not run yet. Retention and the
+		// store check run on bg once the proxy is ready, counted by
+		// background (kick-off section 14.3).
 		base, halt := context.WithCancelCause(context.Background())
-		var flight sync.WaitGroup
-		if err := runServers(ctx, base, log, tlsConfig, ready, []listener{
+		bg, stopBg := context.WithCancel(base)
+		var flight, background sync.WaitGroup
+		ready := func() {
+			background.Go(func() { retain(bg, st, cfg, log) })
+			background.Go(func() { checkStore(bg, st, log, counters) })
+		}
+		if err := runServers(ctx, base, log, tlsConfig, attrs, ready, []listener{
 			{"admin", *adminAddr, admin.Handler(admin.Deps{Config: cfg, KeyHash: keyHash, Log: log, Usage: st.Read(), Admission: limits, Spans: spans, Backup: st.Backup})},
-			{"data", *dataAddr, api.Handler(api.Deps{Config: cfg, Log: log, Clients: clients, Flight: &flight, Usage: records, Admission: limits, Counters: &usage.Counters{}, Spans: spans, Version: cli.Version})},
+			{"data", *dataAddr, api.Handler(api.Deps{Config: cfg, Log: log, Clients: clients, Flight: &flight, Usage: records, Admission: limits, Counters: counters, Spans: spans, Version: cli.Version})},
 		}); err != nil {
 			log.Error("server failed", "error", err.Error())
 			code = 1
@@ -209,6 +227,10 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 			log.Error("requests still running after the drain wait", "drain_wait", drainWait.String())
 			code = 1
 		}
+		// Retention returns between batches, the quick_check is interrupted,
+		// and neither touches the store after this (RES-6).
+		stopBg()
+		background.Wait()
 	}
 	// Every finish that ran has added its record: each is stored before the
 	// store closes, or logged at critical level (USE-10).
@@ -232,6 +254,58 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 		log.Info("stopped")
 	}
 	return code
+}
+
+// retain runs usage.Retain retainFirst after the ready line, then every
+// retainEvery, until ctx ends, each run with the cutoffs of the published
+// snapshot on the service clock (USE-11, ADR-017). Each run logs one line
+// with the rows deleted per table; a failed run logs an error line and is
+// retried at the next run.
+func retain(ctx context.Context, st *store.Store, cfg *config.Service, log *slog.Logger) {
+	next := time.NewTimer(retainFirst)
+	defer next.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-next.C:
+		}
+		snap := cfg.Snapshot()
+		c := usage.CutoffsAt(cfg.Now(), *snap.Settings.Retention, snap.Doc.Providers)
+		d, err := retainRun(ctx, st.Write, c)
+		attrs := []any{"usage", d.Usage, "usage_daily", d.Daily, "audit", d.Audit,
+			"usage_before", c.Usage.UTC().Format(time.RFC3339), "usage_daily_before", c.Day, "audit_before", c.Audit.UTC().Format(time.RFC3339)}
+		switch {
+		case err != nil && ctx.Err() != nil:
+			log.Info("retention stopped between batches", append(attrs, "error", err.Error())...)
+			return
+		case err != nil:
+			log.Error("retention failed: retried at the next run", append(attrs, "next_run", retainEvery.String(), "error", err.Error())...)
+		default:
+			log.Info("retention run", attrs...)
+		}
+		next.Reset(retainEvery)
+	}
+}
+
+// checkStore runs the store check once, after the ready line (kick-off
+// section 14.3, ADR-018): quick_check's rows, or an error that is not the
+// stop's, are one CRITICAL line and add store_check_failed to counters; the
+// proxy keeps serving.
+func checkStore(ctx context.Context, st *store.Store, log *slog.Logger, counters *usage.Counters) {
+	rows, err := st.Check(ctx)
+	switch {
+	case err != nil && ctx.Err() != nil:
+		log.Info("store check stopped", "error", err.Error())
+	case err != nil:
+		log.Log(ctx, usage.LevelCritical, "store check failed", "error", err.Error())
+		counters.Add(usage.Counter{Name: "store_check_failed"}, 1)
+	case rows != nil:
+		log.Log(ctx, usage.LevelCritical, "store check failed", "rows", rows)
+		counters.Add(usage.Counter{Name: "store_check_failed"}, 1)
+	default:
+		log.Info("store check passed")
+	}
 }
 
 // systemResolver is the resolver of set time (CheckResolved) and of dial
@@ -259,13 +333,14 @@ type listener struct {
 	handler    http.Handler
 }
 
-// runServers binds the listeners in order, logs the ready line with the
-// attributes of ready and the bound addresses, and serves until ctx is done or
-// a server fails; then it shuts every server down: the listeners close at
-// once and requests in flight get shutdownGrace to finish. Every request
+// runServers binds the listeners in order, logs the ready line with attrs
+// and the bound addresses, calls ready, which must return at once, and
+// serves until ctx is done or a server fails; then it shuts every server
+// down: the listeners close at once and requests in flight get
+// shutdownGrace to finish. Every request
 // context derives from base. A grace that ends with requests still running
 // is logged, not an error: the caller stops them by cancelling base.
-func runServers(ctx, base context.Context, log *slog.Logger, tlsConfig *tls.Config, ready []any, ls []listener) error {
+func runServers(ctx, base context.Context, log *slog.Logger, tlsConfig *tls.Config, attrs []any, ready func(), ls []listener) error {
 	lns := make([]net.Listener, 0, len(ls))
 	defer func() {
 		for _, ln := range lns {
@@ -278,7 +353,7 @@ func runServers(ctx, base context.Context, log *slog.Logger, tlsConfig *tls.Conf
 			return fmt.Errorf("listener %s: %w", l.name, err)
 		}
 		lns = append(lns, ln)
-		ready = append(ready, l.name+"_addr", ln.Addr().String())
+		attrs = append(attrs, l.name+"_addr", ln.Addr().String())
 	}
 
 	failed := make(chan error, len(ls))
@@ -305,7 +380,8 @@ func runServers(ctx, base context.Context, log *slog.Logger, tlsConfig *tls.Conf
 			failed <- fmt.Errorf("listener %s: %w", l.name, err)
 		}()
 	}
-	log.Info("ready", ready...)
+	log.Info("ready", attrs...)
+	ready()
 
 	var err error
 	select {

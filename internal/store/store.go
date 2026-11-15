@@ -334,6 +334,28 @@ func check(ctx context.Context, db *sql.DB) error {
 	return nil
 }
 
+// Check is PRAGMA quick_check on the read pool: nil for "ok", else its rows
+// (kick-off section 14.3, ADR-018). An answer with no row is not "ok" either.
+// ctx interrupts it.
+func (s *Store) Check(ctx context.Context) ([]string, error) {
+	var lines []string
+	if err := each(ctx, s.reader, "PRAGMA quick_check", func(rows *sql.Rows) error {
+		var line string
+		err := rows.Scan(&line)
+		lines = append(lines, line)
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	switch {
+	case len(lines) == 1 && lines[0] == "ok":
+		return nil, nil
+	case len(lines) == 0:
+		return []string{"quick_check returned no row"}, nil
+	}
+	return lines, nil
+}
+
 // each runs query and calls scan on each row.
 func each(ctx context.Context, db *sql.DB, query string, scan func(*sql.Rows) error) error {
 	rows, err := db.QueryContext(ctx, query)

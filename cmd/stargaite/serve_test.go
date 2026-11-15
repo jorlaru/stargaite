@@ -1280,6 +1280,243 @@ func TestServeQuotaSeedFails(t *testing.T) {
 	_ = st.Close()
 }
 
+// TestServeRetention is AC-49 through serve (phase-4 design section 8): with
+// retainFirst lowered, the first run deletes a 200-day-old record, a
+// 25-month-old audit row and a 37-month-old aggregate, while the current
+// month's aggregate, the configuration's audit rows and the record of a 7d
+// window survive usage_days 1. The second run, a few milliseconds later, is
+// held across the stop and writes once its context has ended: the store is
+// still open, since the run ends before the store closes. No run fails,
+// nothing is logged at CRITICAL, and the stopped line is the last.
+func TestServeRetention(t *testing.T) {
+	holding, held := make(chan struct{}), make(chan error, 1)
+	runs := 0
+	retainFirst, retainEvery = 50*time.Millisecond, 5*time.Millisecond
+	retainRun = func(ctx context.Context, write func(context.Context, func(*sql.Tx) error) error, c usage.Cutoffs) (usage.Deleted, error) {
+		if runs++; runs == 1 {
+			return usage.Retain(ctx, write, c)
+		}
+		close(holding)
+		<-ctx.Done()
+		time.Sleep(100 * time.Millisecond) // time for a store closed too early to close
+		held <- write(context.Background(), func(*sql.Tx) error { return nil })
+		return usage.Deleted{}, ctx.Err()
+	}
+	t.Cleanup(func() { retainFirst, retainEvery, retainRun = time.Minute, 24*time.Hour, usage.Retain })
+	dir, _ := seed(t, map[string]string{"q": "http://127.0.0.1:1"})
+	st, err := store.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Open(context.Background(), st, func() config.Env { return config.Env{Lookup: func(string) (string, bool) { return "", false }} }, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.Commit(context.Background(), config.Change{Summary: "retention", Mutate: func(s *config.State) (map[string]string, error) {
+		q := s.Doc.Providers["q"]
+		q.Billing, q.Quota = domain.BillingSubscription, []domain.QuotaWindow{{Window: "7d", Requests: 100}}
+		s.Doc.Providers["q"] = q
+		s.Doc.Settings.Retention = &domain.Retention{UsageDays: 1}
+		return nil, nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if err := st.Write(context.Background(), func(tx *sql.Tx) error {
+		for id, at := range map[string]time.Time{"old": now.AddDate(0, 0, -200), "window": now.AddDate(0, 0, -3)} {
+			if _, err := tx.Exec(`INSERT INTO usage (id, request_id, endpoint, key_name, model, target, billing, status_code, tokens_source, cost_source,
+				started_at, completed_at, config_revision, proxy_version)
+				VALUES (?, ?, 'chat', 'agent', 'q', 'q/m', 'subscription', 200, 'provider', 'none', ?, ?, 1, 'v')`, id, id, at.UnixMilli()-1000, at.UnixMilli()); err != nil {
+				return err
+			}
+		}
+		for _, day := range []time.Time{now.AddDate(0, -37, 0), now} {
+			if _, err := tx.Exec(`INSERT INTO usage_daily (day, key_name, model, target, billing, requests) VALUES (?, 'agent', 'q', 'q/m', 'subscription', 1)`,
+				day.Format(time.DateOnly)); err != nil {
+				return err
+			}
+		}
+		_, err := tx.Exec(`INSERT INTO audit (id, actor, action, resource_type, resource_name, result, created_at)
+			VALUES ('old', 'operator', 'test', 'settings', 'retention', 'applied', ?)`, now.AddDate(0, -25, 0).UnixMilli())
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var audits int
+	if err := st.Read().QueryRow("SELECT COUNT(*) FROM audit").Scan(&audits); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stop := start(t, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), "--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0")
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "stargaite.db")+"?_busy_timeout=5000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	rows := func(q string) []string { t.Helper(); return dump(t, db, q) }
+	for deadline := time.Now().Add(10 * time.Second); len(rows("SELECT id FROM usage WHERE id = 'old' UNION ALL SELECT id FROM audit WHERE id = 'old'")) != 0 ||
+		len(rows("SELECT day FROM usage_daily")) != 1; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the old rows are still stored after 10 s")
+		}
+	}
+	select {
+	case <-holding:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no second run after 10 s")
+	}
+	code, log := stop()
+	lines := strings.Split(strings.TrimSpace(log), "\n")
+	if code != 0 || !strings.Contains(log, `"msg":"retention run","usage":1,"usage_daily":1,"audit":1,`) || strings.Contains(log, "retention failed") ||
+		strings.Contains(log, `"level":"CRITICAL"`) || !strings.Contains(lines[len(lines)-1], `"msg":"stopped"`) {
+		t.Errorf("exit %d; log %s", code, log)
+	}
+	select {
+	case err := <-held:
+		if err != nil {
+			t.Errorf("a write of the run held across the stop: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("the run held across the stop never wrote")
+	}
+	if got := rows("SELECT id FROM usage"); !slices.Equal(got, []string{"window"}) {
+		t.Errorf("records %q, want the 7d window's", got)
+	}
+	if got := rows("SELECT day FROM usage_daily"); !slices.Equal(got, []string{now.Format(time.DateOnly)}) {
+		t.Errorf("aggregates %q, want this month's", got)
+	}
+	if got := rows("SELECT id FROM audit WHERE id = 'old'"); len(got) != 0 || len(rows("SELECT id FROM audit")) != audits-1 {
+		t.Errorf("audit rows: the old one %q, %d of %d kept", got, len(rows("SELECT id FROM audit")), audits-1)
+	}
+}
+
+// TestServeStoreCheck is the store check of kick-off section 14.3 through
+// serve: with the root page of an index overwritten, serve starts, logs one
+// CRITICAL line with quick_check's rows after the ready line, keeps serving
+// and stops as usual; checkStore counts store_check_failed. On a healthy
+// store it logs that the check passed and counts nothing; when quick_check
+// itself fails, on a closed store, it logs CRITICAL with the error and counts.
+func TestServeStoreCheck(t *testing.T) {
+	dir, token := seed(t, map[string]string{"m": "http://127.0.0.1:1"})
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "stargaite.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var page, size int64
+	if err := db.QueryRow("SELECT rootpage, (SELECT page_size FROM pragma_page_size) FROM sqlite_schema WHERE name = 'idx_usage_key_time'").Scan(&page, &size); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "stargaite.db"), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(bytes.Repeat([]byte{0xA5}, int(size)), (page-1)*size); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	logs, stderr := io.Pipe()
+	exit := make(chan int, 1)
+	go func() {
+		exit <- serve([]string{"--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0"}, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), io.Discard, stderr)
+		_ = stderr.Close()
+	}()
+	lines := bufio.NewScanner(logs)
+	var log strings.Builder
+	var data string
+	for !strings.Contains(log.String(), `"msg":"store check`) {
+		if !lines.Scan() {
+			t.Fatalf("serve ended before its store check; log %s", &log)
+		}
+		log.WriteString(lines.Text() + "\n")
+		var line struct {
+			Msg      string
+			DataAddr string `json:"data_addr"`
+		}
+		if json.Unmarshal(lines.Bytes(), &line) == nil && line.Msg == "ready" {
+			data = line.DataAddr
+		}
+	}
+	rest := make(chan string, 1)
+	go func() { // read to the end, so serve never blocks on its log
+		var b strings.Builder
+		for lines.Scan() {
+			b.WriteString(lines.Text() + "\n")
+		}
+		rest <- b.String()
+	}()
+	if code, err := get(t, &http.Client{Timeout: 5 * time.Second}, "http://"+data+"/v1/models", ""); err != nil || code != http.StatusUnauthorized {
+		t.Errorf("GET /v1/models without a key: %d, %v", code, err)
+	}
+	req, err := http.NewRequest(http.MethodGet, "http://"+data+"/v1/models", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /v1/models after the failed check: %d", resp.StatusCode)
+	}
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	log.WriteString(<-rest)
+	all := strings.Split(strings.TrimSpace(log.String()), "\n")
+	if code := <-exit; code != 0 || strings.Count(log.String(), `"level":"CRITICAL"`) != 1 ||
+		!strings.Contains(log.String(), `"level":"CRITICAL","msg":"store check failed","rows":["*** in database main ***\nTree `+fmt.Sprintf("%d page %d: ", page, page)) ||
+		!strings.Contains(all[len(all)-1], `"msg":"stopped"`) {
+		t.Errorf("exit %d; log %s", code, &log)
+	}
+
+	healthy, _ := seed(t, map[string]string{"m": "http://127.0.0.1:1"})
+	for _, tc := range []struct {
+		dir, want string
+		closed    bool // quick_check itself fails, not by the stop
+		failed    float64
+	}{
+		{dir, `"level":"ERROR+4","msg":"store check failed","rows":[`, false, 1},
+		{healthy, `"level":"INFO","msg":"store check passed"`, false, 0},
+		{healthy, `"level":"ERROR+4","msg":"store check failed","error":"sql: database is closed"`, true, 1},
+	} {
+		st, err := store.Open(context.Background(), tc.dir, slog.New(slog.DiscardHandler))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tc.closed {
+			if err := st.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var buf bytes.Buffer
+		var counters usage.Counters
+		checkStore(context.Background(), st, slog.New(slog.NewJSONHandler(&buf, nil)), &counters)
+		var failed float64
+		counters.Each(func(c usage.Counter, v float64) {
+			if c == (usage.Counter{Name: "store_check_failed"}) {
+				failed = v
+			}
+		})
+		if failed != tc.failed || !strings.Contains(buf.String(), tc.want) {
+			t.Errorf("%s: store_check_failed %v, log %s", tc.dir, failed, &buf)
+		}
+		if err := st.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // TestCheckListener is the listener table of SEC-6 and AC-45.
 func TestCheckListener(t *testing.T) {
 	for _, tc := range []struct {

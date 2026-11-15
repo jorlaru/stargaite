@@ -206,6 +206,10 @@ func newWindow(w time.Duration, origin time.Time) *window {
 // bucket is the width of a window's buckets over span w.
 func bucket(w time.Duration) time.Duration { return max(time.Second, w/600) }
 
+// SeedSpan is how far back a seed reads for a window of span w: w plus one
+// bucket (phase-3 C28). hold uses it; retention keeps that span.
+func SeedSpan(w time.Duration) time.Duration { return w + bucket(w) }
+
 // pos is t's place, in ns.
 func (x *window) pos(t time.Time) int64 { return x.origin.UnixNano() + int64(t.Sub(x.origin)) }
 

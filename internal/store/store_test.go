@@ -658,6 +658,46 @@ func TestWrite(t *testing.T) {
 	}
 }
 
+// TestCheck: quick_check on a healthy store is nil; its context interrupts
+// it; with the root page of an index overwritten the store still opens, and
+// Check returns the rows quick_check gives, not an error.
+func TestCheck(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	if rows, err := s.Check(context.Background()); rows != nil || err != nil {
+		t.Fatalf("healthy store: %q, %v", rows, err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if rows, err := s.Check(cancelled); rows != nil || !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled: %q, %v", rows, err)
+	}
+	var page, size int64
+	if err := s.Read().QueryRow("SELECT rootpage FROM sqlite_schema WHERE name = 'idx_usage_key_time'").Scan(&page); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Read().QueryRow("PRAGMA page_size").Scan(&size); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, "stargaite.db"), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(bytes.Repeat([]byte{0xA5}, int(size)), (page-1)*size); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s = open(t, dir)
+	if rows, err := s.Check(context.Background()); err != nil || !strings.Contains(strings.Join(rows, "\n"), fmt.Sprintf("Tree %d page %d: ", page, page)) {
+		t.Errorf("page %d overwritten: %q, %v", page, rows, err)
+	}
+}
+
 func TestCloseDrainsTheQueue(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(context.Background(), dir, slog.New(slog.DiscardHandler))

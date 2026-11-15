@@ -231,6 +231,14 @@ Settled in C37:
 
 **Mock.** `POST /rerank` joins the routes, default `{"object":"list","model":"mock","results":[{"index":0,"relevance_score":0.5}],"usage":{"total_tokens":3}}`; bare arrays and usage-free bodies are scripted `Step`s.
 
+Settled in C38:
+
+- **What `object(body)` means.** A rerank `2xx` is observed when it is valid JSON by `jsontext.Value.IsValid` with duplicate names allowed (well-formed, valid UTF-8 everywhere) and its top level is an object; anything else, a body that starts with `{` but is malformed or holds invalid UTF-8 included, is "not JSON": relayed unchanged, unobserved, estimated. A valid object that repeats a key at the top level or in `usage` (or a parent of the cost path) is `ObserveUsage`'s error, so C37's unusable `2xx` applies: `502 upstream_error`, no fallback, the estimate recorded. No inline `object` helper exists; the check sits in `relayFor`'s rerank branch.
+- **The relayed answer's headers.** A relayed rerank answer, JSON or not, goes out as every synchronous answer of the shipped relay does: status `200`, `Content-Type: application/json` and the PAR-9 headers; no provider header is relayed or read, `x-compute-tokens` included (kick-off §7.1, USE-3).
+- **Inbound.** `check` scans rerank with walk nil; a body whose top level is not an object is `400 invalid_request` from the scanner, as on every endpoint. A refusal before the alias is resolved (malformed JSON, invalid UTF-8, a repeated top-level key) is counted without an alias, as on chat and embeddings.
+- **No other surface.** `models explain` keeps `--endpoint chat|messages` (PAR-10), as C37 settled for embeddings; validation is unchanged (`endpoint_unservable` already covered a rerank target without `rerank_url`). The mock has no default stream on `/rerank`: a `"stream": true` body gets the JSON default.
+- **Tests.** `TestRerank` and `TestRerankSpans` live in `internal/api/rerank_test.go`; the passthrough cases join `testdata/passthrough.json` (the embeddings cases unchanged), `TestCheckRerank` and `TestNewRecordRerank` are new, `TestObserveUsage` gains Cohere, Jina, Voyage, vLLM and OpenRouter rerank shapes, and the `rerank` span case joins `internal/telemetry/testdata/spans.json`. `tests/e2e` runs a separate `TestRerank` with its own binary and data directory, so the quick start's counts, spans and usage lines are untouched.
+
 ## 6. Targets verify
 
 ```go

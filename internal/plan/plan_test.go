@@ -849,14 +849,16 @@ func TestStreamOptions(t *testing.T) {
 	golden(t, filepath.Join("testdata", "stream_options.json"), got)
 }
 
-// TestPassthrough is Build on embeddings (phase-4 design section 4), in
-// testdata/passthrough.json: per target kind and protocol, an embeddings
-// target of the openai protocol is called at base_url + /embeddings with
-// only model replaced, every other byte as the client sent it, and any other
+// TestPassthrough is Build on embeddings and rerank (phase-4 design sections
+// 4 and 5), in testdata/passthrough.json: per target kind and protocol, an
+// embeddings target of the openai protocol is called at base_url +
+// /embeddings, and a rerank target of the openai protocol whose provider has
+// a rerank_url at that URL, with only model replaced, every other byte and
+// the key order as the client sent them, a stream member included; any other
 // target is skipped endpoint_not_supported; the alias's rules and PAR-12
-// apply as on chat (PAR-2, PAR-3); no cap, effort or include_usage is ever
-// written, whatever the alias sets, so the source is provider_default and
-// every other layer is empty (RSN-6).
+// apply on embeddings as on chat (PAR-2, PAR-3), and on rerank not at all;
+// no cap, effort or include_usage is ever written, whatever the alias sets,
+// so the source is provider_default and every other layer is empty (RSN-6).
 func TestPassthrough(t *testing.T) {
 	type built struct {
 		Case    string `json:"case"`
@@ -870,8 +872,13 @@ func TestPassthrough(t *testing.T) {
 	const body = `{ "input": ["héllo", "\u00e9"], "model":"embed","encoding_format" :"base64", "dimensions":256 }`
 	slash := &domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.example.com/v1/"}
 	rerank := &domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.example.com/v1", RerankURL: "https://api.example.com/rerank"}
-	emb := domain.Target{Kind: domain.KindEmbeddings}
+	const cohere = `{ "query":"héllo", "model" :"rr","documents":["a",{"text":"b","model":"x"}],"top_n":1,"stream":true,"return_documents":false,"x":{"k":1,"k":2} }`
+	const jina = `{"documents":[{"text":"a"}],"top_n":2,"query":"q","model":"rr"}`
+	emb, rr := domain.Target{Kind: domain.KindEmbeddings}, domain.Target{Kind: domain.KindRerank}
+	const E, R = domain.EndpointEmbeddings, domain.EndpointRerank
 	loaded := &domain.Model{MaxOutputTokens: 100, Reasoning: domain.ModelReasoning{Effort: "high", Mode: domain.ModeForced}}
+	anthRerank := &domain.Provider{Protocol: domain.ProtocolAnthropic, BaseURL: "https://api.example.com", RerankURL: "https://api.example.com/rerank"}
+	elsewhere := &domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.example.com/v1", RerankURL: "https://rerank.example.net:8443/v2/rerank?x=1"}
 	var got []built
 	for _, tc := range []struct {
 		name string
@@ -879,23 +886,35 @@ func TestPassthrough(t *testing.T) {
 		tg   domain.Target
 		m    *domain.Model
 		body string
+		ep   domain.Endpoint
 	}{
-		{"embeddings toward openai", openai, emb, nil, body},
-		{"a base_url with a trailing slash", slash, emb, nil, body},
-		{"embeddings toward anthropic", anth, emb, nil, body},
-		{"a chat target", openai, domain.Target{Kind: domain.KindChat}, nil, body},
-		{"a chat target toward anthropic", anth, domain.Target{Kind: domain.KindChat}, nil, body},
-		{"a rerank target", rerank, domain.Target{Kind: domain.KindRerank}, nil, body},
+		{"embeddings toward openai", openai, emb, nil, body, E},
+		{"a base_url with a trailing slash", slash, emb, nil, body, E},
+		{"embeddings toward anthropic", anth, emb, nil, body, E},
+		{"a chat target", openai, domain.Target{Kind: domain.KindChat}, nil, body, E},
+		{"a chat target toward anthropic", anth, domain.Target{Kind: domain.KindChat}, nil, body, E},
+		{"a rerank target", rerank, domain.Target{Kind: domain.KindRerank}, nil, body, E},
 		{"an alias with a cap and a forced effort, a target with a dialect", openai,
-			domain.Target{Kind: domain.KindEmbeddings, Reasoning: &domain.Reasoning{Dialect: "reasoning_effort", Levels: []string{"high"}}}, loaded, body},
-		{"a forward rule", openai, emb, &domain.Model{Params: map[string]string{"input_type": "forward"}}, `{"model":"embed","input":"hi","input_type":"query"}`},
-		{"a drop rule on an unknown key", openai, emb, &domain.Model{Params: map[string]string{"task": "drop"}}, `{"model":"embed","task":"x","input":"hi"}`},
+			domain.Target{Kind: domain.KindEmbeddings, Reasoning: &domain.Reasoning{Dialect: "reasoning_effort", Levels: []string{"high"}}}, loaded, body, E},
+		{"a forward rule", openai, emb, &domain.Model{Params: map[string]string{"input_type": "forward"}}, `{"model":"embed","input":"hi","input_type":"query"}`, E},
+		{"a drop rule on an unknown key", openai, emb, &domain.Model{Params: map[string]string{"task": "drop"}}, `{"model":"embed","task":"x","input":"hi"}`, E},
 		{"an unsupported key dropped", openai, domain.Target{Kind: domain.KindEmbeddings, UnsupportedParams: []string{"encoding_format"}},
-			&domain.Model{Params: map[string]string{"encoding_format": "drop", "input_type": "forward"}}, `{"model":"embed","input":"hi","encoding_format":"base64","input_type":"q"}`},
-		{"an unsupported key without a drop rule", openai, domain.Target{Kind: domain.KindEmbeddings, UnsupportedParams: []string{"dimensions"}}, nil, body},
-		{"a drop rule on a supported known key", openai, emb, &domain.Model{Params: map[string]string{"dimensions": "drop"}}, body},
+			&domain.Model{Params: map[string]string{"encoding_format": "drop", "input_type": "forward"}}, `{"model":"embed","input":"hi","encoding_format":"base64","input_type":"q"}`, E},
+		{"an unsupported key without a drop rule", openai, domain.Target{Kind: domain.KindEmbeddings, UnsupportedParams: []string{"dimensions"}}, nil, body, E},
+		{"a drop rule on a supported known key", openai, emb, &domain.Model{Params: map[string]string{"dimensions": "drop"}}, body, E},
+		{"rerank, Cohere-shaped, toward its rerank_url", rerank, rr, nil, cohere, R},
+		{"rerank, Jina-shaped", rerank, rr, nil, jina, R},
+		{"rerank, a rerank_url on another host", elsewhere, rr, nil, jina, R},
+		{"rerank, no alias rule, cap or effort applied", rerank,
+			domain.Target{Kind: domain.KindRerank, UnsupportedParams: []string{"top_n", "query"}, Reasoning: &domain.Reasoning{Dialect: "reasoning_effort", Levels: []string{"high"}}},
+			&domain.Model{MaxOutputTokens: 100, Reasoning: domain.ModelReasoning{Effort: "high", Mode: domain.ModeForced}, Params: map[string]string{"top_n": "drop", "x": "forward"}},
+			cohere, R},
+		{"rerank, a provider without rerank_url", openai, rr, nil, jina, R},
+		{"rerank toward anthropic", anthRerank, rr, nil, jina, R},
+		{"rerank, an embeddings target", rerank, emb, nil, jina, R},
+		{"rerank, a chat target", rerank, domain.Target{Kind: domain.KindChat}, nil, jina, R},
 	} {
-		out, skip := runTo(t, domain.EndpointEmbeddings, tc.p, tc.body, tc.m, tc.tg)
+		out, skip := runTo(t, tc.ep, tc.p, tc.body, tc.m, tc.tg)
 		if skip != nil {
 			got = append(got, built{Case: tc.name, Skip: skip.Code + " " + skip.Param})
 			continue
@@ -946,5 +965,26 @@ func TestCheckEmbeddings(t *testing.T) {
 	}
 	if _, e := params.Scan([]byte(`{"model":"a","input":[{"k":1,"k":2}]}`), params.Embeddings.Walk); e != nil {
 		t.Errorf("a repeat inside a member is not read: %+v", e)
+	}
+}
+
+// TestCheckRerank: Check on rerank refuses nothing and returns an empty
+// Client at once (phase-4 design section 5): no PAR-2, no type check, no cap
+// or effort read, so a stream member is forwarded and the answer read whole.
+func TestCheckRerank(t *testing.T) {
+	strict := &domain.Model{MaxOutputTokens: 1}
+	for _, body := range []string{
+		`{"model":"a","query":"q","documents":["x"],"top_n":1}`,
+		`{"model":"a","stream":true,"messages":"x","max_tokens":100,"reasoning_effort":"nope","stream_options":7,"tools":{}}`,
+		`{"model":"a"}`,
+	} {
+		b, e := params.Scan([]byte(body), nil)
+		if e != nil {
+			t.Fatalf("%s: %+v", body, e)
+		}
+		c, de := Check(domain.EndpointRerank, b, strict)
+		if de != nil || c == nil || *c != (Client{}) {
+			t.Errorf("%s: got %+v, %+v", body, c, de)
+		}
 	}
 }

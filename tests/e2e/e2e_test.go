@@ -463,6 +463,79 @@ func TestListenerOutsideLoopback(t *testing.T) {
 	}
 }
 
+// TestRerank runs a rerank alias on the mock's /rerank with the built binary,
+// outside the quick start (phase-4 design section 11): a provider whose
+// rerank_url is the mock's, a priced rerank target, an alias and a key; a
+// Cohere-shaped call relayed byte for byte, with the body the mock got
+// identical but for model; a repeated top-level key refused with 400 and no
+// call; and usage show with one request, 3 input tokens from the mock's
+// total_tokens, 0 output and their price_table cost (AC-46).
+func TestRerank(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "stargaite")
+	if code, _, stderr := run(t, "../..", nil, "go", "build", "-o", bin, "./cmd/stargaite"); code != 0 {
+		t.Fatalf("build: exit %d: %s", code, stderr)
+	}
+	mock := mockprovider.New()
+	ms := httptest.NewServer(mock)
+	t.Cleanup(ms.Close)
+	env := []string{"STARGAITE_DATA_DIR=" + filepath.Join(t.TempDir(), "data"), "STARGAITE_LISTEN=127.0.0.1:0", "STARGAITE_ADMIN_LISTEN=127.0.0.1:0"}
+	srv := start(t, bin, env, "serve")
+	cli := func(args ...string) string {
+		t.Helper()
+		code, stdout, stderr := run(t, "", slices.Concat(env, []string{"STARGAITE_ADMIN_URL=http://" + srv.admin}), bin, args...)
+		if code != 0 {
+			t.Fatalf("stargaite %q: exit %d; stdout %q stderr %q", args, code, stdout, stderr)
+		}
+		return stdout
+	}
+	cli("providers", "add", "rr", "--protocol", "openai", "--base-url", ms.URL+"/v1", "--rerank-url", ms.URL+"/rerank", "--allow-private-network", "--billing", "pay_per_use")
+	cli("targets", "add", "rr/rr-1", "--kind", "rerank", "--pricing", "input_per_million=1,output_per_million=0,as_of=2026-11-01")
+	cli("models", "add", "rerank", "--target", "rr/rr-1")
+	token := tokenLine.FindString(cli("keys", "create", "agent", "--model", "rerank"))
+	if token == "" {
+		t.Fatal("keys create printed no token")
+	}
+
+	const body = `{"model":"rerank", "query":"q","documents":["a",{"text":"b"}],"top_n":1,"return_documents":false}`
+	status, h, got := send(t, http.MethodPost, "http://"+srv.data+"/v1/rerank", body, "Authorization: Bearer "+token)
+	if status != http.StatusOK || string(got) != `{"object":"list","model":"mock","results":[{"index":0,"relevance_score":0.5}],"usage":{"total_tokens":3}}` ||
+		h.Get("X-Stargaite-Target") != "rr/rr-1" || h.Get("Content-Type") != "application/json" {
+		t.Errorf("rerank: %d %v %s", status, h, got)
+	}
+	if status, _, got := send(t, http.MethodPost, "http://"+srv.data+"/v1/rerank", `{"model":"rerank","query":"a","query":"b"}`, "Authorization: Bearer "+token); status != http.StatusBadRequest {
+		t.Errorf("a repeated top-level key: %d %s", status, got)
+	}
+	calls := mock.Calls()
+	if len(calls) != 1 || calls[0].Path != "/rerank" || string(calls[0].Body) != strings.Replace(body, `"rerank"`, `"rr-1"`, 1) {
+		t.Fatalf("the mock received %+v", calls)
+	}
+
+	var rep struct {
+		Groups []struct {
+			Requests, Estimated int64
+			Input               int64    `json:"input_tokens"`
+			Output              int64    `json:"output_tokens"`
+			CostUSD             *float64 `json:"cost_usd"`
+		}
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		out := cli("usage", "show", "--since", "1h", "--by", "model", "--json")
+		if err := json.Unmarshal([]byte(out), &rep); err != nil {
+			t.Fatalf("usage show: %s", out)
+		}
+		if len(rep.Groups) == 1 || time.Now().After(deadline) {
+			break
+		}
+	}
+	if len(rep.Groups) != 1 || rep.Groups[0].Requests != 1 || rep.Groups[0].Estimated != 0 || rep.Groups[0].Input != 3 || rep.Groups[0].Output != 0 ||
+		rep.Groups[0].CostUSD == nil || *rep.Groups[0].CostUSD != 3e-6 {
+		t.Errorf("usage show: %+v", rep.Groups)
+	}
+	if code, log := srv.stop(t); code != 0 || !strings.Contains(log, `"key":"agent","alias":"rerank","attempts":1,"status":200`) {
+		t.Errorf("stop: exit %d, log:\n%s", code, log)
+	}
+}
+
 // quickStart returns the command lines of the first sh block after the
 // "## Quick start" heading of README.md, exactly as written. A line with "#"
 // fails: stock interactive zsh does not treat it as a comment.

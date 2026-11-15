@@ -72,7 +72,7 @@ type request struct {
 	trace       telemetry.Context // set by authenticate (TEL-6)
 	session     string            // x-session-id when valid, else ""
 	sample      uint64            // the crypto/rand draw sampling compares, taken once after authenticate (TEL-7)
-	ep          domain.Endpoint   // chat, messages or embeddings
+	ep          domain.Endpoint   // chat, messages, embeddings or rerank
 	snap        *config.Snapshot  // loaded once (RES-7)
 	key         *config.Key
 	alias       string // the body's "model" string, set before the lookup; "" when the body named none
@@ -161,13 +161,21 @@ type relay struct {
 // messages toward anthropic is the native Messages relay; chat toward
 // openai is the native chat relay, chat toward anthropic the translated one,
 // whose chunks take created from now; neither relays a usage chunk only the
-// proxy asked for (USE-8). Build skips messages toward openai. Embeddings,
-// which never streams, is relayed unchanged and observed by ObserveUsage.
+// proxy asked for (USE-8). Build skips messages toward openai. Embeddings and
+// rerank, which never stream, are relayed unchanged and observed by
+// ObserveUsage; a rerank 2xx that is not JSON, or whose top level is not an
+// object (TEI's bare array), is relayed unchanged and unobserved, so its
+// record is the USE-8 estimate (phase-4 design section 5).
 func relayFor(ep domain.Endpoint, t *config.Target, c *plan.Client, now func() time.Time) relay {
 	tg, p := &t.Spec, &t.Provider.Spec
 	switch {
-	case ep == domain.EndpointEmbeddings:
-		return relay{sync: func(body []byte, _ time.Time) ([]byte, domain.Observed, error) { return openai.ObserveUsage(p, body) }}
+	case ep == domain.EndpointEmbeddings || ep == domain.EndpointRerank:
+		return relay{sync: func(body []byte, _ time.Time) ([]byte, domain.Observed, error) {
+			if v := jsontext.Value(body); ep == domain.EndpointRerank && (!v.IsValid(jsontext.AllowDuplicateNames(true)) || v.Kind() != '{') {
+				return body, domain.Observed{}, nil
+			}
+			return openai.ObserveUsage(p, body)
+		}}
 	case ep == domain.EndpointMessages:
 		s := anthropic.NewStream(tg, p)
 		return relay{
@@ -193,9 +201,9 @@ func relayFor(ep domain.Endpoint, t *config.Target, c *plan.Client, now func() t
 	}
 }
 
-// infer serves POST /v1/chat/completions, POST /v1/messages and POST
-// /v1/embeddings (design sections 4 and 8, steps 1 to 8), synchronous and
-// streamed. done runs on every exit once the key is authenticated, a panic
+// infer serves POST /v1/chat/completions, POST /v1/messages, POST
+// /v1/embeddings and POST /v1/rerank (design sections 4 and 8, steps 1 to
+// 8), synchronous and streamed. done runs on every exit once the key is authenticated, a panic
 // included, and gives back the slots admission took. Every error is in the envelope of ep; a
 // stream that fails once committed has already written its terminal event,
 // so it gets no envelope. Only /v1/messages
@@ -290,6 +298,8 @@ func (h *handler) check(w http.ResponseWriter, r *http.Request, rq *request) *do
 		walk = params.Messages.Walk
 	case domain.EndpointEmbeddings:
 		walk = params.Embeddings.Walk // nil: the top level only (PAR-1)
+	case domain.EndpointRerank:
+		walk = nil // no schema: the top level only (kick-off section 7.1)
 	}
 	var pe *params.Error
 	if rq.body, pe = params.Scan(raw, walk); pe != nil {

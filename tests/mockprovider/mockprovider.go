@@ -53,14 +53,17 @@ type Server struct {
 }
 
 // defaults are the replies of an empty queue, by route: OpenAI chat
-// completions and embeddings, Anthropic messages, and an OTLP/HTTP trace
-// export, so the mock is also the in-process OTLP receiver of TEL-14.
+// completions and embeddings, a rerank answer in the common shape with
+// total-only usage, Anthropic messages, and an OTLP/HTTP trace export, so
+// the mock is also the in-process OTLP receiver of TEL-14. Other rerank
+// shapes, such as a bare array or a body without usage, are scripted Steps.
 var defaults = map[string]string{
 	"/chat/completions": `{"id":"chatcmpl-mock","object":"chat.completion","created":0,"model":"mock",` +
 		`"choices":[{"index":0,"message":{"role":"assistant","content":"mock reply"},"finish_reason":"stop"}],` +
 		`"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`,
 	"/embeddings": `{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0,0.5,1]}],"model":"mock",` +
 		`"usage":{"prompt_tokens":1,"total_tokens":1}}`,
+	"/rerank": `{"object":"list","model":"mock","results":[{"index":0,"relevance_score":0.5}],"usage":{"total_tokens":3}}`,
 	"/v1/messages": `{"id":"msg_mock","type":"message","role":"assistant","model":"mock",` +
 		`"content":[{"type":"text","text":"mock reply"}],"stop_reason":"end_turn","stop_sequence":null,` +
 		`"usage":{"input_tokens":1,"output_tokens":2}}`,
@@ -101,7 +104,7 @@ var streams = map[string][]string{
 func New() *Server { return &Server{} }
 
 // ServeHTTP records the request, then answers POST /chat/completions,
-// /embeddings, /v1/messages and /v1/traces; any other route gets 404 or 405 and leaves the
+// /embeddings, /rerank, /v1/messages and /v1/traces; any other route gets 404 or 405 and leaves the
 // script untouched. With an empty queue, a body with "stream": true gets the
 // route's default stream, if it has one, and an embeddings body with
 // "encoding_format": "base64" its vector in base64.

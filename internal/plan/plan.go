@@ -56,8 +56,13 @@ func capNames(ep domain.Endpoint) []string {
 // nil: an unknown top-level key without a rule, a type the proxy reads, an
 // effort off the scale (RSN-11), a cap above the alias's (PAR-6). On
 // embeddings only the unknown key is refused, and the Client is empty: no
-// stream, effort, cap or feature (phase-4 design section 4).
+// stream, effort, cap or feature (phase-4 design section 4). Rerank has no
+// schema: nothing is refused and the Client is empty, so a stream member is
+// forwarded and the answer read whole (phase-4 design section 5).
 func Check(ep domain.Endpoint, b *params.Body, m *domain.Model) (*Client, *domain.Error) {
+	if ep == domain.EndpointRerank {
+		return &Client{}, nil
+	}
 	s, _, ok := schema(ep)
 	if !ok {
 		return nil, domain.NewError(domain.CodeInternalError, fmt.Sprintf("endpoint %q is not served", ep))
@@ -277,9 +282,9 @@ func Header(cs []Change) string {
 // protocol:translated, takes the cap and the reasoning edit in place of the
 // client's body, and a key with no equivalent is handled like an unsupported
 // one (PAR-12). Every sent value is read back from the result (PAR-8).
-// Embeddings is passthrough's alone.
+// Embeddings and rerank are passthrough's alone.
 func Build(in Input) (*Outgoing, *Skip) {
-	if in.Endpoint == domain.EndpointEmbeddings {
+	if in.Endpoint == domain.EndpointEmbeddings || in.Endpoint == domain.EndpointRerank {
 		return passthrough(in)
 	}
 	ep, b, t, p := in.Endpoint, in.Body, in.Target, in.Provider
@@ -448,9 +453,11 @@ func rules(b *params.Body, m *domain.Model, t *domain.Target, s params.Schema, n
 	return drops, changes, nil
 }
 
-// passthrough is Build for embeddings (kick-off section 7.1): an embeddings
-// target of the openai protocol, called at base_url + /embeddings; any other
-// target is skipped. The alias's rules and PAR-12 apply as on chat, and only
+// passthrough is Build for embeddings and rerank (kick-off section 7.1): an
+// embeddings target of the openai protocol, called at base_url +
+// /embeddings, or a rerank target of the openai protocol whose provider has
+// a rerank_url, called there; any other target is skipped. On embeddings the
+// alias's rules and PAR-12 apply as on chat; rerank applies none. Only
 // "model" is replaced besides them, which PAR-3 does not list. No cap, effort
 // or include_usage is ever written, so the source is provider_default (RSN-6)
 // and every other layer is nil.
@@ -462,6 +469,8 @@ func passthrough(in Input) (*Outgoing, *Skip) {
 		return nil, &Skip{Code: domain.CodeEndpointNotSupported}
 	case in.Endpoint == domain.EndpointEmbeddings && t.Kind == domain.KindEmbeddings:
 		out.URL = strings.TrimSuffix(p.BaseURL, "/") + "/embeddings"
+	case in.Endpoint == domain.EndpointRerank && t.Kind == domain.KindRerank && p.RerankURL != "":
+		out.URL = p.RerankURL
 	default:
 		return nil, &Skip{Code: domain.CodeEndpointNotSupported}
 	}

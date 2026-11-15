@@ -149,7 +149,7 @@ func TestNewRecordEndpoints(t *testing.T) {
 	for _, tc := range []struct {
 		ep    domain.Endpoint
 		empty bool
-	}{{domain.EndpointChat, true}, {domain.EndpointMessages, true}, {domain.EndpointEmbeddings, false}} {
+	}{{domain.EndpointChat, true}, {domain.EndpointMessages, true}, {domain.EndpointEmbeddings, false}, {domain.EndpointRerank, false}} {
 		c := base()
 		c.Endpoint, c.Obs.VisibleBytes = tc.ep, 0
 		if r := NewRecord(c); r.ContentEmpty != tc.empty || r.Endpoint != string(tc.ep) {
@@ -193,6 +193,44 @@ func TestNewRecordEndpoints(t *testing.T) {
 	c.Status, c.ErrorCode, c.Obs, c.Complete = 503, "upstream_error", domain.Observed{}, false
 	if r := NewRecord(c); r.InputTokens != 0 || r.OutputTokens != 0 || r.TokensSource != "provider" || r.ErrorType != "upstream_error" || r.ContentEmpty {
 		t.Errorf("a 503: %+v", r)
+	}
+}
+
+// TestNewRecordRerank is NewRecord on rerank (phase-4 design section 5): the
+// reported tokens as input, output 0; a 2xx without usage, an unobserved bare
+// array included, estimated from the bytes sent (67, so 17 tokens), output 0,
+// tokens_source estimated, priced by the target's table; a provider cost
+// winning over the table; no table and no report: no cost.
+func TestNewRecordRerank(t *testing.T) {
+	rerank := func() Call {
+		return Call{
+			RequestID: "req", Key: "k", Model: "rerank", Endpoint: domain.EndpointRerank, Attempt: 1, Status: 200, TargetID: "p/rr-1",
+			Target:   &domain.Target{Kind: domain.KindRerank, Pricing: &domain.Pricing{InputPerMillion: ptr(0.05), OutputPerMillion: ptr(0.0)}},
+			Provider: &domain.Provider{Billing: domain.BillingPayPerUse},
+			Out:      &plan.Outgoing{Body: []byte(`{"model":"rr-1","query":"q","documents":["alpha","beta"],"top_n":1}`), EffortSource: "provider_default"}, // 67 bytes
+			Complete: true,
+			Obs:      domain.Observed{Usage: &domain.Usage{Input: 3}},
+			Started:  t0, Ended: t0.Add(40 * time.Millisecond),
+		}
+	}
+	if r := NewRecord(rerank()); r.Endpoint != "rerank" || r.InputTokens != 3 || r.OutputTokens != 0 || r.TokensSource != "provider" ||
+		!near(r.CostUSD, ptr(3*0.05/1e6)) || r.CostSource != "price_table" || r.ContentEmpty || r.ReasoningTokens != nil || r.EffortSource != "provider_default" {
+		t.Errorf("reported: %+v", r)
+	}
+	c := rerank()
+	c.Obs = domain.Observed{}
+	if r := NewRecord(c); r.InputTokens != 17 || r.OutputTokens != 0 || r.TokensSource != "estimated" ||
+		!near(r.CostUSD, ptr(17*0.05/1e6)) || r.CostSource != "price_table" || r.ContentEmpty {
+		t.Errorf("without usage: %+v", r)
+	}
+	c.Obs.Cost = ptr(0.002)
+	if r := NewRecord(c); r.InputTokens != 17 || r.TokensSource != "estimated" || !near(r.CostUSD, ptr(0.002)) || r.CostSource != "provider" {
+		t.Errorf("a provider cost: %+v", r)
+	}
+	c = rerank()
+	c.Obs, c.Target.Pricing = domain.Observed{}, nil
+	if r := NewRecord(c); r.InputTokens != 17 || r.CostUSD != nil || r.CostSource != "none" {
+		t.Errorf("unpriced: %+v", r)
 	}
 }
 

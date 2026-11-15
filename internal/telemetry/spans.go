@@ -18,10 +18,11 @@ import (
 const SchemaVersion = 1
 
 // operation is gen_ai.operation.name of endpoint ep and the first word of its
-// request span's name: embeddings, else chat (phase-4 design section 4).
+// request span's name: embeddings, rerank (the custom value annex D names),
+// else chat (phase-4 design section 4).
 func operation(ep domain.Endpoint) string {
-	if ep == domain.EndpointEmbeddings {
-		return "embeddings"
+	if ep == domain.EndpointEmbeddings || ep == domain.EndpointRerank {
+		return string(ep)
 	}
 	return "chat"
 }

@@ -89,8 +89,8 @@ type Record struct {
 // tokens with source provider. Cost: none for subscription and none billing;
 // else the provider's figure, else the price table over the recorded
 // tokens, else none (USE-6, USE-7). content_empty is read on chat and
-// messages only: an embeddings answer has no visible bytes, and its estimate
-// has output 0 (phase-4 design section 4).
+// messages only: an embeddings or rerank answer has no visible bytes, and its
+// estimate has output 0 (phase-4 design sections 4 and 5).
 func NewRecord(c Call) Record {
 	r := Record{
 		ID: fmt.Sprintf("%s-%d", c.RequestID, c.Attempt), RequestID: c.RequestID, TraceID: c.TraceID, Attempt: c.Attempt,

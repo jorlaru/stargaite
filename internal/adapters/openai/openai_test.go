@@ -160,7 +160,8 @@ func TestCost(t *testing.T) {
 func ptr[T any](v T) *T { return &v }
 
 // TestObserveUsage is an embeddings answer as each provider shapes it, base64
-// and float alike (phase-4 design section 4): the body comes back unchanged;
+// and float alike, and a rerank answer whose top level is an object (phase-4
+// design sections 4 and 5): the body comes back unchanged;
 // input is usage.prompt_tokens, else usage.total_tokens, output 0, reasoning
 // nil, no usage without either integer; the cost is read at cost_report.path,
 // also outside usage; the vectors are never read, so a repeat inside them is
@@ -205,6 +206,16 @@ func TestObserveUsage(t *testing.T) {
 		{"usage null", &domain.Provider{}, `{"data":` + vector + `,"usage":null}`, domain.Observed{}},
 		{"no usage", openrouter, `{"model":"m","data":` + vector + `}`, domain.Observed{ResponseModel: "m"}},
 		{"a repeat inside the vectors", &domain.Provider{}, `{"data":[{"index":0,"index":1}],"usage":{"total_tokens":1}}`, domain.Observed{Usage: in(1)}},
+		{"rerank, Cohere: billed_units only", &domain.Provider{}, `{"id":"r1","results":[{"index":1,"relevance_score":0.9}],"meta":{"api_version":{"version":"2"},"billed_units":{"search_units":1}}}`,
+			domain.Observed{}},
+		{"rerank, Jina", &domain.Provider{}, `{"model":"jina-reranker-v2-base-multilingual","usage":{"total_tokens":15},"results":[{"index":0,"relevance_score":0.8,"document":{"text":"a"}}]}`,
+			domain.Observed{ResponseModel: "jina-reranker-v2-base-multilingual", Usage: in(15)}},
+		{"rerank, Voyage", &domain.Provider{}, `{"object":"list","data":[{"relevance_score":0.4,"index":0}],"model":"rerank-2.5","usage":{"total_tokens":26}}`,
+			domain.Observed{ResponseModel: "rerank-2.5", Usage: in(26)}},
+		{"rerank, vLLM", &domain.Provider{}, `{"id":"rerank-1","model":"BAAI/bge-reranker-v2-m3","usage":{"total_tokens":9},"results":[{"index":0,"document":{"text":"a"},"relevance_score":0.99}]}`,
+			domain.Observed{ResponseModel: "BAAI/bge-reranker-v2-m3", Usage: in(9)}},
+		{"rerank, OpenRouter with search units and its cost", openrouter, `{"model":"cohere/rerank-v3.5","results":[{"index":0,"relevance_score":0.7}],"usage":{"search_units":1,"total_tokens":20,"cost":0.002}}`,
+			domain.Observed{ResponseModel: "cohere/rerank-v3.5", Usage: in(20), Cost: cost(0.002)}},
 	} {
 		body, got, err := ObserveUsage(tt.p, []byte(tt.body))
 		if err != nil || !reflect.DeepEqual(got, tt.want) || string(body) != tt.body {

@@ -1,8 +1,9 @@
 // Package openai reads the responses of providers of the openai protocol to
 // chat completions on the native path (design sections 7 and 9), synchronous
-// and streamed, and to embeddings (ObserveUsage). The relay sends their bytes unchanged, except the think-tag
-// edits of a target that declares inline_think_tags (RSN-12); this package
-// observes them and makes those edits.
+// and streamed, and to embeddings and rerank (ObserveUsage). The relay sends
+// their bytes unchanged, except the think-tag edits of a target that
+// declares inline_think_tags (RSN-12); this package observes them and makes
+// those edits.
 package openai
 
 import (
@@ -66,15 +67,16 @@ func Observe(t *domain.Target, p *domain.Provider, body []byte) ([]byte, domain.
 	return body, o, nil
 }
 
-// ObserveUsage reads an embeddings answer and relays it unchanged: the
-// returned model, the usage and the cost at cost_report.path, in one scan
-// whose walk is {usage} plus the parents of the cost path, so the vectors,
-// base64 or float, are never decoded. Input is usage.prompt_tokens, else
-// usage.total_tokens (derived: some providers report only the total); Output
-// is 0; Reasoning nil; Usage nil when the usage object is absent, not an
-// object or holds neither integer, so the record estimates (USE-8). The error says the body is not a JSON object or repeats a key in an
-// object it reads: a 2xx that is not relayed, classified as Observe's is
-// (phase-2 design section 10, settled in C37).
+// ObserveUsage reads an embeddings or rerank answer and relays it
+// unchanged: the returned model, the usage and the cost at cost_report.path,
+// in one scan whose walk is {usage} plus the parents of the cost path, so the
+// vectors, base64 or float, and the rerank results are never decoded. Input
+// is usage.prompt_tokens, else usage.total_tokens (derived: some providers
+// report only the total); Output is 0; Reasoning nil; Usage nil when the
+// usage object is absent, not an object or holds neither integer, so the
+// record estimates (USE-8). The error says the body is not a JSON object or
+// repeats a key in an object it reads: a 2xx that is not relayed, classified
+// as Observe's is (phase-2 design section 10, settled in C37).
 func ObserveUsage(p *domain.Provider, body []byte) ([]byte, domain.Observed, error) {
 	cr := report(p)
 	b, e := params.Scan(body, params.Reply([][]string{{"usage"}}, cr.Path))

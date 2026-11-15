@@ -102,8 +102,8 @@ func TestSampled(t *testing.T) {
 
 // goldenCases are one request per span shape (AC-25): a success, a stream,
 // an error, a refusal before any provider, a fallback whose failed attempts
-// are child spans, a success under the content opt-in (TEL-8), and an
-// embeddings success.
+// are child spans, a success under the content opt-in (TEL-8), an
+// embeddings success and a rerank success.
 func goldenCases() []struct {
 	name string
 	req  Request
@@ -134,6 +134,8 @@ func goldenCases() []struct {
 		ParamsChanged: "protocol:translated,output_config.effort:added", TTFTMS: n(30), StartedAt: ms + 81, CompletedAt: ms + 300}
 	emb := usage.Record{Target: "pay/emb-1", Billing: domain.BillingPayPerUse, ResponseModel: "emb-1", StatusCode: 200, InputTokens: 5,
 		TokensSource: "provider", CostUSD: usd(0.0000001), CostSource: "price_table", EffortSource: "provider_default", StartedAt: ms + 2, CompletedAt: ms + 80}
+	rr := usage.Record{Target: "pay/rerank-1", Billing: domain.BillingPayPerUse, StatusCode: 200, InputTokens: 12,
+		TokensSource: "estimated", CostUSD: usd(0.0000012), CostSource: "price_table", EffortSource: "provider_default", StartedAt: ms + 2, CompletedAt: ms + 60}
 	base := Request{Key: "agent", Alias: "fast", Endpoint: domain.EndpointChat, Version: "v1.2.3", Revision: 7, Status: 200, Started: at, Ended: at.Add(time.Second)}
 	with := func(f func(r *Request)) Request {
 		r := base
@@ -188,6 +190,13 @@ func goldenCases() []struct {
 			// section 4).
 			r.Context, r.Endpoint, r.Alias = root, domain.EndpointEmbeddings, "embed"
 			r.Attempts = []Attempt{{Record: emb, Provider: "openai", Host: "api.example.com", Port: 443, Dialect: "none"}}
+		})},
+		{"rerank", with(func(r *Request) {
+			// The custom operation rerank; server.address and server.port of the
+			// rerank_url called, an estimated record with output 0 (phase-4
+			// design section 5).
+			r.Context, r.Endpoint, r.Alias = root, domain.EndpointRerank, "rerank"
+			r.Attempts = []Attempt{{Record: rr, Provider: "cohere", Host: "rerank.example.net", Port: 8443, Dialect: "none"}}
 		})},
 	}
 }

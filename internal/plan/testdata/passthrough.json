@@ -70,5 +70,49 @@
 		"header": "map[Content-Type:[application/json]]",
 		"effort_source": "provider_default",
 		"body": "{ \"input\": [\"héllo\", \"\\u00e9\"], \"model\":\"up-1\",\"encoding_format\" :\"base64\", \"dimensions\":256 }"
+	},
+	{
+		"case": "rerank, Cohere-shaped, toward its rerank_url",
+		"url": "https://api.example.com/rerank",
+		"header": "map[Content-Type:[application/json]]",
+		"effort_source": "provider_default",
+		"body": "{ \"query\":\"héllo\", \"model\" :\"up-1\",\"documents\":[\"a\",{\"text\":\"b\",\"model\":\"x\"}],\"top_n\":1,\"stream\":true,\"return_documents\":false,\"x\":{\"k\":1,\"k\":2} }"
+	},
+	{
+		"case": "rerank, Jina-shaped",
+		"url": "https://api.example.com/rerank",
+		"header": "map[Content-Type:[application/json]]",
+		"effort_source": "provider_default",
+		"body": "{\"documents\":[{\"text\":\"a\"}],\"top_n\":2,\"query\":\"q\",\"model\":\"up-1\"}"
+	},
+	{
+		"case": "rerank, a rerank_url on another host",
+		"url": "https://rerank.example.net:8443/v2/rerank?x=1",
+		"header": "map[Content-Type:[application/json]]",
+		"effort_source": "provider_default",
+		"body": "{\"documents\":[{\"text\":\"a\"}],\"top_n\":2,\"query\":\"q\",\"model\":\"up-1\"}"
+	},
+	{
+		"case": "rerank, no alias rule, cap or effort applied",
+		"url": "https://api.example.com/rerank",
+		"header": "map[Content-Type:[application/json]]",
+		"effort_source": "provider_default",
+		"body": "{ \"query\":\"héllo\", \"model\" :\"up-1\",\"documents\":[\"a\",{\"text\":\"b\",\"model\":\"x\"}],\"top_n\":1,\"stream\":true,\"return_documents\":false,\"x\":{\"k\":1,\"k\":2} }"
+	},
+	{
+		"case": "rerank, a provider without rerank_url",
+		"skip": "endpoint_not_supported "
+	},
+	{
+		"case": "rerank toward anthropic",
+		"skip": "endpoint_not_supported "
+	},
+	{
+		"case": "rerank, an embeddings target",
+		"skip": "endpoint_not_supported "
+	},
+	{
+		"case": "rerank, a chat target",
+		"skip": "endpoint_not_supported "
 	}
 ]

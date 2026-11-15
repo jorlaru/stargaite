@@ -8,8 +8,9 @@ one data directory. MIT licensed.
 built-in presets), targets, model aliases, client keys with rotation and revocation, `export`/`apply`/`validate`,
 `models explain`, `GET /v1/models`, and `POST /v1/chat/completions`, synchronous and streamed, toward providers of
 the `openai` protocol and of the `anthropic` protocol (translated to the Messages API), and `POST /v1/messages`,
-synchronous and streamed, toward providers of the `anthropic` protocol, and `POST /v1/embeddings` toward embeddings
-targets of the `openai` protocol (see [Embeddings](#embeddings)), with the parameter contract and reasoning
+synchronous and streamed, toward providers of the `anthropic` protocol, `POST /v1/embeddings` toward embeddings
+targets of the `openai` protocol (see [Embeddings](#embeddings)) and `POST /v1/rerank` toward a provider's
+`rerank_url` (see [Rerank](#rerank)), with the parameter contract and reasoning
 control of the alias, timeouts, fallback across an alias's targets, a circuit breaker per target, cancellation when a
 client goes away and a graceful stop (see [Resilience](#resilience)). Phase 3 has begun: every provider call leaves a
 usage record with its tokens and cost, and `usage show` sums them (see [Usage](#usage)); keys and aliases have rate
@@ -235,6 +236,21 @@ with `targets set <target> --unsupported-param encoding_format` and its aliases 
 batches can pass `max_response_bytes` (32 MiB by default): 2,048 inputs at 3,072 dimensions return 32 MiB of base64
 vectors alone, and several times more as floats, which answers `502 upstream_error` (the attempt's log line names the
 limit); raise it with `settings set --max-response-bytes <n>`, or send smaller batches.
+
+## Rerank
+
+`POST /v1/rerank` forwards the body to the `rerank_url` of a rerank target's provider (`providers add <name>
+--protocol openai --rerank-url <url>`, then `targets add <provider>/<model> --kind rerank`), with only `model` replaced
+by the upstream id: the proxy defines no rerank schema, so Cohere, Jina, Voyage, vLLM or TEI shapes pass unchanged,
+no alias rule, output cap or effort is applied, and the answer is relayed as the provider sent it. Of the body checks
+only these apply: well-formed UTF-8 JSON, no repeated top-level key, and `model` naming an alias the key may use;
+every other protection of chat applies as well. A target whose provider has no `rerank_url`, or of the `anthropic`
+protocol, is skipped (`422 endpoint_not_supported` when no other is left); `validate` warns about an alias none of
+whose targets can serve any endpoint. A record's
+input tokens are `usage.prompt_tokens`, else `usage.total_tokens`, and its output 0; an answer without them (a bare
+array, as TEI sends, or Cohere's `meta`) is estimated from the bytes sent and priced by the target's table, and a
+provider `cost_report` wins over the table. Search units are not recorded: a target billed by them is priced by its
+`cost_report`, or approximately by its token prices.
 
 ## Resilience
 

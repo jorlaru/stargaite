@@ -344,6 +344,14 @@ func render(w io.Writer, snap *config.Snapshot, counters, spanned *usage.Counter
 
 **Migrations (OPS-7, AC-50).** `migrate(ctx, db, fsys fs.FS)` takes the migrations as an unexported argument; `Open` passes the embedded files. `TestMigrations` seeds rows valid at each `user_version` from 0 to head (`testdata/seed/v1.sql`, `v2.sql`), opens the store, and requires: the schema golden; the seeded rows kept; `PRAGMA integrity_check` `ok` and `PRAGMA foreign_key_check` empty (`integrity_check` does not see foreign keys, and `PRAGMA foreign_keys` is a no-op inside a transaction); a migration injected to fail at its second statement leaves `user_version` and the schema unchanged; a newer `user_version` is refused and the file's bytes are unchanged. The existing `TestMigrationFromVersion1` and `TestReopenKeepsDataAndRefusesANewerSchema` stay. No migration 003 (§15 point 23).
 
+Settled in C33:
+
+- **Atomicity.** `migrate` was already atomic per migration: the migration's text and its `PRAGMA user_version` run in one transaction, rolled back on any error. No code change beyond the `fsys` argument. `TestMigrations` injects, at each version, a next migration whose first statement creates a table and whose second fails: nothing changes. Below head it also runs the real migrations on a copy with a failing one after them: the copy ends at the golden schema, `user_version` head included, with every row. So each version update is in its migration's transaction; one written right after `Commit` would need fault injection to catch.
+- **Seeds.** `testdata/seed/v1.sql` and `v2.sql` put rows in every table of their version, with every foreign key, `NULL`s, a `BLOB`, `REAL`s and timestamps. The test requires a row in each table at each version, so a migration 003 cannot land without a `v3.sql` that fills its tables. Version 0 is the empty file. Rows are compared on the columns that existed at the seeded version, each value with its Go type.
+- **The one expected loss.** Migration 002 drops `usage_daily` (nothing wrote it at version 1, phase-3 §5), so the row `v1.sql` puts there is the only one the test expects gone from a version 1 store; every other row is kept, and the `budget_totals` rows read `since_revision` 0.
+- **Newer version.** The refused `Open` leaves the database file's bytes unchanged and no bytes in a `-wal` file. The seeded file is in WAL mode, as every binary leaves it.
+- **Existing tests.** No store test asserted integrity before C33; `TestMigrationFromVersion1` and `TestReopenKeepsDataAndRefusesANewerSchema` now also require `integrity_check` `ok` and an empty `foreign_key_check`.
+
 **Backup (ADR-018, kick-off §14.3).**
 
 ```go

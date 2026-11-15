@@ -3,18 +3,22 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 )
 
@@ -152,17 +156,16 @@ func TestTxLock(t *testing.T) {
 	}
 }
 
-// TestSchema compares sqlite_master after the migrations with the golden
-// file; migrations 001 and 002 are annex A of the kick-off verbatim.
-func TestSchema(t *testing.T) {
-	s := open(t, t.TempDir())
-	rows, err := s.Read().Query("SELECT type, name, tbl_name, coalesce(sql, '') FROM sqlite_master ORDER BY type, name")
+// schema dumps sqlite_master with user_version, as the golden file holds it.
+func schema(t *testing.T, db *sql.DB) string {
+	t.Helper()
+	var b strings.Builder
+	fmt.Fprintf(&b, "-- user_version %s\n", pragma(t, db, "user_version"))
+	rows, err := db.Query("SELECT type, name, tbl_name, coalesce(sql, '') FROM sqlite_master ORDER BY type, name")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = rows.Close() }()
-	var b strings.Builder
-	fmt.Fprintf(&b, "-- user_version %s\n", pragma(t, s.Read(), "user_version"))
 	for rows.Next() {
 		var typ, name, table, text string
 		if err := rows.Scan(&typ, &name, &table, &text); err != nil {
@@ -173,10 +176,18 @@ func TestSchema(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatal(err)
 	}
+	return b.String()
+}
 
-	const golden = "testdata/schema.golden"
+const golden = "testdata/schema.golden"
+
+// TestSchema compares sqlite_master after the migrations with the golden
+// file; migrations 001 and 002 are annex A of the kick-off verbatim.
+func TestSchema(t *testing.T) {
+	s := open(t, t.TempDir())
+	got := schema(t, s.Read())
 	if *update {
-		if err := os.WriteFile(golden, []byte(b.String()), 0o644); err != nil {
+		if err := os.WriteFile(golden, []byte(got), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -184,8 +195,253 @@ func TestSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if b.String() != string(want) {
-		t.Errorf("schema differs from %s (run the test with -update after a deliberate change):\n%s", golden, b.String())
+	if got != string(want) {
+		t.Errorf("schema differs from %s (run the test with -update after a deliberate change):\n%s", golden, got)
+	}
+}
+
+// checkIntegrity requires integrity_check ok and an empty foreign_key_check:
+// integrity_check does not see foreign keys (ADR-018).
+func checkIntegrity(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if got := pragma(t, db, "integrity_check"); got != "ok" {
+		t.Errorf("integrity_check: %s", got)
+	}
+	rows, err := db.Query("PRAGMA foreign_key_check")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var table, parent string
+		var rowid sql.NullInt64
+		var fk int
+		if err := rows.Scan(&table, &rowid, &parent, &fk); err != nil {
+			t.Fatal(err)
+		}
+		t.Errorf("foreign_key_check: %s rowid %v refers to a missing %s row (constraint %d)", table, rowid, parent, fk)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// columns returns the columns of every table but the sqlite_ ones.
+func columns(t *testing.T, db *sql.DB) map[string][]string {
+	t.Helper()
+	rows, err := db.Query("SELECT m.name, p.name FROM sqlite_master m, pragma_table_info(m.name) p WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%' ORDER BY m.name, p.cid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	cols := map[string][]string{}
+	for rows.Next() {
+		var table, col string
+		if err := rows.Scan(&table, &col); err != nil {
+			t.Fatal(err)
+		}
+		cols[table] = append(cols[table], col)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return cols
+}
+
+// tableRows returns the rows of each table of cols, reading those columns,
+// sorted; each value is written with its Go type, so a changed storage class
+// shows.
+func tableRows(t *testing.T, db *sql.DB, cols map[string][]string) map[string][]string {
+	t.Helper()
+	all := map[string][]string{}
+	for table, names := range cols {
+		rows, err := db.Query(fmt.Sprintf("SELECT %s FROM %s", strings.Join(names, ", "), table))
+		if err != nil {
+			t.Fatal(err)
+		}
+		values := make([]any, len(names))
+		for i := range values {
+			values[i] = new(any)
+		}
+		all[table] = []string{}
+		for rows.Next() {
+			if err := rows.Scan(values...); err != nil {
+				t.Fatal(err)
+			}
+			var b strings.Builder
+			for i, v := range values {
+				fmt.Fprintf(&b, "%s=%T:%v ", names[i], *v.(*any), *v.(*any))
+			}
+			all[table] = append(all[table], b.String())
+		}
+		if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+			t.Fatal(err)
+		}
+		slices.Sort(all[table])
+	}
+	return all
+}
+
+// firstMigrations returns the first n embedded migrations, plus extra.
+func firstMigrations(t *testing.T, n int, extra fstest.MapFS) fstest.MapFS {
+	t.Helper()
+	names, err := fs.Glob(migrations, "migrations/*.sql")
+	if err != nil || n > len(names) {
+		t.Fatalf("%d migrations wanted of %v, error %v", n, names, err)
+	}
+	fsys := fstest.MapFS{}
+	for _, name := range names[:n] {
+		text, err := migrations.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fsys[name] = &fstest.MapFile{Data: text}
+	}
+	maps.Copy(fsys, extra)
+	return fsys
+}
+
+// TestMigrations seeds a store at every version from 0 to head with rows in
+// each table (testdata/seed), and requires that a failing migration changes
+// nothing, that the real migrations before a failing one stay committed with
+// their versions, that Open migrates to the golden schema keeping every row and every
+// foreign key, and that a newer version is refused without touching the file
+// (OPS-7, AC-50).
+func TestMigrations(t *testing.T) {
+	ctx := context.Background()
+	names, err := fs.Glob(migrations, "migrations/*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	head := len(names)
+	want, err := os.ReadFile(golden)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failingSQL := []byte("CREATE TABLE injected (x INTEGER);\nINSERT INTO missing VALUES (1);\n")
+	for version := 0; version <= head; version++ {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			dir := t.TempDir()
+			file := filepath.Join(dir, "stargaite.db")
+			// The seed connection has the pragmas of a real store, so the
+			// file is in WAL mode as a binary at this version leaves it.
+			db, err := sql.Open("sqlite", "file:"+file+pragmas)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = db.Close() }()
+			db.SetMaxOpenConns(1)
+			if err := migrate(ctx, db, firstMigrations(t, version, nil)); err != nil {
+				t.Fatal(err)
+			}
+			if version > 0 {
+				text, err := os.ReadFile(fmt.Sprintf("testdata/seed/v%d.sql", version))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.Exec(string(text)); err != nil {
+					t.Fatalf("seed v%d: %v", version, err)
+				}
+			}
+			checkIntegrity(t, db)
+			cols := columns(t, db)
+			seeded := tableRows(t, db, cols)
+			for table, rows := range seeded {
+				if len(rows) == 0 {
+					t.Errorf("testdata/seed/v%d.sql has no row in %s", version, table)
+				}
+			}
+			before := schema(t, db)
+
+			// A migration that fails at its second statement leaves the
+			// version, the schema and the rows as they were.
+			failing := fmt.Sprintf("migrations/%03d_failing.sql", version+1)
+			fsys := firstMigrations(t, version, fstest.MapFS{failing: {Data: failingSQL}})
+			if err := migrate(ctx, db, fsys); err == nil || !strings.Contains(err.Error(), failing) {
+				t.Errorf("a failing migration: error %v", err)
+			}
+			if got := schema(t, db); got != before {
+				t.Errorf("the failing migration changed the schema:\n%s", got)
+			}
+			if got := tableRows(t, db, columns(t, db)); !maps.EqualFunc(got, seeded, slices.Equal) {
+				t.Errorf("the failing migration changed rows: %v", got)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			// A copy of the seeded file, for the real migrations followed by a failing one.
+			copied := filepath.Join(t.TempDir(), "stargaite.db")
+			if data, err := os.ReadFile(file); err != nil {
+				t.Fatal(err)
+			} else if err := os.WriteFile(copied, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			s := open(t, dir)
+			if got := schema(t, s.Read()); got != string(want) {
+				t.Errorf("schema after migrating differs from %s:\n%s", golden, got)
+			}
+			checkIntegrity(t, s.Read())
+			kept := seeded
+			if version == 1 {
+				// Migration 002 drops usage_daily, which no binary at version
+				// 1 wrote (phase-3 design section 5): its seeded row is the one
+				// expected loss. budget_totals rows start at since_revision 0.
+				kept = maps.Clone(seeded)
+				kept["usage_daily"] = []string{}
+				var n int
+				if err := s.Read().QueryRow("SELECT count(*) FROM budget_totals WHERE since_revision <> 0").Scan(&n); err != nil || n != 0 {
+					t.Errorf("budget_totals since_revision: %d rows not 0, error %v", n, err)
+				}
+			}
+			if got := tableRows(t, s.Read(), cols); !maps.EqualFunc(got, kept, slices.Equal) {
+				t.Errorf("rows after migrating:\n%v\nwant:\n%v", got, kept)
+			}
+
+			// When a later migration fails, the real ones before it stay
+			// committed, each with its own version: the copy ends at head.
+			if version < head {
+				c, err := sql.Open("sqlite", "file:"+copied+pragmas)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = c.Close() }()
+				c.SetMaxOpenConns(1)
+				failing := fmt.Sprintf("migrations/%03d_failing.sql", head+1)
+				if err := migrate(ctx, c, firstMigrations(t, head, fstest.MapFS{failing: {Data: failingSQL}})); err == nil || !strings.Contains(err.Error(), failing) {
+					t.Errorf("a failing migration after the real ones: error %v", err)
+				}
+				if got := schema(t, c); got != string(want) {
+					t.Errorf("schema after a failing migration %d differs from %s:\n%s", head+1, golden, got)
+				}
+				if got := tableRows(t, c, cols); !maps.EqualFunc(got, kept, slices.Equal) {
+					t.Errorf("rows after a failing migration %d:\n%v\nwant:\n%v", head+1, got, kept)
+				}
+			}
+			if err := s.Write(ctx, func(tx *sql.Tx) error {
+				_, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", head+1))
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			newer, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Open(ctx, dir); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("schema version %d", head+1)) {
+				t.Errorf("a newer schema: error %v", err)
+			}
+			if got, err := os.ReadFile(file); err != nil || !bytes.Equal(got, newer) {
+				t.Errorf("the refused Open changed the file (error %v)", err)
+			}
+			if info, err := os.Stat(file + "-wal"); err == nil && info.Size() > 0 {
+				t.Errorf("the refused Open left %d bytes in the WAL", info.Size())
+			}
+		})
 	}
 }
 
@@ -230,6 +486,7 @@ func TestMigrationFromVersion1(t *testing.T) {
 	if v := pragma(t, s.Read(), "user_version"); v != "2" {
 		t.Errorf("user_version %s", v)
 	}
+	checkIntegrity(t, s.Read())
 	var cost float64
 	var since int64
 	if err := s.Read().QueryRow("SELECT cost_usd, since_revision FROM budget_totals WHERE scope_type = 'key' AND scope_name = 'k'").Scan(&cost, &since); err != nil || cost != 2.5 || since != 0 {
@@ -277,6 +534,7 @@ func TestReopenKeepsDataAndRefusesANewerSchema(t *testing.T) {
 	if err := s.Read().QueryRow("SELECT count(*) FROM settings WHERE name = 'kept'").Scan(&n); err != nil || n != 1 {
 		t.Fatalf("row after reopening: %d, error %v", n, err)
 	}
+	checkIntegrity(t, s.Read())
 	if err := s.Write(context.Background(), func(tx *sql.Tx) error {
 		_, err := tx.Exec("PRAGMA user_version = 99")
 		return err

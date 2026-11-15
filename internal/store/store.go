@@ -89,7 +89,7 @@ func Open(ctx context.Context, dataDir string) (_ *Store, err error) {
 		return nil, err
 	}
 	s.writer.SetMaxOpenConns(1)
-	if err := migrate(ctx, s.writer); err != nil {
+	if err := migrate(ctx, s.writer, migrations); err != nil {
 		return nil, err
 	}
 	// The read pool refuses writes through PRAGMA query_only, applied last
@@ -106,11 +106,12 @@ func Open(ctx context.Context, dataDir string) (_ *Store, err error) {
 	return s, nil
 }
 
-// migrate runs every embedded migration above PRAGMA user_version, each in
+// migrate runs every migration of fsys above PRAGMA user_version, each in
 // one transaction that also sets the new version. A store whose version is
-// above this binary's is refused (OPS-7).
-func migrate(ctx context.Context, db *sql.DB) error {
-	names, err := fs.Glob(migrations, "migrations/*.sql") // sorted: 001_, 002_, ...
+// above this binary's is refused (OPS-7). Open passes the embedded files; the
+// tests pass others.
+func migrate(ctx context.Context, db *sql.DB, fsys fs.FS) error {
+	names, err := fs.Glob(fsys, "migrations/*.sql") // sorted: 001_, 002_, ...
 	if err != nil {
 		return err
 	}
@@ -122,7 +123,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("the store has schema version %d; this binary knows up to %d", version, len(names))
 	}
 	for i := version; i < len(names); i++ {
-		text, err := migrations.ReadFile(names[i])
+		text, err := fs.ReadFile(fsys, names[i])
 		if err != nil {
 			return err
 		}

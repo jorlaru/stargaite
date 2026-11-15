@@ -1573,3 +1573,353 @@ func TestRunDispatch(t *testing.T) {
 		t.Errorf("serve --help: exit %d", code)
 	}
 }
+
+// change commits mutate to the configuration stored in dir, with no serve
+// running and no credential resolving.
+func change(t *testing.T, dir string, mutate func(*config.State)) {
+	t.Helper()
+	st, err := store.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Open(context.Background(), st, func() config.Env { return config.Env{Lookup: func(string) (string, bool) { return "", false }} }, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.Commit(context.Background(), config.Change{Summary: "apply", Mutate: func(s *config.State) (map[string]string, error) {
+		mutate(s)
+		return nil, nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// renameInto writes an env file as the README says: a temporary file in the
+// same directory, mode 0600, renamed over the old one, so a reader sees the
+// old file or the new one whole.
+func renameInto(t *testing.T, path, content string) {
+	t.Helper()
+	tmp := filepath.Join(filepath.Dir(path), ".env.new")
+	if err := os.WriteFile(tmp, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("env file %v, error %v", info, err)
+	}
+}
+
+// reloadSecrets runs stargaite secrets reload against admin and returns its
+// exit code, stdout and stderr.
+func reloadSecrets(admin string, args ...string) (int, string, string) {
+	var stdout, stderr bytes.Buffer
+	code := cli.Main(append([]string{"secrets", "reload", "--admin-url", "http://" + admin}, args...), env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), &stdout, &stderr)
+	return code, stdout.String(), stderr.String()
+}
+
+// waitFor polls cond every 10 ms for up to 10 s.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); !cond(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: not within 10 s", what)
+		}
+	}
+}
+
+// TestSecretsReload is AC-44 through serve (phase-4 design section 8). The
+// store holds, as an upgrade would leave it, a value this binary refuses, so
+// serve starts with an error finding; the provider's variable is absent from
+// the env file, so its alias answers 503 no_target_available. A reload then
+// answers the unresolved variable by name. A new env file renamed into place
+// and secrets reload, with no other write: the next call reaches the mock
+// with the new credential, the first telemetry batch after the reload
+// carries the new header value, the revision is unchanged and each reload
+// left an unchanged audit row. Neither value is in the log, the audit rows,
+// the CLI's output or the data plane's answers.
+func TestSecretsReload(t *testing.T) {
+	const planted, oldToken, newToken = "sk-PLANTED-reloaded-credential", "PLANTED-old-ingest-token", "PLANTED-new-ingest-token"
+	mock, receiver := mockprovider.New(), mockprovider.New()
+	srv, rsrv := httptest.NewServer(mock), httptest.NewServer(receiver)
+	t.Cleanup(srv.Close)
+	t.Cleanup(rsrv.Close)
+	dir, token := seed(t, map[string]string{"m": srv.URL})
+	change(t, dir, func(s *config.State) {
+		p := s.Doc.Providers["m"]
+		p.APIKeyEnv = "M_KEY"
+		s.Doc.Providers["m"] = p
+		s.Doc.Settings.Telemetry = &domain.Telemetry{OTLPEndpoint: rsrv.URL, AllowPrivateNetwork: true, HeaderEnv: map[string]string{"X-Ingest-Token": "T_KEY"}}
+	})
+	st, err := store.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO settings (name, value, updated_at) VALUES ('retention', '{"audit_months":-1}', 0)`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	envFile := filepath.Join(t.TempDir(), "env")
+	renameInto(t, envFile, "T_KEY="+oldToken+"\n")
+
+	// serve logs the stored error finding as an ERROR line before it is
+	// ready, which start refuses: its log is read here.
+	logs, stderr := io.Pipe()
+	exit := make(chan int, 1)
+	go func() {
+		exit <- serve([]string{"--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0", "--env-file", envFile},
+			env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), io.Discard, stderr)
+		_ = stderr.Close()
+	}()
+	var log strings.Builder // read once ended is closed
+	readyc, ended := make(chan readyLine, 1), make(chan struct{})
+	go func() { // read to the end, so serve never blocks on its log
+		defer close(ended)
+		for lines := bufio.NewScanner(logs); lines.Scan(); {
+			log.WriteString(lines.Text() + "\n")
+			var line readyLine
+			if json.Unmarshal(lines.Bytes(), &line) == nil && line.Msg == "ready" {
+				readyc <- line
+			}
+		}
+	}()
+	var ready readyLine
+	select {
+	case ready = <-readyc:
+	case <-ended:
+		t.Fatalf("serve ended before it was ready; log %s", &log)
+	case <-time.After(30 * time.Second):
+		t.Fatal("serve was not ready within 30 s")
+	}
+
+	var answers strings.Builder // every answer, for the planted check
+	post := func() int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, "http://"+ready.DataAddr+"/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&answers, "%v\n%s\n", resp.Header, body)
+		if resp.StatusCode != http.StatusOK && !strings.Contains(string(body), `"code":"no_target_available"`) {
+			t.Errorf("status %d: %s", resp.StatusCode, body)
+		}
+		return resp.StatusCode
+	}
+	reload := func(args ...string) (int, string) {
+		t.Helper()
+		code, stdout, stderr := reloadSecrets(ready.AdminAddr, args...)
+		answers.WriteString(stdout + stderr)
+		return code, stdout
+	}
+	traces := func() []mockprovider.Call {
+		var out []mockprovider.Call
+		for _, c := range receiver.Calls() {
+			if c.Path == "/v1/traces" {
+				out = append(out, c)
+			}
+		}
+		return out
+	}
+	const invalid = "retention.audit_months"
+	findings := func(stdout string) (config.Result, []string) {
+		t.Helper()
+		var res config.Result
+		if err := json.Unmarshal([]byte(stdout), &res); err != nil {
+			t.Fatalf("secrets reload --json: %q: %v", stdout, err)
+		}
+		var out []string
+		for _, f := range res.Findings {
+			out = append(out, f.Severity+" "+f.Code+" "+f.Field+" "+f.Message)
+		}
+		return res, out
+	}
+
+	if code := post(); code != http.StatusServiceUnavailable || len(mock.Calls()) != 0 {
+		t.Fatalf("without the variable: status %d, %d provider calls", code, len(mock.Calls()))
+	}
+	waitFor(t, "a telemetry batch before the reload", func() bool { return len(traces()) > 0 })
+
+	// The variable is still absent: the finding names it, never a value.
+	code, stdout := reload("--json")
+	res, got := findings(stdout)
+	if code != 1 || res.Revision != ready.Revision || res.Changed || len(res.Diff) != 0 || !slices.Equal(got, []string{
+		"error invalid_value " + invalid + " " + invalid + " must not be negative",
+		"warning credential_unresolved api_key_env M_KEY does not resolve",
+	}) {
+		t.Errorf("reload without the variable: exit %d, %+v, findings %q", code, res, got)
+	}
+
+	renameInto(t, envFile, "M_KEY="+planted+"\nT_KEY="+newToken+"\n")
+	batches := len(traces())
+	for _, c := range traces() {
+		if c.Header.Get("X-Ingest-Token") != oldToken {
+			t.Errorf("a batch before the reload carries %q", c.Header.Get("X-Ingest-Token"))
+		}
+	}
+	// The stored error finding still fails the exit code, as on every command.
+	if code, stdout := reload(); code != 1 || !strings.Contains(stdout, fmt.Sprintf("revision: %d\n", ready.Revision)) ||
+		!strings.Contains(stdout, "changed: false\n") || !strings.Contains(stdout, invalid) || strings.Contains(stdout, "M_KEY") {
+		t.Errorf("secrets reload: exit %d, stdout %q", code, stdout)
+	}
+	code, stdout = reload("--json")
+	res, got = findings(stdout)
+	if code != 1 || res.Revision != ready.Revision || res.Changed || !slices.Equal(got, []string{"error invalid_value " + invalid + " " + invalid + " must not be negative"}) {
+		t.Errorf("reload with the variable: exit %d, %+v, findings %q", code, res, got)
+	}
+	if code := post(); code != http.StatusOK {
+		t.Fatalf("after the reload: status %d", code)
+	}
+	if calls := mock.Calls(); len(calls) != 1 || calls[0].Header.Get("Authorization") != "Bearer "+planted {
+		t.Errorf("provider calls %d; the credential sent is not the new one", len(calls))
+	}
+	waitFor(t, "a telemetry batch after the reload", func() bool { return len(traces()) > batches })
+	for _, c := range traces()[batches:] {
+		if c.Header.Get("X-Ingest-Token") != newToken {
+			t.Errorf("a batch after the reload carries %q", c.Header.Get("X-Ingest-Token"))
+		}
+	}
+
+	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if code := <-exit; code != 0 {
+		t.Errorf("exit %d", code)
+	}
+	<-ended
+	if !strings.Contains(log.String(), `"level":"ERROR","msg":"configuration finding","severity":"error","rule":"USE-11","code":"invalid_value","resource":"settings","field":"`+invalid+`"`) {
+		t.Errorf("no error finding at the start; log %s", &log)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "stargaite.db")+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if got := dump(t, db, "SELECT action, resource_type, resource_name, result, revision FROM audit WHERE action = 'secrets reload' ORDER BY rowid"); !slices.Equal(got,
+		slices.Repeat([]string{"secrets reload|secrets||unchanged|<nil>"}, 3)) {
+		t.Errorf("audit rows %q", got)
+	}
+	var revision int64
+	if err := db.QueryRow("SELECT MAX(revision) FROM revisions").Scan(&revision); err != nil || revision != ready.Revision {
+		t.Errorf("revision %d after the reloads, want %d: %v", revision, ready.Revision, err)
+	}
+	everything := log.String() + answers.String() + strings.Join(dump(t, db, "SELECT * FROM audit"), "\n")
+	for _, v := range []string{planted, oldToken, newToken, "PLANTED"} {
+		if strings.Contains(everything, v) {
+			t.Errorf("%q is in the log, an answer or an audit row", v)
+		}
+	}
+}
+
+// TestSecretsReloadAlongsideStreams is RES-7 for secrets reload, under
+// -race: three streams are opened one after another, each after a new env
+// file and a reload, while reloads run without pause; each stream reaches the
+// mock with the credential of the snapshot it started on and ends whole.
+func TestSecretsReloadAlongsideStreams(t *testing.T) {
+	mock := mockprovider.New()
+	srv := httptest.NewServer(mock)
+	t.Cleanup(srv.Close)
+	dir, token := seed(t, map[string]string{"m": srv.URL})
+	change(t, dir, func(s *config.State) {
+		p := s.Doc.Providers["m"]
+		p.APIKeyEnv = "M_KEY"
+		s.Doc.Providers["m"] = p
+	})
+	const streams = 3
+	var chunks [][]byte
+	var want strings.Builder
+	for _, c := range []string{"a", "b", "c", "d"} {
+		chunks = append(chunks, []byte(`data: {"id":"c","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"content":"`+c+`"},"finish_reason":null}]}`+"\n\n"))
+	}
+	chunks = append(chunks, []byte("data: [DONE]\n\n"))
+	for _, c := range chunks {
+		want.Write(c)
+	}
+	for range streams {
+		mock.Script(mockprovider.Step{Chunks: chunks, Gap: 100 * time.Millisecond})
+	}
+	envFile := filepath.Join(t.TempDir(), "env")
+	renameInto(t, envFile, "M_KEY=credential-0\n")
+	ready, stop := start(t, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), "--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0", "--env-file", envFile)
+
+	halt, reloaded := make(chan struct{}), make(chan int, 1)
+	reloads := sync.OnceValue(func() int { close(halt); return <-reloaded })
+	defer reloads() // no reload outlives the test, a failed one included
+	go func() {
+		n := 0
+		defer func() { reloaded <- n }()
+		for {
+			select {
+			case <-halt:
+				return
+			default:
+			}
+			if code, stdout, stderr := reloadSecrets(ready.AdminAddr, "--json"); code != 0 {
+				t.Errorf("reload alongside the streams: exit %d, %s %s", code, stdout, stderr)
+				return
+			}
+			n++
+		}
+	}()
+	var open []*bufio.Reader
+	for i := range streams {
+		renameInto(t, envFile, fmt.Sprintf("M_KEY=credential-%d\n", i))
+		if code, stdout, stderr := reloadSecrets(ready.AdminAddr); code != 0 {
+			t.Fatalf("reload %d: exit %d, %s %s", i, code, stdout, stderr)
+		}
+		req, err := http.NewRequest(http.MethodPost, "http://"+ready.DataAddr+"/v1/chat/completions", strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = resp.Body.Close() })
+		r := bufio.NewReader(resp.Body)
+		if line, err := r.ReadString('\n'); resp.StatusCode != http.StatusOK || err != nil || line != string(chunks[0][:len(chunks[0])-1]) {
+			t.Fatalf("stream %d: status %d, first line %q: %v", i, resp.StatusCode, line, err)
+		}
+		open = append(open, r)
+	}
+	for i, r := range open {
+		rest, err := io.ReadAll(r)
+		if got := string(chunks[0][:len(chunks[0])-1]) + string(rest); err != nil || got != want.String() {
+			t.Errorf("stream %d: %q: %v", i, got, err)
+		}
+	}
+	if n := reloads(); n == 0 {
+		t.Error("no reload ran alongside the streams")
+	}
+	calls := mock.Calls()
+	if len(calls) != streams {
+		t.Fatalf("%d provider calls", len(calls))
+	}
+	for i, c := range calls {
+		if got := c.Header.Get("Authorization"); got != fmt.Sprintf("Bearer credential-%d", i) || c.Cancelled {
+			t.Errorf("stream %d: Authorization %q, cancelled %v", i, got, c.Cancelled)
+		}
+	}
+	if code, log := stop(); code != 0 || strings.Contains(log, "credential-") {
+		t.Errorf("exit %d; log %s", code, log)
+	}
+}

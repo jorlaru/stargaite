@@ -638,6 +638,86 @@ func TestCredentialResolution(t *testing.T) {
 	}
 }
 
+// TestEmptyDiffPublishesWithErrors: on a stored configuration this binary
+// finds invalid, a change with an empty diff (secrets reload) is published
+// with its error findings: the env file is read again, the credential
+// resolves, the snapshot is republished at the same revision and an
+// unchanged row is written. A change with a diff is still refused, and a dry
+// run with an empty diff writes and publishes nothing (phase-4 design
+// section 8, AC-44).
+func TestEmptyDiffPublishesWithErrors(t *testing.T) {
+	st := openStore(t, t.TempDir())
+	// As an upgrade would leave the store: a value this binary refuses.
+	if err := st.Write(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`INSERT INTO settings (name, value, updated_at) VALUES ('retention', '{"audit_months":-1}', 0)`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO providers (name, spec, updated_at) VALUES ('p', '{"protocol":"openai","base_url":"https://api.example.com/v1","api_key_env":"P_API_KEY","billing":"none"}', 0)`)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	envFile := filepath.Join(t.TempDir(), "env")
+	if err := os.WriteFile(envFile, []byte("# nothing yet\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := openService(t, st, func() Env { return NewEnv(noEnviron, envFile, fakeResolver(t, answers)) })
+	const invalid = "error USE-11 invalid_value settings retention.audit_months"
+	if got := summary(s.Snapshot().Findings); !slices.Equal(got, []string{invalid, "warning OPS-6 credential_unresolved providers/p api_key_env"}) {
+		t.Fatalf("findings at open %q", got)
+	}
+	reload := func(dryRun bool) Change {
+		return Change{Summary: "secrets reload", Kind: "secrets", DryRun: dryRun, Mutate: func(*State) (map[string]string, error) { return nil, nil }}
+	}
+	refused := func(what string, ch Change) {
+		t.Helper()
+		before := s.Snapshot()
+		_, err := s.Commit(context.Background(), ch)
+		if de, ok := err.(*domain.Error); !ok || de.Status != http.StatusBadRequest || !slices.Contains(summary(de.Findings), invalid) {
+			t.Errorf("%s: error %v", what, err)
+		}
+		if s.Snapshot() != before {
+			t.Errorf("%s: published", what)
+		}
+	}
+
+	if err := os.WriteFile(envFile, []byte("P_API_KEY="+secretValue+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := s.Snapshot()
+	res := commit(t, s, reload(true))
+	if got := summary(res.Findings); res.Changed || len(res.Diff) != 0 || !slices.Equal(got, []string{invalid}) || s.Snapshot() != before {
+		t.Errorf("dry run: %+v, findings %q", res, got)
+	}
+	res = commit(t, s, reload(false))
+	snap := s.Snapshot()
+	if got := summary(res.Findings); res.Revision != 0 || res.Changed || len(res.Diff) != 0 || !slices.Equal(got, []string{invalid}) {
+		t.Errorf("reload: %+v, findings %q", res, got)
+	}
+	sent := http.Header{}
+	snap.Providers["p"].Credential.SetHeader(sent, "Authorization", "Bearer ")
+	if p := snap.Providers["p"]; snap == before || snap.Revision != 0 || p.Disabled || sent.Get("Authorization") != "Bearer "+secretValue ||
+		!slices.Equal(summary(snap.Findings), []string{invalid}) {
+		t.Errorf("after the reload: snapshot revision %d, provider %+v, findings %v", snap.Revision, p, snap.Findings)
+	}
+
+	refused("a change with a diff", change("settings set", func(st *State) { st.Doc.Settings.MaxBodyBytes = 1 << 20 }))
+	// The version is in no diff entry: a change of it alone is not empty.
+	refused("a change of the version", change("apply", func(st *State) { st.Doc.Version = 2 }))
+	refused("a dry run with a diff", Change{Summary: "settings set", DryRun: true, Mutate: func(st *State) (map[string]string, error) {
+		st.Doc.Settings.MaxBodyBytes = 1 << 20
+		return nil, nil
+	}})
+	wantRows(t, "audit", rows(t, st, auditQuery), []string{
+		fmt.Sprintf("admin secrets reload secrets  - - unchanged - %d", testNow),
+		fmt.Sprintf("admin settings set configuration  - - refused:invalid_request - %d", testNow),
+		fmt.Sprintf("admin apply configuration  - - refused:invalid_request - %d", testNow),
+	})
+	if strings.Contains(everything(t, st), secretValue) || strings.Contains(fmt.Sprint(res), secretValue) {
+		t.Error("the credential value is in the store or the result")
+	}
+}
+
 // TestSetTimeResolution: a change resolves the URLs it sets, and only those
 // (SEC-4, design section 13, point 14).
 func TestSetTimeResolution(t *testing.T) {

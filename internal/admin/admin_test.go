@@ -892,3 +892,46 @@ func TestUsageShow(t *testing.T) {
 		t.Errorf("since=48h with usage_days 1: %d %s", w.Code, w.Body)
 	}
 }
+
+// TestSecretsReloadRoute: secrets reload answers the Result of a change with
+// an empty diff, at the same revision, whose findings name an unresolved
+// credential by its variable; once the variable resolves, the republished
+// provider is enabled. Each call writes an unchanged audit row; a query
+// parameter is refused; the value is in no answer, row or log line (OPS-6).
+func TestSecretsReloadRoute(t *testing.T) {
+	const planted = "sk-PLANTED-reload"
+	vars := map[string]string{}
+	f := newFixtureEnv(t, func() config.Env {
+		return config.Env{Lookup: func(n string) (string, bool) { v, ok := vars[n]; return v, ok }, Resolve: resolve}
+	})
+	f.addProvider(t, `{"name":"openrouter"}`)
+	revision := f.cfg.Snapshot().Revision
+	var res config.Result
+	decode(t, f.do(t, http.MethodPost, "/admin/v1/secrets/reload", nil), http.StatusOK, &res)
+	if res.Revision != revision || res.Changed || len(res.Diff) != 0 || len(res.Findings) != 1 ||
+		res.Findings[0].Code != "credential_unresolved" || res.Findings[0].Message != "OPENROUTER_API_KEY does not resolve" {
+		t.Errorf("unresolved: %+v", res)
+	}
+	if !f.cfg.Snapshot().Providers["openrouter"].Disabled {
+		t.Error("the provider is enabled without its credential")
+	}
+	vars["OPENROUTER_API_KEY"] = planted
+	w := f.do(t, http.MethodPost, "/admin/v1/secrets/reload", nil)
+	decode(t, w, http.StatusOK, &res)
+	if res.Revision != revision || res.Changed || len(res.Diff) != 0 || len(res.Findings) != 0 {
+		t.Errorf("resolved: %+v", res)
+	}
+	if snap := f.cfg.Snapshot(); snap.Revision != revision || snap.Providers["openrouter"].Disabled {
+		t.Errorf("after the reload: revision %d, provider %+v", snap.Revision, snap.Providers["openrouter"])
+	}
+	if got := f.lastAudit(t); got != "secrets reload secrets  unchanged" || f.count(t, "SELECT COUNT(*) FROM audit WHERE action = 'secrets reload'") != 2 {
+		t.Errorf("audit %q", got)
+	}
+	errorOf(t, f.do(t, http.MethodPost, "/admin/v1/secrets/reload?dry_run=true", nil), http.StatusBadRequest, domain.CodeInvalidRequest)
+	if f.count(t, "SELECT COUNT(*) FROM audit WHERE action = 'secrets reload'") != 2 {
+		t.Error("a refused query wrote an audit row")
+	}
+	if strings.Contains(w.Body.String()+f.dump(t)+f.log.String(), planted) {
+		t.Error("the credential value left the process")
+	}
+}

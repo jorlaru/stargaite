@@ -108,6 +108,7 @@ var routes = []route{
 	{"PATCH /admin/v1/telemetry", (*server).setTelemetry},
 	{"DELETE /admin/v1/telemetry", (*server).unsetTelemetry},
 	{"POST /admin/v1/telemetry/test", (*server).testTelemetry},
+	{"POST /admin/v1/secrets/reload", (*server).reloadSecrets},
 	{"POST /admin/v1/backup", (*server).sendBackup},
 }
 
@@ -453,6 +454,26 @@ func (s *server) validate(w http.ResponseWriter, r *http.Request) {
 	write(w, http.StatusOK, struct {
 		Findings []domain.Finding `json:"findings"`
 	}{s.cfg.Check(ctx)})
+}
+
+// reloadSecrets is secrets reload (OPS-6): a change that changes nothing, so
+// the env file is read again, every credential and the exporter's are
+// resolved again and the snapshot is republished at the same revision, with
+// an unchanged audit row. Requests in flight keep their snapshot (RES-7).
+// The findings name an unresolved credential by its variable only.
+func (s *server) reloadSecrets(w http.ResponseWriter, r *http.Request) {
+	if r.URL.RawQuery != "" {
+		s.fail(w, invalid("this route takes no query parameter"))
+		return
+	}
+	res, err := s.cfg.Commit(r.Context(), config.Change{Summary: "secrets reload", Kind: "secrets", Mutate: func(*config.State) (map[string]string, error) {
+		return nil, nil
+	}})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	write(w, http.StatusOK, res)
 }
 
 // showUsage answers usage show (USE-9, phase-3 design section 12) from the

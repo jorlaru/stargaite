@@ -189,7 +189,8 @@ func TestCommandWalk(t *testing.T) {
 			{[]string{"-f", example, "--dry-run"}, 0}, {[]string{"-f", example}, 0}, {[]string{"-f", invalid}, 1},
 			{[]string{"-f", example, "--prune", "--yes"}, 0}, {[]string{"-f", example, "--prune", "--dry-run"}, 0},
 		},
-		"backup": {{[]string{filepath.Join(backups, "walk@.db")}, 0}, {[]string{filepath.Join(backups, "missing", "walk@.db")}, 1}},
+		"secrets reload": {{nil, 0}},
+		"backup":         {{[]string{filepath.Join(backups, "walk@.db")}, 0}, {[]string{filepath.Join(backups, "missing", "walk@.db")}, 1}},
 	}
 	vars := adminServer(t)
 	for _, c := range commands {
@@ -285,6 +286,7 @@ func TestRequests(t *testing.T) {
 		{[]string{"telemetry", "unset", "--yes"}, "DELETE", "/admin/v1/telemetry", ""},
 		{[]string{"telemetry", "test"}, "POST", "/admin/v1/telemetry/test", ""},
 		{[]string{"telemetry", "status"}, "GET", "/admin/v1/telemetry", ""},
+		{[]string{"secrets", "reload"}, "POST", "/admin/v1/secrets/reload", ""},
 		{[]string{"providers", "presets"}, "GET", "/admin/v1/presets", ""},
 		{[]string{"providers", "list"}, "GET", "/admin/v1/providers", ""},
 		{[]string{"providers", "add", "openrouter"}, "POST", "/admin/v1/providers", `{"name":"openrouter"}`},

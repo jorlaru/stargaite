@@ -299,6 +299,9 @@ var commands = []command{
 			q := url.Values{"dry_run": {strconv.FormatBool(*in.bools["dry-run"])}, "prune": {strconv.FormatBool(*in.bools["prune"])}}
 			return http.MethodPost, "/apply?" + q.Encode(), yamlFile(*in.flags["f"])
 		}},
+	{words: []string{"secrets", "reload"}, request: func(input) (string, string, any) {
+		return http.MethodPost, "/secrets/reload", nil
+	}},
 	{words: []string{"backup"}, args: []string{"file"}, local: backupFile, save: saveBackup, request: func(input) (string, string, any) {
 		return http.MethodPost, "/backup", nil
 	}},

@@ -68,7 +68,7 @@ type Result struct {
 	Revision int64             `json:"revision"`
 	Changed  bool              `json:"changed"`
 	Diff     []DiffEntry       `json:"diff"`
-	Findings []domain.Finding  `json:"findings"`          // warnings
+	Findings []domain.Finding  `json:"findings"`          // warnings; errors too when the diff is empty
 	Secrets  map[string]string `json:"secrets,omitempty"` // tokens by key name, shown once (OPS-3, SEC-8); empty on a dry run
 }
 
@@ -144,7 +144,9 @@ func (s *Service) Now() time.Time { return s.now() }
 
 // Commit runs the change pipeline of design section 4. The error is always a
 // *domain.Error: 400 with findings, the refusal Mutate returned, or 500 when
-// the store fails, and then nothing is published.
+// the store fails, and then nothing is published. Every accepted change, one
+// with an empty diff included, reads the env file again and republishes, so
+// a Mutate that changes nothing is secrets reload (OPS-6).
 func (s *Service) Commit(ctx context.Context, ch Change) (Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -176,8 +178,14 @@ func (s *Service) Commit(ctx context.Context, ch Change) (Result, error) {
 	env := s.env()
 	findings := append(Validate(&next.Doc), CheckResolved(ctx, &next.Doc, setURLs(old, next), env)...)
 
-	// 5. An error finding refuses the change.
-	if slices.ContainsFunc(findings, func(f domain.Finding) bool { return f.Severity == domain.SeverityError }) {
+	// 5. An error finding refuses a change. A change with an empty diff that
+	// keeps the document's version (which no diff entry shows) alters
+	// nothing validation judges, and a stored configuration a newer binary
+	// finds invalid is still published (design section 13, point 13), so it
+	// is published with its findings: secrets reload works on such a store
+	// (phase-4 design section 8).
+	same := len(diff) == 0 && next.Doc.Version == old.Doc.Version
+	if !same && slices.ContainsFunc(findings, func(f domain.Finding) bool { return f.Severity == domain.SeverityError }) {
 		de := domain.NewError(domain.CodeInvalidRequest, "the change is refused: the configuration it leads to has errors")
 		de.Findings = findings
 		return Result{}, s.refuse(ch, de)

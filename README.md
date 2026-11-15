@@ -263,6 +263,23 @@ there works without a restart. Keep that file readable only by the user that run
 of shell history and of the repository. A provider whose credential does not resolve is disabled, with a warning, and
 `./stargaite providers show <name>` says `credential: unresolved`. No response, log or export ever carries the value.
 
+`./stargaite secrets reload` reads the env file again with no other change: every provider credential and the
+telemetry exporter's are resolved again and published at the same revision, with one `unchanged` audit record. Its
+findings name each variable that still does not resolve, never a value. Requests in flight finish with the
+credentials they started with; the exporter uses the new ones from its next batch. No signal triggers a reload. A
+variable set in `serve`'s own environment wins over the file and cannot change while it runs, so a credential meant
+to rotate without a restart goes in the file. Write the file by rename, so `serve` never reads it half written: write
+a temporary file in the same directory with mode `0600`, then move it over the old one:
+
+```sh
+cp -p /etc/stargaite/env /etc/stargaite/env.new   # keeps mode 0600; edit env.new with your editor
+mv /etc/stargaite/env.new /etc/stargaite/env
+./stargaite secrets reload
+```
+
+As every command whose answer holds an error finding, it exits `1` when the stored configuration has one (such as a
+value an upgraded binary refuses); the reload is still published.
+
 stargaite ignores `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` in v1: `serve` connects to providers directly, so the
 check of each outbound address sees the real destination, and the CLI sends the admin key to the admin URL only.
 
@@ -287,8 +304,10 @@ docker stop -t 60 stargaite
 
 Only the data plane leaves the container. The admin API stays on its loopback, and the CLI inside the container
 administers it with the key in `/data/admin.key`. Pass a credential with `-e OPENROUTER_API_KEY` on `docker run`,
-which copies the variable from your shell without writing its value, or mount a file readable by uid `65532` and add
-`--env-file <path>` after `serve`. To have stargaite terminate TLS itself, mount the certificate and its key and give
+which copies the variable from your shell without writing its value, or mount the directory that holds the env file,
+readable by uid `65532`, and add `--env-file` after `serve` (`-v /etc/stargaite:/run/stargaite:ro` with
+`--env-file /run/stargaite/env`): mount the directory, not the file, because a file replaced by rename on the host is
+not seen through a mount of the file itself. To have stargaite terminate TLS itself, mount the certificate and its key and give
 `--tls-cert` and `--tls-key` in place of `--behind-tls-proxy`; the admin API then speaks TLS too, so the CLI needs
 `--admin-url https://localhost:4001` and must trust the certificate (`docker exec -e SSL_CERT_FILE=<ca file> ...`),
 which must then also be valid for `localhost`. If it is not, add `--add-host <cert name>:127.0.0.1` to `docker run`

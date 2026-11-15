@@ -88,7 +88,9 @@ type Record struct {
 // four and rounded up, the larger output winning); without a 2xx, zero
 // tokens with source provider. Cost: none for subscription and none billing;
 // else the provider's figure, else the price table over the recorded
-// tokens, else none (USE-6, USE-7).
+// tokens, else none (USE-6, USE-7). content_empty is read on chat and
+// messages only: an embeddings answer has no visible bytes, and its estimate
+// has output 0 (phase-4 design section 4).
 func NewRecord(c Call) Record {
 	r := Record{
 		ID: fmt.Sprintf("%s-%d", c.RequestID, c.Attempt), RequestID: c.RequestID, TraceID: c.TraceID, Attempt: c.Attempt,
@@ -122,7 +124,8 @@ func NewRecord(c Call) Record {
 			}
 			u.Output = max(u.Output, quarter(c.Obs.VisibleBytes))
 		}
-		r.ContentEmpty = c.Obs.VisibleBytes == 0 && c.Obs.ToolCalls == 0
+		chatLike := c.Endpoint == domain.EndpointChat || c.Endpoint == domain.EndpointMessages
+		r.ContentEmpty = chatLike && c.Obs.VisibleBytes == 0 && c.Obs.ToolCalls == 0
 	}
 	r.InputTokens, r.CacheReadTokens, r.CacheWriteTokens, r.OutputTokens, r.ReasoningTokens = u.Input, u.CacheRead, u.CacheWrite, u.Output, u.Reasoning
 

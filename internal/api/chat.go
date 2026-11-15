@@ -72,7 +72,7 @@ type request struct {
 	trace       telemetry.Context // set by authenticate (TEL-6)
 	session     string            // x-session-id when valid, else ""
 	sample      uint64            // the crypto/rand draw sampling compares, taken once after authenticate (TEL-7)
-	ep          domain.Endpoint   // chat or messages
+	ep          domain.Endpoint   // chat, messages or embeddings
 	snap        *config.Snapshot  // loaded once (RES-7)
 	key         *config.Key
 	alias       string // the body's "model" string, set before the lookup; "" when the body named none
@@ -161,10 +161,13 @@ type relay struct {
 // messages toward anthropic is the native Messages relay; chat toward
 // openai is the native chat relay, chat toward anthropic the translated one,
 // whose chunks take created from now; neither relays a usage chunk only the
-// proxy asked for (USE-8). Build skips messages toward openai.
+// proxy asked for (USE-8). Build skips messages toward openai. Embeddings,
+// which never streams, is relayed unchanged and observed by ObserveUsage.
 func relayFor(ep domain.Endpoint, t *config.Target, c *plan.Client, now func() time.Time) relay {
 	tg, p := &t.Spec, &t.Provider.Spec
 	switch {
+	case ep == domain.EndpointEmbeddings:
+		return relay{sync: func(body []byte, _ time.Time) ([]byte, domain.Observed, error) { return openai.ObserveUsage(p, body) }}
 	case ep == domain.EndpointMessages:
 		s := anthropic.NewStream(tg, p)
 		return relay{
@@ -190,10 +193,10 @@ func relayFor(ep domain.Endpoint, t *config.Target, c *plan.Client, now func() t
 	}
 }
 
-// infer serves POST /v1/chat/completions and POST /v1/messages (design
-// sections 4 and 8, steps 1 to 8), synchronous and streamed. done runs on
-// every exit once the key is authenticated, a panic included, and gives
-// back the slots admission took. Every error is in the envelope of ep; a
+// infer serves POST /v1/chat/completions, POST /v1/messages and POST
+// /v1/embeddings (design sections 4 and 8, steps 1 to 8), synchronous and
+// streamed. done runs on every exit once the key is authenticated, a panic
+// included, and gives back the slots admission took. Every error is in the envelope of ep; a
 // stream that fails once committed has already written its terminal event,
 // so it gets no envelope. Only /v1/messages
 // keeps the client's anthropic-version and anthropic-beta, for Build to
@@ -282,8 +285,11 @@ func (h *handler) check(w http.ResponseWriter, r *http.Request, rq *request) *do
 	_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
 
 	walk := params.Chat.Walk
-	if rq.ep == domain.EndpointMessages {
+	switch rq.ep {
+	case domain.EndpointMessages:
 		walk = params.Messages.Walk
+	case domain.EndpointEmbeddings:
+		walk = params.Embeddings.Walk // nil: the top level only (PAR-1)
 	}
 	var pe *params.Error
 	if rq.body, pe = params.Scan(raw, walk); pe != nil {
@@ -313,9 +319,10 @@ func (h *handler) check(w http.ResponseWriter, r *http.Request, rq *request) *do
 // admit is step 4 (phase-3 design section 7): the slots and rate windows of
 // the key, the alias and the instance as rq's snapshot declares them, all or
 // nothing. Once admitted, rq.release gives the slots back in done, and
-// rq.content says whether the spans carry content: when an exporter is
-// published, the request is sampled and the key's content_until is after the
-// service clock (TEL-8).
+// rq.content says whether the spans carry content: on chat and messages
+// only, when an exporter is published, the request is sampled and the key's
+// content_until is after the service clock (TEL-8, phase-4 design section 15
+// point 10).
 func (h *handler) admit(rq *request) *domain.Error {
 	k, m, names := &rq.key.Spec, &rq.model.Spec, scopeNames(rq)
 	var e *domain.Error
@@ -324,7 +331,8 @@ func (h *handler) admit(rq *request) *domain.Error {
 		admission.Scope{Name: names[1], Parallel: m.MaxParallelRequests, RPM: m.RPMLimit, TPM: m.TPMLimit},
 		admission.Scope{Name: names[2], Parallel: rq.snap.Settings.MaxParallelRequests})
 	until := rq.key.Spec.ContentUntil
-	rq.content = e == nil && rq.snap.Exporter != nil && telemetry.Sampled(rq.sample, sampleRate(rq)) && !until.IsZero() && until.After(h.Config.Now())
+	chatLike := rq.ep == domain.EndpointChat || rq.ep == domain.EndpointMessages
+	rq.content = e == nil && chatLike && rq.snap.Exporter != nil && telemetry.Sampled(rq.sample, sampleRate(rq)) && !until.IsZero() && until.After(h.Config.Now())
 	return e
 }
 
@@ -993,7 +1001,7 @@ func spanRequest(rq *request, status int, code, version string, ended time.Time)
 		p := a.target.Provider
 		s := telemetry.Attempt{Record: a.rec, Provider: cmp.Or(p.Spec.GenAIProvider, p.Name), Dialect: reasoning.Dialect(a.target.Spec.Reasoning),
 			Stripped: a.obs.Stripped, Level: a.out.Level, Started: a.started, Ended: a.ended}
-		if u, err := url.Parse(p.Spec.BaseURL); err == nil {
+		if u, err := url.Parse(a.out.URL); err == nil { // the URL called, which a rerank_url need not share with base_url
 			s.Host = u.Hostname()
 			s.Port, _ = strconv.ParseInt(u.Port(), 10, 64)
 			if u.Port() == "" {

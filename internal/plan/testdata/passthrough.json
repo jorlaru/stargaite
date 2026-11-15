@@ -1,0 +1,74 @@
+[
+	{
+		"case": "embeddings toward openai",
+		"url": "https://api.example.com/v1/embeddings",
+		"header": "map[Content-Type:[application/json]]",
+		"effort_source": "provider_default",
+		"body": "{ \"input\": [\"héllo\", \"\\u00e9\"], \"model\":\"up-1\",\"encoding_format\" :\"base64\", \"dimensions\":256 }"
+	},
+	{
+		"case": "a base_url with a trailing slash",
+		"url": "https://api.example.com/v1/embeddings",
+		"header": "map[Content-Type:[application/json]]",
+		"effort_source": "provider_default",
+		"body": "{ \"input\": [\"héllo\", \"\\u00e9\"], \"model\":\"up-1\",\"encoding_format\" :\"base64\", \"dimensions\":256 }"
+	},
+	{
+		"case": "embeddings toward anthropic",
+		"skip": "endpoint_not_supported "
+	},
+	{
+		"case": "a chat target",
+		"skip": "endpoint_not_supported "
+	},
+	{
+		"case": "a chat target toward anthropic",
+		"skip": "endpoint_not_supported "
+	},
+	{
+		"case": "a rerank target",
+		"skip": "endpoint_not_supported "
+	},
+	{
+		"case": "an alias with a cap and a forced effort, a target with a dialect",
+		"url": "https://api.example.com/v1/embeddings",
+		"header": "map[Content-Type:[application/json]]",
+		"effort_source": "provider_default",
+		"body": "{ \"input\": [\"héllo\", \"\\u00e9\"], \"model\":\"up-1\",\"encoding_format\" :\"base64\", \"dimensions\":256 }"
+	},
+	{
+		"case": "a forward rule",
+		"url": "https://api.example.com/v1/embeddings",
+		"header": "map[Content-Type:[application/json]]",
+		"changes": "input_type:forwarded",
+		"effort_source": "provider_default",
+		"body": "{\"model\":\"up-1\",\"input\":\"hi\",\"input_type\":\"query\"}"
+	},
+	{
+		"case": "a drop rule on an unknown key",
+		"url": "https://api.example.com/v1/embeddings",
+		"header": "map[Content-Type:[application/json]]",
+		"changes": "task:dropped",
+		"effort_source": "provider_default",
+		"body": "{\"model\":\"up-1\",\"input\":\"hi\"}"
+	},
+	{
+		"case": "an unsupported key dropped",
+		"url": "https://api.example.com/v1/embeddings",
+		"header": "map[Content-Type:[application/json]]",
+		"changes": "encoding_format:dropped,input_type:forwarded",
+		"effort_source": "provider_default",
+		"body": "{\"model\":\"up-1\",\"input\":\"hi\",\"input_type\":\"q\"}"
+	},
+	{
+		"case": "an unsupported key without a drop rule",
+		"skip": "unsupported_parameter dimensions"
+	},
+	{
+		"case": "a drop rule on a supported known key",
+		"url": "https://api.example.com/v1/embeddings",
+		"header": "map[Content-Type:[application/json]]",
+		"effort_source": "provider_default",
+		"body": "{ \"input\": [\"héllo\", \"\\u00e9\"], \"model\":\"up-1\",\"encoding_format\" :\"base64\", \"dimensions\":256 }"
+	}
+]

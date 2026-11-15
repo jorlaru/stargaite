@@ -173,10 +173,10 @@ func TestValidate(t *testing.T) {
 		{"OPS-5 provider name of 64 characters", func(d *domain.Document) { d.Providers[strings.Repeat("p", 64)] = d.Providers["tei-embed"] }, nil},
 		{"OPS-5 protocol outside the enumeration", func(d *domain.Document) {
 			edit(d.Providers, "tei-embed", func(p *domain.Provider) { p.Protocol = "grpc" })
-		}, []string{"error OPS-5 invalid_value providers/tei-embed protocol"}},
+		}, []string{"error OPS-5 invalid_value providers/tei-embed protocol", "warning OPS-5 endpoint_unservable models/embed targets"}},
 		{"OPS-5 protocol is required", func(d *domain.Document) {
 			edit(d.Providers, "tei-embed", func(p *domain.Provider) { p.Protocol = "" })
-		}, []string{"error OPS-5 required providers/tei-embed protocol"}},
+		}, []string{"error OPS-5 required providers/tei-embed protocol", "warning OPS-5 endpoint_unservable models/embed targets"}},
 		{"OPS-5 billing outside the enumeration", func(d *domain.Document) {
 			edit(d.Providers, "tei-embed", func(p *domain.Provider) { p.Billing = "free" })
 		}, []string{"error OPS-5 invalid_value providers/tei-embed billing"}},
@@ -229,17 +229,17 @@ func TestValidate(t *testing.T) {
 		{"OPS-5 target of an unknown provider", func(d *domain.Document) { d.Targets["nope/model"] = domain.Target{Kind: "chat"} },
 			[]string{"error OPS-5 unknown_provider targets/nope/model "}},
 		{"OPS-5 removing a provider that targets still use", func(d *domain.Document) { delete(d.Providers, "tei-embed") },
-			[]string{"error OPS-5 unknown_provider targets/tei-embed/bge-m3 "}},
+			[]string{"error OPS-5 unknown_provider targets/tei-embed/bge-m3 ", "warning OPS-5 endpoint_unservable models/embed targets"}},
 		{"OPS-5 target id without a slash", func(d *domain.Document) { d.Targets["model"] = domain.Target{Kind: "chat"} },
 			[]string{"error OPS-5 invalid_name targets/model "}},
 		{"OPS-5 upstream id with a space", func(d *domain.Document) { d.Targets["tei-embed/a b"] = domain.Target{Kind: "embeddings"} },
 			[]string{"error OPS-5 invalid_name targets/tei-embed/a b "}},
 		{"OPS-5 kind is required", func(d *domain.Document) {
 			edit(d.Targets, "tei-embed/bge-m3", func(t *domain.Target) { t.Kind = "" })
-		}, []string{"error OPS-5 required targets/tei-embed/bge-m3 kind"}},
+		}, []string{"error OPS-5 required targets/tei-embed/bge-m3 kind", "warning OPS-5 endpoint_unservable models/embed targets"}},
 		{"OPS-5 kind outside the enumeration", func(d *domain.Document) {
 			edit(d.Targets, "tei-embed/bge-m3", func(t *domain.Target) { t.Kind = "image" })
-		}, []string{"error OPS-5 invalid_value targets/tei-embed/bge-m3 kind"}},
+		}, []string{"error OPS-5 invalid_value targets/tei-embed/bge-m3 kind", "warning OPS-5 endpoint_unservable models/embed targets"}},
 		{"PAR-6 negative target limit", func(d *domain.Document) {
 			edit(d.Targets, "tei-embed/bge-m3", func(t *domain.Target) { t.MaxOutputTokens = -1 })
 		}, []string{"error PAR-6 invalid_value targets/tei-embed/bge-m3 max_output_tokens"}},
@@ -482,6 +482,12 @@ func TestValidate(t *testing.T) {
 		{"PAR-7 an openai target needs no alias cap", func(d *domain.Document) {
 			edit(d.Models, "fast", func(m *domain.Model) { m.Targets, m.MaxOutputTokens = []string{qw}, 0 })
 		}, nil},
+		// PAR-7, RSN-5 and RSN-7 read chat targets only: passthrough writes no
+		// cap and no effort (phase-4 design section 15 point 12); an anthropic
+		// embeddings target serves nothing instead (OPS-5).
+		{"PAR-7 an anthropic embeddings target and no alias cap", func(d *domain.Document) {
+			edit(d.Providers, "tei-embed", func(p *domain.Provider) { p.Protocol = "anthropic" })
+		}, []string{"warning OPS-5 endpoint_unservable models/embed targets"}},
 		{"PAR-2 forward rule naming the dialect's key", func(d *domain.Document) {
 			edit(d.Models, "fast", func(m *domain.Model) { m.Params["reasoning"] = "forward" })
 		}, []string{"error PAR-2 param_collision models/fast params.reasoning"}},
@@ -553,8 +559,11 @@ func TestValidate(t *testing.T) {
 			edit(d.Models, "embed", func(m *domain.Model) { m.Reasoning.Mode = "forced" })
 		}, []string{"error RSN-5 required models/embed reasoning.effort"}},
 		{"RSN-5 warning for an effort toward a none dialect", func(d *domain.Document) {
+			edit(d.Targets, qw, func(t *domain.Target) { t.Reasoning = nil })
+		}, []string{"warning RSN-5 effort_dropped models/fast reasoning.effort"}},
+		{"RSN-5 an effort toward a non-chat target", func(d *domain.Document) {
 			edit(d.Models, "embed", func(m *domain.Model) { m.Reasoning = domain.ModelReasoning{Effort: "low", Mode: "default"} })
-		}, []string{"warning RSN-5 effort_dropped models/embed reasoning.effort"}},
+		}, nil},
 		{"RSN-5 provider_default toward a none dialect", func(d *domain.Document) {
 			edit(d.Models, "embed", func(m *domain.Model) {
 				m.Reasoning = domain.ModelReasoning{Effort: "provider_default", Mode: "default"}
@@ -566,12 +575,24 @@ func TestValidate(t *testing.T) {
 		{"RSN-7 always-reasoning fallback and no effort", func(d *domain.Document) {
 			edit(d.Models, "fast", func(m *domain.Model) { m.Targets, m.Reasoning = []string{qw, mm}, domain.ModelReasoning{} })
 		}, []string{"error RSN-7 effort_required models/fast reasoning.effort"}},
+		{"RSN-7 a non-chat target that always reasons, and no effort", func(d *domain.Document) {
+			edit(d.Targets, "tei-embed/bge-m3", func(t *domain.Target) {
+				t.Reasoning = &domain.Reasoning{Dialect: "reasoning_effort", Levels: []string{"low"}, CanDisable: new(false)}
+			})
+		}, nil},
 		{"RSN-7 provider_default counts as an effort", func(d *domain.Document) {
 			edit(d.Models, "fast", func(m *domain.Model) { m.Reasoning.Effort = "provider_default" })
 		}, nil},
 		{"RSN-7 an output cap does not replace the effort", func(d *domain.Document) {
 			edit(d.Models, "deep", func(m *domain.Model) { m.Reasoning = domain.ModelReasoning{} })
 		}, []string{"error RSN-7 effort_required models/deep reasoning.effort"}},
+		{"OPS-5 a rerank target whose provider has no rerank_url", func(d *domain.Document) {
+			edit(d.Providers, "tei-rerank", func(p *domain.Provider) { p.RerankURL = "" })
+		}, []string{"warning OPS-5 endpoint_unservable models/rerank targets"}},
+		{"OPS-5 a fallback that serves an endpoint", func(d *domain.Document) {
+			edit(d.Providers, "tei-embed", func(p *domain.Provider) { p.Protocol = "anthropic" })
+			edit(d.Models, "embed", func(m *domain.Model) { m.Targets = append(m.Targets, qw) })
+		}, nil},
 		{"LIM-2 alias budget without an interval", func(d *domain.Document) {
 			edit(d.Models, "deep", func(m *domain.Model) { m.Budget.ResetInterval = "" })
 		}, []string{"error LIM-2 required models/deep budget.reset_interval"}},

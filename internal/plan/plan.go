@@ -37,6 +37,8 @@ func schema(ep domain.Endpoint) (s params.Schema, out [][]string, ok bool) {
 		return params.Chat, params.ChatOut, true
 	case domain.EndpointMessages:
 		return params.Messages, params.MessagesOut, true
+	case domain.EndpointEmbeddings:
+		return params.Embeddings, nil, true
 	}
 	return params.Schema{}, nil, false
 }
@@ -52,7 +54,9 @@ func capNames(ep domain.Endpoint) []string {
 // Check refuses a request before any target is tried (design section 5), for
 // a body scanned with the inbound walk of ep and the alias m, which may be
 // nil: an unknown top-level key without a rule, a type the proxy reads, an
-// effort off the scale (RSN-11), a cap above the alias's (PAR-6).
+// effort off the scale (RSN-11), a cap above the alias's (PAR-6). On
+// embeddings only the unknown key is refused, and the Client is empty: no
+// stream, effort, cap or feature (phase-4 design section 4).
 func Check(ep domain.Endpoint, b *params.Body, m *domain.Model) (*Client, *domain.Error) {
 	s, _, ok := schema(ep)
 	if !ok {
@@ -65,6 +69,9 @@ func Check(ep domain.Endpoint, b *params.Body, m *domain.Model) (*Client, *domai
 			e.Param = k
 			return nil, e
 		}
+	}
+	if ep == domain.EndpointEmbeddings {
+		return &Client{}, nil
 	}
 	if e := checkTypes(ep, b); e != nil {
 		return nil, e
@@ -270,7 +277,11 @@ func Header(cs []Change) string {
 // protocol:translated, takes the cap and the reasoning edit in place of the
 // client's body, and a key with no equivalent is handled like an unsupported
 // one (PAR-12). Every sent value is read back from the result (PAR-8).
+// Embeddings is passthrough's alone.
 func Build(in Input) (*Outgoing, *Skip) {
+	if in.Endpoint == domain.EndpointEmbeddings {
+		return passthrough(in)
+	}
 	ep, b, t, p := in.Endpoint, in.Body, in.Target, in.Provider
 	m, c := cmp.Or(in.Model, &domain.Model{}), cmp.Or(in.Client, &Client{})
 	s, outWalk, ok := schema(ep)
@@ -307,20 +318,11 @@ func Build(in Input) (*Outgoing, *Skip) {
 		translatedBody, noEquivalent, untranslatable = anthropic.FromChat(b)
 		out.Changes = append(out.Changes, Change{Name: "protocol", Action: reasoning.ActionTranslated})
 	}
-	var drops []params.Op
-	for _, k := range b.Keys() {
-		rule := m.Params[k]
-		unsupported := slices.Contains(t.UnsupportedParams, k) || slices.Contains(noEquivalent, k)
-		switch {
-		case unsupported && rule != domain.ParamDrop:
-			return nil, &Skip{Code: domain.CodeUnsupportedParameter, Param: k}
-		case rule == domain.ParamDrop && (!s.Known[k] || unsupported):
-			drops = append(drops, params.Op{Path: []string{k}})
-			out.Changes = append(out.Changes, Change{Name: k, Action: reasoning.ActionDropped})
-		case rule == domain.ParamForward && !s.Known[k]:
-			out.Changes = append(out.Changes, Change{Name: k, Action: "forwarded"})
-		}
+	drops, changes, skip := rules(b, m, t, s, noEquivalent)
+	if skip != nil {
+		return nil, skip
 	}
+	out.Changes = append(out.Changes, changes...)
 	// The cap and the reasoning edit see the body without the dropped members,
 	// so a member they write is written even when the client sent it.
 	if len(drops) > 0 {
@@ -419,6 +421,64 @@ func Build(in Input) (*Outgoing, *Skip) {
 		if v := in.Header.Values(h); len(v) > 0 {
 			out.Header[http.CanonicalHeaderKey(h)] = slices.Clone(v)
 		}
+	}
+	return out, nil
+}
+
+// rules applies the alias's params rules and PAR-12 to the top-level keys of
+// b toward t, in body order: a key t lists unsupported, or one with no
+// equivalent on the translated path, skips t unless a drop rule removes it;
+// a drop rule removes an unknown key too; a forward rule lets an unknown key
+// through. Each removal is an op of drops, and each is listed with every
+// forward in changes (PAR-2, PAR-3).
+func rules(b *params.Body, m *domain.Model, t *domain.Target, s params.Schema, noEquivalent []string) (drops []params.Op, changes []Change, skip *Skip) {
+	for _, k := range b.Keys() {
+		rule := m.Params[k]
+		unsupported := slices.Contains(t.UnsupportedParams, k) || slices.Contains(noEquivalent, k)
+		switch {
+		case unsupported && rule != domain.ParamDrop:
+			return nil, nil, &Skip{Code: domain.CodeUnsupportedParameter, Param: k}
+		case rule == domain.ParamDrop && (!s.Known[k] || unsupported):
+			drops = append(drops, params.Op{Path: []string{k}})
+			changes = append(changes, Change{Name: k, Action: reasoning.ActionDropped})
+		case rule == domain.ParamForward && !s.Known[k]:
+			changes = append(changes, Change{Name: k, Action: "forwarded"})
+		}
+	}
+	return drops, changes, nil
+}
+
+// passthrough is Build for embeddings (kick-off section 7.1): an embeddings
+// target of the openai protocol, called at base_url + /embeddings; any other
+// target is skipped. The alias's rules and PAR-12 apply as on chat, and only
+// "model" is replaced besides them, which PAR-3 does not list. No cap, effort
+// or include_usage is ever written, so the source is provider_default (RSN-6)
+// and every other layer is nil.
+func passthrough(in Input) (*Outgoing, *Skip) {
+	t, p := in.Target, in.Provider
+	out := &Outgoing{Header: http.Header{"Content-Type": {"application/json"}}, EffortSource: reasoning.SourceProviderDefault}
+	switch {
+	case p.Protocol != domain.ProtocolOpenAI:
+		return nil, &Skip{Code: domain.CodeEndpointNotSupported}
+	case in.Endpoint == domain.EndpointEmbeddings && t.Kind == domain.KindEmbeddings:
+		out.URL = strings.TrimSuffix(p.BaseURL, "/") + "/embeddings"
+	default:
+		return nil, &Skip{Code: domain.CodeEndpointNotSupported}
+	}
+	model, err := jsontext.AppendQuote(nil, in.Upstream)
+	if err != nil {
+		return nil, &Skip{Code: domain.CodeInternalError, Param: err.Error()}
+	}
+	ops := []params.Op{{Path: []string{"model"}, Value: model}}
+	if in.Endpoint == domain.EndpointEmbeddings {
+		drops, changes, skip := rules(in.Body, cmp.Or(in.Model, &domain.Model{}), t, params.Embeddings, nil)
+		if skip != nil {
+			return nil, skip // 422 unsupported_parameter when no target is left
+		}
+		ops, out.Changes = append(drops, ops...), changes
+	}
+	if out.Body, err = in.Body.Edit(ops...); err != nil {
+		return nil, &Skip{Code: domain.CodeInternalError, Param: err.Error()}
 	}
 	return out, nil
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -778,7 +779,7 @@ func TestCheckReads(t *testing.T) {
 			t.Errorf("%s: got %+v cap %d", tt.body, c, *c.Cap)
 		}
 	}
-	if _, e := Check("embeddings", nil, nil); e == nil || e.Code != "internal_error" {
+	if _, e := Check("unknown", nil, nil); e == nil || e.Code != "internal_error" {
 		t.Errorf("an endpoint not served: %+v", e)
 	}
 }
@@ -846,4 +847,104 @@ func TestStreamOptions(t *testing.T) {
 		got = append(got, injected{tc.name, Header(out.Changes), string(out.Body)})
 	}
 	golden(t, filepath.Join("testdata", "stream_options.json"), got)
+}
+
+// TestPassthrough is Build on embeddings (phase-4 design section 4), in
+// testdata/passthrough.json: per target kind and protocol, an embeddings
+// target of the openai protocol is called at base_url + /embeddings with
+// only model replaced, every other byte as the client sent it, and any other
+// target is skipped endpoint_not_supported; the alias's rules and PAR-12
+// apply as on chat (PAR-2, PAR-3); no cap, effort or include_usage is ever
+// written, whatever the alias sets, so the source is provider_default and
+// every other layer is empty (RSN-6).
+func TestPassthrough(t *testing.T) {
+	type built struct {
+		Case    string `json:"case"`
+		Skip    string `json:"skip,omitempty"`
+		URL     string `json:"url,omitempty"`
+		Header  string `json:"header,omitempty"`
+		Changes string `json:"changes,omitempty"`
+		Source  string `json:"effort_source,omitempty"`
+		Body    string `json:"body,omitempty"`
+	}
+	const body = `{ "input": ["héllo", "\u00e9"], "model":"embed","encoding_format" :"base64", "dimensions":256 }`
+	slash := &domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.example.com/v1/"}
+	rerank := &domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.example.com/v1", RerankURL: "https://api.example.com/rerank"}
+	emb := domain.Target{Kind: domain.KindEmbeddings}
+	loaded := &domain.Model{MaxOutputTokens: 100, Reasoning: domain.ModelReasoning{Effort: "high", Mode: domain.ModeForced}}
+	var got []built
+	for _, tc := range []struct {
+		name string
+		p    *domain.Provider
+		tg   domain.Target
+		m    *domain.Model
+		body string
+	}{
+		{"embeddings toward openai", openai, emb, nil, body},
+		{"a base_url with a trailing slash", slash, emb, nil, body},
+		{"embeddings toward anthropic", anth, emb, nil, body},
+		{"a chat target", openai, domain.Target{Kind: domain.KindChat}, nil, body},
+		{"a chat target toward anthropic", anth, domain.Target{Kind: domain.KindChat}, nil, body},
+		{"a rerank target", rerank, domain.Target{Kind: domain.KindRerank}, nil, body},
+		{"an alias with a cap and a forced effort, a target with a dialect", openai,
+			domain.Target{Kind: domain.KindEmbeddings, Reasoning: &domain.Reasoning{Dialect: "reasoning_effort", Levels: []string{"high"}}}, loaded, body},
+		{"a forward rule", openai, emb, &domain.Model{Params: map[string]string{"input_type": "forward"}}, `{"model":"embed","input":"hi","input_type":"query"}`},
+		{"a drop rule on an unknown key", openai, emb, &domain.Model{Params: map[string]string{"task": "drop"}}, `{"model":"embed","task":"x","input":"hi"}`},
+		{"an unsupported key dropped", openai, domain.Target{Kind: domain.KindEmbeddings, UnsupportedParams: []string{"encoding_format"}},
+			&domain.Model{Params: map[string]string{"encoding_format": "drop", "input_type": "forward"}}, `{"model":"embed","input":"hi","encoding_format":"base64","input_type":"q"}`},
+		{"an unsupported key without a drop rule", openai, domain.Target{Kind: domain.KindEmbeddings, UnsupportedParams: []string{"dimensions"}}, nil, body},
+		{"a drop rule on a supported known key", openai, emb, &domain.Model{Params: map[string]string{"dimensions": "drop"}}, body},
+	} {
+		out, skip := runTo(t, domain.EndpointEmbeddings, tc.p, tc.body, tc.m, tc.tg)
+		if skip != nil {
+			got = append(got, built{Case: tc.name, Skip: skip.Code + " " + skip.Param})
+			continue
+		}
+		if out.Effort != (Layers[string]{}) || out.MaxOutput != (Layers[int64]{}) || out.EffortAdjusted || out.Level != "" {
+			t.Errorf("%s: layers %+v %+v adjusted %v level %q", tc.name, out.Effort, out.MaxOutput, out.EffortAdjusted, out.Level)
+		}
+		got = append(got, built{tc.name, "", out.URL, fmt.Sprint(out.Header), Header(out.Changes), out.EffortSource, string(out.Body)})
+	}
+	golden(t, filepath.Join("testdata", "passthrough.json"), got)
+}
+
+// TestCheckEmbeddings: Check on embeddings refuses an unknown top-level key
+// without a rule, stream included (PAR-2), reads no type and returns an
+// empty Client, so Build gets no stream, effort, cap or feature.
+func TestCheckEmbeddings(t *testing.T) {
+	scan := func(body string) *params.Body {
+		t.Helper()
+		b, e := params.Scan([]byte(body), params.Embeddings.Walk)
+		if e != nil {
+			t.Fatalf("%s: %+v", body, e)
+		}
+		return b
+	}
+	rules := &domain.Model{MaxOutputTokens: 1, Params: map[string]string{"input_type": "forward"}}
+	for _, tt := range []struct{ body, param string }{
+		{`{"model":"a","input":"hi","stream":true}`, "stream"},
+		{`{"model":"a","input":"hi","messages":[]}`, "messages"},
+		{`{"model":"a","input":"hi","max_tokens":1}`, "max_tokens"},
+		{`{"model":"a","input":"hi","reasoning_effort":"low"}`, "reasoning_effort"},
+	} {
+		c, e := Check(domain.EndpointEmbeddings, scan(tt.body), rules)
+		if c != nil || e == nil || e.Code != "unknown_parameter" || e.Param != tt.param || e.Status != 400 {
+			t.Errorf("%s: got %+v, %+v", tt.body, c, e)
+		}
+	}
+	for _, body := range []string{
+		`{"model":"a","input":"hi","dimensions":"x","encoding_format":7,"user":null,"input_type":"q"}`,
+		`{"model":"a"}`,
+	} {
+		c, e := Check(domain.EndpointEmbeddings, scan(body), rules)
+		if e != nil || c == nil || *c != (Client{}) {
+			t.Errorf("%s: got %+v, %+v", body, c, e)
+		}
+	}
+	if _, e := params.Scan([]byte(`{"model":"a","input":"x","input":"y"}`), params.Embeddings.Walk); e == nil || e.Code != "invalid_request" || e.Param != "input" {
+		t.Errorf("a repeated top-level key: %+v", e)
+	}
+	if _, e := params.Scan([]byte(`{"model":"a","input":[{"k":1,"k":2}]}`), params.Embeddings.Walk); e != nil {
+		t.Errorf("a repeat inside a member is not read: %+v", e)
+	}
 }

@@ -49,6 +49,11 @@ var Messages = Schema{
 	},
 }
 
+// Embeddings is OpenAI Embeddings, the reference as read on AsOf (PAR-1, R7).
+// Walk is nil: only the top-level object is indexed and checked for repeats,
+// since the proxy reads nothing inside a member. stream is unknown.
+var Embeddings = Schema{AsOf: "2026-11-15", Known: set("input", "model", "dimensions", "encoding_format", "user")}
+
 // AnthropicVersion is the anthropic-version header sent when the client sends
 // none (PAR-14).
 const AnthropicVersion = "2023-06-01"

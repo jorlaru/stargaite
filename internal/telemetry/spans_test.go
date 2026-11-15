@@ -102,7 +102,8 @@ func TestSampled(t *testing.T) {
 
 // goldenCases are one request per span shape (AC-25): a success, a stream,
 // an error, a refusal before any provider, a fallback whose failed attempts
-// are child spans, and a success under the content opt-in (TEL-8).
+// are child spans, a success under the content opt-in (TEL-8), and an
+// embeddings success.
 func goldenCases() []struct {
 	name string
 	req  Request
@@ -131,6 +132,8 @@ func goldenCases() []struct {
 	served := usage.Record{Target: "anth/claude", Billing: domain.BillingNone, ResponseModel: "claude-x", StatusCode: 200, FinishReason: "end_turn",
 		Stream: true, InputTokens: 9, OutputTokens: 4, TokensSource: "provider", CostSource: "none", EffortSent: p("high"), EffortSource: "client",
 		ParamsChanged: "protocol:translated,output_config.effort:added", TTFTMS: n(30), StartedAt: ms + 81, CompletedAt: ms + 300}
+	emb := usage.Record{Target: "pay/emb-1", Billing: domain.BillingPayPerUse, ResponseModel: "emb-1", StatusCode: 200, InputTokens: 5,
+		TokensSource: "provider", CostUSD: usd(0.0000001), CostSource: "price_table", EffortSource: "provider_default", StartedAt: ms + 2, CompletedAt: ms + 80}
 	base := Request{Key: "agent", Alias: "fast", Endpoint: domain.EndpointChat, Version: "v1.2.3", Revision: 7, Status: 200, Started: at, Ended: at.Add(time.Second)}
 	with := func(f func(r *Request)) Request {
 		r := base
@@ -178,6 +181,13 @@ func goldenCases() []struct {
 			r.Context, r.ContentMax = root, 29
 			r.Attempts = []Attempt{{Record: ok, Provider: "openai", Host: "api.example.com", Port: 443, Dialect: "reasoning_effort", Level: "high"}}
 			r.Input, r.Output = []byte(`[{"role":"user","content":"héllo"}]`), []byte("a\xffb")
+		})},
+		{"embeddings", with(func(r *Request) {
+			// Only the operation name differs: output tokens are the recorded 0,
+			// and the effort source, adjusted and dialect stay (phase-4 design
+			// section 4).
+			r.Context, r.Endpoint, r.Alias = root, domain.EndpointEmbeddings, "embed"
+			r.Attempts = []Attempt{{Record: emb, Provider: "openai", Host: "api.example.com", Port: 443, Dialect: "none"}}
 		})},
 	}
 }

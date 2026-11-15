@@ -57,8 +57,9 @@ const (
 type Endpoint string
 
 const (
-	EndpointChat     Endpoint = "chat"     // POST /v1/chat/completions
-	EndpointMessages Endpoint = "messages" // POST /v1/messages
+	EndpointChat       Endpoint = "chat"       // POST /v1/chat/completions
+	EndpointMessages   Endpoint = "messages"   // POST /v1/messages
+	EndpointEmbeddings Endpoint = "embeddings" // POST /v1/embeddings
 )
 
 // Error is the error object of the response envelope, {"error": {...}}. The

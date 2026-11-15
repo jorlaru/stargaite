@@ -522,6 +522,7 @@ func validateModel(r *report, doc *domain.Document, name string) {
 		return // refused as too_many_targets: a long list costs no more than that one finding
 	}
 
+	known, servable := false, false
 	for i, id := range m.Targets {
 		t, ok := doc.Targets[id]
 		switch {
@@ -534,6 +535,7 @@ func validateModel(r *report, doc *domain.Document, name string) {
 		}
 		provider, _, _ := domain.SplitTarget(id)
 		protocol := doc.Providers[provider].Protocol
+		known, servable = true, servable || serves(t, doc.Providers[provider])
 		for _, c := range m.Requires {
 			if v := capability(t.Capabilities, c); slices.Contains(capabilities, c) && (v == nil || !*v) {
 				r.fail("PAR-5", "requirement_not_met", res, "requires", "target %s does not declare %s true", id, c)
@@ -543,7 +545,8 @@ func validateModel(r *report, doc *domain.Document, name string) {
 			r.fail("PAR-6", "output_cap_exceeds_target", res, "max_output_tokens",
 				"max_output_tokens %d is above the %d that target %s declares", m.MaxOutputTokens, t.MaxOutputTokens, id)
 		}
-		if protocol == domain.ProtocolAnthropic && m.MaxOutputTokens == 0 {
+		chat := t.Kind == domain.KindChat // PAR-7, RSN-5 and RSN-7: passthrough writes no cap or effort (phase-4 design section 15 point 12)
+		if chat && protocol == domain.ProtocolAnthropic && m.MaxOutputTokens == 0 {
 			r.fail("PAR-7", "output_cap_required", res, "max_output_tokens", "target %s speaks the anthropic protocol, which requires an output cap: set max_output_tokens", id)
 		}
 		keys := written(t, protocol)
@@ -563,13 +566,33 @@ func validateModel(r *report, doc *domain.Document, name string) {
 				}
 			}
 		}
-		if t.Reasoning != nil && t.Reasoning.CanDisable != nil && !*t.Reasoning.CanDisable && m.Reasoning.Effort == "" {
+		if chat && t.Reasoning != nil && t.Reasoning.CanDisable != nil && !*t.Reasoning.CanDisable && m.Reasoning.Effort == "" {
 			r.fail("RSN-7", "effort_required", res, "reasoning.effort", "target %s always reasons and the alias sets no effort", id)
 		}
-		if e := m.Reasoning.Effort; e != "" && e != domain.EffortProviderDefault && dialect(t) == domain.DialectNone {
+		if e := m.Reasoning.Effort; chat && e != "" && e != domain.EffortProviderDefault && dialect(t) == domain.DialectNone {
 			r.warn("RSN-5", "effort_dropped", res, "reasoning.effort", "target %s has the reasoning dialect none: the effort is dropped toward it", id)
 		}
 	}
+	if known && !servable {
+		r.warn("OPS-5", "endpoint_unservable", res, "targets",
+			"no target of this alias can serve an endpoint: an embeddings target needs the openai protocol, a rerank target the openai protocol and a rerank_url")
+	}
+}
+
+// serves reports whether target t of provider p can serve some endpoint
+// (OPS-5): a chat target serves chat, an embeddings target of the openai
+// protocol embeddings, a rerank target of the openai protocol whose provider
+// declares a rerank_url rerank (phase-4 design sections 4 and 5).
+func serves(t domain.Target, p domain.Provider) bool {
+	switch t.Kind {
+	case domain.KindChat:
+		return true
+	case domain.KindEmbeddings:
+		return p.Protocol == domain.ProtocolOpenAI
+	case domain.KindRerank:
+		return p.Protocol == domain.ProtocolOpenAI && p.RerankURL != ""
+	}
+	return false
 }
 
 func validateKey(r *report, doc *domain.Document, name string) {

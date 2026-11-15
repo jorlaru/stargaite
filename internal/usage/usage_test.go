@@ -139,6 +139,63 @@ func TestNewRecord(t *testing.T) {
 	}
 }
 
+// TestNewRecordEndpoints is NewRecord per endpoint (phase-4 design section
+// 4): content_empty only on chat and messages; an embeddings record with
+// every column as the design lists it, its input reported, output 0,
+// reasoning NULL, provider_default and every other effort and cap column
+// NULL, priced by USE-6; a 2xx without usage estimated by USE-8 from the
+// bytes sent (49, so 13 tokens), output 0, still priced; a failed call with zero tokens.
+func TestNewRecordEndpoints(t *testing.T) {
+	for _, tc := range []struct {
+		ep    domain.Endpoint
+		empty bool
+	}{{domain.EndpointChat, true}, {domain.EndpointMessages, true}, {domain.EndpointEmbeddings, false}} {
+		c := base()
+		c.Endpoint, c.Obs.VisibleBytes = tc.ep, 0
+		if r := NewRecord(c); r.ContentEmpty != tc.empty || r.Endpoint != string(tc.ep) {
+			t.Errorf("%s: endpoint %q content_empty %v", tc.ep, r.Endpoint, r.ContentEmpty)
+		}
+	}
+
+	embeddings := func() Call {
+		return Call{
+			RequestID: "req", TraceID: "0af7651916cd43dd8448eb211c80319c", Key: "k", Model: "embed", Version: "v1.2.3",
+			Endpoint: domain.EndpointEmbeddings, Attempt: 1, Status: 200, TargetID: "p/emb-1",
+			Target:   &domain.Target{Kind: domain.KindEmbeddings, Pricing: &domain.Pricing{InputPerMillion: ptr(0.02), OutputPerMillion: ptr(0.0)}},
+			Provider: &domain.Provider{Billing: domain.BillingPayPerUse},
+			Out:      &plan.Outgoing{Body: []byte(`{"model":"emb-1","input":"hello world, embedded"}`), EffortSource: "provider_default"}, // 49 bytes
+			Complete: true,
+			Obs:      domain.Observed{ResponseModel: "emb-1", Usage: &domain.Usage{Input: 5}},
+			Started:  t0, Ended: t0.Add(80 * time.Millisecond), Revision: 3,
+		}
+	}
+	want := Record{
+		ID: "req-1", RequestID: "req", TraceID: "0af7651916cd43dd8448eb211c80319c", Attempt: 1, Endpoint: "embeddings", KeyName: "k",
+		Model: "embed", Target: "p/emb-1", Billing: "pay_per_use", ResponseModel: "emb-1", StatusCode: 200, InputTokens: 5,
+		TokensSource: "provider", CostUSD: ptr(5 * 0.02 / 1e6), CostSource: "price_table", EffortSource: "provider_default",
+		StartedAt: t0.UnixMilli(), CompletedAt: t0.UnixMilli() + 80, ConfigRevision: 3, ProxyVersion: "v1.2.3",
+	}
+	got := NewRecord(embeddings())
+	if !near(got.CostUSD, want.CostUSD) {
+		t.Errorf("cost %v, want %v", deref(got.CostUSD), deref(want.CostUSD))
+	}
+	if got.CostUSD, want.CostUSD = nil, nil; !reflect.DeepEqual(got, want) {
+		t.Errorf("record\n%+v\nwant\n%+v", got, want)
+	}
+
+	c := embeddings()
+	c.Obs.Usage = nil
+	if r := NewRecord(c); r.InputTokens != 13 || r.OutputTokens != 0 || r.ReasoningTokens != nil || r.TokensSource != "estimated" ||
+		!near(r.CostUSD, ptr(13*0.02/1e6)) || r.CostSource != "price_table" || r.ContentEmpty {
+		t.Errorf("a 2xx without usage: %+v", r)
+	}
+	c = embeddings()
+	c.Status, c.ErrorCode, c.Obs, c.Complete = 503, "upstream_error", domain.Observed{}, false
+	if r := NewRecord(c); r.InputTokens != 0 || r.OutputTokens != 0 || r.TokensSource != "provider" || r.ErrorType != "upstream_error" || r.ContentEmpty {
+		t.Errorf("a 503: %+v", r)
+	}
+}
+
 func near(a, b *float64) bool {
 	return a == nil && b == nil || a != nil && b != nil && math.Abs(*a-*b) < 1e-15
 }

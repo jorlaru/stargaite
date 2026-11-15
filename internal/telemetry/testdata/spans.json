@@ -1773,6 +1773,202 @@
           ]
         }
       ]
+    },
+    {
+      "case": "embeddings",
+      "spans": [
+        {
+          "traceId": "11000000000000000000000000000022",
+          "spanId": "ee00000000000001",
+          "flags": 257,
+          "name": "embeddings embed",
+          "kind": 2,
+          "startTimeUnixNano": "1790000000000000000",
+          "endTimeUnixNano": "1790000001000000000",
+          "attributes": [
+            {
+              "key": "stargaite.schema.version",
+              "value": {
+                "intValue": "1"
+              }
+            },
+            {
+              "key": "stargaite.version",
+              "value": {
+                "stringValue": "v1.2.3"
+              }
+            },
+            {
+              "key": "stargaite.config.revision",
+              "value": {
+                "intValue": "7"
+              }
+            },
+            {
+              "key": "stargaite.key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_key",
+              "value": {
+                "stringValue": "agent"
+              }
+            },
+            {
+              "key": "stargaite.endpoint",
+              "value": {
+                "stringValue": "embeddings"
+              }
+            },
+            {
+              "key": "gen_ai.operation.name",
+              "value": {
+                "stringValue": "embeddings"
+              }
+            },
+            {
+              "key": "stargaite.model",
+              "value": {
+                "stringValue": "embed"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_model",
+              "value": {
+                "stringValue": "embed"
+              }
+            },
+            {
+              "key": "gen_ai.request.model",
+              "value": {
+                "stringValue": "embed"
+              }
+            },
+            {
+              "key": "stargaite.target",
+              "value": {
+                "stringValue": "pay/emb-1"
+              }
+            },
+            {
+              "key": "langfuse.observation.metadata.stargaite_target",
+              "value": {
+                "stringValue": "pay/emb-1"
+              }
+            },
+            {
+              "key": "gen_ai.provider.name",
+              "value": {
+                "stringValue": "openai"
+              }
+            },
+            {
+              "key": "server.address",
+              "value": {
+                "stringValue": "api.example.com"
+              }
+            },
+            {
+              "key": "server.port",
+              "value": {
+                "intValue": "443"
+              }
+            },
+            {
+              "key": "stargaite.upstream.model",
+              "value": {
+                "stringValue": "emb-1"
+              }
+            },
+            {
+              "key": "stargaite.billing",
+              "value": {
+                "stringValue": "pay_per_use"
+              }
+            },
+            {
+              "key": "stargaite.cost.source",
+              "value": {
+                "stringValue": "price_table"
+              }
+            },
+            {
+              "key": "gen_ai.response.model",
+              "value": {
+                "stringValue": "emb-1"
+              }
+            },
+            {
+              "key": "stargaite.model_mismatch",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "stargaite.response.empty",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "gen_ai.usage.input_tokens",
+              "value": {
+                "intValue": "5"
+              }
+            },
+            {
+              "key": "gen_ai.usage.output_tokens",
+              "value": {
+                "intValue": "0"
+              }
+            },
+            {
+              "key": "stargaite.cost.usd",
+              "value": {
+                "doubleValue": 1e-7
+              }
+            },
+            {
+              "key": "gen_ai.usage.cost",
+              "value": {
+                "doubleValue": 1e-7
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.source",
+              "value": {
+                "stringValue": "provider_default"
+              }
+            },
+            {
+              "key": "stargaite.reasoning.effort.adjusted",
+              "value": {
+                "boolValue": false
+              }
+            },
+            {
+              "key": "stargaite.reasoning.dialect",
+              "value": {
+                "stringValue": "none"
+              }
+            },
+            {
+              "key": "stargaite.attempts",
+              "value": {
+                "intValue": "1"
+              }
+            },
+            {
+              "key": "http.response.status_code",
+              "value": {
+                "intValue": "200"
+              }
+            }
+          ]
+        }
+      ]
     }
   ]
 }

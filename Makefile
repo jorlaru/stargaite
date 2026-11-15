@@ -22,7 +22,7 @@ export LINT_SHA256
 
 # Tools and checks run with an empty environment, so none can lean on an ambient credential.
 ci:
-	@GOTOOLCHAIN=local go list -m >/dev/null 2>&1 || { echo "make ci needs Go 1.27 or later; 'make ci-container' runs it inside the golang image"; exit 1; }
+	@GOTOOLCHAIN=local go list -m >/dev/null 2>&1 || { echo "make ci needs Go 1.27.4 or later; 'make ci-container' runs it inside the golang image"; exit 1; }
 	env -i PATH="$(PATH)" HOME="$(HOME)" $(MAKE) tools check
 
 check:
@@ -51,7 +51,7 @@ $(BIN)/golangci-lint:
 $(BIN)/govulncheck:
 	CGO_ENABLED=0 GOBIN="$(CURDIR)/$(BIN)" go install golang.org/x/vuln/cmd/govulncheck@$(VULN_VERSION)
 
-# The same checks for a machine without Go 1.27 or a C compiler (the race detector needs one).
+# The same checks for a machine without Go 1.27.4 or a C compiler (the race detector needs one).
 ci-container:
 	docker run --rm --user "$$(id -u):$$(id -g)" -e HOME=/tmp -v "$(CURDIR)":/src -w /src $(GO_IMAGE) make ci
 

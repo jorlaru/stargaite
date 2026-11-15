@@ -8,7 +8,8 @@ one data directory. MIT licensed.
 built-in presets), targets, model aliases, client keys with rotation and revocation, `export`/`apply`/`validate`,
 `models explain`, `GET /v1/models`, and `POST /v1/chat/completions`, synchronous and streamed, toward providers of
 the `openai` protocol and of the `anthropic` protocol (translated to the Messages API), and `POST /v1/messages`,
-synchronous and streamed, toward providers of the `anthropic` protocol, with the parameter contract and reasoning
+synchronous and streamed, toward providers of the `anthropic` protocol, and `POST /v1/embeddings` toward embeddings
+targets of the `openai` protocol (see [Embeddings](#embeddings)), with the parameter contract and reasoning
 control of the alias, timeouts, fallback across an alias's targets, a circuit breaker per target, cancellation when a
 client goes away and a graceful stop (see [Resilience](#resilience)). Phase 3 has begun: every provider call leaves a
 usage record with its tokens and cost, and `usage show` sums them (see [Usage](#usage)); keys and aliases have rate
@@ -19,7 +20,7 @@ and parallel limits (see [Limits](#limits)), USD budgets (see [Budgets](#budgets
 
 ## Quick start
 
-From a clone of this repository, with Go 1.27 or later. The mock provider in `tests/mockprovider` stands in for a real
+From a clone of this repository, with Go 1.27.4 or later. The mock provider in `tests/mockprovider` stands in for a real
 one, so no account or credential is needed and no file is edited by hand. `tests/e2e` runs this block line by line.
 
 ```sh
@@ -30,33 +31,40 @@ curl -sS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:4000/he
 ./stargaite providers add mock --protocol openai --base-url http://127.0.0.1:4010 --allow-private-network --billing pay_per_use
 ./stargaite models add fast --target mock/mock
 ./stargaite targets set mock/mock --pricing input_per_million=1,output_per_million=2,as_of=2026-11-01
-./stargaite keys create my-agent --model fast --rpm-limit 60
+./stargaite targets add mock/mock-embed --kind embeddings --pricing input_per_million=1,output_per_million=0,as_of=2026-11-01
+./stargaite models add embed --target mock/mock-embed
+./stargaite keys create my-agent --model fast --model embed --rpm-limit 60
 ./stargaite models explain fast
 ./stargaite telemetry set --otlp-endpoint http://127.0.0.1:4010 --allow-private-network
 ./stargaite telemetry test
 curl -s http://127.0.0.1:4000/v1/models -H "Authorization: Bearer sk-stargaite-..."
 curl -s http://127.0.0.1:4000/v1/chat/completions -H "Authorization: Bearer sk-stargaite-..." -d '{"model":"fast","messages":[{"role":"user","content":"hi"}]}'
-./stargaite usage show --since 1h
+curl -s http://127.0.0.1:4000/v1/embeddings -H "Authorization: Bearer sk-stargaite-..." -d '{"model":"embed","input":"hi"}'
+./stargaite usage show --since 1h --by model
 ./stargaite backup backup.db
 ```
 
 The mock provider listens on `127.0.0.1:4010`; `serve` puts the data plane on `127.0.0.1:4000`, the admin API on
 `127.0.0.1:4001` and the store in `./data`, and the health check waits until it is up. The mock provider is billed per
 use: `models add` also creates the target `mock/mock` (with a warning that it has no prices yet), and `targets set`
-gives it a price in USD per million input and output tokens. `keys create` limits the key to 60 requests a minute and
-prints the client key once: paste it in place of `sk-stargaite-...` in the two `curl` calls. `models explain` shows what the alias would send, without calling
+gives it a price in USD per million input and output tokens. `targets add` declares a second model of the mock
+provider, `mock/mock-embed`, as an embeddings target priced per million input tokens, and `models add embed` makes it
+an alias. `keys create` limits the key to 60 requests a minute, allows it both aliases and
+prints the client key once: paste it in place of `sk-stargaite-...` in the three `curl` calls. `models explain` shows what the alias would send, without calling
 the provider: per target, the effort and output-cap layers, the list of changes, the URL, the headers without the
 credential and the body, which for the minimal request it explains by default are the bytes the chat completion below
 sends (`--body <file>` explains a request of your own; `--json` gives each body's exact bytes). `telemetry set` points
 the OTLP exporter at the mock provider, which also accepts trace exports, and `telemetry test` sends it one span and
 prints `credentials: resolved · reachable: yes · authorized: yes · span: accepted (200) · trace_id=…` (see
 [Telemetry](#telemetry)). The first `curl` lists
-the alias `fast`; the second sends a chat completion to it and gets the mock provider's answer, with the response
-headers `x-stargaite-request-id`, `x-stargaite-trace-id` and `x-stargaite-target` (add `-i` to `curl` to see them),
-and its span reaches the mock provider within the 2 s of a batch.
-`usage show` then sums the last hour from the store: one request, the tokens the mock provider reported (1 input, 2
-output) and their cost at the target's prices, 0.000005 USD. `backup` writes a checked copy of the store, that
-request included, to `backup.db` with mode `0600` and prints its size (see [Backup and restore](#backup-and-restore)).
+the aliases `embed` and `fast`; the second sends a chat completion to `fast` and gets the mock provider's answer, with
+the response headers `x-stargaite-request-id`, `x-stargaite-trace-id` and `x-stargaite-target` (add `-i` to `curl` to
+see them), and its span reaches the mock provider within the 2 s of a batch; the third sends an embeddings request to
+`embed` and gets the mock provider's vector, byte for byte.
+`usage show --by model` then sums the last hour from the store per alias: for `fast` one request, the tokens the mock
+provider reported (1 input, 2 output) and their cost at the target's prices, 0.000005 USD; for `embed` one request,
+1 input token, 0 output and 0.000001 USD. `backup` writes a checked copy of the store, both
+requests included, to `backup.db` with mode `0600` and prints its size (see [Backup and restore](#backup-and-restore)).
 Both processes log JSON lines to the terminal; `kill %1 %2` stops them.
 `./stargaite --help` lists every command, and each one accepts `--json`, never prompts, and exits `0` on success, `1`
 on failure and `2` on wrong usage; `remove`, `keys revoke` and `apply --prune` (unless `--dry-run`) need `--yes`.
@@ -205,6 +213,29 @@ use the Anthropic envelope, `{"type":"error","error":{"type":...,"message":"<cod
 the `x-stargaite-error-code` header. A target of the `openai` protocol is skipped, so an alias with no other answers
 `422 endpoint_not_supported`. `./stargaite models explain <alias> --endpoint messages` shows the bytes it would send.
 
+## Embeddings
+
+`POST /v1/embeddings` is the OpenAI Embeddings API, served by targets of kind `embeddings` on providers of the `openai`
+protocol, at the provider's `base_url` plus `/embeddings`: an OpenAI SDK works with its base URL set to
+`http://127.0.0.1:4000/v1`, a client key and an alias as the model. It has every protection of chat: the key and the
+alias, `max_body_bytes`, the limits, budgets and quotas, fallback and the circuit, records and spans. The known body
+members are `input`, `model`, `dimensions`, `encoding_format` and `user`; any other, `stream` included, is refused with
+`400 unknown_parameter` unless the alias has a rule for it (`models set <alias> --param input_type=forward`, for a
+provider field such as `input_type` or `output_dimension`). Only `model` is replaced by the upstream id and the
+alias's rules applied; no output cap or effort is ever sent, whatever the alias declares. The answer is relayed as the
+provider sent it, `float` or `base64` vectors alike. A record's input tokens are the provider's `usage.prompt_tokens`,
+else its `usage.total_tokens`, and its output tokens 0; an answer without `usage` is estimated from the bytes sent, so
+a priced embeddings target (`output_per_million=0`) always moves its budgets. A chat, anthropic or rerank target
+behind an embeddings alias is skipped, and an alias with no other answers `422 endpoint_not_supported`; `validate`
+warns about an alias none of whose targets can serve any endpoint.
+
+The OpenAI SDKs ask for `encoding_format: base64` when the caller sets none. A provider that refuses it is declared
+with `targets set <target> --unsupported-param encoding_format` and its aliases with
+`--param encoding_format=drop`, so the member is removed toward it and listed in `x-stargaite-params-changed`. Large
+batches can pass `max_response_bytes` (32 MiB by default): 2,048 inputs at 3,072 dimensions return 32 MiB of base64
+vectors alone, and several times more as floats, which answers `502 upstream_error` (the attempt's log line names the
+limit); raise it with `settings set --max-response-bytes <n>`, or send smaller batches.
+
 ## Resilience
 
 An alias lists up to three targets. A connection failure, a timeout, a `429` or a `5xx` from the provider moves the
@@ -316,7 +347,7 @@ and use `--admin-url https://<cert name>:4001`; a certificate from a public CA n
 ## Development
 
 `make ci` runs every check (format, vet, tidy, lint, vulnerability scan, four cross-builds, `go test -race ./...`,
-including `tests/e2e`) with Go 1.27 or later; `make ci-container` runs the same inside the Go image, and
+including `tests/e2e`) with Go 1.27.4 or later; `make ci-container` runs the same inside the Go image, and
 `make image-test` builds the image and runs it. No check needs a secret, and the tests use no network beyond loopback.
 `tests/contract` runs the per-target cases against a live provider only when `STARGAITE_CONTRACT_BASE_URL` and
 `STARGAITE_CONTRACT_API_KEY` are set (its package comment lists the variables); it costs tokens, and without them it

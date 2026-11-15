@@ -67,6 +67,12 @@ var defaults = map[string]string{
 	"/v1/traces": `{}`,
 }
 
+// embeddingsBase64 is the default embeddings reply to a body whose
+// encoding_format is "base64": the same vector, [0, 0.5, 1], as the
+// little-endian float32 bytes the OpenAI API encodes.
+const embeddingsBase64 = `{"object":"list","data":[{"object":"embedding","index":0,"embedding":"AAAAAAAAAD8AAIA/"}],"model":"mock",` +
+	`"usage":{"prompt_tokens":1,"total_tokens":1}}`
+
 // streams are the replies of an empty queue to a body with "stream": true,
 // by route: OpenAI chat chunks with a usage chunk (see UsageOnRequest) and [DONE];
 // the Anthropic Messages events.
@@ -97,7 +103,8 @@ func New() *Server { return &Server{} }
 // ServeHTTP records the request, then answers POST /chat/completions,
 // /embeddings, /v1/messages and /v1/traces; any other route gets 404 or 405 and leaves the
 // script untouched. With an empty queue, a body with "stream": true gets the
-// route's default stream, if it has one.
+// route's default stream, if it has one, and an embeddings body with
+// "encoding_format": "base64" its vector in base64.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	s.mu.Lock()
@@ -148,6 +155,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			reply(w, r, step, &cancelled)
 			return
+		}
+		var enc struct {
+			Format string `json:"encoding_format"`
+		}
+		if r.URL.Path == "/embeddings" && json.Unmarshal(body, &enc) == nil && enc.Format == "base64" {
+			def = embeddingsBase64
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, def)

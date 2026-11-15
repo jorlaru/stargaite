@@ -15,10 +15,16 @@ import (
 // e6658f14c9d9ea0760825f029cb82e7673f48fab, and spans carry no schemaUrl
 // (TEL-9). testdata/spans.json, the golden, records the same commit; a change
 // of a name or of the attribute set is a new schema version.
-const (
-	SchemaVersion = 1
-	operation     = "chat" // gen_ai.operation.name of both endpoints
-)
+const SchemaVersion = 1
+
+// operation is gen_ai.operation.name of endpoint ep and the first word of its
+// request span's name: embeddings, else chat (phase-4 design section 4).
+func operation(ep domain.Endpoint) string {
+	if ep == domain.EndpointEmbeddings {
+		return "embeddings"
+	}
+	return "chat"
+}
 
 // Context is the trace a request belongs to (TEL-6).
 type Context struct {
@@ -93,7 +99,7 @@ type Request struct {
 type Attempt struct {
 	Record   usage.Record
 	Provider string // gen_ai.provider.name
-	Host     string // of the provider's base_url
+	Host     string // of the URL the call went to
 	Port     int64
 	Dialect  string
 	Stripped bool
@@ -114,7 +120,7 @@ type Attempt struct {
 // Content, given only under the opt-in, goes on the request span alone
 // (TEL-8).
 func Build(r Request) []Span {
-	req := Span{Trace: r.Context.Trace, Parent: r.Context.Parent, Remote: r.Context.Remote, Name: operation, Kind: KindServer,
+	req := Span{Trace: r.Context.Trace, Parent: r.Context.Parent, Remote: r.Context.Remote, Name: operation(r.Endpoint), Kind: KindServer,
 		Start: r.Started, End: r.Ended, Failed: r.Code != "", Message: r.Message}
 	random(req.ID[:])
 	if r.Alias != "" {
@@ -191,7 +197,7 @@ func common(r Request, a *Attempt) []Attr {
 	attrs := []Attr{
 		{"stargaite.schema.version", int64(SchemaVersion)}, {"stargaite.version", r.Version}, {"stargaite.config.revision", r.Revision},
 		{"stargaite.key", r.Key}, {"langfuse.observation.metadata.stargaite_key", r.Key},
-		{"stargaite.endpoint", string(r.Endpoint)}, {"gen_ai.operation.name", operation},
+		{"stargaite.endpoint", string(r.Endpoint)}, {"gen_ai.operation.name", operation(r.Endpoint)},
 	}
 	if r.Alias != "" {
 		attrs = append(attrs, Attr{"stargaite.model", r.Alias}, Attr{"langfuse.observation.metadata.stargaite_model", r.Alias},

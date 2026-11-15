@@ -3,10 +3,13 @@ package mockprovider
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
 	"maps"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -121,6 +124,37 @@ func TestDefaultStreams(t *testing.T) {
 	}
 	if status, header, _ := send(t, srv, http.MethodPost, "/embeddings", nil, []byte(`{"stream":true}`)); status != http.StatusOK || header.Get("Content-Type") != "application/json" {
 		t.Errorf("embeddings: %d %v", status, header)
+	}
+}
+
+// An empty queue answers embeddings in float, and in base64 to a body that
+// asks for it: the same vector and usage either way.
+func TestEmbeddingsEncoding(t *testing.T) {
+	srv := httptest.NewServer(New())
+	defer srv.Close()
+	for _, tt := range []struct{ body, want string }{
+		{`{"input":"hi"}`, defaults["/embeddings"]},
+		{`{"input":"hi","encoding_format":"float"}`, defaults["/embeddings"]},
+		{`{"input":"hi","encoding_format":"base64"}`, embeddingsBase64},
+	} {
+		if status, _, got := send(t, srv, http.MethodPost, "/embeddings", nil, []byte(tt.body)); status != http.StatusOK || string(got) != tt.want {
+			t.Errorf("%s: %d %s", tt.body, status, got)
+		}
+	}
+	var reply struct {
+		Data []struct{ Embedding string }
+	}
+	if err := json.Unmarshal([]byte(embeddingsBase64), &reply); err != nil || len(reply.Data) != 1 {
+		t.Fatalf("%s: %v", embeddingsBase64, err)
+	}
+	raw, err := base64.StdEncoding.DecodeString(reply.Data[0].Embedding)
+	if err != nil || len(raw) != 12 {
+		t.Fatalf("%q: %v", raw, err)
+	}
+	for i, want := range []float32{0, 0.5, 1} {
+		if got := math.Float32frombits(binary.LittleEndian.Uint32(raw[4*i:])); got != want {
+			t.Errorf("element %d: %v, want %v", i, got, want)
+		}
 	}
 }
 

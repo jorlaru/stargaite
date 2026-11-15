@@ -93,6 +93,7 @@ func Handler(d Deps) http.Handler {
 	mux.HandleFunc("GET /v1/models", h.models)
 	mux.HandleFunc("POST /v1/chat/completions", h.infer(domain.EndpointChat))
 	mux.HandleFunc("POST /v1/messages", h.infer(domain.EndpointMessages))
+	mux.HandleFunc("POST /v1/embeddings", h.infer(domain.EndpointEmbeddings))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(domain.RequestIDHeader, rand.Text())
 		mux.ServeHTTP(w, r)

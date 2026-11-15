@@ -158,3 +158,63 @@ func TestCost(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// TestObserveUsage is an embeddings answer as each provider shapes it, base64
+// and float alike (phase-4 design section 4): the body comes back unchanged;
+// input is usage.prompt_tokens, else usage.total_tokens, output 0, reasoning
+// nil, no usage without either integer; the cost is read at cost_report.path,
+// also outside usage; the vectors are never read, so a repeat inside them is
+// no error, while a body that is not an object or repeats a key in an object
+// read is.
+func TestObserveUsage(t *testing.T) {
+	const vector = `[{"object":"embedding","index":0,"embedding":[0.0023,-0.0093,1e-5]}]`
+	const b64 = `[{"object":"embedding","index":0,"embedding":"AAAAAAAAAD8AAIA/"}]`
+	cost := func(v float64) *float64 { return &v }
+	in := func(n int64) *domain.Usage { return &domain.Usage{Input: n} }
+	openrouter := &domain.Provider{CostReport: &domain.CostReport{Path: "usage.cost", USDPerUnit: 1}}
+	nested := &domain.Provider{CostReport: &domain.CostReport{Path: "billing.detail.cost", USDPerUnit: 0.5}}
+	for _, tt := range []struct {
+		name string
+		p    *domain.Provider
+		body string
+		want domain.Observed
+	}{
+		{"OpenAI, float", &domain.Provider{}, `{"object":"list","data":` + vector + `,"model":"text-embedding-3-small","usage":{"prompt_tokens":8,"total_tokens":8}}`,
+			domain.Observed{ResponseModel: "text-embedding-3-small", Usage: in(8)}},
+		{"OpenAI, base64", &domain.Provider{}, `{"object":"list","data":` + b64 + `,"model":"text-embedding-3-small","usage":{"prompt_tokens":8,"total_tokens":8}}`,
+			domain.Observed{ResponseModel: "text-embedding-3-small", Usage: in(8)}},
+		{"Mistral", &domain.Provider{}, `{"id":"e1","object":"list","data":` + vector + `,"model":"mistral-embed","usage":{"prompt_tokens":15,"total_tokens":15,"completion_tokens":0}}`,
+			domain.Observed{ResponseModel: "mistral-embed", Usage: in(15)}},
+		{"Voyage, total only", &domain.Provider{}, `{"object":"list","data":` + vector + `,"model":"voyage-3.5","usage":{"total_tokens":10}}`,
+			domain.Observed{ResponseModel: "voyage-3.5", Usage: in(10)}},
+		{"Jina", &domain.Provider{}, `{"model":"jina-embeddings-v3","object":"list","usage":{"total_tokens":12,"prompt_tokens":11},"data":` + b64 + `}`,
+			domain.Observed{ResponseModel: "jina-embeddings-v3", Usage: in(11)}},
+		{"Jina, total only", &domain.Provider{}, `{"model":"jina-clip-v2","object":"list","usage":{"total_tokens":12},"data":` + vector + `}`,
+			domain.Observed{ResponseModel: "jina-clip-v2", Usage: in(12)}},
+		{"vLLM", &domain.Provider{}, `{"id":"embd-1","object":"list","created":1790000000,"model":"BAAI/bge-m3","data":` + vector +
+			`,"usage":{"prompt_tokens":5,"total_tokens":5,"completion_tokens":0,"prompt_tokens_details":null}}`,
+			domain.Observed{ResponseModel: "BAAI/bge-m3", Usage: in(5)}},
+		{"OpenRouter, with its cost", openrouter, `{"object":"list","data":` + b64 + `,"model":"openai/text-embedding-3-small","usage":{"prompt_tokens":4,"total_tokens":4,"cost":0.00000008}}`,
+			domain.Observed{ResponseModel: "openai/text-embedding-3-small", Usage: in(4), Cost: cost(0.00000008)}},
+		{"a cost path outside usage", nested, `{"data":` + vector + `,"billing":{"detail":{"cost":2}},"usage":{"total_tokens":3}}`,
+			domain.Observed{Usage: in(3), Cost: cost(1)}},
+		{"prompt_tokens null", &domain.Provider{}, `{"usage":{"prompt_tokens":null,"total_tokens":7}}`, domain.Observed{Usage: in(7)}},
+		{"a usage object without tokens", &domain.Provider{}, `{"usage":{"prompt_tokens":"8","completion_tokens":0}}`, domain.Observed{}},
+		{"usage not an object", &domain.Provider{}, `{"usage":"8"}`, domain.Observed{}},
+		{"zero reported", &domain.Provider{}, `{"usage":{"prompt_tokens":0,"total_tokens":0}}`, domain.Observed{Usage: in(0)}},
+		{"usage null", &domain.Provider{}, `{"data":` + vector + `,"usage":null}`, domain.Observed{}},
+		{"no usage", openrouter, `{"model":"m","data":` + vector + `}`, domain.Observed{ResponseModel: "m"}},
+		{"a repeat inside the vectors", &domain.Provider{}, `{"data":[{"index":0,"index":1}],"usage":{"total_tokens":1}}`, domain.Observed{Usage: in(1)}},
+	} {
+		body, got, err := ObserveUsage(tt.p, []byte(tt.body))
+		if err != nil || !reflect.DeepEqual(got, tt.want) || string(body) != tt.body {
+			t.Errorf("%s: %+v (usage %+v, cost %v), error %v", tt.name, got, got.Usage, got.Cost, err)
+		}
+	}
+	for _, body := range []string{``, `[]`, `[{"object":"embedding"}]`, `{"usage":`, `not json`, `{"model":"a","model":"b"}`,
+		`{"usage":{"total_tokens":1,"total_tokens":2}}`, `{"billing":{"detail":{"cost":1,"cost":2}}}`} {
+		if _, _, err := ObserveUsage(nested, []byte(body)); err == nil {
+			t.Errorf("%q: no error", body)
+		}
+	}
+}

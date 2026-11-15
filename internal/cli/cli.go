@@ -71,6 +71,7 @@ type command struct {
 	request  func(in input) (method, path string, body any)           // the one admin call
 	local    func(ctx context.Context, in input, out io.Writer) error // runs without a server; errRemote hands over to request
 	render   func(out io.Writer, answer []byte) error                 // prints a 2xx answer without --json; nil is the generic renderer
+	save     func(in input, resp *http.Response, out io.Writer) error // takes a 2xx answer's body itself, sent without the client timeout; nil reads it
 }
 
 // yamlFile is a request body: the file at that path, sent as YAML.
@@ -298,6 +299,9 @@ var commands = []command{
 			q := url.Values{"dry_run": {strconv.FormatBool(*in.bools["dry-run"])}, "prune": {strconv.FormatBool(*in.bools["prune"])}}
 			return http.MethodPost, "/apply?" + q.Encode(), yamlFile(*in.flags["f"])
 		}},
+	{words: []string{"backup"}, args: []string{"file"}, local: backupFile, save: saveBackup, request: func(input) (string, string, any) {
+		return http.MethodPost, "/backup", nil
+	}},
 }
 
 var (
@@ -390,7 +394,7 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 		return exitUsage
 	}
 	method, path, body := cmd.request(in)
-	return call(ctx, name, in, method, path, body, cmd.render, stdout, stderr)
+	return call(ctx, name, in, method, path, body, cmd.render, cmd.save, stdout, stderr)
 }
 
 // match returns the command whose words lead args, and the arguments after them.

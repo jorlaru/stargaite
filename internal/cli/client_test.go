@@ -45,7 +45,7 @@ func runMain(vars map[string]string, args ...string) run {
 // leaving the test. It returns the environment that points the CLI at it.
 func adminServer(t *testing.T) map[string]string {
 	t.Helper()
-	st, err := store.Open(context.Background(), t.TempDir())
+	st, err := store.Open(context.Background(), t.TempDir(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +76,7 @@ func adminServer(t *testing.T) map[string]string {
 		spans.Close(ctx)
 	})
 	srv := httptest.NewServer(admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(testKey)), Log: log, Usage: st.Read(),
-		Admission: admission.New(cfg.Now, records.Seeder(st.Read(), log)), Spans: spans}))
+		Admission: admission.New(cfg.Now, records.Seeder(st.Read(), log)), Spans: spans, Backup: st.Backup}))
 	t.Cleanup(srv.Close)
 	return map[string]string{"STARGAITE_ADMIN_URL": srv.URL, "STARGAITE_ADMIN_KEY": testKey}
 }
@@ -109,6 +109,7 @@ func TestCommandWalk(t *testing.T) {
 	example := "../../config.example.yaml"
 	invalid := writeFile(t, "version: 2\n")
 	bodies := t.TempDir()
+	backups := t.TempDir()
 	for _, n := range []string{"1", "2"} {
 		body := `{"model":"m` + n + `","messages":[{"role":"user","content":"hi"}],"temperature":0.5}`
 		if err := os.WriteFile(filepath.Join(bodies, "body"+n+".json"), []byte(body), 0o600); err != nil {
@@ -188,6 +189,7 @@ func TestCommandWalk(t *testing.T) {
 			{[]string{"-f", example, "--dry-run"}, 0}, {[]string{"-f", example}, 0}, {[]string{"-f", invalid}, 1},
 			{[]string{"-f", example, "--prune", "--yes"}, 0}, {[]string{"-f", example, "--prune", "--dry-run"}, 0},
 		},
+		"backup": {{[]string{filepath.Join(backups, "walk@.db")}, 0}, {[]string{filepath.Join(backups, "missing", "walk@.db")}, 1}},
 	}
 	vars := adminServer(t)
 	for _, c := range commands {
@@ -518,6 +520,9 @@ func TestFailures(t *testing.T) {
 func TestClientIgnoresProxyVariables(t *testing.T) {
 	if tr, ok := client.Transport.(*http.Transport); !ok || tr.Proxy != nil {
 		t.Error("the admin client has a proxy function")
+	}
+	if untimed.Transport != client.Transport || untimed.CheckRedirect == nil || untimed.Timeout != 0 {
+		t.Errorf("the untimed client: %+v", untimed)
 	}
 }
 

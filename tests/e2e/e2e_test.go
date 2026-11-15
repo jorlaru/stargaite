@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -25,6 +26,7 @@ import (
 	"time"
 
 	"github.com/jorlaru/stargaite/tests/mockprovider"
+	_ "modernc.org/sqlite" // registers the "sqlite" driver
 )
 
 const (
@@ -50,7 +52,8 @@ var (
 // new key, usage show with the one request, its tokens and its price_table
 // cost (AC-33), telemetry test accepted by the mock as OTLP receiver, which
 // got the test span (AC-24), then the request span of the chat completion
-// with the key my-agent (AC-25), and nothing else, the key's parallel limit shown as 5 and exported as declared
+// with the key my-agent (AC-25), and nothing else, a backup with mode 0600
+// that opens with integrity_check ok and the record (ADR-018), the key's parallel limit shown as 5 and exported as declared
 // (LIM-7), a second serve on the same directory refused (AC-42), and the
 // same export, the same key and the same usage after a restart (RES-9). The guide's commands use
 // the default data directory and addresses; here the environment points them
@@ -68,6 +71,7 @@ func TestQuickStart(t *testing.T) {
 		shown    string // what usage show printed
 		tested   string // what telemetry test printed
 		trace    string // the trace id of the chat completion
+		backedUp bool   // the backup opened with integrity_check ok
 	)
 	cli := func(args ...string) string {
 		t.Helper()
@@ -104,6 +108,13 @@ func TestQuickStart(t *testing.T) {
 					break
 				}
 			}
+		case fields[0] == "./stargaite" && fields[1] == "backup" && srv != nil:
+			// The copy goes to a directory of the test's, not to the clone.
+			file := filepath.Join(t.TempDir(), fields[2])
+			if out := cli("backup", file); !strings.HasPrefix(out, file+": ") {
+				t.Errorf("%s printed %q", line, out)
+			}
+			backedUp = checkBackup(t, file)
 		case fields[0] == "./stargaite" && fields[1] == "telemetry" && fields[2] == "test" && srv != nil:
 			// AC-24: the mock, as OTLP receiver, accepts the test span.
 			if tested = cli(fields[1:]...); !acceptedLine.MatchString(tested) {
@@ -149,8 +160,8 @@ func TestQuickStart(t *testing.T) {
 			t.Fatalf("a quick start line this test does not run: %q", line)
 		}
 	}
-	if srv == nil || mock == nil || token == "" || !answered || shown == "" || tested == "" {
-		t.Fatalf("the quick start did not start the proxy and the mock provider, create a key, test the exporter, get an answer and show the usage")
+	if srv == nil || mock == nil || token == "" || !answered || shown == "" || tested == "" || !backedUp {
+		t.Fatalf("the quick start did not start the proxy and the mock provider, create a key, test the exporter, get an answer, show the usage and back up")
 	}
 	// The mock's usage, 1 input and 2 output tokens, at 1 and 2 USD per million;
 	// no length finish, no empty answer, an output median and p90 of 2 and no
@@ -312,6 +323,30 @@ func TestQuickStart(t *testing.T) {
 			t.Errorf("log line is not JSON or carries a key: %q", line)
 		}
 	}
+}
+
+// checkBackup reports whether the backup at file has mode 0600 and opens
+// read-only with integrity_check ok, an empty foreign_key_check and the one
+// usage record of the quick start (ADR-018).
+func checkBackup(t *testing.T, file string) bool {
+	t.Helper()
+	if info, err := os.Stat(file); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("the backup: %v, error %v", info, err)
+		return false
+	}
+	db, err := sql.Open("sqlite", "file:"+file+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	var integrity string
+	var violations, records int
+	if err := db.QueryRow("SELECT (SELECT integrity_check FROM pragma_integrity_check), (SELECT COUNT(*) FROM pragma_foreign_key_check), (SELECT COUNT(*) FROM usage)").
+		Scan(&integrity, &violations, &records); err != nil || integrity != "ok" || violations != 0 || records != 1 {
+		t.Errorf("the backup: integrity_check %q, %d foreign key violations, %d records, error %v", integrity, violations, records, err)
+		return false
+	}
+	return true
 }
 
 // requestSpan checks that an export holds the request span of the quick

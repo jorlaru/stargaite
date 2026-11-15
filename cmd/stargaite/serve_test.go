@@ -15,6 +15,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"maps"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -24,15 +27,19 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/jorlaru/stargaite/internal/admission"
 	"github.com/jorlaru/stargaite/internal/auth"
 	"github.com/jorlaru/stargaite/internal/cli"
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/store"
+	"github.com/jorlaru/stargaite/internal/usage"
 	"github.com/jorlaru/stargaite/tests/mockprovider"
 )
 
@@ -193,7 +200,7 @@ func TestServe(t *testing.T) {
 func TestServeLoadsTheConfiguration(t *testing.T) {
 	const planted = "sk-PLANTED-credential"
 	dir := t.TempDir()
-	st, err := store.Open(context.Background(), dir)
+	st, err := store.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +243,7 @@ func TestServeLoadsTheConfiguration(t *testing.T) {
 	}
 
 	// A row this binary cannot decode stops the start, and the lock is released.
-	if st, err = store.Open(context.Background(), dir); err != nil {
+	if st, err = store.Open(context.Background(), dir, slog.New(slog.DiscardHandler)); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.Write(context.Background(), func(tx *sql.Tx) error {
@@ -256,7 +263,7 @@ func TestServeLoadsTheConfiguration(t *testing.T) {
 	if err := json.Unmarshal(stderr.Bytes(), &line); err != nil || line.Msg != "configuration failed" || !strings.Contains(line.Error, `provider q: unknown member "/colour"`) {
 		t.Errorf("log %q: %+v, error %v", &stderr, line, err)
 	}
-	if st, err = store.Open(context.Background(), dir); err != nil {
+	if st, err = store.Open(context.Background(), dir, slog.New(slog.DiscardHandler)); err != nil {
 		t.Errorf("the lock was not released: %v", err)
 	} else {
 		_ = st.Close()
@@ -321,7 +328,7 @@ func TestServeDeadlines(t *testing.T) {
 func seed(t *testing.T, providers map[string]string) (dir, token string) {
 	t.Helper()
 	dir = t.TempDir()
-	st, err := store.Open(context.Background(), dir)
+	st, err := store.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -506,7 +513,7 @@ func TestServeDrain(t *testing.T) {
 		t.Errorf("exit %d; log %s", code, log)
 	}
 
-	st, err := store.Open(context.Background(), dir)
+	st, err := store.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -572,53 +579,48 @@ func TestServeLostRecords(t *testing.T) {
 	}
 }
 
-// TestServeKilled is ADR-016 and RES-9 through serve: serve runs as a
-// process of its own, commits the records of three priced requests, which
-// exhaust the key's never budget and the alias's monthly one, and of two
-// requests that exhaust a subscription's 1h window, and is killed with
-// SIGKILL; serve then starts again on the same data directory, whose lock
-// the kernel released: the key still gets 402, and once its budget is
-// removed the alias's still answers 402, and the plan's alias 429
-// quota_exceeded with Retry-After, before any provider call; usage show and
-// the store hold the five records.
-func TestServeKilled(t *testing.T) {
-	mock := mockprovider.New()
-	srv := httptest.NewServer(mock)
-	t.Cleanup(srv.Close)
-	dir, token := seed(t, map[string]string{"m": srv.URL, "q": srv.URL})
-	{
-		st, err := store.Open(context.Background(), dir)
-		if err != nil {
-			t.Fatal(err)
-		}
-		cfg, err := config.Open(context.Background(), st, func() config.Env { return config.Env{Lookup: func(string) (string, bool) { return "", false }} }, time.Now)
-		if err != nil {
-			t.Fatal(err)
-		}
-		// Each call costs 0.03 USD: the mock's 1 input and 2 output tokens.
-		price, limit := 10000.0, 0.08
-		if _, err := cfg.Commit(context.Background(), config.Change{Summary: "budgets", Mutate: func(s *config.State) (map[string]string, error) {
-			p := s.Doc.Providers["m"]
-			p.Billing = domain.BillingPayPerUse
-			s.Doc.Providers["m"] = p
-			s.Doc.Targets["m/m"] = domain.Target{Kind: domain.KindChat, Pricing: &domain.Pricing{InputPerMillion: &price, OutputPerMillion: &price, AsOf: "2026-11-01"}}
-			k := s.Doc.Keys["agent"]
-			k.Budget = &domain.Budget{LimitUSD: &limit, ResetInterval: domain.ResetNever}
-			s.Doc.Keys["agent"] = k
-			m := s.Doc.Models["m"]
-			m.Budget = &domain.Budget{LimitUSD: &limit, ResetInterval: domain.ResetMonthly}
-			s.Doc.Models["m"] = m
-			q := s.Doc.Providers["q"]
-			q.Billing, q.Quota = domain.BillingSubscription, []domain.QuotaWindow{{Window: "1h", Requests: 2}}
-			s.Doc.Providers["q"] = q
-			return nil, nil
-		}}); err != nil {
-			t.Fatal(err)
-		}
-		if err := st.Close(); err != nil {
-			t.Fatal(err)
-		}
+// budgets prices the provider m of a seeded directory at 0.01 USD per
+// token, so each mock call costs 0.03 USD (1 input and 2 output tokens), gives
+// the key agent a never budget and the alias m a monthly one of limit, and
+// makes the provider q a subscription of 2 requests an hour.
+func budgets(t *testing.T, dir string, limit float64) {
+	t.Helper()
+	st, err := store.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
 	}
+	cfg, err := config.Open(context.Background(), st, func() config.Env { return config.Env{Lookup: func(string) (string, bool) { return "", false }} }, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	price := 10000.0
+	if _, err := cfg.Commit(context.Background(), config.Change{Summary: "budgets", Mutate: func(s *config.State) (map[string]string, error) {
+		p := s.Doc.Providers["m"]
+		p.Billing = domain.BillingPayPerUse
+		s.Doc.Providers["m"] = p
+		s.Doc.Targets["m/m"] = domain.Target{Kind: domain.KindChat, Pricing: &domain.Pricing{InputPerMillion: &price, OutputPerMillion: &price, AsOf: "2026-11-01"}}
+		k := s.Doc.Keys["agent"]
+		k.Budget = &domain.Budget{LimitUSD: &limit, ResetInterval: domain.ResetNever}
+		s.Doc.Keys["agent"] = k
+		m := s.Doc.Models["m"]
+		m.Budget = &domain.Budget{LimitUSD: &limit, ResetInterval: domain.ResetMonthly}
+		s.Doc.Models["m"] = m
+		q := s.Doc.Providers["q"]
+		q.Billing, q.Quota = domain.BillingSubscription, []domain.QuotaWindow{{Window: "1h", Requests: 2}}
+		s.Doc.Providers["q"] = q
+		return nil, nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// spawn runs serve on dir as a process of its own, as TestMain allows, and
+// returns its bound addresses; kill sends it SIGKILL and waits for its end.
+func spawn(t *testing.T, dir string) (data, adminAddr string, kill func()) {
+	t.Helper()
 	cmd := exec.Command(os.Args[0], "serve", "--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0")
 	logs, stderr := io.Pipe()
 	cmd.Env, cmd.Stderr = []string{"STARGAITE_TEST_RUN=1", "STARGAITE_ADMIN_KEY=" + adminKey}, stderr
@@ -628,66 +630,227 @@ func TestServeKilled(t *testing.T) {
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait(); _ = stderr.Close() }()
 	t.Cleanup(func() { _ = cmd.Process.Kill() })
-	addr := make(chan string, 1)
+	addrs := make(chan [2]string, 1)
 	go func() {
 		for lines := bufio.NewScanner(logs); lines.Scan(); { // read to the end, so serve never blocks on its log
 			var line struct {
-				Msg      string
-				DataAddr string `json:"data_addr"`
+				Msg       string
+				DataAddr  string `json:"data_addr"`
+				AdminAddr string `json:"admin_addr"`
 			}
 			if json.Unmarshal(lines.Bytes(), &line) == nil && line.Msg == "ready" {
-				addr <- line.DataAddr
+				addrs <- [2]string{line.DataAddr, line.AdminAddr}
 			}
 		}
 	}()
-	var data string
 	select {
-	case data = <-addr:
+	case a := <-addrs:
+		data, adminAddr = a[0], a[1]
 	case err := <-exited:
 		t.Fatalf("serve exited before it was ready: %v", err)
 	case <-time.After(30 * time.Second):
 		t.Fatal("serve was not ready within 30 s")
 	}
-	for _, alias := range []string{"m", "m", "m", "q", "q"} {
-		req, err := http.NewRequest(http.MethodPost, "http://"+data+"/v1/chat/completions", strings.NewReader(`{"model":"`+alias+`","messages":[{"role":"user","content":"hi"}]}`))
-		if err != nil {
+	return data, adminAddr, func() {
+		t.Helper()
+		if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
 			t.Fatal(err)
 		}
-		req.Header.Set("Authorization", "Bearer "+token)
-		resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status %d", resp.StatusCode)
+		if err := <-exited; err == nil || !strings.Contains(err.Error(), "killed") {
+			t.Fatalf("serve after SIGKILL: %v", err)
 		}
 	}
-	// Committed: another connection reads the five rows.
+}
+
+// chat sends one chat completion to alias with token and requires a 200.
+func chat(t *testing.T, data, token, alias string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, "http://"+data+"/v1/chat/completions", strings.NewReader(`{"model":"`+alias+`","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+}
+
+// committed waits until another connection reads n usage rows in dir.
+func committed(t *testing.T, dir string, n int) {
+	t.Helper()
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "stargaite.db")+"?_busy_timeout=5000")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = db.Close() }()
 	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(10 * time.Millisecond) {
-		var n int
-		if err := db.QueryRow("SELECT COUNT(*) FROM usage").Scan(&n); err != nil {
+		var got int
+		if err := db.QueryRow("SELECT COUNT(*) FROM usage").Scan(&got); err != nil {
 			t.Fatal(err)
 		}
-		if n == 5 {
-			break
+		if got == n {
+			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%d records committed after 5 s", n)
+			t.Fatalf("%d records committed after 5 s, want %d", got, n)
 		}
+	}
+}
+
+// checkIntegrity requires integrity_check ok and an empty foreign_key_check.
+func checkIntegrity(t *testing.T, db *sql.DB) {
+	t.Helper()
+	var result string
+	if err := db.QueryRow("PRAGMA integrity_check").Scan(&result); err != nil || result != "ok" {
+		t.Errorf("integrity_check %q, error %v", result, err)
+	}
+	if got := dump(t, db, "PRAGMA foreign_key_check"); len(got) != 0 {
+		t.Errorf("foreign_key_check %v", got)
+	}
+}
+
+// dump returns the rows of query, each as one line of text.
+func dump(t *testing.T, db *sql.DB, query string) []string {
+	t.Helper()
+	rows, err := db.Query(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for rows.Next() {
+		values := make([]any, len(cols))
+		for i := range values {
+			values[i] = new(any)
+		}
+		if err := rows.Scan(values...); err != nil {
+			t.Fatal(err)
+		}
+		line := make([]string, len(values))
+		for i, v := range values {
+			line[i] = fmt.Sprintf("%v", *v.(*any))
+		}
+		out = append(out, strings.Join(line, "|"))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// copies lists the server's own backup copies in dir.
+func copies(t *testing.T, dir string) []string {
+	t.Helper()
+	names, err := filepath.Glob(filepath.Join(dir, ".stargaite-backup-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return names
+}
+
+// TestServeKilled is ADR-016 and RES-9 through serve: serve runs as a
+// process of its own, commits the records of three priced requests, which
+// exhaust the key's never budget and the alias's monthly one, and of two
+// requests that exhaust a subscription's 1h window, and is killed with
+// SIGKILL while it streams a backup whose response headers have reached the
+// CLI; the CLI then exits 1 and leaves neither its file nor its part. serve
+// starts again on the same data directory, whose lock the kernel released:
+// the key still gets 402, and once its budget is removed the alias's still
+// answers 402, and the plan's alias 429 quota_exceeded with Retry-After,
+// before any provider call; usage show and the store hold the five records,
+// and the store passes integrity_check.
+func TestServeKilled(t *testing.T) {
+	mock := mockprovider.New()
+	srv := httptest.NewServer(mock)
+	t.Cleanup(srv.Close)
+	dir, token := seed(t, map[string]string{"m": srv.URL, "q": srv.URL})
+	budgets(t, dir, 0.08)
+	// 24 MiB, more than the socket buffers between serve and the CLI hold:
+	// serve is still streaming the copy when it is killed.
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "stargaite.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE filler (b BLOB); INSERT INTO filler VALUES (zeroblob(24 << 20))"); err != nil {
+		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
-		t.Fatal(err)
+	data, adminAddr, kill := spawn(t, dir)
+	for _, alias := range []string{"m", "m", "m", "q", "q"} {
+		chat(t, data, token, alias)
 	}
-	if err := <-exited; err == nil || !strings.Contains(err.Error(), "killed") {
-		t.Fatalf("serve after SIGKILL: %v", err)
+	committed(t, dir, 5)
+
+	// Between the CLI and serve, a proxy passes the response headers and
+	// the first 4 KiB on at once, and holds the rest until serve is killed.
+	killed := make(chan struct{})
+	// Set only by a real kill: a cleanup after an early Fatal also closes
+	// killed while serve is alive, and the rest of the copy then arrives.
+	var wasKilled atomic.Bool
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, "http://"+adminAddr+r.URL.RequestURI(), nil)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		req.Header = r.Header.Clone()
+		resp, err := (&http.Transport{}).RoundTrip(req)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		maps.Copy(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.CopyN(w, resp.Body, 4096)
+		w.(http.Flusher).Flush()
+		<-killed
+		if _, err := io.Copy(io.Discard, resp.Body); err == nil && wasKilled.Load() {
+			t.Error("the whole copy arrived although serve was killed")
+		}
+		panic(http.ErrAbortHandler) // the CLI's connection is cut as serve's was
+	}))
+	t.Cleanup(proxy.Close)
+	// Run before proxy.Close (cleanups run last first), so a Fatal below
+	// does not leave the handler, and so the test, blocked.
+	release := sync.OnceFunc(func() { close(killed) })
+	t.Cleanup(release)
+	file := filepath.Join(t.TempDir(), "killed.db")
+	backedUp := make(chan int, 1)
+	var cliOut, cliErr bytes.Buffer
+	go func() {
+		backedUp <- cli.Main([]string{"backup", file, "--admin-url", proxy.URL}, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), &cliOut, &cliErr)
+	}()
+	// The CLI creates its part once it has the response headers.
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		if _, err := os.Stat(file + ".part"); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the CLI did not start writing the backup within 10 s")
+		}
+	}
+	kill()
+	wasKilled.Store(true)
+	release()
+	if code := <-backedUp; code != 1 || !strings.Contains(cliErr.String(), "the backup was not written") {
+		t.Errorf("backup cut by the kill: exit %d, stdout %q, stderr %q", code, &cliOut, &cliErr)
+	}
+	for _, name := range []string{file, file + ".part"} {
+		if _, err := os.Lstat(name); !os.IsNotExist(err) {
+			t.Errorf("%s is there after the cut backup: %v", name, err)
+		}
 	}
 
 	ready, stop := start(t, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), "--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0")
@@ -750,7 +913,7 @@ func TestServeKilled(t *testing.T) {
 	if code, log := stop(); code != 0 {
 		t.Errorf("exit %d; log %s", code, log)
 	}
-	st, err := store.Open(context.Background(), dir)
+	st, err := store.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -759,6 +922,160 @@ func TestServeKilled(t *testing.T) {
 	if err := st.Read().QueryRow("SELECT (SELECT COUNT(*) FROM usage), (SELECT SUM(requests) FROM usage_daily)").Scan(&records, &daily); err != nil ||
 		records != 5 || daily != 5 {
 		t.Errorf("%d records, usage_daily counts %d, error %v", records, daily, err)
+	}
+	checkIntegrity(t, st.Read())
+	if left := copies(t, dir); len(left) != 0 {
+		t.Errorf("copies left in the data directory: %v", left)
+	}
+}
+
+// TestBackupRestore is AC-50 and OPS-7: serve commits traffic, the CLI takes
+// a backup, more traffic follows, and serve is killed with SIGKILL, leaving a
+// -wal. The README's procedure (stargaite.db, -wal and -shm moved aside
+// together, the backup copied in as stargaite.db with mode 0600) and a start
+// give a store whose records, daily sums and budget totals are the backup's,
+// with no row written after it, whose usage_daily equals the GROUP BY over
+// usage, which passes integrity_check, whose budgets a fresh Restore reads as
+// it reads the backup's, and where a key token of before the backup still
+// authenticates. The negative control keeps the stale -wal beside the copy
+// and finds the newer rows.
+func TestBackupRestore(t *testing.T) {
+	srv := httptest.NewServer(mockprovider.New())
+	t.Cleanup(srv.Close)
+	dir, token := seed(t, map[string]string{"m": srv.URL, "q": srv.URL})
+	budgets(t, dir, 1000)
+	data, adminAddr, kill := spawn(t, dir)
+	for range 4 {
+		chat(t, data, token, "m")
+	}
+	committed(t, dir, 4)
+	backup := filepath.Join(t.TempDir(), "backup.db")
+	var stdout, stderr bytes.Buffer
+	if code := cli.Main([]string{"backup", backup, "--admin-url", "http://" + adminAddr}, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), &stdout, &stderr); code != 0 ||
+		!strings.HasPrefix(stdout.String(), backup+": ") {
+		t.Fatalf("backup: exit %d, stdout %q, stderr %q", code, &stdout, &stderr)
+	}
+	if info, err := os.Stat(backup); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("the backup: %v, error %v", info, err)
+	}
+	if left := copies(t, dir); len(left) != 0 {
+		t.Errorf("copies left in the data directory: %v", left)
+	}
+	for range 3 {
+		chat(t, data, token, "m")
+	}
+	committed(t, dir, 7)
+	kill()
+	if info, err := os.Stat(filepath.Join(dir, "stargaite.db-wal")); err != nil || info.Size() == 0 {
+		t.Fatalf("no -wal after the kill: %v, error %v", info, err)
+	}
+	copyFile := func(from, to string) {
+		t.Helper()
+		in, err := os.ReadFile(from)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(to, in, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The negative control: the stale -wal beside the copy is replayed onto
+	// it, so the store is no longer the backup. VACUUM INTO lays the pages
+	// out afresh (the indexes after the tables), so the frames meant for the
+	// live file land on other pages: the store holds the newer rows or, as
+	// measured with this layout, fails integrity_check.
+	control := t.TempDir()
+	copyFile(backup, filepath.Join(control, "stargaite.db"))
+	for _, suffix := range []string{"-wal", "-shm"} {
+		copyFile(filepath.Join(dir, "stargaite.db"+suffix), filepath.Join(control, "stargaite.db"+suffix))
+	}
+	if ctl, err := store.Open(context.Background(), control, slog.New(slog.DiscardHandler)); err == nil {
+		var integrity string
+		var records int
+		errIntegrity := ctl.Read().QueryRow("PRAGMA integrity_check").Scan(&integrity)
+		errRecords := ctl.Read().QueryRow("SELECT COUNT(*) FROM usage").Scan(&records)
+		if errIntegrity == nil && integrity == "ok" && errRecords == nil && records != 7 {
+			t.Errorf("the copy with the stale -wal passes integrity_check with %d records: the -wal was not replayed", records)
+		}
+		_ = ctl.Close()
+	}
+
+	// The procedure of the README.
+	aside := t.TempDir()
+	for _, name := range []string{"stargaite.db", "stargaite.db-wal", "stargaite.db-shm"} {
+		if err := os.Rename(filepath.Join(dir, name), filepath.Join(aside, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	copyFile(backup, filepath.Join(dir, "stargaite.db"))
+	ready, stop := start(t, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), "--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0")
+	if code, err := get(t, &http.Client{Timeout: 5 * time.Second}, "http://"+ready.DataAddr+"/v1/models", ""); err != nil || code != http.StatusUnauthorized {
+		t.Errorf("/v1/models without a key: %d, error %v", code, err)
+	}
+	req, err := http.NewRequest(http.MethodGet, "http://"+ready.DataAddr+"/v1/models", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("the key token of before the backup: status %d", resp.StatusCode)
+	}
+	if code, log := stop(); code != 0 {
+		t.Errorf("exit %d; log %s", code, log)
+	}
+
+	st, err := store.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	copied, err := sql.Open("sqlite", "file:"+backup+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = copied.Close() }()
+	for _, q := range []string{"SELECT * FROM usage ORDER BY id", "SELECT * FROM usage_daily ORDER BY 1, 2, 3, 4, 5",
+		"SELECT * FROM budget_totals ORDER BY 1, 2", "SELECT * FROM key_secrets ORDER BY 1"} {
+		if got, want := dump(t, st.Read(), q), dump(t, copied, q); fmt.Sprint(got) != fmt.Sprint(want) || len(want) == 0 {
+			t.Errorf("%s:\n%v\nthe backup's:\n%v", q, got, want)
+		}
+	}
+	if n := dump(t, st.Read(), "SELECT COUNT(*) FROM usage"); fmt.Sprint(n) != "[4]" {
+		t.Errorf("%v records after the restore, want the 4 of the backup", n)
+	}
+	daily := `SELECT day, key_name, model, target, billing, requests, errors, input_tokens, output_tokens, printf('%.9f', cost_usd) FROM usage_daily ORDER BY 1, 2, 3, 4, 5`
+	grouped := `SELECT strftime('%Y-%m-%d', completed_at / 1000, 'unixepoch'), key_name, model, target, billing, COUNT(*), COUNT(error_type),
+		SUM(input_tokens), SUM(output_tokens), printf('%.9f', SUM(COALESCE(cost_usd, 0))) FROM usage GROUP BY 1, 2, 3, 4, 5 ORDER BY 1, 2, 3, 4, 5`
+	if a, b := dump(t, st.Read(), daily), dump(t, st.Read(), grouped); fmt.Sprint(a) != fmt.Sprint(b) {
+		t.Errorf("usage_daily\n%v\nGROUP BY usage\n%v", a, b)
+	}
+	checkIntegrity(t, st.Read())
+	restored, fresh := admission.New(time.Now, nil), admission.New(time.Now, nil)
+	for state, db := range map[*admission.State]*sql.DB{restored: st.Read(), fresh: copied} {
+		if err := usage.Restore(context.Background(), db, state, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var since int64
+	if err := copied.QueryRow("SELECT since_revision FROM budget_totals WHERE scope_type = 'key' AND scope_name = 'agent'").Scan(&since); err != nil {
+		t.Fatal(err)
+	}
+	bs := []admission.Budget{{Scope: "key:agent", Spec: domain.Budget{ResetInterval: domain.ResetNever}, Since: since}}
+	for _, scope := range []string{"global", "key:agent", "model:m"} {
+		for _, r := range []string{domain.ResetDaily, domain.ResetMonthly} {
+			bs = append(bs, admission.Budget{Scope: scope, Spec: domain.Budget{ResetInterval: r}})
+		}
+	}
+	for _, b := range bs {
+		if got, want := restored.Spent(b), fresh.Spent(b); math.Abs(got-want) > 1e-9 || math.Abs(want-0.12) > 1e-9 {
+			t.Errorf("%s %s: %v restored, %v from the backup, want 0.12", b.Scope, b.Spec.ResetInterval, got, want)
+		}
 	}
 }
 
@@ -892,7 +1209,7 @@ func TestServeExitCodes(t *testing.T) {
 // 11), and the store is closed, so its lock is released.
 func TestServeRestoreFails(t *testing.T) {
 	dir := t.TempDir()
-	st, err := store.Open(context.Background(), dir)
+	st, err := store.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -910,7 +1227,7 @@ func TestServeRestoreFails(t *testing.T) {
 		!strings.Contains(stderr.String(), `"level":"ERROR","msg":"budgets not restored"`) || strings.Contains(stderr.String(), `"msg":"ready"`) {
 		t.Fatalf("exit %d; log %s", code, &stderr)
 	}
-	st, err = store.Open(context.Background(), dir)
+	st, err = store.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("the lock is still held: %v", err)
 	}
@@ -922,7 +1239,7 @@ func TestServeRestoreFails(t *testing.T) {
 // design section 11), with the cause logged, and the store is closed.
 func TestServeQuotaSeedFails(t *testing.T) {
 	dir, _ := seed(t, map[string]string{"q": "http://127.0.0.1:1"})
-	st, err := store.Open(context.Background(), dir)
+	st, err := store.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -956,7 +1273,7 @@ func TestServeQuotaSeedFails(t *testing.T) {
 		!strings.Contains(stderr.String(), `"level":"ERROR","msg":"quotas not restored"`) || strings.Contains(stderr.String(), `"msg":"ready"`) {
 		t.Fatalf("exit %d; log %s", code, &stderr)
 	}
-	st, err = store.Open(context.Background(), dir)
+	st, err = store.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatalf("the lock is still held: %v", err)
 	}

@@ -5,11 +5,14 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
+	"log/slog"
 	"maps"
 	"os"
 	"path"
@@ -26,7 +29,7 @@ var update = flag.Bool("update", false, "rewrite the golden files")
 
 func open(t *testing.T, dir string) *Store {
 	t.Helper()
-	s, err := Open(context.Background(), dir)
+	s, err := Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -432,7 +435,7 @@ func TestMigrations(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := Open(ctx, dir); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("schema version %d", head+1)) {
+			if _, err := Open(ctx, dir, slog.New(slog.DiscardHandler)); err == nil || !strings.Contains(err.Error(), fmt.Sprintf("schema version %d", head+1)) {
 				t.Errorf("a newer schema: error %v", err)
 			}
 			if got, err := os.ReadFile(file); err != nil || !bytes.Equal(got, newer) {
@@ -511,7 +514,7 @@ func TestMigrationFromVersion1(t *testing.T) {
 
 func TestReopenKeepsDataAndRefusesANewerSchema(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "data")
-	s, err := Open(context.Background(), dir)
+	s, err := Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,11 +547,11 @@ func TestReopenKeepsDataAndRefusesANewerSchema(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(context.Background(), dir); err == nil || !strings.Contains(err.Error(), "schema version 99") {
+	if _, err := Open(context.Background(), dir, slog.New(slog.DiscardHandler)); err == nil || !strings.Contains(err.Error(), "schema version 99") {
 		t.Errorf("a newer schema: error %v", err)
 	}
 	// The refused Open released the lock: the second try fails the same way.
-	if _, err := Open(context.Background(), dir); err == nil || !strings.Contains(err.Error(), "schema version 99") {
+	if _, err := Open(context.Background(), dir, slog.New(slog.DiscardHandler)); err == nil || !strings.Contains(err.Error(), "schema version 99") {
 		t.Errorf("second try: error %v", err)
 	}
 
@@ -563,18 +566,18 @@ func TestReopenKeepsDataAndRefusesANewerSchema(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(context.Background(), dir); err == nil || !strings.Contains(err.Error(), "schema version -1") {
+	if _, err := Open(context.Background(), dir, slog.New(slog.DiscardHandler)); err == nil || !strings.Contains(err.Error(), "schema version -1") {
 		t.Errorf("a negative schema version: error %v", err)
 	}
 }
 
 func TestLock(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(context.Background(), dir)
+	s, err := Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(context.Background(), dir); err == nil || !strings.Contains(err.Error(), "locked by another process") {
+	if _, err := Open(context.Background(), dir, slog.New(slog.DiscardHandler)); err == nil || !strings.Contains(err.Error(), "locked by another process") {
 		t.Errorf("second holder: error %v", err)
 	}
 	if err := s.Close(); err != nil {
@@ -657,7 +660,7 @@ func TestWrite(t *testing.T) {
 
 func TestCloseDrainsTheQueue(t *testing.T) {
 	dir := t.TempDir()
-	s, err := Open(context.Background(), dir)
+	s, err := Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -701,5 +704,298 @@ func TestCloseDrainsTheQueue(t *testing.T) {
 	var n int
 	if err := open(t, dir).Read().QueryRow("SELECT count(*) FROM settings WHERE name = 'last'").Scan(&n); err != nil || n != 1 {
 		t.Errorf("the queued write: %d rows, error %v", n, err)
+	}
+}
+
+// copyOf writes what f holds, from where it stands, to a new file and opens
+// that file read-only.
+func copyOf(t *testing.T, f *os.File) *sql.DB {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "copy.db")
+	out, err := os.Create(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(out, f); err != nil {
+		t.Fatal(err)
+	}
+	if err := out.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+file+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// copies lists the files of dir that Backup names.
+func copies(t *testing.T, dir string) []string {
+	t.Helper()
+	names, err := filepath.Glob(filepath.Join(dir, backupPrefix+"*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return names
+}
+
+// TestBackup is ADR-018 on the store: a copy taken under concurrent writes
+// holds whole transactions, comes back open at offset 0 and already
+// unlinked, and passes the checks; a copy that fails integrity_check,
+// foreign_key_check or the user_version, or whose context ends, is an error
+// and leaves no file; Close waits for a Backup in progress, and a Backup
+// after Close has begun gets ErrClosed; Open removes the leftover copies of a
+// crash, by exact name, and nothing else.
+func TestBackup(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	planted := filepath.Join(dir, backupPrefix+rand.Text())
+	kept := []string{filepath.Join(dir, "backup-x.db"), filepath.Join(dir, backupPrefix+rand.Text()[:25]),
+		filepath.Join(dir, backupPrefix+rand.Text()+".part"), filepath.Join(dir, backupPrefix+strings.ToLower(rand.Text())),
+		filepath.Join(dir, backupPrefix+rand.Text()+"-wal")}
+	for _, file := range append([]string{planted, planted + "-journal"}, kept...) {
+		if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A directory with a copy's name is not a copy.
+	keptDir := filepath.Join(dir, backupPrefix+rand.Text())
+	if err := os.Mkdir(keptDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	s, err := Open(ctx, dir, slog.New(slog.NewJSONHandler(&logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	for _, file := range []string{planted, planted + "-journal"} {
+		if _, err := os.Stat(file); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("the leftover %s is still there: %v", file, err)
+		}
+	}
+	for _, file := range append(kept, keptDir) {
+		if _, err := os.Stat(file); err != nil {
+			t.Errorf("Open removed %s: %v", file, err)
+		}
+	}
+	if lines := strings.Split(strings.TrimSpace(logs.String()), "\n"); len(lines) != 2 ||
+		!strings.Contains(lines[0], `"level":"WARN","msg":"leftover backup copy removed","path":"`+planted+`"`) ||
+		!strings.Contains(lines[1], `"level":"WARN","msg":"leftover backup copy removed","path":"`+planted+`-journal"`) {
+		t.Errorf("log %q", &logs)
+	}
+	for _, file := range append(kept, keptDir) {
+		if err := os.Remove(file); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Batches of 10 records, each one transaction with its usage_daily
+	// upsert, as the usage writer commits them.
+	stop := make(chan struct{})
+	written := make(chan error, 1)
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				written <- nil
+				return
+			default:
+			}
+			if err := s.Write(ctx, func(tx *sql.Tx) error {
+				for j := range 10 {
+					if _, err := tx.Exec(`INSERT INTO usage (id, request_id, endpoint, key_name, model, target, billing, status_code,
+						input_tokens, output_tokens, tokens_source, cost_usd, cost_source, started_at, completed_at, config_revision, proxy_version)
+						VALUES (?, ?, 'chat', 'k', 'm', 'p/m', 'pay_per_use', 200, 3, 5, 'provider', 0.25, 'price_table', 0, 0, 1, 'test')`,
+						fmt.Sprint(i, "-", j), fmt.Sprint(i)); err != nil {
+						return err
+					}
+					if _, err := tx.Exec(`INSERT INTO usage_daily (day, key_name, model, target, billing, requests, input_tokens, output_tokens, cost_usd)
+						VALUES ('1970-01-01', 'k', 'm', 'p/m', 'pay_per_use', 1, 3, 5, 0.25)
+						ON CONFLICT DO UPDATE SET requests = requests + 1, input_tokens = input_tokens + 3, output_tokens = output_tokens + 5,
+						cost_usd = cost_usd + 0.25`); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				written <- err
+				return
+			}
+		}
+	}()
+	last := 0 // records in the previous copy
+	for range 3 {
+		// At least one more batch committed before each copy.
+		for n := last; n <= last; time.Sleep(time.Millisecond) {
+			select {
+			case err := <-written:
+				t.Fatalf("the writes stopped: %v", err)
+			default:
+			}
+			if err := s.Read().QueryRow("SELECT COUNT(*) FROM usage").Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+		}
+		f, err := s.Backup(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(f.Name()); !errors.Is(err, fs.ErrNotExist) || !strings.HasPrefix(filepath.Base(f.Name()), backupPrefix) {
+			t.Errorf("the copy %s is not unlinked: %v", f.Name(), err)
+		}
+		header := make([]byte, 16)
+		if _, err := f.ReadAt(header, 0); err != nil || string(header) != "SQLite format 3\x00" {
+			t.Errorf("header %q, error %v", header, err)
+		}
+		db := copyOf(t, f)
+		_ = f.Close()
+		checkIntegrity(t, db)
+		var records, input, output int
+		var cost float64
+		if err := db.QueryRow("SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cost_usd), 0) FROM usage").
+			Scan(&records, &input, &output, &cost); err != nil {
+			t.Fatal(err)
+		}
+		var daily [3]int
+		var dailyCost float64
+		if err := db.QueryRow("SELECT COALESCE(SUM(requests), 0), COALESCE(SUM(input_tokens), 0), COALESCE(SUM(output_tokens), 0), COALESCE(SUM(cost_usd), 0) FROM usage_daily").
+			Scan(&daily[0], &daily[1], &daily[2], &dailyCost); err != nil {
+			t.Fatal(err)
+		}
+		if records <= last || records%10 != 0 || daily != [3]int{records, input, output} || dailyCost != cost {
+			t.Errorf("the copy holds %d records (%d, %d, %v) and usage_daily %v %v", records, input, output, cost, daily, dailyCost)
+		}
+		last = records
+		if v := pragma(t, db, "user_version"); v != "2" {
+			t.Errorf("the copy's user_version %s", v)
+		}
+	}
+	close(stop)
+	if err := <-written; err != nil {
+		t.Fatal(err)
+	}
+	if left := copies(t, dir); len(left) != 0 {
+		t.Errorf("files left: %v", left)
+	}
+
+	// A copy that fails a check, or whose context ends, is an error and is
+	// removed.
+	t.Cleanup(func() { vacuumed = nil })
+	for name, tc := range map[string]struct {
+		damage func(t *testing.T, path string, cancel context.CancelFunc)
+		want   string
+	}{
+		"page 2 overwritten": {func(t *testing.T, path string, _ context.CancelFunc) {
+			f, err := os.OpenFile(path, os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			header := make([]byte, 100)
+			if _, err := f.ReadAt(header, 0); err != nil {
+				t.Fatal(err)
+			}
+			size := int64(header[16])<<8 | int64(header[17])
+			if size == 1 {
+				size = 65536
+			}
+			if _, err := f.WriteAt(bytes.Repeat([]byte{0xA5}, int(size)), size); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}, "the copy failed its check"},
+		// Rows and an index that disagree, which only integrity_check sees.
+		"index redefined": {func(t *testing.T, path string, _ context.CancelFunc) {
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = db.Close() }()
+			if _, err := db.Exec("PRAGMA writable_schema = ON; UPDATE sqlite_schema SET sql = 'CREATE INDEX idx_usage_key_time ON usage(model, completed_at)' WHERE name = 'idx_usage_key_time'"); err != nil {
+				t.Fatal(err)
+			}
+		}, "integrity_check: row 1 missing from index idx_usage_key_time"},
+		"foreign key broken": {func(t *testing.T, path string, _ context.CancelFunc) {
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = db.Close() }()
+			if _, err := db.Exec("INSERT INTO targets (id, provider, upstream_model, spec, updated_at) VALUES ('p/m', 'nobody', 'm', '{}', 0)"); err != nil {
+				t.Fatal(err)
+			}
+		}, "foreign_key_check: targets rowid 1 refers to a missing providers row"},
+		"newer user_version": {func(t *testing.T, path string, _ context.CancelFunc) {
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = db.Close() }()
+			if _, err := db.Exec("PRAGMA user_version = 3"); err != nil {
+				t.Fatal(err)
+			}
+		}, "user_version 3; this binary's is 2"},
+		"context ended": {func(_ *testing.T, _ string, cancel context.CancelFunc) { cancel() }, "context canceled"},
+	} {
+		cancelled, cancel := context.WithCancel(ctx)
+		vacuumed = func(path string) { tc.damage(t, path, cancel) }
+		f, err := s.Backup(cancelled)
+		cancel()
+		if f != nil {
+			_ = f.Close()
+		}
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: error %v, want %q", name, err, tc.want)
+		}
+		if left := copies(t, dir); len(left) != 0 {
+			t.Errorf("%s: files left: %v", name, left)
+		}
+	}
+
+	// Close waits for a Backup in progress; one asked after Close has begun
+	// gets ErrClosed.
+	entered, release := make(chan struct{}), make(chan struct{})
+	vacuumed = func(string) { close(entered); <-release }
+	type result struct {
+		f   *os.File
+		err error
+	}
+	backedUp := make(chan result, 1)
+	go func() { f, err := s.Backup(ctx); backedUp <- result{f, err} }()
+	<-entered
+	closed := make(chan error, 1)
+	go func() { closed <- s.Close() }()
+	for {
+		s.mu.RLock()
+		c := s.closed
+		s.mu.RUnlock()
+		if c {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if f, err := s.Backup(ctx); !errors.Is(err, ErrClosed) || f != nil {
+		t.Errorf("a Backup after Close: %v", err)
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("Close returned while a Backup was running: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	r := <-backedUp
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	checkIntegrity(t, copyOf(t, r.f))
+	_ = r.f.Close()
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	if left := copies(t, dir); len(left) != 0 {
+		t.Errorf("files left: %v", left)
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -43,6 +44,11 @@ const (
 	lookupTimeout = 30 * time.Second
 )
 
+// backupWait is the write deadline of a backup, which replaces the
+// listener's write timeout: the copy and its stream must end within it.
+// Tests lower it.
+var backupWait = 15 * time.Minute
+
 type server struct {
 	cfg     *config.Service
 	keyHash [32]byte
@@ -50,6 +56,7 @@ type server struct {
 	usage   *sql.DB
 	limits  *admission.State
 	spans   *telemetry.Exporter
+	backup  func(ctx context.Context) (*os.File, error)
 
 	mu        sync.Mutex // guards the two fields below
 	refusedAt time.Time  // when the last refusal line was logged
@@ -101,6 +108,7 @@ var routes = []route{
 	{"PATCH /admin/v1/telemetry", (*server).setTelemetry},
 	{"DELETE /admin/v1/telemetry", (*server).unsetTelemetry},
 	{"POST /admin/v1/telemetry/test", (*server).testTelemetry},
+	{"POST /admin/v1/backup", (*server).sendBackup},
 }
 
 // Deps is what the admin listener needs from serve.
@@ -108,14 +116,15 @@ type Deps struct {
 	Config    *config.Service
 	KeyHash   [32]byte // the SHA-256 of the admin key, the only form of it the process keeps
 	Log       *slog.Logger
-	Usage     *sql.DB             // the store's read pool, which usage show reads
-	Admission *admission.State    // the data plane's, whose quota windows usage quota shows
-	Spans     *telemetry.Exporter // the exporter telemetry test sends through and telemetry status reads
+	Usage     *sql.DB                                     // the store's read pool, which usage show reads
+	Admission *admission.State                            // the data plane's, whose quota windows usage quota shows
+	Spans     *telemetry.Exporter                         // the exporter telemetry test sends through and telemetry status reads
+	Backup    func(ctx context.Context) (*os.File, error) // store.Store.Backup
 }
 
 // Handler returns the admin listener's handler.
 func Handler(d Deps) http.Handler {
-	s := &server{cfg: d.Config, keyHash: d.KeyHash, log: d.Log, usage: d.Usage, limits: d.Admission, spans: d.Spans}
+	s := &server{cfg: d.Config, keyHash: d.KeyHash, log: d.Log, usage: d.Usage, limits: d.Admission, spans: d.Spans, backup: d.Backup}
 	mux := http.NewServeMux()
 	for _, rt := range routes {
 		mux.HandleFunc(rt.pattern, func(w http.ResponseWriter, r *http.Request) { rt.handle(s, w, r) })
@@ -198,6 +207,11 @@ func (rec *recorder) Write(b []byte) (int, error) {
 		return len(b), nil
 	}
 	return rec.ResponseWriter.Write(b)
+}
+
+// Unwrap lets http.NewResponseController reach the connection's deadlines.
+func (rec *recorder) Unwrap() http.ResponseWriter {
+	return rec.ResponseWriter
 }
 
 func (rec *recorder) dropped() bool {

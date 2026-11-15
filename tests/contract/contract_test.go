@@ -90,7 +90,7 @@ func live(t *testing.T) *proxy {
 		provider = ", " + more
 	}
 
-	st, err := store.Open(context.Background(), t.TempDir())
+	st, err := store.Open(context.Background(), t.TempDir(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}

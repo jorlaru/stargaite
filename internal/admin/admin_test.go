@@ -81,7 +81,7 @@ func newFixture(t *testing.T) *fixture {
 // newFixtureEnv is newFixture with its own Env.
 func newFixtureEnv(t *testing.T, env func() config.Env) *fixture {
 	t.Helper()
-	st, err := store.Open(context.Background(), t.TempDir())
+	st, err := store.Open(context.Background(), t.TempDir(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}

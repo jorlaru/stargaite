@@ -37,6 +37,7 @@ curl -sS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:4000/he
 curl -s http://127.0.0.1:4000/v1/models -H "Authorization: Bearer sk-stargaite-..."
 curl -s http://127.0.0.1:4000/v1/chat/completions -H "Authorization: Bearer sk-stargaite-..." -d '{"model":"fast","messages":[{"role":"user","content":"hi"}]}'
 ./stargaite usage show --since 1h
+./stargaite backup backup.db
 ```
 
 The mock provider listens on `127.0.0.1:4010`; `serve` puts the data plane on `127.0.0.1:4000`, the admin API on
@@ -54,8 +55,9 @@ the alias `fast`; the second sends a chat completion to it and gets the mock pro
 headers `x-stargaite-request-id`, `x-stargaite-trace-id` and `x-stargaite-target` (add `-i` to `curl` to see them),
 and its span reaches the mock provider within the 2 s of a batch.
 `usage show` then sums the last hour from the store: one request, the tokens the mock provider reported (1 input, 2
-output) and their cost at the target's prices, 0.000005 USD. Both processes log JSON lines to the terminal;
-`kill %1 %2` stops them.
+output) and their cost at the target's prices, 0.000005 USD. `backup` writes a checked copy of the store, that
+request included, to `backup.db` with mode `0600` and prints its size (see [Backup and restore](#backup-and-restore)).
+Both processes log JSON lines to the terminal; `kill %1 %2` stops them.
 `./stargaite --help` lists every command, and each one accepts `--json`, never prompts, and exits `0` on success, `1`
 on failure and `2` on wrong usage; `remove`, `keys revoke` and `apply --prune` (unless `--dry-run`) need `--yes`.
 
@@ -227,6 +229,30 @@ The CLI finds the admin API at `--admin-url`, else `STARGAITE_ADMIN_URL`, else `
 One `serve` per data directory: a second one exits `1`. Keep the directory on a local disk, not a network file system.
 `./stargaite export` prints the whole configuration as YAML, and `./stargaite apply -f <file>` applies one;
 `config.example.yaml` is an example input (`./stargaite validate -f config.example.yaml` checks it without a server).
+
+## Backup and restore
+
+`./stargaite backup <file>` asks the running `serve` for a copy of the store and writes it to `<file>`. The copy is
+taken while `serve` keeps serving (`VACUUM INTO`, on a connection of its own) and holds every committed transaction;
+usage records still waiting for their batch (at most 50 ms of traffic) are not in it. Before sending it, `serve`
+checks it (`PRAGMA integrity_check` and `PRAGMA foreign_key_check`) and refuses one that fails; the copy never stays
+in the data directory. The CLI writes `<file>.part` first, with mode `0600`, since the copy holds the key hashes and
+every usage record: keep it as private as the data directory. Once the size matches the announced one and the part is
+synced, it is linked to `<file>`; `backup` never replaces a file, refuses a `<file>` that exists, and removes the part
+on any failure, `Ctrl-C` and `SIGTERM` included. `serve` gives a backup up to 15 minutes. A backup is a read: one
+log line with its size, no audit record. The admin key (`admin.key`) is not in the store, so a restored store keeps
+the key of its data directory.
+
+To restore a backup:
+
+1. Stop `serve` (`SIGTERM`, or `Ctrl-C`) and wait for it to exit: it releases the data directory.
+2. Move `stargaite.db`, `stargaite.db-wal` and `stargaite.db-shm` out of the data directory, all three together. A
+   `-wal` left beside the restored copy is replayed onto it, which brings back rows the backup does not hold or
+   corrupts the store.
+3. Copy the backup in as `stargaite.db` with mode `0600`, owned by the user that runs `serve`:
+   `install -m 600 backup.db data/stargaite.db`.
+4. Start `serve`. It turns the copy back to WAL mode and runs any newer migration, and budgets and quota windows are
+   rebuilt from it, as at every start. Key tokens, aliases and usage are those of the backup.
 
 ## Provider credentials
 

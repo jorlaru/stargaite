@@ -12,10 +12,13 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"text/tabwriter"
 	"time"
 	"unicode/utf8"
@@ -42,6 +45,10 @@ var client = &http.Client{
 	Transport:     direct(),
 	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 }
+
+// untimed is client without its timeout, for a command whose server bounds
+// the call by a longer write deadline of its own (backup: 15 minutes).
+var untimed = &http.Client{Transport: client.Transport, CheckRedirect: client.CheckRedirect}
 
 func direct() *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
@@ -176,8 +183,10 @@ func parent(body map[string]any, path []string) map[string]any {
 }
 
 // call sends the one request of a command and prints the answer, through
-// rowRender when it is not nil.
-func call(ctx context.Context, name string, in input, method, path string, body any, rowRender func(io.Writer, []byte) error, stdout, stderr io.Writer) int {
+// rowRender when it is not nil; save, when it is not nil, takes a 2xx
+// answer instead, and the request goes without the client timeout.
+func call(ctx context.Context, name string, in input, method, path string, body any, rowRender func(io.Writer, []byte) error,
+	save func(input, *http.Response, io.Writer) error, stdout, stderr io.Writer) int {
 	base := cmp.Or(*in.flags["admin-url"], in.getenv("STARGAITE_ADMIN_URL"), defaultAdminURL)
 	if u, err := url.Parse(base); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		say(stderr, "%s: the admin URL %q is not an http or https URL\n", name, base)
@@ -233,6 +242,13 @@ func call(ctx context.Context, name string, in input, method, path string, body 
 		key = strings.TrimSpace(string(file))
 	}
 
+	if save != nil {
+		// Ctrl-C or a SIGTERM ends the transfer as an error, so the part
+		// is removed instead of dying with the process.
+		var stop context.CancelFunc
+		ctx, stop = signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+		defer stop()
+	}
 	req, err := http.NewRequestWithContext(ctx, method, strings.TrimSuffix(base, "/")+"/admin/v1"+path, bytes.NewReader(data))
 	if err != nil {
 		return failed(name, in, unreachable(err.Error()), stdout, stderr)
@@ -241,11 +257,21 @@ func call(ctx context.Context, name string, in input, method, path string, body 
 	if data != nil {
 		req.Header.Set("Content-Type", contentType)
 	}
-	resp, err := client.Do(req)
+	c := client
+	if save != nil {
+		c = untimed
+	}
+	resp, err := c.Do(req)
 	if err != nil {
 		return failed(name, in, unreachable(err.Error()), stdout, stderr)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if save != nil && resp.StatusCode/100 == 2 {
+		if err := save(in, resp, stdout); err != nil {
+			return failed(name, in, domain.NewError(domain.CodeInternalError, err.Error()), stdout, stderr)
+		}
+		return exitOK
+	}
 	answer, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return failed(name, in, unreachable(err.Error()), stdout, stderr)

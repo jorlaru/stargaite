@@ -117,7 +117,7 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 		tlsConfig = &tls.Config{Certificates: []tls.Certificate{cert}}
 	}
 
-	st, err := store.Open(ctx, *dataDir)
+	st, err := store.Open(ctx, *dataDir, log)
 	if err != nil {
 		log.Error("store failed", "data_dir", *dataDir, "error", err.Error())
 		return 1
@@ -192,7 +192,7 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 		base, halt := context.WithCancelCause(context.Background())
 		var flight sync.WaitGroup
 		if err := runServers(ctx, base, log, tlsConfig, ready, []listener{
-			{"admin", *adminAddr, admin.Handler(admin.Deps{Config: cfg, KeyHash: keyHash, Log: log, Usage: st.Read(), Admission: limits, Spans: spans})},
+			{"admin", *adminAddr, admin.Handler(admin.Deps{Config: cfg, KeyHash: keyHash, Log: log, Usage: st.Read(), Admission: limits, Spans: spans, Backup: st.Backup})},
 			{"data", *dataAddr, api.Handler(api.Deps{Config: cfg, Log: log, Clients: clients, Flight: &flight, Usage: records, Admission: limits, Counters: &usage.Counters{}, Spans: spans, Version: cli.Version})},
 		}); err != nil {
 			log.Error("server failed", "error", err.Error())

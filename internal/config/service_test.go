@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/netip"
 	"os"
@@ -50,7 +51,7 @@ func testEnv(t *testing.T, vars map[string]string) func() Env {
 
 func openStore(t *testing.T, dir string) *store.Store {
 	t.Helper()
-	st, err := store.Open(context.Background(), dir)
+	st, err := store.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -520,7 +521,7 @@ func TestCommitConcurrent(t *testing.T) {
 // commit and the publication.
 func TestReload(t *testing.T) {
 	dir := t.TempDir()
-	st, err := store.Open(context.Background(), dir)
+	st, err := store.Open(context.Background(), dir, slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -833,7 +834,7 @@ func TestExporter(t *testing.T) {
 // kick-off section 18 (100 providers, 1,000 targets, 1,000 aliases, 10,000
 // keys with a secret each), which must publish within 1 s.
 func BenchmarkCommitScale18(b *testing.B) {
-	st, err := store.Open(context.Background(), b.TempDir())
+	st, err := store.Open(context.Background(), b.TempDir(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		b.Fatal(err)
 	}

@@ -123,7 +123,7 @@ func TestLangfuse(t *testing.T) {
 		urls = append(urls, s.URL)
 	}
 
-	st, err := store.Open(context.Background(), t.TempDir())
+	st, err := store.Open(context.Background(), t.TempDir(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}

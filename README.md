@@ -53,7 +53,9 @@ workflow tools, `curl`.
 `gemini`, `xai`, `mistral`, `groq`, `together`, `fireworks` and `cerebras` (`stargaite providers presets` shows them,
 with an `untested` mark on those not yet run against the live service). Any other OpenAI- or Anthropic-compatible
 endpoint, local servers such as Ollama, vLLM or TEI included, is one `providers add` with `--protocol` and
-`--base-url`.
+`--base-url`. A preset used with another `--protocol` (MiniMax's Anthropic-format endpoint, say) keeps its credential
+variable and billing but not the defaults it gives new targets, which are written for its own protocol: declare them
+with `--target-defaults dialect=...`.
 
 ## How it works
 

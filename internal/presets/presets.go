@@ -47,7 +47,7 @@ var Catalog = []Preset{
 	{Name: "minimax", Provider: domain.Provider{
 		Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.minimax.io/v1", APIKeyEnv: "MINIMAX_API_KEY", Billing: domain.BillingPayPerUse,
 		StreamUsage:    domain.StreamUsageRequest,
-		TargetDefaults: domain.TargetDefaults{OutputCapParam: "max_completion_tokens"},
+		TargetDefaults: domain.TargetDefaults{Dialect: domain.DialectReasoningEffort, OutputCapParam: "max_completion_tokens"},
 	}},
 	{Name: "zai", Provider: domain.Provider{Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.z.ai/api/paas/v4", APIKeyEnv: "ZAI_API_KEY", Billing: domain.BillingPayPerUse}},
 	{Name: "moonshot", Provider: domain.Provider{

@@ -57,6 +57,7 @@
 		"billing": "pay_per_use",
 		"stream_usage": "request",
 		"target_defaults": {
+			"dialect": "reasoning_effort",
 			"output_cap_param": "max_completion_tokens"
 		}
 	},

@@ -86,6 +86,11 @@ func TestAddProvider(t *testing.T) {
 	withDialect.TargetDefaults.Dialect = domain.DialectReasoningObject
 	noKey := preset(t, "anthropic")
 	noKey.APIKeyEnv = ""
+	// The minimax preset's target defaults are for its OpenAI endpoint: they
+	// would send reasoning_effort in a Messages body.
+	switched := preset(t, "minimax")
+	switched.Protocol, switched.BaseURL, switched.APIKeyEnv = domain.ProtocolAnthropic, "https://api.minimax.io/anthropic", "MINIMAX_PLAN_API_KEY"
+	switched.TargetDefaults = domain.TargetDefaults{}
 
 	for _, tc := range []struct {
 		name, body string
@@ -97,6 +102,9 @@ func TestAddProvider(t *testing.T) {
 		{"minimax-plan", `{"name":"minimax-plan","preset":"minimax","protocol":"anthropic","base_url":"https://api.minimax.io/anthropic",
 			"api_key_env":"MINIMAX_PLAN_API_KEY","target_defaults":{"dialect":"adaptive_effort","output_cap_param":null},"stream_usage":"native",
 			"billing":"subscription","quota":[{"window":"5h","requests":1000},{"window":"7d","requests":10000}]}`, annexB.Providers["minimax-plan"], "resolved"},
+		// A body that changes the preset's protocol drops its target defaults.
+		{"minimax-messages", `{"name":"minimax-messages","preset":"minimax","protocol":"anthropic","base_url":"https://api.minimax.io/anthropic",
+			"api_key_env":"MINIMAX_PLAN_API_KEY"}`, switched, "resolved"},
 		// A provider that no preset names takes only what the request declares.
 		{"my-vllm", `{"name":"my-vllm","protocol":"openai","base_url":"http://vllm.internal:8000/v1","allow_private_network":true,"billing":"none"}`,
 			domain.Provider{Protocol: "openai", BaseURL: "http://vllm.internal:8000/v1", AllowPrivateNetwork: true, Billing: "none"}, "none"},

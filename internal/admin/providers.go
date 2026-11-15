@@ -99,7 +99,8 @@ func (s *server) addProvider(w http.ResponseWriter, r *http.Request) {
 		}
 		var spec domain.Provider
 		from := cmp.Or(preset, name)
-		switch i := slices.IndexFunc(presets.Catalog, func(p presets.Preset) bool { return p.Name == from }); {
+		i := slices.IndexFunc(presets.Catalog, func(p presets.Preset) bool { return p.Name == from })
+		switch {
 		case i >= 0:
 			spec = presets.Catalog[i].Provider
 		case preset != "":
@@ -107,6 +108,14 @@ func (s *server) addProvider(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := merge(&spec, patch); err != nil {
 			return nil, err
+		}
+		// A preset's target defaults are written for its protocol: a provider
+		// that changes the protocol keeps only the ones the body gives.
+		if i >= 0 && spec.Protocol != presets.Catalog[i].Protocol {
+			spec.TargetDefaults = domain.TargetDefaults{}
+			if err := merge(&spec, patch); err != nil {
+				return nil, err
+			}
 		}
 		st.Doc.Providers[name] = spec
 		return nil, nil

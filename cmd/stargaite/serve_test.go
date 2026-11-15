@@ -574,16 +574,18 @@ func TestServeLostRecords(t *testing.T) {
 
 // TestServeKilled is ADR-016 and RES-9 through serve: serve runs as a
 // process of its own, commits the records of three priced requests, which
-// exhaust the key's never budget and the alias's monthly one, and is killed
-// with SIGKILL; serve then starts again on the same data directory, whose
-// lock the kernel released: the key still gets 402, and once its budget is
-// removed the alias's still answers 402, before any provider call; usage
-// show and the store hold the three records.
+// exhaust the key's never budget and the alias's monthly one, and of two
+// requests that exhaust a subscription's 1h window, and is killed with
+// SIGKILL; serve then starts again on the same data directory, whose lock
+// the kernel released: the key still gets 402, and once its budget is
+// removed the alias's still answers 402, and the plan's alias 429
+// quota_exceeded with Retry-After, before any provider call; usage show and
+// the store hold the five records.
 func TestServeKilled(t *testing.T) {
 	mock := mockprovider.New()
 	srv := httptest.NewServer(mock)
 	t.Cleanup(srv.Close)
-	dir, token := seed(t, map[string]string{"m": srv.URL})
+	dir, token := seed(t, map[string]string{"m": srv.URL, "q": srv.URL})
 	{
 		st, err := store.Open(context.Background(), dir)
 		if err != nil {
@@ -606,6 +608,9 @@ func TestServeKilled(t *testing.T) {
 			m := s.Doc.Models["m"]
 			m.Budget = &domain.Budget{LimitUSD: &limit, ResetInterval: domain.ResetMonthly}
 			s.Doc.Models["m"] = m
+			q := s.Doc.Providers["q"]
+			q.Billing, q.Quota = domain.BillingSubscription, []domain.QuotaWindow{{Window: "1h", Requests: 2}}
+			s.Doc.Providers["q"] = q
 			return nil, nil
 		}}); err != nil {
 			t.Fatal(err)
@@ -643,8 +648,8 @@ func TestServeKilled(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("serve was not ready within 30 s")
 	}
-	for range 3 {
-		req, err := http.NewRequest(http.MethodPost, "http://"+data+"/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	for _, alias := range []string{"m", "m", "m", "q", "q"} {
+		req, err := http.NewRequest(http.MethodPost, "http://"+data+"/v1/chat/completions", strings.NewReader(`{"model":"`+alias+`","messages":[{"role":"user","content":"hi"}]}`))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -658,7 +663,7 @@ func TestServeKilled(t *testing.T) {
 			t.Fatalf("status %d", resp.StatusCode)
 		}
 	}
-	// Committed: another connection reads the three rows.
+	// Committed: another connection reads the five rows.
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "stargaite.db")+"?_busy_timeout=5000")
 	if err != nil {
 		t.Fatal(err)
@@ -668,7 +673,7 @@ func TestServeKilled(t *testing.T) {
 		if err := db.QueryRow("SELECT COUNT(*) FROM usage").Scan(&n); err != nil {
 			t.Fatal(err)
 		}
-		if n == 3 {
+		if n == 5 {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -686,9 +691,9 @@ func TestServeKilled(t *testing.T) {
 	}
 
 	ready, stop := start(t, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), "--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0")
-	refused := func(message string) {
+	post := func(alias string) (*http.Response, string) {
 		t.Helper()
-		req, err := http.NewRequest(http.MethodPost, "http://"+ready.DataAddr+"/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+		req, err := http.NewRequest(http.MethodPost, "http://"+ready.DataAddr+"/v1/chat/completions", strings.NewReader(`{"model":"`+alias+`","messages":[{"role":"user","content":"hi"}]}`))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -699,18 +704,28 @@ func TestServeKilled(t *testing.T) {
 		}
 		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		if resp.StatusCode != http.StatusPaymentRequired || !strings.Contains(string(body), `"code":"budget_exceeded"`) || !strings.Contains(string(body), message) {
+		return resp, string(body)
+	}
+	refused := func(message string) {
+		t.Helper()
+		if resp, body := post("m"); resp.StatusCode != http.StatusPaymentRequired || !strings.Contains(body, `"code":"budget_exceeded"`) || !strings.Contains(body, message) {
 			t.Errorf("after the restart: %d %s, want 402 %s", resp.StatusCode, body, message)
 		}
 	}
 	refused("the budget of this key is exhausted")
+	// The window was seeded before the listeners bound: a Retry-After of
+	// at most an hour and a 6 s bucket.
+	if resp, body := post("q"); resp.StatusCode != http.StatusTooManyRequests || !strings.Contains(body, `"code":"quota_exceeded"`) ||
+		resp.Header.Get("Retry-After") == "" || len(resp.Header.Get("Retry-After")) > 4 {
+		t.Errorf("the plan after the restart: %d %s, Retry-After %q", resp.StatusCode, body, resp.Header.Get("Retry-After"))
+	}
 	if code := cli.Main([]string{"keys", "set", "agent", "--budget=", "--admin-url", "http://" + ready.AdminAddr},
 		env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), io.Discard, io.Discard); code != 0 {
 		t.Fatalf("keys set: exit %d", code)
 	}
 	refused(`the budget of model \"m\" is exhausted`)
-	if n := len(mock.Calls()); n != 3 {
-		t.Errorf("the mock got %d calls, want 3", n)
+	if n := len(mock.Calls()); n != 5 {
+		t.Errorf("the mock got %d calls, want 5", n)
 	}
 	var stdout bytes.Buffer
 	if code := cli.Main([]string{"usage", "show", "--json", "--since", "1h", "--admin-url", "http://" + ready.AdminAddr},
@@ -723,8 +738,14 @@ func TestServeKilled(t *testing.T) {
 			Requests int64
 		}
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || len(report.Groups) != 1 || report.Groups[0].Requests != 3 {
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil || fmt.Sprint(report.Groups) != "[{pay_per_use 3} {subscription 2}]" {
 		t.Errorf("usage show after the restart: %s, error %v", &stdout, err)
+	}
+	stdout.Reset()
+	if code := cli.Main([]string{"usage", "quota", "--admin-url", "http://" + ready.AdminAddr},
+		env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), &stdout, io.Discard); code != 0 ||
+		!strings.Contains(stdout.String(), "counts this proxy's traffic only") || !strings.Contains(stdout.String(), "q         -    -      1h      requests  2     2      100") {
+		t.Errorf("usage quota after the restart: exit %d\n%s", code, &stdout)
 	}
 	if code, log := stop(); code != 0 {
 		t.Errorf("exit %d; log %s", code, log)
@@ -736,7 +757,7 @@ func TestServeKilled(t *testing.T) {
 	defer func() { _ = st.Close() }()
 	var records, daily int
 	if err := st.Read().QueryRow("SELECT (SELECT COUNT(*) FROM usage), (SELECT SUM(requests) FROM usage_daily)").Scan(&records, &daily); err != nil ||
-		records != 3 || daily != 3 {
+		records != 5 || daily != 5 {
 		t.Errorf("%d records, usage_daily counts %d, error %v", records, daily, err)
 	}
 }
@@ -887,6 +908,52 @@ func TestServeRestoreFails(t *testing.T) {
 	var stderr bytes.Buffer
 	if code := serve([]string{"--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0"}, env(nil), io.Discard, &stderr); code != 1 ||
 		!strings.Contains(stderr.String(), `"level":"ERROR","msg":"budgets not restored"`) || strings.Contains(stderr.String(), `"msg":"ready"`) {
+		t.Fatalf("exit %d; log %s", code, &stderr)
+	}
+	st, err = store.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatalf("the lock is still held: %v", err)
+	}
+	_ = st.Close()
+}
+
+// TestServeQuotaSeedFails: quota windows that cannot be seeded from the store
+// stop serve with exit 1 before the listeners bind (RES-9, LIM-8, phase-3
+// design section 11), with the cause logged, and the store is closed.
+func TestServeQuotaSeedFails(t *testing.T) {
+	dir, _ := seed(t, map[string]string{"q": "http://127.0.0.1:1"})
+	st, err := store.Open(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.Open(context.Background(), st, func() config.Env { return config.Env{Lookup: func(string) (string, bool) { return "", false }} }, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.Commit(context.Background(), config.Change{Summary: "quota", Mutate: func(s *config.State) (map[string]string, error) {
+		q := s.Doc.Providers["q"]
+		q.Billing, q.Quota = domain.BillingSubscription, []domain.QuotaWindow{{Window: "5h", Requests: 10}}
+		s.Doc.Providers["q"] = q
+		return nil, nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	// A stored row the seed cannot read: its started_at is not a number.
+	if err := st.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec(`INSERT INTO usage (id, request_id, endpoint, key_name, model, target, billing, status_code, tokens_source, cost_source,
+			started_at, completed_at, config_revision, proxy_version)
+			VALUES ('bad-1', 'bad', 'chat', 'agent', 'q', 'q/m', 'subscription', 200, 'provider', 'none', 'not a time', ?, 1, 'v')`, time.Now().UnixMilli())
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var stderr bytes.Buffer
+	if code := serve([]string{"--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0"}, env(nil), io.Discard, &stderr); code != 1 ||
+		!strings.Contains(stderr.String(), `"level":"ERROR","msg":"quota windows not seeded","provider":"q"`) ||
+		!strings.Contains(stderr.String(), `"level":"ERROR","msg":"quotas not restored"`) || strings.Contains(stderr.String(), `"msg":"ready"`) {
 		t.Fatalf("exit %d; log %s", code, &stderr)
 	}
 	st, err = store.Open(context.Background(), dir)

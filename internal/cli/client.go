@@ -523,3 +523,36 @@ func usageShown(w io.Writer, answer []byte) error {
 	}
 	return nil
 }
+
+// quotaShown renders the answer of usage quota: its note, then a header and a
+// row per window, the providers' own before the keys' shares; "-" for a value
+// absent from the answer, such as the key of a provider's own window or the
+// retry of a window not exhausted.
+func quotaShown(w io.Writer, answer []byte) error {
+	var v struct {
+		Note    string                      `json:"note"`
+		Windows []map[string]jsontext.Value `json:"windows"`
+	}
+	if err := json.Unmarshal(answer, &v); err != nil {
+		return err
+	}
+	say(w, "quota windows: %s\n", printable(v.Note))
+	if len(v.Windows) == 0 {
+		say(w, "no quota window is declared\n")
+		return nil
+	}
+	columns := []string{"provider", "key", "share", "window", "unit", "used", "limit", "used_pct", "retry_after_s"}
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	say(tw, "%s\n", strings.Join(columns, "\t"))
+	for _, win := range v.Windows {
+		cells := make([]string, len(columns))
+		for i, c := range columns {
+			cells[i] = "-"
+			if value, ok := win[c]; ok {
+				cells[i] = cell(value)
+			}
+		}
+		say(tw, "%s\n", strings.Join(cells, "\t"))
+	}
+	return tw.Flush()
+}

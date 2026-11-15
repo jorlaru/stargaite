@@ -20,8 +20,10 @@ import (
 	"time"
 
 	"github.com/jorlaru/stargaite/internal/admin"
+	"github.com/jorlaru/stargaite/internal/admission"
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/store"
+	records "github.com/jorlaru/stargaite/internal/usage"
 )
 
 const testKey = "test-admin-key-of-at-least-32-characters"
@@ -58,7 +60,9 @@ func adminServer(t *testing.T) map[string]string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(testKey)), Log: slog.New(slog.NewJSONHandler(io.Discard, nil)), Usage: st.Read()}))
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	srv := httptest.NewServer(admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(testKey)), Log: log, Usage: st.Read(),
+		Admission: admission.New(cfg.Now, records.Seeder(st.Read(), log))}))
 	t.Cleanup(srv.Close)
 	return map[string]string{"STARGAITE_ADMIN_URL": srv.URL, "STARGAITE_ADMIN_KEY": testKey}
 }
@@ -156,7 +160,8 @@ func TestCommandWalk(t *testing.T) {
 			{[]string{"--by", "key,model,effort-sent", "--compare-previous"}, 0}, {[]string{"--compare-previous=false"}, 0},
 			{[]string{"--since", "2400h", "--by", "effort-sent"}, 1},
 		},
-		"export": {{nil, 0}},
+		"usage quota": {{nil, 0}},
+		"export":      {{nil, 0}},
 		"apply": {
 			{[]string{"-f", example, "--dry-run"}, 0}, {[]string{"-f", example}, 0}, {[]string{"-f", invalid}, 1},
 			{[]string{"-f", example, "--prune", "--yes"}, 0}, {[]string{"-f", example, "--prune", "--dry-run"}, 0},
@@ -244,6 +249,7 @@ func TestRequests(t *testing.T) {
 		{[]string{"usage", "show"}, "GET", "/admin/v1/usage", ""},
 		{[]string{"usage", "show", "--by", "key,effort-sent", "--compare-previous"}, "GET", "/admin/v1/usage?by=key%2Ceffort-sent&compare_previous=true", ""},
 		{[]string{"usage", "show", "--compare-previous=false", "--since", "1h"}, "GET", "/admin/v1/usage?compare_previous=false&since=1h", ""},
+		{[]string{"usage", "quota"}, "GET", "/admin/v1/usage/quota", ""},
 		{[]string{"providers", "presets"}, "GET", "/admin/v1/presets", ""},
 		{[]string{"providers", "list"}, "GET", "/admin/v1/providers", ""},
 		{[]string{"providers", "add", "openrouter"}, "POST", "/admin/v1/providers", `{"name":"openrouter"}`},
@@ -585,6 +591,30 @@ pay_per_use  3         0       30     0           0            15      0        
 	_, vars = recorder(t, http.StatusOK, `{"source":"records","since":"2026-11-13T12:00:00Z","until":"2026-11-14T12:00:00Z","groups":[]}`+"\n")
 	if r := runMain(vars, "usage", "show"); r.code != 0 || r.stdout != "window 2026-11-13T12:00:00Z to 2026-11-14T12:00:00Z, from the records\nno usage in the window\n" {
 		t.Errorf("an empty window: exit %d, stdout %q", r.code, r.stdout)
+	}
+}
+
+// TestQuotaRender: usage quota prints its note, then a row per window, "-"
+// for what the answer leaves out; text from the server never reaches the
+// terminal raw.
+func TestQuotaRender(t *testing.T) {
+	_, vars := recorder(t, http.StatusOK, `{"note":"counts this proxy's traffic only","windows":[`+
+		`{"provider":"plan","window":"5h","unit":"requests","used":5,"limit":5,"used_pct":100,"retry_after_s":17999},`+
+		`{"provider":"plan","window":"7d","unit":"tokens","used":120,"limit":1000,"used_pct":12},`+
+		`{"provider":"plan","key":"a\u001b","share":0.4,"window":"5h","unit":"requests","used":1,"limit":2,"used_pct":50}]}`+"\n")
+	r := runMain(vars, "usage", "quota")
+	want := `quota windows: counts this proxy's traffic only
+provider  key      share  window  unit      used  limit  used_pct  retry_after_s
+plan      -        -      5h      requests  5     5      100       17999
+plan      -        -      7d      tokens    120   1000   12        -
+plan      "a\x1b"  0.4    5h      requests  1     2      50        -
+`
+	if r.code != 0 || r.stdout != want {
+		t.Errorf("exit %d, stderr %q, stdout\n%s\nwant\n%s", r.code, r.stderr, r.stdout, want)
+	}
+	_, vars = recorder(t, http.StatusOK, `{"note":"counts this proxy's traffic only","windows":[]}`+"\n")
+	if r := runMain(vars, "usage", "quota"); r.code != 0 || r.stdout != "quota windows: counts this proxy's traffic only\nno quota window is declared\n" {
+		t.Errorf("no window: exit %d, stdout %q", r.code, r.stdout)
 	}
 }
 

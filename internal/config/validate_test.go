@@ -189,6 +189,17 @@ func TestValidate(t *testing.T) {
 		{"LIM-8 a token window", func(d *domain.Document) {
 			edit(d.Providers, "minimax-plan", func(p *domain.Provider) { p.Quota[0] = domain.QuotaWindow{Window: "30m", Tokens: 100000} })
 		}, nil},
+		{"LIM-8 a window longer than the default usage_days", func(d *domain.Document) {
+			edit(d.Providers, "minimax-plan", func(p *domain.Provider) { p.Quota[1].Window = "91d" })
+		}, []string{"warning LIM-8 quota_beyond_retention providers/minimax-plan quota"}},
+		{"LIM-8 a window within the usage_days declared", func(d *domain.Document) {
+			edit(d.Providers, "minimax-plan", func(p *domain.Provider) { p.Quota[1].Window = "2161h" })
+			d.Settings.Retention = &domain.Retention{UsageDays: 91}
+		}, nil},
+		{"LIM-8 a window one minute beyond the usage_days declared", func(d *domain.Document) {
+			edit(d.Providers, "minimax-plan", func(p *domain.Provider) { p.Quota[1].Window = "131041m" })
+			d.Settings.Retention = &domain.Retention{UsageDays: 91}
+		}, []string{"warning LIM-8 quota_beyond_retention providers/minimax-plan quota"}},
 		{"USE-6 cost_report path with an empty segment", func(d *domain.Document) {
 			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.CostReport.Path = "usage..cost" })
 		}, []string{"error USE-6 invalid_value providers/openrouter cost_report.path"}},

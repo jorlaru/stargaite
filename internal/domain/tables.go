@@ -2,7 +2,9 @@ package domain
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -117,4 +119,25 @@ func SplitTarget(id string) (provider, upstream string, ok bool) {
 	ok = ok && ValidName(provider) && upstream != "" && utf8.ValidString(upstream) &&
 		!strings.ContainsFunc(upstream, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) })
 	return provider, upstream, ok
+}
+
+// MaxQuotaSpan is the longest span a quota window counts over. A window
+// declared longer counts over 100 years, which holds every record since 1970
+// until 2070.
+const MaxQuotaSpan = 100 * 365 * 24 * time.Hour
+
+// QuotaSpan is the span of a quota window such as 5h or 7d (LIM-8): a whole
+// number of minutes, hours or days, at most MaxQuotaSpan. ok is false for any
+// other text, which validation refuses but a stored configuration may still
+// hold.
+func QuotaSpan(window string) (span time.Duration, ok bool) {
+	if window == "" {
+		return 0, false
+	}
+	unit := map[byte]time.Duration{'m': time.Minute, 'h': time.Hour, 'd': 24 * time.Hour}[window[len(window)-1]]
+	n, err := strconv.ParseInt(window[:len(window)-1], 10, 64)
+	if unit == 0 || err != nil || n <= 0 {
+		return 0, false
+	}
+	return time.Duration(min(n, int64(MaxQuotaSpan/unit))) * unit, true
 }

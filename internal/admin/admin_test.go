@@ -22,10 +22,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jorlaru/stargaite/internal/admission"
 	"github.com/jorlaru/stargaite/internal/auth"
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/store"
+	"github.com/jorlaru/stargaite/internal/usage"
 )
 
 var update = flag.Bool("update", false, "rewrite the golden files")
@@ -87,7 +89,9 @@ func newFixtureEnv(t *testing.T, env func() config.Env) *fixture {
 		t.Fatal(err)
 	}
 	log := &bytes.Buffer{}
-	return &fixture{Handler(Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(testKey)), Log: slog.New(slog.NewJSONHandler(log, nil)), Usage: st.Read()}), cfg, st, log}
+	logger := slog.New(slog.NewJSONHandler(log, nil))
+	return &fixture{Handler(Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(testKey)), Log: logger, Usage: st.Read(),
+		Admission: admission.New(cfg.Now, usage.Seeder(st.Read(), logger))}), cfg, st, log}
 }
 
 // as sends one request with the Authorization header given.

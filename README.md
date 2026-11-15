@@ -12,7 +12,8 @@ synchronous and streamed, toward providers of the `anthropic` protocol, with the
 control of the alias, timeouts, fallback across an alias's targets, a circuit breaker per target, cancellation when a
 client goes away and a graceful stop (see [Resilience](#resilience)). Phase 3 has begun: every provider call leaves a
 usage record with its tokens and cost, and `usage show` sums them (see [Usage](#usage)); keys and aliases have rate
-and parallel limits (see [Limits](#limits)) and USD budgets (see [Budgets](#budgets)); quotas and telemetry follow. The full specification is [kick-off.md](kick-off.md); the designs are
+and parallel limits (see [Limits](#limits)), USD budgets (see [Budgets](#budgets)) and subscription quotas (see
+[Quotas](#quotas)); telemetry follows. The full specification is [kick-off.md](kick-off.md); the designs are
 [docs/design/phase-1.md](docs/design/phase-1.md), [docs/design/phase-2.md](docs/design/phase-2.md) and
 [docs/design/phase-3.md](docs/design/phase-3.md).
 
@@ -111,6 +112,27 @@ in the budget's scope; for a key, its parallel slots (5 by default) times one ca
 is bounded only when it sets `max_parallel_requests` and its targets cap output. Reaching 80 % and 100 % of a budget writes one `WARN` log line, one audit row and one counter
 each per period. Spend survives a restart, as it is rebuilt from the stored records; a `never` budget's total starts
 at zero when it is set or its interval changes, and is kept when only its limit changes.
+
+## Quotas
+
+A `subscription` provider (a flat-fee plan) declares the windows of its plan, each limited in requests, tokens or both:
+`providers add|set <name> --billing subscription --quota 5h:requests=1000 --quota 7d:tokens=5000000`. A key may use a
+fraction of each window of a plan: `keys create|set <key> --quota-share <provider>=0.4` (rounded down: 0.4 of 1001
+requests is 400). Each provider call through the plan counts one request when its target is chosen, whatever its
+result, and its input plus output tokens when it ends. Once a window is used up, the plan's targets are passed over:
+the alias's next target serves, and with none left the request gets `429 quota_exceeded` with `Retry-After` set to the
+seconds until the window admits again, rounded up and uncapped, before any provider is called; a key at its share is
+refused the same way while other keys are still served. A quota never touches a USD budget. Reaching 80 % of a window
+writes one `WARN` log line, one audit row and one counter, again only after the window has dropped below 80 %.
+
+Windows slide: a `5h` window counts the last five hours, in steps of a six-hundredth of the window (30 s for `5h`, about
+17 minutes for `7d`), so it may count up to one step more of the past, never less. Windows are rebuilt from the stored
+records when `serve` starts, before it accepts requests, and a window or share added while running is rebuilt at its
+first use, so the use made before counts, calls still running included. `./stargaite usage quota` shows each window of
+each plan and of each key's share: used, limit, `used_pct` and, once used up, `retry_after_s`. It counts this proxy's
+traffic only: a plan also used by other clients, or whose provider resets on a calendar or from the first use, makes the
+provider's own `429` authoritative, and that `429` moves the request to the next target like any other. `validate` warns
+when a window is longer than `retention.usage_days`, whose records the rebuild reads.
 
 ## Anthropic clients
 

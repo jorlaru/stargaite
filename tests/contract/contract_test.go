@@ -90,15 +90,16 @@ func live(t *testing.T) *proxy {
 		t.Fatal(err)
 	}
 	log := slog.New(slog.DiscardHandler) // a provider's message may be logged; the test shows only redacted answers
+	limits := admission.New(cfg.Now, usage.Seeder(st.Read(), log))
 	p := &proxy{
-		admin: admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(adminKey)), Log: log, Usage: st.Read()}),
+		admin: admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(adminKey)), Log: log, Usage: st.Read(), Admission: limits}),
 		key:   key, target: "live/" + model, flight: &sync.WaitGroup{},
 	}
 	records := usage.NewWriter(st.Write, log)
 	t.Cleanup(func() { records.Close(context.Background()) })
 	p.data = api.Handler(api.Deps{Config: cfg, Log: log,
 		Clients: [2]*http.Client{transport.NewClient(false, resolve), transport.NewClient(true, resolve)}, Flight: p.flight,
-		Usage: records, Admission: admission.New(cfg.Now), Counters: &usage.Counters{}})
+		Usage: records, Admission: limits, Counters: &usage.Counters{}})
 	// A cap on every alias: the anthropic protocol needs one (PAR-7), and
 	// the budgets of a thinking_budget target must stay below it (RSN-3).
 	// provider_default sends no effort unless the request has one, and is

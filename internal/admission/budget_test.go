@@ -36,7 +36,7 @@ func exhausted(s *State, bs ...Budget) string {
 // missing one, blocks at once.
 func TestExhausted(t *testing.T) {
 	c := newClock()
-	s := New(c.now)
+	s := New(c.now, nil)
 	k, m, g := budget("key:a", "daily", 1, 0), budget("model:m", "monthly", 2, 0), budget("global", "daily", 3, 0)
 	if got := exhausted(s, k, m, g); got != "" {
 		t.Errorf("nothing spent: %s", got)
@@ -84,7 +84,7 @@ func TestExhausted(t *testing.T) {
 func TestRollover(t *testing.T) {
 	c := newClock()
 	c.set(time.Date(2026, 11, 30, 23, 59, 59, 0, time.UTC))
-	s := New(c.now)
+	s := New(c.now, nil)
 	d, m := budget("key:a", "daily", 1, 0), budget("key:a", "monthly", 1.5, 0)
 	late := c.now()
 	s.Spend(1, late, everyScope, nil)
@@ -119,7 +119,7 @@ func TestRollover(t *testing.T) {
 // touch it, and it never rolls over.
 func TestNever(t *testing.T) {
 	c := newClock()
-	s := New(c.now)
+	s := New(c.now, nil)
 	n3 := budget("key:a", "never", 1, 3)
 	s.Spend(0.5, c.now(), everyScope, []Budget{n3})
 	s.Spend(0.25, c.now(), everyScope, []Budget{budget("key:a", "never", 10, 3)}) // limit_usd changed, same since
@@ -158,7 +158,7 @@ func TestNever(t *testing.T) {
 func TestWarnings(t *testing.T) {
 	c := newClock()
 	c.set(time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC))
-	s := New(c.now)
+	s := New(c.now, nil)
 	d, n := budget("key:a", "daily", 1, 0), budget("model:m", "never", 2, 4)
 	bs := []Budget{d, n}
 	spend := func(usd float64) string { return fmt.Sprint(s.Spend(usd, c.now(), everyScope, bs)) }
@@ -189,7 +189,7 @@ func TestWarnings(t *testing.T) {
 		t.Errorf("next day: %s, want %s", got, want)
 	}
 
-	r := New(c.now)
+	r := New(c.now, nil)
 	r.SeedSpend("key:a", "d:2026-11-15", 0.9)
 	if got := fmt.Sprint(r.Spend(0.05, c.now(), everyScope, []Budget{d})); got != "[]" {
 		t.Errorf("seeded at 90 percent: %s", got)
@@ -197,7 +197,7 @@ func TestWarnings(t *testing.T) {
 
 	// A daily limit doubled on the day it warned: its new 80 percent is
 	// crossed in the same period, which already warned.
-	r = New(c.now)
+	r = New(c.now, nil)
 	r.Spend(0.875, c.now(), everyScope, []Budget{d})
 	if got := fmt.Sprint(r.Spend(0.75, c.now(), everyScope, []Budget{budget("key:a", "daily", 2, 0)})); got != "[]" {
 		t.Errorf("at 81.25 percent of a doubled limit, same day: %s", got)
@@ -209,7 +209,7 @@ func TestWarnings(t *testing.T) {
 func TestSeedSpend(t *testing.T) {
 	c := newClock()
 	c.set(time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC))
-	s := New(c.now)
+	s := New(c.now, nil)
 	for _, p := range []struct {
 		period string
 		usd    float64
@@ -225,7 +225,7 @@ func TestSeedSpend(t *testing.T) {
 // charge counts once.
 func TestSpendConcurrent(t *testing.T) {
 	c := newClock()
-	s := New(c.now)
+	s := New(c.now, nil)
 	n := budget("global", "never", 1000, 1)
 	var wg sync.WaitGroup
 	for range 50 {

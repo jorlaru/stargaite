@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -597,7 +598,7 @@ func TestRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 11, 14, 23, 0, 0, 0, time.UTC)
-	a := admission.New(func() time.Time { return now })
+	a := admission.New(func() time.Time { return now }, nil)
 	if err := Restore(context.Background(), st.Read(), a, now); err != nil {
 		t.Fatal(err)
 	}
@@ -623,5 +624,51 @@ func TestRestore(t *testing.T) {
 		if got := a.Spent(tc.b); got < tc.want-1e-9 || got > tc.want+1e-9 {
 			t.Errorf("%+v: %v, want %v", tc.b, got, tc.want)
 		}
+	}
+}
+
+// TestSeeder: the quota seed reads the subscription records of the
+// provider's targets that completed at or after from, each with its key,
+// times and input plus output tokens; a provider whose name extends
+// another's, another billing and an older record are not read; a failure is
+// logged with the provider and returned.
+func TestSeeder(t *testing.T) {
+	st := openStore(t)
+	sub := func(r *Record) { r.Billing, r.CostUSD, r.CostSource = domain.BillingSubscription, nil, "none" }
+	batch := []Record{
+		rec("a", sub),
+		rec("b", sub, func(r *Record) {
+			r.KeyName, r.Target, r.StartedAt, r.CompletedAt = "j", "p/other/x", 1_794_614_402_000, 1_794_614_403_500
+		}),
+		rec("c", sub, func(r *Record) { r.Target = "p0/m" }),
+		rec("d", sub, func(r *Record) { r.Target = "p.x/m" }),
+		rec("e"), // pay_per_use
+		rec("f", sub, func(r *Record) { r.CompletedAt = 1_794_614_399_999 }),
+	}
+	if err := st.Write(context.Background(), func(tx *sql.Tx) error { return insert(tx, entries(batch)) }); err != nil {
+		t.Fatal(err)
+	}
+	var log bytes.Buffer
+	seed := Seeder(st.Read(), slog.New(slog.NewJSONHandler(&log, nil)))
+	events, err := seed("p", time.UnixMilli(1_794_614_400_000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.SortFunc(events, func(a, b admission.Event) int { return a.Sent.Compare(b.Sent) })
+	want := []admission.Event{
+		{Key: "k", Sent: time.UnixMilli(1_794_614_400_000), Ended: time.UnixMilli(1_794_614_401_000), Tokens: 15},
+		{Key: "j", Sent: time.UnixMilli(1_794_614_402_000), Ended: time.UnixMilli(1_794_614_403_500), Tokens: 15},
+	}
+	if fmt.Sprint(events) != fmt.Sprint(want) {
+		t.Errorf("events %v, want %v", events, want)
+	}
+	if err := st.Write(context.Background(), func(tx *sql.Tx) error {
+		_, err := tx.Exec("UPDATE usage SET started_at = 'not a time' WHERE id = 'a'")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed("p", time.UnixMilli(0)); err == nil || !strings.Contains(log.String(), `"level":"ERROR","msg":"quota windows not seeded","provider":"p","error":`) {
+		t.Errorf("a row that cannot be read: %v; log %s", err, &log)
 	}
 }

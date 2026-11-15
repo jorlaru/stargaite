@@ -349,27 +349,55 @@ func noTarget(rq *request) *domain.Error {
 
 // exclude is the dynamic exclusion of t (step 6) in RES-10 order: for a
 // pay_per_use target, an exhausted budget of the key, the alias or the
-// instance (LIM-3), then the usage store unavailable (USE-10); then a
-// provider whose credential does not resolve, then an open circuit; nil when
-// t may be called. A circuit's permit, once taken, goes back with its gen in
-// the finish of the call that follows at once. The quota check (C28) goes
-// between the budget's and the store's, as RES-10 orders them.
+// instance (LIM-3); for a subscription, an exhausted window of its quota or
+// of the key's share (LIM-9, LIM-10); for a pay_per_use target, the usage
+// store unavailable (USE-10); then a provider whose credential does not
+// resolve, then an open circuit; nil when t may be called. Last, a
+// subscription's request is counted, checked again under the same lock
+// (Take, LIM-8); a refusal there gives the circuit's permit back. A permit
+// kept goes back with its gen in the finish of the call that follows at once.
 func (h *handler) exclude(rq *request, t *config.Target) (gen uint64, e *domain.Error) {
-	if t.Provider.Spec.Billing == domain.BillingPayPerUse {
+	pay := t.Provider.Spec.Billing == domain.BillingPayPerUse
+	if pay {
 		if e := h.Admission.Exhausted(budgets(rq)...); e != nil {
 			return 0, e
 		}
-		if !h.Usage.Available() {
-			return 0, domain.NewError(domain.CodeUsageStoreUnavailable, "the usage store is unavailable")
+	}
+	qp := quotaPlan(rq, t)
+	if qp != nil {
+		if e := h.Admission.Quota(*qp); e != nil {
+			return 0, e
 		}
+	}
+	if pay && !h.Usage.Available() {
+		return 0, domain.NewError(domain.CodeUsageStoreUnavailable, "the usage store is unavailable")
 	}
 	if t.Provider.Disabled {
 		return 0, noTarget(rq)
 	}
-	if gen, ok := h.breakers.Acquire(t.ID); ok {
-		return gen, nil
+	gen, ok := h.breakers.Acquire(t.ID)
+	if !ok {
+		return 0, noTarget(rq)
 	}
-	return 0, noTarget(rq)
+	if qp != nil {
+		if e := h.Admission.Take(*qp); e != nil {
+			h.breakers.Release(t.ID, gen, routing.None)
+			return 0, e
+		}
+	}
+	return gen, nil
+}
+
+// quotaPlan is the quota of t's provider as rq's snapshot declares it, with
+// rq's key and its share; nil unless the provider is a subscription. A
+// subscription without quota still gives a plan, so that a quota removed
+// drops its windows at once (phase-3 design section 9).
+func quotaPlan(rq *request, t *config.Target) *admission.Plan {
+	p := t.Provider
+	if p.Spec.Billing != domain.BillingSubscription {
+		return nil
+	}
+	return &admission.Plan{Provider: p.Name, Windows: p.Spec.Quota, Key: rq.key.Name, Share: rq.key.Spec.QuotaShare[p.Name], Revision: rq.snap.Revision}
 }
 
 // call is step 7 for one target: the credential header, the RES-3 timers
@@ -697,17 +725,26 @@ func message(status int, body []byte) string {
 // finish ends one provider call (design section 11, point 2) after its last
 // byte, its failure or a panic: the circuit's permit goes back with the
 // call's verdict (None on a panic), then the usage record (phase-3 design
-// section 4), whose input plus output tokens count in tpm (LIM-5) and whose
-// cost, for a pay_per_use call, is charged to the budgets before done
-// releases the slot (LIM-4), which the counters count and the writer stores,
-// and one log line, without the credential.
+// section 4), whose input plus output tokens count in tpm (LIM-5) and, for a
+// subscription, in its quota's token windows (LIM-8), and whose cost, for a
+// pay_per_use call, is charged to the budgets before done releases the slot
+// (LIM-4), which the counters count and the writer stores, and one log line,
+// without the credential.
 func (h *handler) finish(rq *request, a *attempt) {
 	a.ended = h.Config.Now()
 	h.breakers.Release(a.target.ID, a.gen, a.end.breaker)
 	a.rec = usage.NewRecord(h.usageCall(rq, a))
-	h.Admission.Tokens(a.rec.InputTokens+a.rec.OutputTokens, a.ended, scopeNames(rq)...)
-	if a.rec.Billing == domain.BillingPayPerUse && a.rec.CostUSD != nil {
-		h.warn(rq, h.Admission.Spend(*a.rec.CostUSD, a.ended, scopeNames(rq), budgets(rq)))
+	tokens := a.rec.InputTokens + a.rec.OutputTokens
+	h.Admission.Tokens(tokens, a.ended, scopeNames(rq)...)
+	switch a.rec.Billing {
+	case domain.BillingPayPerUse:
+		if a.rec.CostUSD != nil {
+			h.warn(rq, h.Admission.Spend(*a.rec.CostUSD, a.ended, scopeNames(rq), budgets(rq)))
+		}
+	case domain.BillingSubscription:
+		if qp := quotaPlan(rq, a.target); qp != nil {
+			h.warn(rq, h.Admission.Ended(*qp, tokens, a.ended))
+		}
 	}
 	h.count(&a.rec)
 	h.Usage.Add(a.rec)
@@ -736,9 +773,10 @@ func (h *handler) finish(rq *request, a *attempt) {
 	h.Log.Info("attempt", append(attrs, "visible_bytes", a.obs.VisibleBytes, "tool_calls", a.obs.ToolCalls, "stripped", a.obs.Stripped)...)
 }
 
-// warn sends each crossing of a budget to the log, as one WARN line, to the
-// audit, as a row through the writer, and to the counters (kick-off section
-// 10, LIM-3), keyed by the key or the alias it is about.
+// warn sends each crossing of a budget or a quota window to the log, as one
+// WARN line, to the audit, as a row through the writer, and to the counters
+// (kick-off section 10, LIM-3, LIM-9), keyed by the key or the alias it is
+// about (neither for a provider's own window or the instance).
 func (h *handler) warn(rq *request, ws []admission.Warning) {
 	for _, w := range ws {
 		h.Log.Warn(strings.ReplaceAll(w.Event, "_", " "), "request_id", rq.id, "scope", w.Scope, "period", w.Period)

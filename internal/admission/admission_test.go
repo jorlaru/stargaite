@@ -147,7 +147,7 @@ func TestMonotonicClock(t *testing.T) {
 		t.Fatalf("place %d", x.pos(base.Add(time.Hour)))
 	}
 	var el atomic.Int64
-	s := New(func() time.Time { return base.Add(time.Duration(el.Load())) })
+	s := New(func() time.Time { return base.Add(time.Duration(el.Load())) }, nil)
 	r, e := s.Admit(key(0, 1, 0))
 	if e != nil {
 		t.Fatal(e)
@@ -202,7 +202,7 @@ func held(s *State, name string, now time.Time) []int64 {
 // a slot and the window's wait for a rate.
 func TestAdmitAllOrNothing(t *testing.T) {
 	c := newClock()
-	s := New(c.now)
+	s := New(c.now, nil)
 	r1, e := s.Admit(key(1, 0, 0), alias(0, 2, 0), global(0))
 	if e != nil {
 		t.Fatal(e)
@@ -305,7 +305,7 @@ func TestAdmitAllOrNothing(t *testing.T) {
 // all cleared is no longer held once idle.
 func TestReleaseAcrossChange(t *testing.T) {
 	c := newClock()
-	s := New(c.now)
+	s := New(c.now, nil)
 	r1, _ := s.Admit(key(1, 5, 5))
 	// The limits are cleared: requests pass, taking and releasing slots.
 	for range 3 {
@@ -338,7 +338,7 @@ func TestReleaseAcrossChange(t *testing.T) {
 // limit, and every slot comes back.
 func TestAdmitConcurrent(t *testing.T) {
 	c := newClock()
-	s := New(c.now)
+	s := New(c.now, nil)
 	var in, peak, admitted atomic.Int64
 	var wg sync.WaitGroup
 	for range 32 {

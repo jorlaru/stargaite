@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -309,7 +310,8 @@ func TestBudgetBeforeStore(t *testing.T) {
 
 // ledgerConfig is the template of TestLedger: four pay_per_use providers,
 // one answering, one failing with 500 behind a fallback, one cutting its
-// streams and one holding them open, and budgets that each apply sets.
+// streams and one holding them open, a subscription plan with a request and
+// a token window that the key shares, and budgets that each apply sets.
 const ledgerConfig = `version: 1
 settings: { GLOBAL }
 providers:
@@ -317,26 +319,31 @@ providers:
   bad: { protocol: openai, base_url: BAD, api_key_env: K, billing: pay_per_use, allow_private_network: true }
   cut: { protocol: openai, base_url: CUT, api_key_env: K, billing: pay_per_use, allow_private_network: true }
   hang: { protocol: openai, base_url: HANG, api_key_env: K, billing: pay_per_use, allow_private_network: true }
+  plan: { protocol: openai, base_url: OK, api_key_env: K, billing: subscription, allow_private_network: true,
+    quota: [{ window: 1h, requests: 100000 }, { window: 5h, tokens: 100000000 }] }
 targets:
   ok/m: { kind: chat, pricing: { input_per_million: 1000, output_per_million: 3000, as_of: "2026-11-01" } }
   bad/m: { kind: chat, pricing: { input_per_million: 1000, output_per_million: 3000, as_of: "2026-11-01" } }
   cut/m: { kind: chat, pricing: { input_per_million: 1000, output_per_million: 3000, as_of: "2026-11-01" } }
   hang/m: { kind: chat, pricing: { input_per_million: 1000, output_per_million: 3000, as_of: "2026-11-01" } }
+  plan/m: { kind: chat }
 models:
   fast: { targets: [ok/m], FAST }
   fb: { targets: [bad/m, ok/m] }
   cut: { targets: [cut/m] }
   hang: { targets: [hang/m] }
+  sub: { targets: [plan/m] }
 keys:
-  agent: { models: ["*"], max_parallel_requests: 100, KEY }
+  agent: { models: ["*"], max_parallel_requests: 100, quota_share: { plan: 0.5 }, KEY }
 `
 
-// TestLedger (-race) is the budgets' part of the ledger of phase-3 design
-// section 14: concurrent requests with fallbacks, cancels and cut streams
-// while applies set, change and remove never budgets, which races the
-// charges; afterwards the records equal the provider calls, usage_daily the
-// GROUP BY over usage, every budget counter in memory the one a fresh
-// Restore reads from the store, and every slot is back.
+// TestLedger (-race) is the ledger of phase-3 design section 14: concurrent
+// requests with fallbacks, cancels and cut streams while applies set, change
+// and remove never budgets, which races the charges, and subscription calls
+// counted in the plan's windows and the key's share; afterwards the records
+// equal the provider calls, usage_daily the GROUP BY over usage, every budget
+// counter in memory the one a fresh Restore reads from the store, every
+// quota window the one a fresh seed reads, and every slot is back.
 func TestLedger(t *testing.T) {
 	f := newFixture(t)
 	mock := mockprovider.New()
@@ -389,7 +396,7 @@ func TestLedger(t *testing.T) {
 		for g := range 8 {
 			wg.Go(func() {
 				for i := range 4 {
-					switch (round + g + i) % 5 {
+					switch (round + g + i) % 6 {
 					case 0:
 						<-send(t, data.URL, tokens["agent"], "/v1/chat/completions", chatBody("fast", "")).answer
 					case 1:
@@ -403,6 +410,8 @@ func TestLedger(t *testing.T) {
 						<-r.started
 						r.cancel()
 						<-r.answer
+					case 5:
+						<-send(t, data.URL, tokens["agent"], "/v1/chat/completions", chatBody("sub", "")).answer
 					}
 				}
 			})
@@ -428,11 +437,18 @@ func TestLedger(t *testing.T) {
 		t.Errorf("usage_daily\n%v\nGROUP BY usage\n%v", a, b)
 	}
 
-	fresh := admission.New(f.cfg.Now)
+	fresh := admission.New(f.cfg.Now, usage.Seeder(f.st.Read(), slog.New(slog.DiscardHandler)))
 	if err := usage.Restore(context.Background(), f.st.Read(), fresh, f.cfg.Now()); err != nil {
 		t.Fatal(err)
 	}
 	snap := f.cfg.Snapshot()
+	if err := fresh.Sync(snap.Revision, snap.Doc.Providers, snap.Doc.Keys); err != nil {
+		t.Fatal(err)
+	}
+	live, seeded := f.limits.Windows(), fresh.Windows()
+	if fmt.Sprint(live) != fmt.Sprint(seeded) || len(live) != 4 || live[0].Used == 0 || live[3].Used == 0 {
+		t.Errorf("quota windows in memory %+v, seeded %+v", live, seeded)
+	}
 	var bs []admission.Budget
 	for _, scope := range []string{"global", "key:agent", "model:fast", "model:fb", "model:cut", "model:hang"} {
 		for _, r := range []string{domain.ResetDaily, domain.ResetMonthly} {

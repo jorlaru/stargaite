@@ -79,6 +79,7 @@ type fixture struct {
 	counters    *usage.Counters
 	limits      *admission.State
 	cfg         *config.Service
+	tick        *atomic.Pointer[func()] // when set, run at every read of the clock
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -103,7 +104,13 @@ func newFixture(t *testing.T) *fixture {
 	}
 	now := &atomic.Int64{}
 	now.Store(testNow)
-	cfg, err := config.Open(context.Background(), st, env, func() time.Time { return time.UnixMilli(now.Load()) })
+	tick := &atomic.Pointer[func()]{}
+	cfg, err := config.Open(context.Background(), st, env, func() time.Time {
+		if h := tick.Load(); h != nil {
+			(*h)()
+		}
+		return time.UnixMilli(now.Load())
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,11 +126,11 @@ func newFixture(t *testing.T) *fixture {
 	}
 	flight := &sync.WaitGroup{}
 	logger := slog.New(slog.NewJSONHandler(log, nil))
-	records, counters, limits := usage.NewWriter(st.Write, logger), &usage.Counters{}, admission.New(cfg.Now)
+	records, counters, limits := usage.NewWriter(st.Write, logger), &usage.Counters{}, admission.New(cfg.Now, usage.Seeder(st.Read(), logger))
 	t.Cleanup(func() { records.Close(context.Background()) }) // before the store closes
-	return &fixture{admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(adminKey)), Log: logger, Usage: st.Read()}),
+	return &fixture{admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(adminKey)), Log: logger, Usage: st.Read(), Admission: limits}),
 		Handler(Deps{Config: cfg, Log: logger, Clients: [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)},
-			Flight: flight, Usage: records, Admission: limits, Counters: counters, Version: "test-version"}), now, log, flight, st, counters, limits, cfg}
+			Flight: flight, Usage: records, Admission: limits, Counters: counters, Version: "test-version"}), now, log, flight, st, counters, limits, cfg, tick}
 }
 
 // pastWindow moves the service clock past the RES-2 window of 30 s, so the

@@ -374,6 +374,43 @@ func Restore(ctx context.Context, db *sql.DB, a *admission.State, now time.Time)
 	return totals.Err()
 }
 
+// Seeder is the seed of the quota windows from db, the store's read pool
+// (phase-3 design section 9): the subscription records of a provider's
+// targets (the ids from "<provider>/" up to "<provider>0") that completed at
+// or after from, read on idx_usage_time; each event is sent at started_at and
+// ended at completed_at with its input plus output tokens. A failure is
+// logged, with the provider, and returned: admission then refuses the
+// provider's targets until a seed succeeds.
+func Seeder(db *sql.DB, log *slog.Logger) admission.Seed {
+	return func(provider string, from time.Time) ([]admission.Event, error) {
+		events, err := readEvents(db, provider, from)
+		if err != nil {
+			log.Error("quota windows not seeded", "provider", provider, "error", err.Error())
+		}
+		return events, err
+	}
+}
+
+func readEvents(db *sql.DB, provider string, from time.Time) ([]admission.Event, error) {
+	rows, err := db.Query(`SELECT key_name, started_at, completed_at, input_tokens + output_tokens FROM usage
+		WHERE billing = 'subscription' AND completed_at >= ? AND target >= ? AND target < ?`, from.UnixMilli(), provider+"/", provider+"0")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var events []admission.Event
+	for rows.Next() {
+		var e admission.Event
+		var sent, ended int64
+		if err := rows.Scan(&e.Key, &sent, &ended, &e.Tokens); err != nil {
+			return nil, err
+		}
+		e.Sent, e.Ended = time.UnixMilli(sent), time.UnixMilli(ended)
+		events = append(events, e)
+	}
+	return events, rows.Err()
+}
+
 // null is s, or NULL when s is empty.
 func null(s string) any {
 	if s == "" {

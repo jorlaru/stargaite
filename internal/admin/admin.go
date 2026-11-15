@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"slices"
@@ -22,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jorlaru/stargaite/internal/admission"
 	"github.com/jorlaru/stargaite/internal/auth"
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
@@ -45,6 +47,7 @@ type server struct {
 	keyHash [32]byte
 	log     *slog.Logger
 	usage   *sql.DB
+	limits  *admission.State
 
 	mu        sync.Mutex // guards the two fields below
 	refusedAt time.Time  // when the last refusal line was logged
@@ -91,19 +94,21 @@ var routes = []route{
 	{"POST /admin/v1/keys/{name}/rotate", (*server).rotateKey},
 	{"POST /admin/v1/keys/{name}/revoke", (*server).revokeKey},
 	{"GET /admin/v1/usage", (*server).showUsage},
+	{"GET /admin/v1/usage/quota", (*server).showQuota},
 }
 
 // Deps is what the admin listener needs from serve.
 type Deps struct {
-	Config  *config.Service
-	KeyHash [32]byte // the SHA-256 of the admin key, the only form of it the process keeps
-	Log     *slog.Logger
-	Usage   *sql.DB // the store's read pool, which usage show reads
+	Config    *config.Service
+	KeyHash   [32]byte // the SHA-256 of the admin key, the only form of it the process keeps
+	Log       *slog.Logger
+	Usage     *sql.DB          // the store's read pool, which usage show reads
+	Admission *admission.State // the data plane's, whose quota windows usage quota shows
 }
 
 // Handler returns the admin listener's handler.
 func Handler(d Deps) http.Handler {
-	s := &server{cfg: d.Config, keyHash: d.KeyHash, log: d.Log, usage: d.Usage}
+	s := &server{cfg: d.Config, keyHash: d.KeyHash, log: d.Log, usage: d.Usage, limits: d.Admission}
 	mux := http.NewServeMux()
 	for _, rt := range routes {
 		mux.HandleFunc(rt.pattern, func(w http.ResponseWriter, r *http.Request) { rt.handle(s, w, r) })
@@ -478,4 +483,48 @@ func (s *server) showUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, http.StatusOK, rep)
+}
+
+// quotaNote says what a quota window counts (phase-3 design section 9).
+const quotaNote = "counts this proxy's traffic only"
+
+// showQuota answers usage quota (phase-3 design section 9): every window of
+// every subscription provider's quota, then of every key's share of one, as
+// the published configuration declares them, with the requests or tokens
+// used, the limit, the percentage used and, once exhausted, the seconds
+// until it admits again. A window declared since the start and not used yet
+// is seeded from the store first. A read: not audited.
+func (s *server) showQuota(w http.ResponseWriter, r *http.Request) {
+	if r.URL.RawQuery != "" {
+		s.fail(w, invalid("this route takes no query parameter"))
+		return
+	}
+	snap := s.cfg.Snapshot()
+	if err := s.limits.Sync(snap.Revision, snap.Doc.Providers, snap.Doc.Keys); err != nil {
+		s.fail(w, fmt.Errorf("quota windows not seeded: %w", err))
+		return
+	}
+	type window struct {
+		Provider    string  `json:"provider"`
+		Key         string  `json:"key,omitempty"`
+		Share       float64 `json:"share,omitzero"`
+		Window      string  `json:"window"`
+		Unit        string  `json:"unit"`
+		Used        int64   `json:"used"`
+		Limit       int64   `json:"limit"`
+		UsedPct     float64 `json:"used_pct"`
+		RetryAfterS int64   `json:"retry_after_s,omitzero"`
+	}
+	ws := []window{}
+	for _, v := range s.limits.Windows() {
+		pct := 100.0 // a limit of 0 or below admits nothing
+		if v.Limit > 0 {
+			pct = math.Round(float64(v.Used)*1000/float64(v.Limit)) / 10
+		}
+		ws = append(ws, window{v.Provider, v.Key, v.Share, v.Window, v.Unit, v.Used, v.Limit, pct, int64(v.RetryAfter / time.Second)})
+	}
+	write(w, http.StatusOK, struct {
+		Note    string   `json:"note"`
+		Windows []window `json:"windows"`
+	}{quotaNote, ws})
 }

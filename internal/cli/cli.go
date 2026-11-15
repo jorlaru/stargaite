@@ -256,6 +256,7 @@ var commands = []command{
 		}
 		return http.MethodGet, "/usage?" + q.Encode(), nil
 	}, render: usageShown},
+	{words: []string{"usage", "quota"}, request: get("/usage/quota"), render: quotaShown},
 	{words: []string{"export"}, request: func(in input) (string, string, any) {
 		if in.json {
 			return http.MethodGet, "/export?format=json", nil

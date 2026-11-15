@@ -1,8 +1,8 @@
 // Package admission decides step 4 of the hot path (kick-off section 14.1):
 // the parallel slots and the rpm and tpm windows of a key, an alias and the
 // instance, counted in memory on an injected clock (phase-3 design section 7),
-// and the USD budgets that exclude pay_per_use targets at step 5 (section 8).
-// It reaches no internal package but domain.
+// and the USD budgets and subscription quotas that exclude targets at step 5
+// (sections 8 and 9). It reaches no internal package but domain.
 package admission
 
 import (
@@ -28,12 +28,18 @@ type Scope struct {
 // State holds every scope's requests in flight and, while the scope declares
 // rpm_limit or tpm_limit, its window. A scope with nothing in flight and no
 // window is not held. It also holds the spend of every scope charged
-// (budget.go), apart from them: a spend is never dropped at rest.
+// (budget.go), apart from them: a spend is never dropped at rest; and the
+// quota windows (quota.go), each from its seed until a newer plan drops it.
 type State struct {
-	now    func() time.Time
-	mu     sync.Mutex
-	scopes map[string]*scope
-	spend  map[string]*spend
+	now     func() time.Time
+	seed    Seed
+	mu      sync.Mutex
+	scopes  map[string]*scope
+	spend   map[string]*spend
+	quotas  map[holder][]*quota
+	seeding map[string]chan struct{} // by provider: closed when its seed in flight ends
+	flying  map[holder][]time.Time   // the Take times of the calls not yet Ended, oldest first
+	rev     int64                    // the newest plan revision seen
 }
 
 // scope is the state of one scope name.
@@ -42,9 +48,11 @@ type scope struct {
 	rpm, tpm *window // nil while the scope declares no such limit
 }
 
-// New returns an empty State on the clock now, the service's.
-func New(now func() time.Time) *State {
-	return &State{now: now, scopes: map[string]*scope{}, spend: map[string]*spend{}}
+// New returns an empty State on the clock now, the service's, whose quota
+// windows are seeded by seed.
+func New(now func() time.Time, seed Seed) *State {
+	return &State{now: now, seed: seed, scopes: map[string]*scope{}, spend: map[string]*spend{}, quotas: map[holder][]*quota{},
+		seeding: map[string]chan struct{}{}, flying: map[holder][]time.Time{}}
 }
 
 // Admit admits a request into scopes, given in the order key, alias,
@@ -173,12 +181,16 @@ func what(name string) string {
 // more of the past, phase-3 design §17 point 13). A time's place is the Unix
 // time of origin plus the time elapsed since origin, which time.Time.Sub reads
 // on the monotonic clock when both times carry a reading, as the service
-// clock's (time.Now) do: a step of the wall clock, back or forward, moves no
-// entry and no look. While the host sleeps the monotonic clock may stop, and
-// entries then count as if no time had passed: for a rate window, at most one
-// window of extra refusal. Without a step a time's place is its own Unix time
-// within microseconds, and on a clock without monotonic readings (the tests',
-// the store's) it is exactly that. Times are after 1970.
+// clock's (time.Now) do: for a rate window, a step of the wall clock, back or
+// forward, moves no entry and no look. While the host sleeps the monotonic
+// clock may stop, and entries then count as if no time had passed: for a rate
+// window, at most one window of extra refusal. Without a step a time's place
+// is its own Unix time within microseconds, and on a clock without monotonic
+// readings (the tests', the store's) it is exactly that. A quota window has
+// an origin without a monotonic reading (Round(0)), so every time is placed
+// by its Unix time alone, as the store's records are when it is seeded: a
+// seeded and a live window agree after a sleep or a wall step (quota.go).
+// Times are after 1970.
 type window struct {
 	w, g    time.Duration
 	origin  time.Time
@@ -187,9 +199,12 @@ type window struct {
 }
 
 func newWindow(w time.Duration, origin time.Time) *window {
-	g := max(time.Second, w/600)
+	g := bucket(w)
 	return &window{w: w, g: g, origin: origin, last: origin.UnixNano() / int64(g), buckets: make([]int64, (w+g-1)/g+1)}
 }
+
+// bucket is the width of a window's buckets over span w.
+func bucket(w time.Duration) time.Duration { return max(time.Second, w/600) }
 
 // pos is t's place, in ns.
 func (x *window) pos(t time.Time) int64 { return x.origin.UnixNano() + int64(t.Sub(x.origin)) }
@@ -205,13 +220,14 @@ func (x *window) advance(b int64) {
 }
 
 // span is the buckets counted at p, a place: lo, the oldest whose end is less
-// than w before p, to the newest held. A look placed before the newest bucket
+// than w before p and not before 1970 (a quota window may be longer than the
+// time since), to the newest held. A look placed before the newest bucket
 // held (a clock without monotonic readings that went back) counts every
 // bucket held; entries cleared when the ring moved ahead are lost, so such
 // times must not reach a window (the service clock never gives them).
 func (x *window) span(p int64) (lo, hi int64) {
 	x.advance(p / int64(x.g))
-	return max((p-int64(x.w))/int64(x.g), x.last-int64(len(x.buckets))+1), x.last
+	return max((p-int64(x.w))/int64(x.g), x.last-int64(len(x.buckets))+1, 0), x.last
 }
 
 // add counts n at at, in its own bucket: an entry counted late (tokens at

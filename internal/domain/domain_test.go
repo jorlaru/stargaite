@@ -541,3 +541,22 @@ func TestErrorEnvelope(t *testing.T) {
 		}
 	}
 }
+
+// TestQuotaSpan: a window is a whole number of minutes, hours or days, at
+// most MaxQuotaSpan; any other text is not one.
+func TestQuotaSpan(t *testing.T) {
+	for _, tc := range []struct {
+		window string
+		span   time.Duration
+		ok     bool
+	}{
+		{"30m", 30 * time.Minute, true}, {"5h", 5 * time.Hour, true}, {"7d", 7 * 24 * time.Hour, true},
+		{"999999d", MaxQuotaSpan, true}, {"36501d", MaxQuotaSpan, true}, {"36500d", MaxQuotaSpan, true}, {"36499d", 36499 * 24 * time.Hour, true},
+		{"", 0, false}, {"h", 0, false}, {"0h", 0, false}, {"-1h", 0, false}, {"5s", 0, false}, {"5 hours", 0, false}, {"1.5h", 0, false},
+		{"99999999999999999999d", 0, false},
+	} {
+		if span, ok := QuotaSpan(tc.window); span != tc.span || ok != tc.ok {
+			t.Errorf("%q: %v %v, want %v %v", tc.window, span, ok, tc.span, tc.ok)
+		}
+	}
+}

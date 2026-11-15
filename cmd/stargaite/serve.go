@@ -146,15 +146,24 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 			"resource", f.Resource, "field", f.Field, "message", f.Message)
 	}
 
-	// The budgets' counters are rebuilt from the store before the listeners
-	// bind, so a restart changes no figure (RES-9).
-	limits := admission.New(cfg.Now)
-	if err := usage.Restore(ctx, st.Read(), limits, cfg.Now()); err != nil {
-		log.Error("budgets not restored", "error", err.Error())
-		if err := st.Close(); err != nil {
-			log.Error("store close failed", "error", err.Error())
+	// The budgets' counters and every declared quota window are rebuilt from
+	// the store before the listeners bind, so a restart changes no figure
+	// (RES-9, LIM-8). A window declared later is seeded at its first use.
+	limits := admission.New(cfg.Now, usage.Seeder(st.Read(), log))
+	for _, step := range []struct {
+		failed string
+		run    func() error
+	}{
+		{"budgets not restored", func() error { return usage.Restore(ctx, st.Read(), limits, cfg.Now()) }},
+		{"quotas not restored", func() error { return limits.Sync(snap.Revision, snap.Doc.Providers, snap.Doc.Keys) }},
+	} {
+		if err := step.run(); err != nil {
+			log.Error(step.failed, "error", err.Error())
+			if err := st.Close(); err != nil {
+				log.Error("store close failed", "error", err.Error())
+			}
+			return 1
 		}
-		return 1
 	}
 	// Every record goes through one writer on the store's write path, which
 	// config commits share (ADR-003).
@@ -177,7 +186,7 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 		base, halt := context.WithCancelCause(context.Background())
 		var flight sync.WaitGroup
 		if err := runServers(ctx, base, log, tlsConfig, ready, []listener{
-			{"admin", *adminAddr, admin.Handler(admin.Deps{Config: cfg, KeyHash: keyHash, Log: log, Usage: st.Read()})},
+			{"admin", *adminAddr, admin.Handler(admin.Deps{Config: cfg, KeyHash: keyHash, Log: log, Usage: st.Read(), Admission: limits})},
 			{"data", *dataAddr, api.Handler(api.Deps{Config: cfg, Log: log, Clients: [2]*http.Client{
 				transport.NewClient(false, systemResolver), transport.NewClient(true, systemResolver)}, Flight: &flight,
 				Usage: records, Admission: limits, Counters: &usage.Counters{}, Version: cli.Version})},

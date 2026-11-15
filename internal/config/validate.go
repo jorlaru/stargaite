@@ -190,8 +190,12 @@ func Validate(doc *domain.Document) []domain.Finding {
 		r.fail("OPS-3", "unsupported_version", "document", "version", "version must be 1")
 	}
 	validateSettings(&r, doc.Settings)
+	days := int64(domain.DefaultUsageDays)
+	if doc.Settings.Retention != nil {
+		days = cmp.Or(doc.Settings.Retention.UsageDays, days)
+	}
 	for _, name := range slices.Sorted(maps.Keys(doc.Providers)) {
-		validateProvider(&r, name, doc.Providers[name])
+		validateProvider(&r, name, doc.Providers[name], days)
 	}
 	scopes := budgetScopes(doc)
 	for _, id := range slices.Sorted(maps.Keys(doc.Targets)) {
@@ -262,7 +266,7 @@ func validateSettings(r *report, s domain.Settings) {
 	}
 }
 
-func validateProvider(r *report, name string, p domain.Provider) {
+func validateProvider(r *report, name string, p domain.Provider, usageDays int64) {
 	res := "providers/" + name
 	if !domain.ValidName(name) {
 		r.fail("OPS-5", "invalid_name", res, "", "provider name %.64q must match [A-Za-z0-9][A-Za-z0-9._-]* with at most 64 characters", name)
@@ -281,6 +285,11 @@ func validateProvider(r *report, name string, p domain.Provider) {
 		}
 		if q.Requests < 0 || q.Tokens < 0 || q.Requests == 0 && q.Tokens == 0 {
 			r.fail("LIM-8", "invalid_value", res, "quota", "quota window %.64q needs a positive limit in requests or tokens", q.Window)
+		}
+		// The seed of a window reads the records of its span (phase-3 design
+		// section 9), which retention keeps for usage_days only.
+		if span, ok := domain.QuotaSpan(q.Window); ok && quotaWindow.MatchString(q.Window) && span.Hours()/24 > float64(usageDays) {
+			r.warn("LIM-8", "quota_beyond_retention", res, "quota", "quota window %s is longer than retention.usage_days (%d days): its count after a restart can only read the records kept", q.Window, usageDays)
 		}
 	}
 	if c := p.CostReport; c != nil {

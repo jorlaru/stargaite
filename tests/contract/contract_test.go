@@ -1,8 +1,9 @@
 // Package contract runs the per-target cases of phase 2 against a live
 // provider through the proxy: a simple request, a stream, structured output
 // and tools when the target declares them, each declared level, a provider
-// error, a client that goes away mid-stream (RES-5) and, toward the anthropic
-// protocol, /v1/messages with a thinking tool loop (AC-02). It runs only when STARGAITE_CONTRACT_BASE_URL and
+// error, a client that goes away mid-stream (RES-5), toward the anthropic
+// protocol /v1/messages with a thinking tool loop (AC-02), and the usage
+// cases of phase 3 (TestUsage). It runs only when STARGAITE_CONTRACT_BASE_URL and
 // STARGAITE_CONTRACT_API_KEY are set, so make ci and a fork with no secret
 // skip it (PUB-4, PUB-5); it costs tokens. The variables:
 //
@@ -14,13 +15,23 @@
 //	                             (default "{ kind: chat }"), as in a
 //	                             configuration: its levels and capabilities
 //	                             choose the cases
+//	STARGAITE_CONTRACT_PROVIDER  more members of the provider declaration, as
+//	                             in a YAML flow mapping without its braces:
+//	                             the preset's stream_usage and cost_report
+//	                             under test (providers presets --json shows
+//	                             them), for example "stream_usage: request,
+//	                             cost_report: { path: usage.cost, usd_per_unit: 1 }";
+//	                             protocol, base_url, api_key_env and billing
+//	                             (pay_per_use) are the test's
 package contract
 
 import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -53,6 +64,7 @@ type proxy struct {
 	doc         domain.Document
 	target      string
 	flight      *sync.WaitGroup // the data plane's requests in flight
+	db          *sql.DB         // the store, where the usage records land
 }
 
 func live(t *testing.T) *proxy {
@@ -72,6 +84,10 @@ func live(t *testing.T) *proxy {
 	target := os.Getenv("STARGAITE_CONTRACT_TARGET")
 	if target == "" {
 		target = "{ kind: chat }"
+	}
+	provider := ""
+	if more := os.Getenv("STARGAITE_CONTRACT_PROVIDER"); more != "" {
+		provider = ", " + more
 	}
 
 	st, err := store.Open(context.Background(), t.TempDir())
@@ -93,7 +109,7 @@ func live(t *testing.T) *proxy {
 	limits := admission.New(cfg.Now, usage.Seeder(st.Read(), log))
 	p := &proxy{
 		admin: admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(adminKey)), Log: log, Usage: st.Read(), Admission: limits}),
-		key:   key, target: "live/" + model, flight: &sync.WaitGroup{},
+		key:   key, target: "live/" + model, flight: &sync.WaitGroup{}, db: st.Read(),
 	}
 	records := usage.NewWriter(st.Write, log)
 	t.Cleanup(func() { records.Close(context.Background()) })
@@ -103,10 +119,11 @@ func live(t *testing.T) *proxy {
 	// A cap on every alias: the anthropic protocol needs one (PAR-7), and
 	// the budgets of a thinking_budget target must stay below it (RSN-3).
 	// provider_default sends no effort unless the request has one, and is
-	// what a target that cannot disable reasoning needs (RSN-7).
+	// what a target that cannot disable reasoning needs (RSN-7). Billing
+	// pay_per_use lets a record take the provider's cost (USE-6).
 	yaml := fmt.Sprintf(`version: 1
 providers:
-  live: { protocol: %s, base_url: %q, api_key_env: CONTRACT_KEY, billing: none }
+  live: { protocol: %s, base_url: %q, api_key_env: CONTRACT_KEY, billing: pay_per_use%s }
 targets:
   %q: %s
   %q: { kind: chat }
@@ -115,7 +132,7 @@ models:
   missing: { targets: [%q], max_output_tokens: 8192, reasoning: { effort: provider_default, mode: default } }
 keys:
   contract: { models: ["*"] }
-`, protocol, base, p.target, target, "live/stargaite-contract-no-such-model", p.target, "live/stargaite-contract-no-such-model")
+`, protocol, base, provider, p.target, target, "live/stargaite-contract-no-such-model", p.target, "live/stargaite-contract-no-such-model")
 	w := p.call(p.admin, http.MethodPost, "/admin/v1/apply", yaml, "Authorization", "Bearer "+adminKey)
 	var res config.Result
 	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &res) != nil {
@@ -235,6 +252,136 @@ func TestChat(t *testing.T) {
 	if status != http.StatusBadRequest && status != http.StatusNotFound && status != http.StatusUnprocessableEntity || !strings.Contains(string(body), `"code":"upstream_error"`) ||
 		h.Get("X-Stargaite-Target") != "live/stargaite-contract-no-such-model" {
 		t.Errorf("unknown upstream model: %d %s", status, p.show(body))
+	}
+}
+
+// record is the usage record of a provider call that answered 2xx.
+type record struct {
+	input, cacheRead, cacheWrite, output int64
+	reasoning                            *int64
+	tokens, costSource                   string
+	cost                                 *float64
+}
+
+func (r record) String() string {
+	reasoning, cost := "NULL", "NULL"
+	if r.reasoning != nil {
+		reasoning = fmt.Sprint(*r.reasoning)
+	}
+	if r.cost != nil {
+		cost = fmt.Sprint(*r.cost)
+	}
+	return fmt.Sprintf("input %d (cache read %d, write %d), output %d (reasoning %s), tokens %s, cost %s from %s",
+		r.input, r.cacheRead, r.cacheWrite, r.output, reasoning, r.tokens, cost, r.costSource)
+}
+
+// record reads the record of the 2xx call of trace, once the writer has
+// committed it (a batch takes 50 ms).
+func (p *proxy) record(t *testing.T, trace string) record {
+	t.Helper()
+	var r record
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		err := p.db.QueryRow(`SELECT input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, reasoning_tokens,
+			tokens_source, cost_usd, cost_source FROM usage WHERE trace_id = ? AND status_code BETWEEN 200 AND 299`, trace).
+			Scan(&r.input, &r.cacheRead, &r.cacheWrite, &r.output, &r.reasoning, &r.tokens, &r.cost, &r.costSource)
+		if err == nil {
+			return r
+		}
+		if !errors.Is(err, sql.ErrNoRows) || time.Now().After(deadline) {
+			t.Fatalf("the record of trace %q: %v", trace, err)
+		}
+	}
+}
+
+// TestUsage is the usage cases of phase-3 design section 14: the usage a
+// synchronous answer reports gives the record the USE-3 totals, and the
+// provider's own total is input plus output, so no part counts twice or goes
+// missing; a stream whose client did not ask for usage records the
+// provider's tokens when the declared stream_usage says they arrive (native;
+// request, which the proxy then asks for; and toward anthropic unless
+// declared none) and estimated ones under none; and, when the provider declares a cost_report,
+// its path holds a number in the answer and the record's cost is that figure
+// with source provider, for the stream too once its usage arrived (USE-6).
+func TestUsage(t *testing.T) {
+	p := live(t)
+	prov := p.doc.Providers["live"]
+	anthropic := prov.Protocol == domain.ProtocolAnthropic
+	path, auth := "/v1/chat/completions", "Authorization"
+	ask := `{"model":"live","messages":[{"role":"user","content":"Answer in one word: what colour is the sky?"}]`
+	if anthropic {
+		path, auth = "/v1/messages", "X-Api-Key"
+		ask = `{"model":"live","max_tokens":64,"messages":[{"role":"user","content":"Say hi."}]`
+	}
+	token := p.token
+	if !anthropic {
+		token = "Bearer " + token
+	}
+	w := p.call(p.data, http.MethodPost, path, ask+"}", auth, token)
+	var reply struct {
+		Usage *struct {
+			Prompt     int64 `json:"prompt_tokens"`
+			Completion int64 `json:"completion_tokens"`
+			Total      int64 `json:"total_tokens"`
+			Details    struct {
+				Reasoning *int64 `json:"reasoning_tokens"`
+			} `json:"completion_tokens_details"`
+			Input      int64 `json:"input_tokens"`
+			CacheRead  int64 `json:"cache_read_input_tokens"`
+			CacheWrite int64 `json:"cache_creation_input_tokens"`
+			Output     int64 `json:"output_tokens"`
+		}
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &reply); w.Code != http.StatusOK || err != nil || reply.Usage == nil {
+		t.Fatalf("synchronous answer without usage: %d %s", w.Code, p.show(w.Body.Bytes()))
+	}
+	u, r := reply.Usage, p.record(t, w.Header().Get("X-Stargaite-Trace-Id"))
+	if r.tokens != "provider" {
+		t.Errorf("synchronous answer: tokens %s, not the provider's", r.tokens)
+	}
+	if anthropic {
+		if r.input != u.Input+u.CacheRead+u.CacheWrite || r.cacheRead != u.CacheRead || r.cacheWrite != u.CacheWrite || r.output != u.Output {
+			t.Errorf("USE-3: recorded %v from %s", r, p.show(w.Body.Bytes()))
+		}
+	} else {
+		if r.input != u.Prompt || r.output != max(u.Completion, u.Total-u.Prompt) || (u.Details.Reasoning == nil) != (r.reasoning == nil) ||
+			u.Details.Reasoning != nil && *u.Details.Reasoning != *r.reasoning {
+			t.Errorf("USE-3: recorded %v from %s", r, p.show(w.Body.Bytes()))
+		}
+		if u.Total != 0 && u.Prompt+r.output != u.Total {
+			t.Errorf("USE-3: the reported total %d is not input %d plus output %d", u.Total, u.Prompt, r.output)
+		}
+	}
+	if r.cacheRead+r.cacheWrite > r.input || r.reasoning != nil && *r.reasoning > r.output {
+		t.Errorf("USE-3: a part above its total: %v", r)
+	}
+	if prov.CostReport != nil {
+		var v any = map[string]any{}
+		_ = json.Unmarshal(w.Body.Bytes(), &v)
+		for name := range strings.SplitSeq(prov.CostReport.Path, ".") {
+			m, _ := v.(map[string]any)
+			v = m[name]
+		}
+		if f, ok := v.(float64); !ok || f < 0 || r.costSource != "provider" || r.cost == nil || *r.cost != f*prov.CostReport.USDPerUnit {
+			t.Errorf("cost_report %s: the answer holds %v, the record %v", prov.CostReport.Path, v, r)
+		}
+	}
+
+	w = p.call(p.data, http.MethodPost, path, ask+`,"stream":true}`, auth, token)
+	if w.Code != http.StatusOK {
+		t.Fatalf("stream: %d %s", w.Code, p.show(w.Body.Bytes()))
+	}
+	r = p.record(t, w.Header().Get("X-Stargaite-Trace-Id"))
+	arrives := prov.StreamUsage != domain.StreamUsageNone && (anthropic || prov.StreamUsage == domain.StreamUsageNative || prov.StreamUsage == domain.StreamUsageRequest)
+	switch {
+	case !anthropic && prov.StreamUsage == "":
+		t.Logf("stream_usage is undeclared; a stream that did not ask for usage recorded %s tokens (provider: native fits; estimated: run again with request)", r.tokens)
+	case arrives && r.tokens != "provider":
+		t.Errorf("stream_usage %q: the stream's usage did not arrive (tokens %s)", prov.StreamUsage, r.tokens)
+	case !arrives && r.tokens != "estimated":
+		t.Errorf("stream_usage none: the provider sent usage unasked (tokens %s): native fits", r.tokens)
+	}
+	if prov.CostReport != nil && r.tokens == "provider" && r.costSource != "provider" {
+		t.Errorf("cost_report %s: the stream's usage arrived without the cost (source %s)", prov.CostReport.Path, r.costSource)
 	}
 }
 

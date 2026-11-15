@@ -151,7 +151,9 @@ sends a static header that carries no secret, and `Authorization`, `Proxy-Author
 refused there. A plain HTTP, loopback or private endpoint needs `--allow-private-network`; the address is checked again
 at every connection and redirects are never followed. `--preset langfuse` fills in
 `--basic-auth-env LANGFUSE_PUBLIC_KEY:LANGFUSE_SECRET_KEY` and the header `x-langfuse-ingestion-version: 4`, which
-explicit flags override; give the endpoint as `https://<host>/api/public/otel`.
+explicit flags override; give the endpoint as `https://<host>/api/public/otel`. Langfuse shows the cost stargaite
+sends; for a call without one (`subscription`, `none` or unpriced) it shows a cost of its own, from its price table and
+the returned model, which no record has.
 
 `./stargaite telemetry test` sends one span, `stargaite telemetry test` under the reserved key `_telemetry`, and names
 the first thing that failed: `credential_unresolved` (a referenced variable is not visible to `serve`; nothing is
@@ -273,4 +275,21 @@ including `tests/e2e`) with Go 1.27 or later; `make ci-container` runs the same 
 `make image-test` builds the image and runs it. No check needs a secret, and the tests use no network beyond loopback.
 `tests/contract` runs the per-target cases against a live provider only when `STARGAITE_CONTRACT_BASE_URL` and
 `STARGAITE_CONTRACT_API_KEY` are set (its package comment lists the variables); it costs tokens, and without them it
-is skipped.
+is skipped. Its usage cases (`-run TestUsage`) check the declared `stream_usage` and `cost_report` of the preset under
+test, given in `STARGAITE_CONTRACT_PROVIDER`, and the token totals of the records:
+
+```sh
+STARGAITE_CONTRACT_BASE_URL=https://api.x.ai/v1 STARGAITE_CONTRACT_API_KEY=... STARGAITE_CONTRACT_MODEL=<model> \
+  STARGAITE_CONTRACT_PROTOCOL=openai \
+  STARGAITE_CONTRACT_PROVIDER='stream_usage: request, cost_report: { path: usage.cost_in_usd_ticks, usd_per_unit: 1e-10 }' \
+  go test -count=1 -v ./tests/contract
+```
+
+`tests/langfuse` sends the proxy's spans, with the `langfuse` preset, to a self-hosted Langfuse (v4.80.0, started with
+its own `docker compose`; use a disposable project) and reads them back through its public API: each trace readable,
+filtered by key, alias and target, the cost of each `pay_per_use` trace equal to its records. It runs only when
+`STARGAITE_LANGFUSE_URL` (the base URL, such as `http://localhost:3000`), `LANGFUSE_PUBLIC_KEY` and
+`LANGFUSE_SECRET_KEY` are set: `go test -count=1 -timeout 30m -v ./tests/langfuse` (its wait for traces sent without
+the ingestion version header can pass go test's default 10 minutes). Neither suite is part of `make ci`;
+maintainers run both before a release that changes the span schema or the exporter, and the contract suite before a
+preset loses its `untested` mark.

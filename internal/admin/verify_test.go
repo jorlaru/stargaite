@@ -25,6 +25,7 @@ import (
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/store"
+	"github.com/jorlaru/stargaite/internal/telemetry"
 	"github.com/jorlaru/stargaite/internal/transport"
 	"github.com/jorlaru/stargaite/internal/usage"
 	"github.com/jorlaru/stargaite/tests/mockprovider"
@@ -44,6 +45,12 @@ type verifyFixture struct {
 	limits  *admission.State
 	flight  *sync.WaitGroup
 	halt    context.CancelCauseFunc // the stop: cancels every request context
+	// The data plane's writer and exporter, and the exporter's receiver,
+	// which a configuration that sets telemetry points at.
+	writer      *usage.Writer
+	spans       *telemetry.Exporter
+	receiver    *mockprovider.Server
+	receiverURL string
 }
 
 func newVerifyFixture(t *testing.T) *verifyFixture {
@@ -68,20 +75,32 @@ func newVerifyFixture(t *testing.T) *verifyFixture {
 		return nil, errors.New("no name is resolved in tests")
 	}
 	limits, flight := admission.New(cfg.Now, usage.Seeder(st.Read(), logger)), &sync.WaitGroup{}
-	d := api.Deps{Config: cfg, Log: logger, Clients: [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)},
-		Flight: flight, Usage: writer, Admission: limits, Counters: &usage.Counters{}, Version: "test-version"}
+	clients := [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)}
+	receiver := mockprovider.New()
+	rsrv := httptest.NewServer(receiver)
+	t.Cleanup(rsrv.Close)
+	spans := telemetry.NewExporter(func() *config.Exporter { return cfg.Snapshot().Exporter }, clients, "test-version", logger)
+	t.Cleanup(func() { // before the receiver closes
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		spans.Close(ctx)
+	})
+	counters, spanned := &usage.Counters{}, &usage.Counters{}
+	d := api.Deps{Config: cfg, Log: logger, Clients: clients, Flight: flight, Usage: writer, Admission: limits, Counters: counters, Spanned: spanned,
+		Spans: spans, Version: "test-version"}
 	mock := mockprovider.New()
 	msrv := httptest.NewServer(mock)
 	t.Cleanup(msrv.Close)
 	base, halt := context.WithCancelCause(context.Background())
 	t.Cleanup(func() { halt(nil) })
+	metricsHash := sha256.Sum256([]byte(testMetricsToken))
 	srv := httptest.NewUnstartedServer(Handler(Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(testKey)), Log: logger, Usage: st.Read(),
-		Admission: limits, Verify: api.Verify(d)}))
+		Admission: limits, Spans: spans, Counters: counters, Spanned: spanned, MetricsHash: &metricsHash, Verify: api.Verify(d)}))
 	srv.Config.ReadTimeout, srv.Config.WriteTimeout = 200*time.Millisecond, 200*time.Millisecond
 	srv.Config.BaseContext = func(net.Listener) context.Context { return base }
 	srv.Start()
 	t.Cleanup(srv.Close)
-	return &verifyFixture{srv.URL, srv.Client(), api.Handler(d), mock, msrv.URL, st, cfg, limits, flight, halt}
+	return &verifyFixture{srv.URL, srv.Client(), api.Handler(d), mock, msrv.URL, st, cfg, limits, flight, halt, writer, spans, receiver, rsrv.URL}
 }
 
 // send sends one admin request with the key and returns the status and the

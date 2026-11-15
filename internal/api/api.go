@@ -58,6 +58,10 @@ type Deps struct {
 	Usage     *usage.Writer    // one record per provider call (USE-1)
 	Admission *admission.State // slots and rate windows (LIM-5, LIM-6)
 	Counters  *usage.Counters  // OPS-8
+	// Spanned counts the spans done hands to Spans, by key and alias
+	// (OPS-8): a set apart from Counters, which keeps no span count, so the
+	// sampling rate changes no entry of Counters (AC-28).
+	Spanned *usage.Counters
 	// Spans is the exporter done hands the spans of a sampled request to,
 	// when an exporter is published (phase-3 design section 10).
 	Spans   *telemetry.Exporter
@@ -108,9 +112,9 @@ func Handler(d Deps) http.Handler {
 // is in Authorization: Bearer or, on /v1/messages, in x-api-key (ACT-1);
 // when both are sent, Authorization wins. The admin key never has the shape
 // of a client key, so it is refused like any other wrong token (SEC-2). A
-// failure answers 401 invalid_api_key in the envelope of ep and is logged
-// rate-limited, never with the token, so a flood of wrong tokens cannot grow
-// the log (OPS-9).
+// failure answers 401 invalid_api_key in the envelope of ep, adds
+// unauthenticated to the counters (TEL-5) and is logged rate-limited, never
+// with the token, so a flood of wrong tokens cannot grow the log (OPS-9).
 func (h *handler) authenticate(w http.ResponseWriter, r *http.Request, snap *config.Snapshot, ep domain.Endpoint) (*config.Key, telemetry.Context) {
 	now := h.Config.Now()
 	var key *config.Key
@@ -128,6 +132,7 @@ func (h *handler) authenticate(w http.ResponseWriter, r *http.Request, snap *con
 	}
 	if key == nil {
 		fail(w, ep, domain.NewError(domain.CodeInvalidAPIKey, want))
+		h.Counters.Add(usage.Counter{Name: "unauthenticated"}, 1)
 		if n, ok := h.refused.tick(now); ok {
 			h.Log.Warn("authentication failed", "request_id", w.Header().Get(domain.RequestIDHeader), "method", r.Method, "path", r.URL.Path,
 				"status", http.StatusUnauthorized, "remote", r.RemoteAddr, "failures", n)

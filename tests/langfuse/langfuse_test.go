@@ -156,7 +156,7 @@ func TestLangfuse(t *testing.T) {
 	t.Cleanup(func() { records.Close(context.Background()) })
 	adminH := admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(adminKey)), Log: log, Usage: st.Read(), Admission: limits, Spans: spans})
 	data := api.Handler(api.Deps{Config: cfg, Log: log, Clients: clients, Flight: &sync.WaitGroup{}, Usage: records,
-		Admission: limits, Counters: &usage.Counters{}, Spans: spans, Version: "langfuse-test"})
+		Admission: limits, Counters: &usage.Counters{}, Spanned: &usage.Counters{}, Spans: spans, Version: "langfuse-test"})
 	call := func(h http.Handler, method, path, body string, header ...string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(method, path, strings.NewReader(body))
 		for i := 0; i < len(header); i += 2 {

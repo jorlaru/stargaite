@@ -144,7 +144,7 @@ func newFixture(t *testing.T) *fixture {
 		spans.Close(ctx)
 	})
 	return &fixture{admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(adminKey)), Log: logger, Usage: st.Read(), Admission: limits, Spans: spans}),
-		Handler(Deps{Config: cfg, Log: logger, Clients: clients, Flight: flight, Usage: records, Admission: limits, Counters: counters, Spans: spans,
+		Handler(Deps{Config: cfg, Log: logger, Clients: clients, Flight: flight, Usage: records, Admission: limits, Counters: counters, Spanned: &usage.Counters{}, Spans: spans,
 			Version: "test-version"}), now, log, flight, st, counters, limits, cfg, tick, spans, receiver, rsrv.URL}
 }
 
@@ -326,6 +326,16 @@ func TestRefusalLogRateLimited(t *testing.T) {
 	if n := strings.Count(log, `"msg":"authentication failed"`); n != 2 || !strings.Contains(log, `"failures":1000`) ||
 		strings.Contains(log, `"msg":"request"`) || strings.Contains(log, token[len(token)-20:]) {
 		t.Errorf("%d lines, log %s", n, log)
+	}
+	// TEL-5: every 401 is counted, GET /v1/models and each endpoint's own
+	// token header included, while the log stays rate-limited.
+	f.traffic("/v1/chat/completions", "", `{"model":"x"}`)
+	f.traffic("/v1/messages", "", `{"model":"x"}`, "X-Api-Key", token)
+	var counted []usage.Counter
+	var n float64
+	f.counters.Each(func(c usage.Counter, v float64) { counted, n = append(counted, c), v })
+	if !slices.Equal(counted, []usage.Counter{{Name: "unauthenticated"}}) || n != 1003 {
+		t.Errorf("counters %v, the last %v, want unauthenticated 1003", counted, n)
 	}
 }
 

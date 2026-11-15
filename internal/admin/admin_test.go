@@ -36,9 +36,11 @@ var update = flag.Bool("update", false, "rewrite the golden files")
 
 const (
 	testKey = "test-admin-key-of-at-least-32-characters"
-	testNow = 1_790_000_000_000
-	example = "../../config.example.yaml"
-	golden  = "testdata/export.yaml"
+	// testMetricsToken opens GET /admin/v1/metrics alone (SEC-3).
+	testMetricsToken = "test-metrics-token-of-at-least-32-characters"
+	testNow          = 1_790_000_000_000
+	example          = "../../config.example.yaml"
+	golden           = "testdata/export.yaml"
 )
 
 // exampleEnv resolves every credential config.example.yaml references.
@@ -104,8 +106,10 @@ func newFixtureEnv(t *testing.T, env func() config.Env) *fixture {
 		defer cancel()
 		spans.Close(ctx)
 	})
+	metricsHash := sha256.Sum256([]byte(testMetricsToken))
 	return &fixture{Handler(Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(testKey)), Log: logger, Usage: st.Read(),
-		Admission: admission.New(cfg.Now, usage.Seeder(st.Read(), logger)), Spans: spans}), cfg, st, log}
+		Admission: admission.New(cfg.Now, usage.Seeder(st.Read(), logger)), Spans: spans, Counters: &usage.Counters{}, Spanned: &usage.Counters{},
+		MetricsHash: &metricsHash}), cfg, st, log}
 }
 
 // as sends one request with the Authorization header given.
@@ -335,14 +339,27 @@ func TestEveryRouteNeedsTheKey(t *testing.T) {
 	for _, rt := range routes {
 		targets = append(targets, rt.pattern)
 	}
+	// The metrics token on every route but GET /admin/v1/metrics, and on
+	// that path by another method or spelling (SEC-3).
+	metricsOnly := []string{"HEAD /admin/v1/metrics", "POST /admin/v1/metrics", "GET /admin/v1/metrics/", "GET /admin/v1//metrics",
+		"GET /admin/v1/./metrics"}
 	for _, target := range targets {
 		method, path, _ := strings.Cut(target, " ")
-		for _, authorization := range []string{
+		authorizations := []string{
 			"", testKey, "Bearer", "Bearer ", "Bearer  " + testKey, "Bearer " + testKey + "x", "Bearer " + testKey[:len(testKey)-1],
-			"Bearer " + strings.ToUpper(testKey), "Basic " + testKey, "Bearer " + token,
-		} {
+			"Bearer " + strings.ToUpper(testKey), "Basic " + testKey, "Bearer " + token, "Basic " + testMetricsToken, "Bearer " + testMetricsToken + "x",
+		}
+		if target != "GET /admin/v1/metrics" {
+			authorizations = append(authorizations, "Bearer "+testMetricsToken)
+			metricsOnly = append(metricsOnly, target)
+		}
+		for _, authorization := range authorizations {
 			errorOf(t, f.as(t, authorization, method, path, []byte("version: 1\n")), http.StatusUnauthorized, domain.CodeInvalidAPIKey)
 		}
+	}
+	for _, target := range metricsOnly {
+		method, path, _ := strings.Cut(target, " ")
+		errorOf(t, f.as(t, "Bearer "+testMetricsToken, method, path, nil), http.StatusUnauthorized, domain.CodeInvalidAPIKey)
 	}
 	lines := strings.Split(strings.TrimSpace(f.log.String()), "\n")
 	if len(lines) != 1 || !strings.Contains(lines[0], `"msg":"admin authentication failed"`) || !strings.Contains(lines[0], `"failures":1`) {
@@ -357,6 +374,12 @@ func TestEveryRouteNeedsTheKey(t *testing.T) {
 	// The scheme is case-insensitive (RFC 9110).
 	if w := f.as(t, "bearer "+testKey, http.MethodGet, "/admin/v1/settings", nil); w.Code != http.StatusOK {
 		t.Errorf("lower-case scheme: status %d", w.Code)
+	}
+	// The metrics route answers the admin key and the metrics token alike.
+	for _, authorization := range []string{"Bearer " + testKey, "bearer " + testMetricsToken} {
+		if w := f.as(t, authorization, http.MethodGet, "/admin/v1/metrics", nil); w.Code != http.StatusOK || w.Header().Get("Content-Type") != metricsType {
+			t.Errorf("metrics with %.12s: status %d, headers %v", authorization, w.Code, w.Header())
+		}
 	}
 }
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"flag"
@@ -17,10 +18,12 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jorlaru/stargaite/internal/admin"
 	"github.com/jorlaru/stargaite/internal/admission"
 	"github.com/jorlaru/stargaite/internal/api"
+	"github.com/jorlaru/stargaite/internal/auth"
 	"github.com/jorlaru/stargaite/internal/cli"
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
@@ -193,9 +196,18 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 	case created:
 		log.Info("admin key created", "path", filepath.Join(*dataDir, admin.KeyFile))
 	}
+	// The metrics token, read once; only its SHA-256 is kept (SEC-3).
+	var metricsHash *[32]byte
+	if code == 0 {
+		if metricsHash, err = metricsToken(getenv("STARGAITE_METRICS_TOKEN"), keyHash); err != nil {
+			log.Error("metrics token refused", "rule", "SEC-3", "error", err.Error())
+			code = 1
+		}
+	}
 	attrs := []any{"data_dir", *dataDir, "tls", tlsConfig != nil, "version", cli.Version, "revision", snap.Revision}
-	// The data plane's OPS-8 counters, which the store check shares.
-	counters := &usage.Counters{}
+	// The data plane's OPS-8 counters, which the store check shares, and its
+	// span counts by key and alias; the metrics route renders both.
+	counters, spanned := &usage.Counters{}, &usage.Counters{}
 	if code == 0 {
 		// Every request context derives from base: cancelling it stops the
 		// requests still running when the grace ends, and flight counts the
@@ -213,10 +225,11 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 		// One data plane: a verify run goes through the same Flight, writer,
 		// admission state, counters and exporter as traffic (RSN-9), and
 		// halt stops its call like any other.
-		d := api.Deps{Config: cfg, Log: log, Clients: clients, Flight: &flight, Usage: records, Admission: limits, Counters: counters, Spans: spans, Version: cli.Version}
+		d := api.Deps{Config: cfg, Log: log, Clients: clients, Flight: &flight, Usage: records, Admission: limits, Counters: counters, Spanned: spanned,
+			Spans: spans, Version: cli.Version}
 		if err := runServers(ctx, base, log, tlsConfig, attrs, ready, []listener{
 			{"admin", *adminAddr, admin.Handler(admin.Deps{Config: cfg, KeyHash: keyHash, Log: log, Usage: st.Read(), Admission: limits, Spans: spans,
-				Backup: st.Backup, Verify: api.Verify(d)})},
+				Counters: counters, Spanned: spanned, MetricsHash: metricsHash, Backup: st.Backup, Verify: api.Verify(d)})},
 			{"data", *dataAddr, api.Handler(d)},
 		}); err != nil {
 			log.Error("server failed", "error", err.Error())
@@ -312,6 +325,29 @@ func checkStore(ctx context.Context, st *store.Store, log *slog.Logger, counters
 	default:
 		log.Info("store check passed")
 	}
+}
+
+// metricsToken is the SHA-256 of STARGAITE_METRICS_TOKEN, nil when it is
+// unset (SEC-3, phase-4 design section 15 point 17). The admin key's rule
+// applies, and the token may not be the admin key, which opens every route:
+// at least 32 characters, no leading or trailing whitespace, not the client
+// key prefix. No error carries the token.
+func metricsToken(token string, adminHash [32]byte) (*[32]byte, error) {
+	if token == "" {
+		return nil, nil
+	}
+	hash := sha256.Sum256([]byte(token))
+	switch {
+	case utf8.RuneCountInString(token) < 32:
+		return nil, errors.New("STARGAITE_METRICS_TOKEN has fewer than 32 characters")
+	case token != strings.TrimSpace(token):
+		return nil, errors.New("STARGAITE_METRICS_TOKEN has leading or trailing whitespace, which no client can present")
+	case strings.HasPrefix(token, auth.Prefix):
+		return nil, errors.New("STARGAITE_METRICS_TOKEN starts with " + auth.Prefix + ", the prefix of a client key")
+	case hash == adminHash:
+		return nil, errors.New("STARGAITE_METRICS_TOKEN is the admin key; it must differ, since it opens the metrics alone")
+	}
+	return &hash, nil
 }
 
 // systemResolver is the resolver of set time (CheckResolved) and of dial

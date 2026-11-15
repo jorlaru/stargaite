@@ -1,0 +1,2 @@
+go test fuzz v1
+string("é\u2028\x00\t}\",x=\"")

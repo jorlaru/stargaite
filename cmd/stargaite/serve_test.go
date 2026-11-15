@@ -7,6 +7,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
@@ -44,7 +45,10 @@ import (
 )
 
 // adminKey is an admin key given through STARGAITE_ADMIN_KEY.
-const adminKey = "test-admin-key-of-at-least-32-characters"
+const (
+	adminKey         = "test-admin-key-of-at-least-32-characters"
+	testMetricsToken = "test-metrics-token-of-40-characters-long"
+)
 
 // TestMain runs the command in place of the tests when STARGAITE_TEST_RUN is
 // set, so a test can start serve as a process of its own and kill it.
@@ -1172,6 +1176,11 @@ func TestServeExitCodes(t *testing.T) {
 		{name: "address in use", vars: map[string]string{"STARGAITE_ADMIN_KEY": adminKey}, args: []string{"--json", "--listen", taken.Addr().String(), "--admin-listen", "127.0.0.1:0"}, code: 1, msg: "server failed", created: true},
 		{name: "short admin key", vars: map[string]string{"STARGAITE_ADMIN_KEY": adminKey[:31]}, args: loopback, code: 1, msg: "admin key refused", created: true},
 		{name: "admin key with the client key prefix", vars: map[string]string{"STARGAITE_ADMIN_KEY": "sk-stargaite-" + adminKey}, args: loopback, code: 1, msg: "admin key refused", created: true},
+		// SEC-3, phase-4 design section 15 point 17.
+		{name: "short metrics token", vars: map[string]string{"STARGAITE_ADMIN_KEY": adminKey, "STARGAITE_METRICS_TOKEN": testMetricsToken[:31]}, args: loopback, code: 1, msg: "metrics token refused", created: true},
+		{name: "metrics token with the client key prefix", vars: map[string]string{"STARGAITE_ADMIN_KEY": adminKey, "STARGAITE_METRICS_TOKEN": "sk-stargaite-" + testMetricsToken}, args: loopback, code: 1, msg: "metrics token refused", created: true},
+		{name: "metrics token equal to the admin key", vars: map[string]string{"STARGAITE_ADMIN_KEY": adminKey, "STARGAITE_METRICS_TOKEN": adminKey}, args: loopback, code: 1, msg: "metrics token refused", created: true},
+		{name: "metrics token with whitespace", vars: map[string]string{"STARGAITE_ADMIN_KEY": adminKey, "STARGAITE_METRICS_TOKEN": testMetricsToken + " "}, args: loopback, code: 1, msg: "metrics token refused", created: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "data")
@@ -1186,9 +1195,12 @@ func TestServeExitCodes(t *testing.T) {
 				t.Errorf("a failure must write to stderr only; stdout %q stderr %q", &stdout, &stderr)
 			}
 			if tc.code == 1 {
-				var line struct{ Level, Msg string }
+				var line struct{ Level, Msg, Rule string }
 				if err := json.Unmarshal(stderr.Bytes(), &line); err != nil || line.Level != "ERROR" || line.Msg != tc.msg {
 					t.Errorf("log line %q: %+v, error %v", &stderr, line, err)
+				}
+				if token := tc.vars["STARGAITE_METRICS_TOKEN"]; token != "" && (line.Rule != "SEC-3" || strings.Contains(stderr.String(), strings.TrimSpace(token))) {
+					t.Errorf("log line %q: the rule SEC-3, never the token", &stderr)
 				}
 			}
 			if _, err := os.Stat(dir); err == nil && !tc.created {
@@ -1426,23 +1438,21 @@ func TestServeStoreCheck(t *testing.T) {
 	logs, stderr := io.Pipe()
 	exit := make(chan int, 1)
 	go func() {
-		exit <- serve([]string{"--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0"}, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), io.Discard, stderr)
+		exit <- serve([]string{"--data-dir", dir, "--listen", "127.0.0.1:0", "--admin-listen", "127.0.0.1:0"},
+			env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey, "STARGAITE_METRICS_TOKEN": testMetricsToken}), io.Discard, stderr)
 		_ = stderr.Close()
 	}()
 	lines := bufio.NewScanner(logs)
 	var log strings.Builder
-	var data string
+	var data, adminAddr string
 	for !strings.Contains(log.String(), `"msg":"store check`) {
 		if !lines.Scan() {
 			t.Fatalf("serve ended before its store check; log %s", &log)
 		}
 		log.WriteString(lines.Text() + "\n")
-		var line struct {
-			Msg      string
-			DataAddr string `json:"data_addr"`
-		}
+		var line readyLine
 		if json.Unmarshal(lines.Bytes(), &line) == nil && line.Msg == "ready" {
-			data = line.DataAddr
+			data, adminAddr = line.DataAddr, line.AdminAddr
 		}
 	}
 	rest := make(chan string, 1)
@@ -1468,6 +1478,23 @@ func TestServeStoreCheck(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("GET /v1/models after the failed check: %d", resp.StatusCode)
+	}
+	// The failure is counted on the metrics endpoint, which the metrics
+	// token opens; so is the unauthenticated GET /v1/models above.
+	req, err = http.NewRequest(http.MethodGet, "http://"+adminAddr+"/admin/v1/metrics", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testMetricsToken)
+	resp, err = (&http.Client{Timeout: 5 * time.Second}).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scraped, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil || resp.StatusCode != http.StatusOK || !strings.Contains(string(scraped), "\nstargaite_store_check_failures_total 1\n") ||
+		!strings.Contains(string(scraped), "\nstargaite_unauthenticated_requests_total 1\n") {
+		t.Errorf("metrics: status %d, error %v:\n%s", resp.StatusCode, err, scraped)
 	}
 	if err := syscall.Kill(syscall.Getpid(), syscall.SIGTERM); err != nil {
 		t.Fatal(err)
@@ -1514,6 +1541,38 @@ func TestServeStoreCheck(t *testing.T) {
 		if err := st.Close(); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// TestMetricsToken is the rule of STARGAITE_METRICS_TOKEN (SEC-3, phase-4
+// design section 15 point 17): the admin key's rule, counted in characters,
+// and not the admin key; only its SHA-256 is kept, and no error carries it.
+func TestMetricsToken(t *testing.T) {
+	adminHash := sha256.Sum256([]byte(adminKey))
+	for _, tc := range []struct {
+		token string
+		ok    bool
+	}{
+		{testMetricsToken, true},
+		{testMetricsToken[:32], true},
+		{testMetricsToken[:31], false},
+		{strings.Repeat("é", 31), false}, // 62 bytes, 31 characters
+		{strings.Repeat("é", 32), true},
+		{" " + testMetricsToken, false},
+		{testMetricsToken + "\n", false},
+		{"sk-stargaite-" + testMetricsToken, false},
+		{adminKey, false},
+	} {
+		hash, err := metricsToken(tc.token, adminHash)
+		switch {
+		case tc.ok && (err != nil || hash == nil || *hash != sha256.Sum256([]byte(tc.token))):
+			t.Errorf("%q: hash %v, error %v", tc.token, hash, err)
+		case !tc.ok && (err == nil || hash != nil || strings.Contains(err.Error(), strings.TrimSpace(tc.token))):
+			t.Errorf("%q: hash %v, error %v: refused, never naming the token", tc.token, hash, err)
+		}
+	}
+	if hash, err := metricsToken("", adminHash); hash != nil || err != nil {
+		t.Errorf("unset: hash %v, error %v", hash, err)
 	}
 }
 

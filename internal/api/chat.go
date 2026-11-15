@@ -934,7 +934,8 @@ func (h *handler) count(r *usage.Record) {
 
 // done ends one authenticated request (design section 11, point 3) after
 // its last finish: the request counter, then the spans of a sampled request
-// when an exporter is published (phase-3 design section 10), then the
+// when an exporter is published (phase-3 design section 10), counted in
+// Spanned by key and alias as the request counter is, then the
 // request line (OPS-9), then the slots of an admitted request (LIM-6), also
 // on a panic, then Flight. Nothing but the spans reads the sampling draw.
 // Its status and code are those of the error the client got, also as the
@@ -963,7 +964,9 @@ func (h *handler) done(rq *request) {
 	h.Counters.Add(usage.Counter{Name: "requests", Key: rq.key.Name, Model: model, Label: strconv.Itoa(status)}, 1)
 	ended := h.Config.Now()
 	if rq.snap.Exporter != nil && telemetry.Sampled(rq.sample, sampleRate(rq)) {
-		h.Spans.Enqueue(telemetry.Build(spanRequest(rq, status, code, h.Version, ended))...)
+		spans := telemetry.Build(spanRequest(rq, status, code, h.Version, ended))
+		h.Spans.Enqueue(spans...)
+		h.Spanned.Add(usage.Counter{Name: "spans", Key: rq.key.Name, Model: model}, float64(len(spans)))
 	}
 	attrs := []any{"request_id", rq.id, "trace_id", rq.traceID, "key", rq.key.Name}
 	if rq.alias != "" {

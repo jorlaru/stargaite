@@ -56,8 +56,12 @@ type server struct {
 	usage   *sql.DB
 	limits  *admission.State
 	spans   *telemetry.Exporter
-	backup  func(ctx context.Context) (*os.File, error)
-	verify  func(ctx context.Context, target string, maxOutput *int64) (domain.Verification, *domain.Error)
+	// counters and spanned are the data plane's OPS-8 counters and its span
+	// counts; metricsHash opens GET /admin/v1/metrics alone (SEC-3).
+	counters, spanned *usage.Counters
+	metricsHash       *[32]byte
+	backup            func(ctx context.Context) (*os.File, error)
+	verify            func(ctx context.Context, target string, maxOutput *int64) (domain.Verification, *domain.Error)
 
 	mu        sync.Mutex // guards the two fields below
 	refusedAt time.Time  // when the last refusal line was logged
@@ -105,6 +109,7 @@ var routes = []route{
 	{"POST /admin/v1/keys/{name}/revoke", (*server).revokeKey},
 	{"GET /admin/v1/usage", (*server).showUsage},
 	{"GET /admin/v1/usage/quota", (*server).showQuota},
+	{"GET /admin/v1/metrics", (*server).metrics},
 	{"GET /admin/v1/telemetry", (*server).showTelemetry},
 	{"PATCH /admin/v1/telemetry", (*server).setTelemetry},
 	{"DELETE /admin/v1/telemetry", (*server).unsetTelemetry},
@@ -120,17 +125,23 @@ type Deps struct {
 	Config    *config.Service
 	KeyHash   [32]byte // the SHA-256 of the admin key, the only form of it the process keeps
 	Log       *slog.Logger
-	Usage     *sql.DB                                     // the store's read pool, which usage show reads
-	Admission *admission.State                            // the data plane's, whose quota windows usage quota shows
-	Spans     *telemetry.Exporter                         // the exporter telemetry test sends through and telemetry status reads
-	Backup    func(ctx context.Context) (*os.File, error) // store.Store.Backup
+	Usage     *sql.DB             // the store's read pool, which usage show reads
+	Admission *admission.State    // the data plane's, whose quota windows usage quota shows
+	Spans     *telemetry.Exporter // the exporter telemetry test sends through and telemetry status reads
+	Counters  *usage.Counters     // the data plane's (OPS-8), which metrics renders
+	Spanned   *usage.Counters     // spans emitted, by key and alias (api.Deps.Spanned)
+	// MetricsHash is the SHA-256 of STARGAITE_METRICS_TOKEN, nil when unset:
+	// the token opens GET /admin/v1/metrics and no other route (SEC-3).
+	MetricsHash *[32]byte
+	Backup      func(ctx context.Context) (*os.File, error) // store.Store.Backup
 	// Verify is api.Verify over the data plane's Deps (RSN-9).
 	Verify func(ctx context.Context, target string, maxOutput *int64) (domain.Verification, *domain.Error)
 }
 
 // Handler returns the admin listener's handler.
 func Handler(d Deps) http.Handler {
-	s := &server{cfg: d.Config, keyHash: d.KeyHash, log: d.Log, usage: d.Usage, limits: d.Admission, spans: d.Spans, backup: d.Backup, verify: d.Verify}
+	s := &server{cfg: d.Config, keyHash: d.KeyHash, log: d.Log, usage: d.Usage, limits: d.Admission, spans: d.Spans,
+		counters: d.Counters, spanned: d.Spanned, metricsHash: d.MetricsHash, backup: d.Backup, verify: d.Verify}
 	mux := http.NewServeMux()
 	for _, rt := range routes {
 		mux.HandleFunc(rt.pattern, func(w http.ResponseWriter, r *http.Request) { rt.handle(s, w, r) })
@@ -140,8 +151,12 @@ func Handler(d Deps) http.Handler {
 		w.Header().Set(RequestIDHeader, id)
 		// Authentication comes first, so an unknown route is 401 too and a
 		// caller without the key learns nothing about the routes (SEC-2).
+		// The metrics token opens one route, by its exact method and path,
+		// and nothing else (SEC-3).
 		scheme, token, _ := strings.Cut(r.Header.Get("Authorization"), " ")
-		if !strings.EqualFold(scheme, "Bearer") || !auth.Equal(token, s.keyHash) {
+		ok := strings.EqualFold(scheme, "Bearer") && (auth.Equal(token, s.keyHash) ||
+			s.metricsHash != nil && r.Method == http.MethodGet && r.URL.Path == "/admin/v1/metrics" && auth.Equal(token, *s.metricsHash))
+		if !ok {
 			s.refused(r, id)
 			write(w, http.StatusUnauthorized, envelope{domain.NewError(domain.CodeInvalidAPIKey, "a valid admin key is required: Authorization: Bearer <admin key>")})
 			return

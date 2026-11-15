@@ -42,6 +42,7 @@ curl -sS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:4000/he
 curl -s http://127.0.0.1:4000/v1/models -H "Authorization: Bearer sk-stargaite-..."
 curl -s http://127.0.0.1:4000/v1/chat/completions -H "Authorization: Bearer sk-stargaite-..." -d '{"model":"fast","messages":[{"role":"user","content":"hi"}]}'
 curl -s http://127.0.0.1:4000/v1/embeddings -H "Authorization: Bearer sk-stargaite-..." -d '{"model":"embed","input":"hi"}'
+curl -s http://127.0.0.1:4001/admin/v1/metrics -H "Authorization: Bearer $(cat data/admin.key)"
 ./stargaite usage show --since 1h --by model
 ./stargaite backup backup.db
 ```
@@ -66,7 +67,9 @@ prints `credentials: resolved · reachable: yes · authorized: yes · span: acce
 the aliases `embed` and `fast`; the second sends a chat completion to `fast` and gets the mock provider's answer, with
 the response headers `x-stargaite-request-id`, `x-stargaite-trace-id` and `x-stargaite-target` (add `-i` to `curl` to
 see them), and its span reaches the mock provider within the 2 s of a batch; the third sends an embeddings request to
-`embed` and gets the mock provider's vector, byte for byte.
+`embed` and gets the mock provider's vector, byte for byte. The fourth `curl` reads the metrics from the admin API
+with the admin key, in the Prometheus text format: among them `stargaite_requests_total{key="my-agent",model="fast",status="200"} 1`
+(see [Metrics](#metrics)).
 `usage show --by model` then sums the last hour from the store per alias: for `fast` one request, the tokens the mock
 provider reported (1 input, 2 output) and their cost at the target's prices, 0.000005 USD; for `embed` one request,
 1 input token, 0 output and 0.000001 USD; and on the first row, under the alias `-` (none), the verify call, recorded
@@ -207,6 +210,54 @@ cut at a UTF-8 boundary to `content_max_bytes` (32768 by default; `telemetry set
 by `stargaite.content.truncated` when cut, with the provider credential redacted. A provider's own error text, which
 may quote the prompt, never enters a span status, opt-in or not, and nothing of the content reaches a log or a usage
 record.
+
+## Metrics
+
+`GET /admin/v1/metrics` on the admin listener answers the Prometheus text format, always as
+`Content-Type: text/plain; version=0.0.4; charset=utf-8` whatever `Accept` asks, which any Prometheus scrapes. It
+takes the admin key, or a read-only token that opens this route and no other: set `STARGAITE_METRICS_TOKEN` in the
+environment of `serve`, which reads it once at start and keeps only its SHA-256. The token follows the admin key's
+rule: at least 32 characters, no leading or trailing whitespace, not starting with `sk-stargaite-`, and not the admin
+key itself; otherwise `serve` refuses to start (exit `1`, a log line naming `SEC-3`, never the token). A scrape is a
+read: it writes no audit record.
+
+| Family | Type | Labels |
+|---|---|---|
+| `stargaite_requests_total` | counter | `key`, `model`, `status` |
+| `stargaite_tokens_total` | counter | `key`, `model`, `type` (`input`, `cache_read`, `cache_write`, `output`, `reasoning`) |
+| `stargaite_cost_usd_total` | counter | `key`, `model` |
+| `stargaite_unpriced_requests_total`, `stargaite_length_finishes_total`, `stargaite_empty_responses_total`, `stargaite_model_mismatches_total` | counter | `key`, `model` |
+| `stargaite_params_changed_total` | counter | `key`, `model`, `action` |
+| `stargaite_budget_warnings_total`, `stargaite_budget_exhausted_total`, `stargaite_quota_warnings_total` | counter | `key`, `model` |
+| `stargaite_spans_emitted_total` | counter | `key`, `model` |
+| `stargaite_unauthenticated_requests_total`, `stargaite_store_check_failures_total` | counter | none |
+| `stargaite_spans_sent_total`, `stargaite_spans_dropped_total` | counter | none |
+| `stargaite_spans_rejected_total` | counter | `reason` (`status`, `backend`), `status` |
+| `stargaite_spans_queued` | gauge | none |
+| `stargaite_exporter_last_error_info` | gauge, value 1 | `message`: the exporter's last error as `telemetry status` shows it, redacted |
+| `stargaite_budget_spent_usd`, `stargaite_budget_limit_usd` | gauge | `scope` (`global`, `key`, `model`), `name`, `interval` |
+| `stargaite_quota_used`, `stargaite_quota_limit` | gauge | `provider`, `key` (empty for the provider's own window), `window`, `unit` |
+
+`model` is the alias a request named; a request whose alias does not exist is counted under `model=""`, and the calls
+of `targets verify` under `key="_verify"`, `model=""`. Request, token, cost and span counts are those of the usage
+records and spans since the start: counters live in memory and start again from zero on a restart, which Prometheus
+reads as a counter reset. The budget gauges are each declared budget's spend in its current period; the quota gauges
+are the windows held since the start or the last use, read as they are, so a scrape never seeds a window from the
+store. A series exists only for a combination seen: keys and aliases are names the configuration declares, and
+statuses, token types, actions and reasons are closed sets, so the number of series is bounded by the declared keys
+times the aliases each may use times the statuses they got. At the scale of 10,000 keys and 1,000 aliases that bound
+can pass what one Prometheus should hold; drop or aggregate labels there with `metric_relabel_configs`. A Prometheus
+scrape job, with the token in a file only Prometheus reads:
+
+```yaml
+scrape_configs:
+  - job_name: stargaite
+    metrics_path: /admin/v1/metrics
+    authorization:
+      credentials_file: /etc/prometheus/stargaite-metrics-token
+    static_configs:
+      - targets: ["127.0.0.1:4001"]
+```
 
 ## Anthropic clients
 

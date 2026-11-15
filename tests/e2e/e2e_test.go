@@ -34,6 +34,9 @@ const (
 	mockDefault = "http://127.0.0.1:4010"
 	tokenShown  = "sk-stargaite-..."
 	dataDefault = "http://127.0.0.1:4000"
+	// The metrics scrape of the quick start, with the admin key read from the
+	// default data directory.
+	scrapeLine = `curl -s http://127.0.0.1:4001/admin/v1/metrics -H "Authorization: Bearer $(cat data/admin.key)"`
 )
 
 var (
@@ -57,7 +60,8 @@ var (
 // price_table costs (AC-33, AC-46), telemetry test accepted by the mock as
 // OTLP receiver, which got the test span (AC-24), then the request spans of
 // the chat completion and of the embeddings request with the key my-agent
-// (AC-25), and nothing else, a backup with mode 0600 that opens with
+// (AC-25), and nothing else, a metrics scrape with the admin key holding the
+// chat completion by key, alias and status (OPS-8), a backup with mode 0600 that opens with
 // integrity_check ok and the records (ADR-018), the key's parallel limit shown as 5 and exported as declared
 // (LIM-7), a second serve on the same directory refused (AC-42), and the
 // same export, the same key and the same usage after a restart (RES-9). The guide's commands use
@@ -80,6 +84,7 @@ func TestQuickStart(t *testing.T) {
 		embTrace string // the trace id of the embeddings request
 		backedUp bool   // the backup opened with integrity_check ok
 		verified string // what targets verify printed
+		scraped  bool   // the metrics scrape counted the chat completion
 	)
 	cli := func(args ...string) string {
 		t.Helper()
@@ -137,6 +142,19 @@ func TestQuickStart(t *testing.T) {
 			if m := tokenLine.FindString(cli(fields[1:]...)); m != "" {
 				token = m
 			}
+		case line == scrapeLine && srv != nil:
+			// OPS-8: the chat completion, by key, alias and status, in the
+			// text format 0.0.4 (phase-4 design section 7).
+			key, err := os.ReadFile(filepath.Join(dir, "admin.key"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			status, h, body := send(t, http.MethodGet, "http://"+srv.admin+"/admin/v1/metrics", "", "Authorization: Bearer "+strings.TrimSpace(string(key)))
+			if status != http.StatusOK || h.Get("Content-Type") != "text/plain; version=0.0.4; charset=utf-8" ||
+				!strings.Contains(string(body), "\nstargaite_requests_total{key=\"my-agent\",model=\"fast\",status=\"200\"} 1\n") {
+				t.Errorf("%s: status %d, headers %v, body:\n%s", line, status, h, body)
+			}
+			scraped = true
 		case fields[0] == "curl" && srv != nil:
 			m := curlURL.FindStringSubmatch(line)
 			if m == nil {
@@ -182,8 +200,8 @@ func TestQuickStart(t *testing.T) {
 			t.Fatalf("a quick start line this test does not run: %q", line)
 		}
 	}
-	if srv == nil || mock == nil || token == "" || !answered || !embedded || shown == "" || tested == "" || !backedUp || verified == "" {
-		t.Fatalf("the quick start did not start the proxy and the mock provider, create a key, verify the target, test the exporter, get both answers, show the usage and back up")
+	if srv == nil || mock == nil || token == "" || !answered || !embedded || shown == "" || tested == "" || !backedUp || verified == "" || !scraped {
+		t.Fatalf("the quick start did not start the proxy and the mock provider, create a key, verify the target, test the exporter, get both answers, scrape the metrics, show the usage and back up")
 	}
 	// By alias: the verify call under the empty alias, shown "-", with the tokens and
 	// cost of the chat completion; the chat completion's usage, 1 input and 2

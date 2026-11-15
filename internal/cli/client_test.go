@@ -86,7 +86,7 @@ func adminServer(t *testing.T) map[string]string {
 		return nil, errors.New("no name is resolved in tests")
 	}
 	verify := api.Verify(api.Deps{Config: cfg, Log: log, Clients: [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)},
-		Flight: &sync.WaitGroup{}, Usage: writer, Admission: limits, Counters: &records.Counters{}, Spans: spans, Version: "test"})
+		Flight: &sync.WaitGroup{}, Usage: writer, Admission: limits, Counters: &records.Counters{}, Spanned: &records.Counters{}, Spans: spans, Version: "test"})
 	srv := httptest.NewServer(admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(testKey)), Log: log, Usage: st.Read(),
 		Admission: limits, Spans: spans, Backup: st.Backup, Verify: verify}))
 	t.Cleanup(srv.Close)

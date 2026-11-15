@@ -176,8 +176,18 @@ configuration revision), and `langfuse.observation.metadata.stargaite_key`, `_mo
 Langfuse filters. Tokens and cost sit on one span per provider call. A request with a valid W3C `traceparent` joins the
 client's trace (`telemetry set --trust-traceparent=false` turns that off); `x-session-id`, 1 to 128 printable ASCII
 bytes, sets `session.id`. `--trace-sample-rate` on a key or an alias (0 to 1; the lower one applies) keeps that share of
-requests, decided once per request; it never changes records, budgets, quotas or counters. Spans carry no prompt, answer or
-header value other than `x-session-id`.
+requests, decided once per request; it never changes records, budgets, quotas or counters. Unless a key opts in to
+content (below), spans carry no prompt or answer, and never a header value other than `x-session-id`.
+
+Content is an opt-in per key, with an expiry: `./stargaite keys set <key> --content 24h` (a positive duration from now,
+also on `keys create`) sets the key's `content_until`, which `keys show` displays and the audit records like any key
+change; `--content=` stops it at once. Until then the request spans of that key's sampled requests carry
+`gen_ai.input.messages`, the `messages` member of the body sent to the provider that answered, and
+`gen_ai.output.messages`, the answer relayed to the client (a stream's event data joined by newlines), each a string
+cut at a UTF-8 boundary to `content_max_bytes` (32768 by default; `telemetry set --content-max-bytes <n>`) and flagged
+by `stargaite.content.truncated` when cut, with the provider credential redacted. A provider's own error text, which
+may quote the prompt, never enters a span status, opt-in or not, and nothing of the content reaches a log or a usage
+record.
 
 ## Anthropic clients
 

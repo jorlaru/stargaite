@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
@@ -197,6 +198,56 @@ func TestKeyChanges(t *testing.T) {
 	}
 	if bytes := f.export(t); strings.Contains(string(bytes), "k:") {
 		t.Errorf("export shows a revoked key:\n%s", bytes)
+	}
+}
+
+// TestKeyContent is TEL-8's opt-in: content, a positive duration, becomes
+// content_until on the service clock at keys create and keys set, shown in
+// the key and audited as any key change; "" and null clear it; anything else
+// is refused, audited, and publishes nothing.
+func TestKeyContent(t *testing.T) {
+	f := newFixture(t)
+	now := time.UnixMilli(testNow).UTC()
+	res := f.createKey(t, `{"name":"k","models":["fast"],"content":"24h"}`)
+	if got := f.cfg.Snapshot().Doc.Keys["k"].ContentUntil; !got.Equal(now.Add(24*time.Hour)) || !res.Resource.ContentUntil.Equal(got) ||
+		f.lastAudit(t) != "keys create k key k applied" {
+		t.Errorf("create: stored %v, shown %v, audit %q", got, res.Resource.ContentUntil, f.lastAudit(t))
+	}
+	for _, tc := range []struct {
+		body string
+		want time.Time
+	}{
+		{`{"content":"1h30m"}`, now.Add(90 * time.Minute)},
+		{`{"content":null}`, time.Time{}},
+		{`{"content":"2h","rpm_limit":5}`, now.Add(2 * time.Hour)},
+		{`{"content":""}`, time.Time{}},
+	} {
+		var res keyAnswer
+		decode(t, f.do(t, http.MethodPatch, "/admin/v1/keys/k", []byte(tc.body)), http.StatusOK, &res)
+		if got := f.cfg.Snapshot().Doc.Keys["k"].ContentUntil; !got.Equal(tc.want) || !res.Resource.ContentUntil.Equal(got) ||
+			f.lastAudit(t) != "keys set k key k applied" || !slices.Equal(entries(res.Diff), []string{"key k updated"}) {
+			t.Errorf("%s: stored %v, shown %v, audit %q, diff %+v", tc.body, got, res.Resource.ContentUntil, f.lastAudit(t), res.Diff)
+		}
+	}
+	if export := string(f.export(t)); strings.Contains(export, "content") {
+		t.Errorf("a cleared opt-in is exported:\n%s", export)
+	}
+	revision := f.cfg.Snapshot().Revision
+	for _, tc := range []struct{ method, path, body, audit string }{
+		{http.MethodPatch, "/admin/v1/keys/k", `{"content":"-1h"}`, "keys set k key k refused:invalid_request"},
+		{http.MethodPatch, "/admin/v1/keys/k", `{"content":"0s"}`, "keys set k key k refused:invalid_request"},
+		{http.MethodPatch, "/admin/v1/keys/k", `{"content":"a day"}`, "keys set k key k refused:invalid_request"},
+		{http.MethodPatch, "/admin/v1/keys/k", `{"content":24}`, "keys set k key k refused:invalid_request"},
+		{http.MethodPatch, "/admin/v1/keys/k", `{"content":"1h","content_until":"2030-01-01T00:00:00Z"}`, "keys set k key k refused:invalid_request"},
+		{http.MethodPost, "/admin/v1/keys", `{"name":"k2","models":[],"content":"0s"}`, "keys create k2 key k2 refused:invalid_request"},
+	} {
+		errorOf(t, f.do(t, tc.method, tc.path, []byte(tc.body)), http.StatusBadRequest, domain.CodeInvalidRequest)
+		if f.lastAudit(t) != tc.audit {
+			t.Errorf("%s: audit %q", tc.body, f.lastAudit(t))
+		}
+	}
+	if f.cfg.Snapshot().Revision != revision || !f.cfg.Snapshot().Doc.Keys["k"].ContentUntil.IsZero() {
+		t.Error("a refused content published")
 	}
 }
 

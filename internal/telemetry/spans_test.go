@@ -101,8 +101,8 @@ func TestSampled(t *testing.T) {
 }
 
 // goldenCases are one request per span shape (AC-25): a success, a stream,
-// an error, a refusal before any provider, and a fallback whose failed
-// attempts are child spans.
+// an error, a refusal before any provider, a fallback whose failed attempts
+// are child spans, and a success under the content opt-in (TEL-8).
 func goldenCases() []struct {
 	name string
 	req  Request
@@ -171,6 +171,32 @@ func goldenCases() []struct {
 				{Record: served, Provider: "anthropic", Host: "api.anthropic.com", Port: 443, Dialect: "adaptive_effort", Level: "high"},
 			}
 		})},
+		{"content", with(func(r *Request) {
+			// The limit of 29 bytes falls inside the "é" of the input's 29th and
+			// 30th bytes, so 28 are kept; the output fits, its invalid byte
+			// replaced.
+			r.Context, r.ContentMax = root, 29
+			r.Attempts = []Attempt{{Record: ok, Provider: "openai", Host: "api.example.com", Port: 443, Dialect: "reasoning_effort", Level: "high"}}
+			r.Input, r.Output = []byte(`[{"role":"user","content":"héllo"}]`), []byte("a\xffb")
+		})},
+	}
+}
+
+// content cuts at a UTF-8 boundary to the limit in bytes, says when it cut,
+// and replaces invalid UTF-8, which the JSON encoding cannot carry (TEL-8).
+func TestContent(t *testing.T) {
+	for _, tt := range []struct {
+		in    string
+		limit int64
+		want  string
+		cut   bool
+	}{
+		{"abc", 3, "abc", false}, {"abcd", 3, "abc", true}, {"ab€", 4, "ab", true}, {"ab€", 5, "ab€", false},
+		{"€", 2, "", true}, {"a\xff", 4, "a\uFFFD", false}, {"a\xff", 2, "a", true}, {"abc", 0, "", true},
+	} {
+		if got, cut := content([]byte(tt.in), tt.limit); got != tt.want || cut != tt.cut {
+			t.Errorf("content(%q, %d) = %q, %v", tt.in, tt.limit, got, cut)
+		}
 	}
 }
 

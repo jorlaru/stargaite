@@ -150,8 +150,8 @@ var modelFlags = []flagSpec{
 	{"trace-sample-rate", kindNumber, "trace_sample_rate", "the share of requests traced, 0 to 1"},
 }
 
-// keyFlags are the fields of a key (kick-off section 6); --content ships with
-// phase 3.
+// keyFlags are the fields of a key (kick-off section 6); --content is
+// content_until given as a duration from now (TEL-8).
 var keyFlags = []flagSpec{
 	{"model", kindList, "models", "an alias the key may use, repeated"},
 	{"all-models", kindAll, "models", `every alias: models ["*"]`},
@@ -161,6 +161,7 @@ var keyFlags = []flagSpec{
 	{"max-parallel-requests", kindNumber, "max_parallel_requests", "requests in flight (5 when undeclared)"},
 	{"quota-share", kindTypedPairs, "quota_share", "<provider>=<fraction>: the share of each window of a subscription provider"},
 	{"trace-sample-rate", kindNumber, "trace_sample_rate", "the share of requests traced, 0 to 1"},
+	{"content", kindString, "content", "a duration, such as 24h: until then the key's spans carry prompts and answers; --content= stops it"},
 }
 
 // telemetryFlags are the fields of settings.telemetry (TEL-2) and the preset

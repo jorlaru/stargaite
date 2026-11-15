@@ -695,3 +695,261 @@ func TestExporterDown(t *testing.T) {
 		})
 	}
 }
+
+// TestCaptureBound: capture keeps at most content_max_bytes + 1 bytes of an
+// answer however long it grows, so nothing is buffered past the bound (TEL-8).
+func TestCaptureBound(t *testing.T) {
+	a := &attempt{}
+	for range 5 {
+		a.capture([]byte(strings.Repeat("x", 100)), 10)
+	}
+	if string(a.answer) != strings.Repeat("x", 11) {
+		t.Errorf("captured %d bytes: %q", len(a.answer), a.answer)
+	}
+}
+
+// TestPlantedSecret is AC-29 (TEL-8, SEC-9): a fake secret planted in a
+// prompt and one in an unknown header. Without an opt-in neither reaches a
+// span, the log or the store; under an unexpired one only the prompt's
+// does, in gen_ai.input.messages (the messages member sent), with the answer
+// relayed in gen_ai.output.messages (a stream's event data joined by "\n"),
+// both cut at content_max_bytes at a UTF-8 boundary and flagged; once the
+// opt-in expires on the service clock, none. A provider's 400 that echoes the
+// prompt keeps it out of span status with the opt-in and without.
+func TestPlantedSecret(t *testing.T) {
+	const (
+		inPrompt = "fake-secret-in-the-PROMPT-01234" // 31 bytes
+		inHeader = "fake-secret-in-a-HEADER-56789"
+	)
+	f, mock, token := newSpans(t, "", "")
+	// The messages member: 27 bytes, "say " and the secret end at byte 62, a
+	// space, then "é" in bytes 64 and 65 (offsets 63 and 64).
+	messages := `[{"role":"user","content":"say ` + inPrompt + ` ` + strings.Repeat("é", 40) + `"}]`
+	body := func(extra string) string { return `{"model":"fast","messages":` + messages + extra + `}` }
+	admin := func(method, path, body string) {
+		t.Helper()
+		if w := call(f.admin, "Bearer "+adminKey, method, path, []byte(body)); w.Code != http.StatusOK {
+			t.Fatalf("%s %s: %d %s", method, path, w.Code, w.Body)
+		}
+	}
+	type want struct {
+		input, output string // "" for none
+		cut           bool
+		status        string // the span's status message; "" for none
+	}
+	wants := map[string]want{} // by trace id
+	send := func(name, extra string, status int, w want) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := f.traffic("/v1/chat/completions", token, body(extra), "X-Custom-Token", inHeader)
+		if rec.Code != status {
+			t.Fatalf("%s: %d %s", name, rec.Code, rec.Body)
+		}
+		wants[rec.Header().Get(traceHeader)] = w
+		return rec
+	}
+	sent := func() string { // the messages member the mock got last
+		var b struct{ Messages json.RawMessage }
+		calls := mock.Calls()
+		if json.Unmarshal(calls[len(calls)-1].Body, &b) != nil {
+			t.Fatal("the mock got no JSON body")
+		}
+		return string(b.Messages)
+	}
+	echo := mockprovider.Step{Status: 400, Body: []byte(`{"error":{"message":"input_value='` + inPrompt + `'"}}`)}
+
+	// No opt-in: no content.
+	send("sync", "", 200, want{})
+	send("stream", `,"stream":true`, 200, want{})
+	mock.Script(echo)
+	if w := send("echoing 400", "", 400, want{status: "the provider answered 400"}); !strings.Contains(w.Body.String(), inPrompt) {
+		t.Errorf("the client lost the provider's text: %s", w.Body)
+	}
+
+	// An opt-in of 1 h, at the default bound of 32 KiB: whole content.
+	admin(http.MethodPatch, "/admin/v1/keys/agent", `{"content":"1h"}`)
+	w := send("opted sync", "", 200, want{})
+	if sent() != messages {
+		t.Fatalf("the mock got messages %s", sent())
+	}
+	wants[w.Header().Get(traceHeader)] = want{input: messages, output: w.Body.String()}
+	events := func(stream string) string { // the event data relayed, joined by "\n"
+		var data []string
+		for line := range strings.Lines(stream) {
+			if d, ok := strings.CutPrefix(strings.TrimSuffix(line, "\n"), "data: "); ok {
+				data = append(data, d)
+			}
+		}
+		if len(data) < 2 {
+			t.Fatalf("stream %s", stream)
+		}
+		return strings.Join(data, "\n")
+	}
+	w = send("opted stream", `,"stream":true`, 200, want{})
+	if strings.Count(w.Body.String(), "data: ") < 3 {
+		t.Fatalf("stream %s", w.Body)
+	}
+	wants[w.Header().Get(traceHeader)] = want{input: messages, output: events(w.Body.String())}
+	mock.Script(echo)
+	send("opted echoing 400", "", 400, want{input: messages, status: "the provider answered 400"})
+
+	// The provider credential in a prompt, echoed in a synchronous answer and
+	// in a stream event: redacted in both attributes, as every relayed byte is
+	// (the synchronous body reaches the client as mapped, so the echo shows).
+	key := planted + "MOCK_KEY"
+	leaky := `{"model":"fast","messages":[{"role":"user","content":"` + key + `"}]`
+	redacted := `[{"role":"user","content":"[redacted]"}]`
+	mock.Script(mockprovider.Step{Status: 200, Body: []byte(`{"id":"c","object":"chat.completion","created":0,"model":"mock",` +
+		`"choices":[{"index":0,"message":{"role":"assistant","content":"` + key + `"},"finish_reason":"stop"}],` +
+		`"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`)})
+	w = f.traffic("/v1/chat/completions", token, leaky+`}`)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), key) {
+		t.Fatalf("echoing sync: %d %s", w.Code, w.Body)
+	}
+	wants[w.Header().Get(traceHeader)] = want{input: redacted, output: strings.ReplaceAll(w.Body.String(), key, "[redacted]")}
+	mock.Script(mockprovider.Step{Chunks: sse(chunk(key), "[DONE]")})
+	w = f.traffic("/v1/chat/completions", token, leaky+`,"stream":true}`)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "[redacted]") {
+		t.Fatalf("echoing stream: %d %s", w.Code, w.Body)
+	}
+	wants[w.Header().Get(traceHeader)] = want{input: redacted, output: events(w.Body.String())}
+
+	// content_max_bytes 64: cut before the "é" the 64th byte would split.
+	admin(http.MethodPatch, "/admin/v1/telemetry", `{"content_max_bytes":64}`)
+	w = send("opted and cut", "", 200, want{})
+	wants[w.Header().Get(traceHeader)] = want{input: messages[:63], output: w.Body.String()[:64], cut: true}
+	w = send("opted stream and cut", `,"stream":true`, 200, want{})
+	wants[w.Header().Get(traceHeader)] = want{input: messages[:63], output: w.Body.String()[len("data: "):][:64], cut: true}
+
+	// Expired on the service clock: no content again.
+	f.now.Add(time.Hour.Milliseconds())
+	send("expired", "", 200, want{})
+
+	spans := f.exported(t)
+	if len(spans) != len(wants) {
+		t.Fatalf("%d spans for %d requests", len(spans), len(wants))
+	}
+	for _, s := range spans {
+		w, ok := wants[s.TraceID]
+		if !ok {
+			t.Fatalf("span %q of an unknown trace", s.Name)
+		}
+		for name, v := range map[string]string{"gen_ai.input.messages": w.input, "gen_ai.output.messages": w.output} {
+			if got, _ := s.attrs[name].(string); got != v {
+				t.Errorf("trace %s: %s = %q, want %q", s.TraceID, name, got, v)
+			}
+		}
+		if got, _ := s.attrs["stargaite.content.truncated"].(bool); got != w.cut {
+			t.Errorf("trace %s: truncated %v", s.TraceID, got)
+		}
+		if message := ""; s.Status != nil {
+			if message = s.Status.Message; message != w.status || strings.Contains(message, inPrompt) {
+				t.Errorf("trace %s: status %q", s.TraceID, message)
+			}
+		}
+		raw, _ := json.Marshal(s.Attributes)
+		if strings.Contains(string(raw), inHeader) || strings.Contains(string(raw), key) || w.input == "" && strings.Contains(string(raw), inPrompt) {
+			t.Errorf("trace %s: a planted secret in an attribute", s.TraceID)
+		}
+	}
+	for _, c := range f.receiver.Calls() {
+		if strings.Contains(string(c.Body), inHeader) || strings.Contains(string(c.Body), key) {
+			t.Error("an export carries the header's secret or the provider credential")
+		}
+	}
+	if log := f.log.String(); strings.Contains(log, inPrompt) || strings.Contains(log, inHeader) || strings.Contains(log, key) {
+		t.Errorf("the log carries a planted secret:\n%s", log)
+	}
+	f.stored(t, len(wants))
+	tables := rows(t, f, "SELECT name FROM sqlite_master WHERE type = 'table'")
+	for _, table := range tables {
+		r, err := f.st.Read().Query("SELECT * FROM " + table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cols, _ := r.Columns()
+		for r.Next() {
+			vals := make([]any, len(cols))
+			ptrs := make([]any, len(cols))
+			for i := range vals {
+				ptrs[i] = &vals[i]
+			}
+			if err := r.Scan(ptrs...); err != nil {
+				t.Fatal(err)
+			}
+			if row := fmt.Sprintf("%s", vals); strings.Contains(row, inPrompt) || strings.Contains(row, inHeader) || strings.Contains(row, key) {
+				t.Errorf("table %s holds a planted secret: %s", table, row)
+			}
+		}
+		_ = r.Close()
+	}
+}
+
+// TestContentSource: under the opt-in, gen_ai.input.messages is the messages
+// member the serving attempt sent, not the client's, and
+// gen_ai.output.messages the bytes relayed to the client, not the
+// provider's; after a fallback both come from the attempt that served.
+// Toward anthropic the system message leaves messages and the answer is
+// translated, so each wrong source differs from the right one.
+func TestContentSource(t *testing.T) {
+	f, mock, token := newSpans(t, "", "")
+	if w := call(f.admin, "Bearer "+adminKey, http.MethodPatch, "/admin/v1/keys/agent", []byte(`{"content":"1h"}`)); w.Code != http.StatusOK {
+		t.Fatalf("content opt-in: %d %s", w.Code, w.Body)
+	}
+	client := `[{"role":"system","content":"be brief"},{"role":"user","content":"hello"}]`
+	type want struct{ input, output string }
+	wants := map[string]want{} // by trace id
+	sent := func() string {    // the messages member the mock got last
+		var b struct{ Messages json.RawMessage }
+		calls := mock.Calls()
+		if json.Unmarshal(calls[len(calls)-1].Body, &b) != nil || b.Messages == nil {
+			t.Fatal("the mock got no messages member")
+		}
+		return string(b.Messages)
+	}
+	relayed := func(w *httptest.ResponseRecorder, stream bool) string {
+		if !stream {
+			return w.Body.String()
+		}
+		var data []string
+		for line := range strings.Lines(w.Body.String()) {
+			if d, ok := strings.CutPrefix(strings.TrimSuffix(line, "\n"), "data: "); ok {
+				data = append(data, d)
+			}
+		}
+		return strings.Join(data, "\n")
+	}
+	for _, c := range []struct {
+		alias  string
+		stream bool
+		fail   bool // the first target answers 500
+	}{{"claude", false, false}, {"claude", true, false}, {"fb", false, true}} {
+		if c.fail {
+			mock.Script(mockprovider.Step{Status: 500})
+		}
+		extra := ""
+		if c.stream {
+			extra = `,"stream":true`
+		}
+		w := f.traffic("/v1/chat/completions", token, `{"model":"`+c.alias+`","messages":`+client+extra+`}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: %d %s", c.alias, w.Code, w.Body)
+		}
+		in := sent()
+		if c.alias == "claude" && in == client {
+			t.Fatalf("toward anthropic the messages member was sent unchanged: %s", in)
+		}
+		wants[w.Header().Get(traceHeader)] = want{in, relayed(w, c.stream)}
+	}
+	seen := 0
+	for _, s := range f.exported(t) {
+		w, ok := wants[s.TraceID]
+		if !ok || s.Kind != 2 {
+			continue
+		}
+		seen++
+		s.has(t, map[string]any{"gen_ai.input.messages": w.input, "gen_ai.output.messages": w.output}, "stargaite.content.truncated")
+	}
+	if seen != len(wants) {
+		t.Errorf("%d request spans with content, want %d", seen, len(wants))
+	}
+}

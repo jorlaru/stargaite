@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/usage"
@@ -83,6 +84,8 @@ type Request struct {
 	Code, Message       string // the kick-off section 15 error; "" on success
 	Started, Ended      time.Time
 	Attempts            []Attempt
+	Input, Output       []byte // content, set only under the opt-in (TEL-8)
+	ContentMax          int64  // content_max_bytes
 }
 
 // Attempt is one provider call: its record, and what the record does not
@@ -108,6 +111,8 @@ type Attempt struct {
 // call answered 2xx, and on the request span only for the last attempt, so a
 // backend that adds them up never counts a call twice (TEL-10). A failure
 // sets status ERROR with its message, error.type and the HTTP status (TEL-5).
+// Content, given only under the opt-in, goes on the request span alone
+// (TEL-8).
 func Build(r Request) []Span {
 	req := Span{Trace: r.Context.Trace, Parent: r.Context.Parent, Remote: r.Context.Remote, Name: operation, Kind: KindServer,
 		Start: r.Started, End: r.Ended, Failed: r.Code != "", Message: r.Message}
@@ -146,8 +151,37 @@ func Build(r Request) []Span {
 	if r.Code != "" {
 		attrs = append(attrs, Attr{"error.type", r.Code})
 	}
-	spans[0].Attrs = append(attrs, Attr{"http.response.status_code", int64(r.Status)})
+	attrs = append(attrs, Attr{"http.response.status_code", int64(r.Status)})
+	cut := false
+	for _, c := range []struct {
+		name  string
+		value []byte
+	}{{"gen_ai.input.messages", r.Input}, {"gen_ai.output.messages", r.Output}} {
+		if len(c.value) > 0 {
+			s, short := content(c.value, r.ContentMax)
+			attrs, cut = append(attrs, Attr{c.name, s}), cut || short
+		}
+	}
+	if cut {
+		attrs = append(attrs, Attr{"stargaite.content.truncated", true})
+	}
+	spans[0].Attrs = attrs
 	return spans
+}
+
+// content is b as a content attribute (TEL-8): a string, invalid UTF-8
+// replaced (the JSON encoding carries none), cut at a UTF-8 boundary to at
+// most limit bytes; cut reports whether it was.
+func content(b []byte, limit int64) (s string, cut bool) {
+	s = strings.ToValidUTF8(string(b), "\uFFFD")
+	if int64(len(s)) <= limit {
+		return s, false
+	}
+	i := int(max(limit, 0))
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return s[:i], true
 }
 
 // common are the attributes of every span of r (TEL-4, TEL-13), with the

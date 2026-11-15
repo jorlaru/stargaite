@@ -83,6 +83,7 @@ type request struct {
 	attempts    []*attempt
 	err         *domain.Error // what the client got; nil on success
 	release     func()        // admission's; nil until admitted
+	content     bool          // sampled with a content opt-in ahead on the service clock: spans carry content (TEL-8)
 	started     time.Time
 	deadline    sync.Mutex // held by infer's deadline hook and by writeDeadline
 	capped      bool       // the hook ran: the deadlines it set stay
@@ -113,6 +114,27 @@ type attempt struct {
 	started, firstByte, ended time.Time       // the service clock; firstByte: when the response headers arrived
 	firstEvent                time.Time       // the first upstream event of a stream (ttft_ms)
 	rec                       usage.Record    // made by finish
+	answer                    []byte          // the answer relayed, when rq.content: at most content_max_bytes + 1 (capture)
+}
+
+// capture adds data, the synchronous body or one relayed event's data, to
+// a's answer, events joined by "\n", and keeps at most limit + 1 bytes: the
+// byte past content_max_bytes only tells Build that the answer was longer,
+// so nothing is buffered beyond the bound (TEL-8).
+func (a *attempt) capture(data []byte, limit int64) {
+	add := func(b []byte) {
+		n := int64(len(b))
+		if left := limit - int64(len(a.answer)); n > left {
+			n = max(left+1, 0)
+		}
+		a.answer = append(a.answer, b[:n]...)
+	}
+	if a.answer == nil {
+		a.answer = []byte{}
+	} else {
+		add([]byte{'\n'})
+	}
+	add(data)
 }
 
 // verdict is how an attempt ended (design section 10): whether the next
@@ -290,7 +312,10 @@ func (h *handler) check(w http.ResponseWriter, r *http.Request, rq *request) *do
 
 // admit is step 4 (phase-3 design section 7): the slots and rate windows of
 // the key, the alias and the instance as rq's snapshot declares them, all or
-// nothing. Once admitted, rq.release gives the slots back in done.
+// nothing. Once admitted, rq.release gives the slots back in done, and
+// rq.content says whether the spans carry content: when an exporter is
+// published, the request is sampled and the key's content_until is after the
+// service clock (TEL-8).
 func (h *handler) admit(rq *request) *domain.Error {
 	k, m, names := &rq.key.Spec, &rq.model.Spec, scopeNames(rq)
 	var e *domain.Error
@@ -298,6 +323,8 @@ func (h *handler) admit(rq *request) *domain.Error {
 		admission.Scope{Name: names[0], Parallel: k.MaxParallelRequests, RPM: k.RPMLimit, TPM: k.TPMLimit},
 		admission.Scope{Name: names[1], Parallel: m.MaxParallelRequests, RPM: m.RPMLimit, TPM: m.TPMLimit},
 		admission.Scope{Name: names[2], Parallel: rq.snap.Settings.MaxParallelRequests})
+	until := rq.key.Spec.ContentUntil
+	rq.content = e == nil && rq.snap.Exporter != nil && telemetry.Sampled(rq.sample, sampleRate(rq)) && !until.IsZero() && until.After(h.Config.Now())
 	return e
 }
 
@@ -518,6 +545,8 @@ func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *c
 			a.written = true
 			if _, err = w.Write(answer); err != nil {
 				err = fmt.Errorf("%w: %v", errClientGone, err)
+			} else if rq.content { // redacted whole, so no cut leaves a part of the credential
+				a.capture([]byte(t.Provider.Credential.Redact(string(answer))), rq.snap.Settings.Telemetry.ContentMaxBytes)
 			}
 		}
 	}
@@ -666,6 +695,9 @@ func (h *handler) stream(ctx context.Context, w http.ResponseWriter, rq *request
 		}
 		if err != nil {
 			return fmt.Errorf("%w: %v", errClientGone, err)
+		}
+		if rq.content && !e.Comment {
+			a.capture(e.Data, rq.snap.Settings.Telemetry.ContentMaxBytes)
 		}
 		return nil
 	}
@@ -937,7 +969,10 @@ func sampleRate(rq *request) float64 {
 // as in the request line: one that does not exist is as long as the body
 // allows. A client gone is a failure with the message "client gone". The
 // provider's own text, which 400, 404, 413 and 422 pass to the client and
-// which may quote the prompt, becomes its status alone (TEL-8).
+// which may quote the prompt, becomes its status alone (TEL-8), with or
+// without the opt-in. Under the opt-in the request carries the serving
+// (last) attempt's content: the messages member of its outgoing body, the
+// credential redacted, and the answer it relayed; Build cuts both.
 func spanRequest(rq *request, status int, code, version string, ended time.Time) telemetry.Request {
 	r := telemetry.Request{Context: rq.trace, Key: rq.key.Name, Alias: fmt.Sprintf("%.200s", rq.alias), Session: rq.session, Endpoint: rq.ep,
 		Stream: rq.client != nil && rq.client.Stream, Version: version, Revision: rq.snap.Revision, Status: status, Code: code,
@@ -972,6 +1007,15 @@ func spanRequest(rq *request, status int, code, version string, ended time.Time)
 			s.Message = errClientGone.Error()
 		}
 		r.Attempts = append(r.Attempts, s)
+	}
+	if n := len(rq.attempts); rq.content && n > 0 {
+		a := rq.attempts[n-1]
+		r.Output, r.ContentMax = a.answer, rq.snap.Settings.Telemetry.ContentMaxBytes
+		if b, e := params.ReadBack(a.out.Body, nil); e == nil { // Build wrote the body
+			if m, ok := b.Get("messages"); ok {
+				r.Input = []byte(a.target.Provider.Credential.Redact(string(m)))
+			}
+		}
 	}
 	return r
 }

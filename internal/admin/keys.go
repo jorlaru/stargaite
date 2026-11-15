@@ -2,6 +2,8 @@ package admin
 
 import (
 	"cmp"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"maps"
 	"net/http"
@@ -73,9 +75,45 @@ func (s *server) keyChanged(w http.ResponseWriter, status int, res config.Result
 	write(w, status, out)
 }
 
+// content turns the content member of a key's body, a duration from now on
+// the service clock (TEL-8), into content_until: a positive duration sets
+// it, "" or null clears it. Any other value, and a body that also holds
+// content_until, is refused; it runs inside Mutate, so a refusal is audited
+// as any key change.
+func content(patch jsontext.Value, now time.Time) (jsontext.Value, error) {
+	var members map[string]jsontext.Value
+	if patch.Kind() != '{' || json.Unmarshal(patch, &members) != nil {
+		return patch, nil // merge refuses it
+	}
+	raw, ok := members["content"]
+	if !ok {
+		return patch, nil
+	}
+	if _, both := members["content_until"]; both {
+		return nil, invalid("content and content_until cannot both be given")
+	}
+	delete(members, "content")
+	var d string
+	if raw.Kind() != 'n' && config.Decode(raw, &d) != nil {
+		return nil, invalid("content must be a string")
+	}
+	members["content_until"] = jsontext.Value("null")
+	if d != "" {
+		v, err := time.ParseDuration(d)
+		if err != nil || v <= 0 {
+			return nil, invalid("content must be a positive duration, such as 24h, or empty to stop the capture")
+		}
+		if members["content_until"], err = config.Encode(now.Add(v).UTC()); err != nil {
+			return nil, err
+		}
+	}
+	return config.Encode(members)
+}
+
 // createKey is "keys create": the body is the declaration plus name, and
 // models is required (Validate refuses a key without it: no access by
 // omission). The key gets its first secret, whose token the result shows once.
+// content sets content_until (TEL-8).
 func (s *server) createKey(w http.ResponseWriter, r *http.Request) {
 	var name string
 	patch, err := addBody(w, r, "name", &name, nil)
@@ -89,6 +127,10 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request) {
 		}
 		if _, ok := st.Doc.Keys[name]; ok {
 			return nil, domain.NewError(domain.CodeConflict, fmt.Sprintf("key %.64q exists", name))
+		}
+		patch, err := content(patch, s.cfg.Now())
+		if err != nil {
+			return nil, err
 		}
 		var spec domain.Key
 		if err := merge(&spec, patch); err != nil {
@@ -106,6 +148,7 @@ func (s *server) createKey(w http.ResponseWriter, r *http.Request) {
 }
 
 // setKey merges the patch into the stored declaration; the secrets stay.
+// content sets or clears content_until (TEL-8).
 func (s *server) setKey(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	patch, err := patchBody(w, r)
@@ -115,6 +158,10 @@ func (s *server) setKey(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.cfg.Commit(r.Context(), config.Change{Summary: "keys set " + name, Kind: config.KindKey, Name: name, Mutate: func(st *config.State) (map[string]string, error) {
 		k, err := findKey(st, name)
+		if err != nil {
+			return nil, err
+		}
+		patch, err := content(patch, s.cfg.Now())
 		if err != nil {
 			return nil, err
 		}

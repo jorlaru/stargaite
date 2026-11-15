@@ -30,6 +30,7 @@ func load(ctx context.Context, db *sql.DB) (*State, error) {
 		},
 		Revoked:    map[string]int64{},
 		NeverSince: map[string]int64{},
+		Verified:   map[string]Verification{},
 	}
 	d := &st.Doc
 	if err := db.QueryRowContext(ctx, "SELECT COALESCE(MAX(revision), 0) FROM revisions").Scan(&st.Revision); err != nil {
@@ -70,6 +71,18 @@ func load(ctx context.Context, db *sql.DB) (*State, error) {
 		err := Decode(spec, &t)
 		d.Targets[id] = t
 		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	err = each(ctx, db, "SELECT id, verified_at, COALESCE(verified_version, '') FROM targets WHERE verified_at IS NOT NULL", func(rows *sql.Rows) error {
+		var id string
+		var v Verification
+		if err := rows.Scan(&id, &v.At, &v.Version); err != nil {
+			return err
+		}
+		st.Verified[id] = v
+		return nil
 	})
 	if err != nil {
 		return nil, err
@@ -258,17 +271,21 @@ func writeChange(sqlTx *sql.Tx, ch Change, old, next *State, diff []DiffEntry, a
 		}
 	}
 
+	// A change of a target or of its provider clears the target's stored
+	// verification (RSN-9), as Commit drops it from State.Verified.
 	for _, e := range byKind[KindProvider] {
 		if e.Action != ActionRemoved {
 			t.exec(`INSERT INTO providers (name, spec, updated_at) VALUES (?, ?, ?)
 				ON CONFLICT (name) DO UPDATE SET spec = excluded.spec, updated_at = excluded.updated_at`, e.Name, text(e.New), at)
+			t.exec("UPDATE targets SET verified_at = NULL, verified_version = NULL WHERE provider = ?", e.Name)
 		}
 	}
 	for _, e := range byKind[KindTarget] {
 		if e.Action != ActionRemoved {
 			provider, upstream, _ := domain.SplitTarget(e.Name)
 			t.exec(`INSERT INTO targets (id, provider, upstream_model, spec, updated_at) VALUES (?, ?, ?, ?, ?)
-				ON CONFLICT (id) DO UPDATE SET spec = excluded.spec, updated_at = excluded.updated_at`, e.Name, provider, upstream, text(e.New), at)
+				ON CONFLICT (id) DO UPDATE SET spec = excluded.spec, updated_at = excluded.updated_at, verified_at = NULL, verified_version = NULL`,
+				e.Name, provider, upstream, text(e.New), at)
 		}
 	}
 	for _, e := range byKind[KindModel] {

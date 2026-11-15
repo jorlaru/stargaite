@@ -72,6 +72,7 @@ type command struct {
 	local    func(ctx context.Context, in input, out io.Writer) error // runs without a server; errRemote hands over to request
 	render   func(out io.Writer, answer []byte) error                 // prints a 2xx answer without --json; nil is the generic renderer
 	save     func(in input, resp *http.Response, out io.Writer) error // takes a 2xx answer's body itself, sent without the client timeout; nil reads it
+	long     bool                                                     // sent without the client timeout: the server bounds the call by its write deadline
 }
 
 // yamlFile is a request body: the file at that path, sent as YAML.
@@ -231,6 +232,11 @@ var commands = []command{
 	{words: []string{"targets", "list"}, request: get("/targets")},
 	{words: []string{"targets", "show"}, args: []string{"id"}, request: named(http.MethodGet, "/targets")},
 	{words: []string{"targets", "set"}, args: []string{"id"}, flags: targetFlags, request: named(http.MethodPatch, "/targets")},
+	{words: []string{"targets", "verify"}, args: []string{"id"}, flags: []flagSpec{
+		{"max-output-tokens", kindNumber, "max_output_tokens", "the only output cap sent; required for an anthropic target (PAR-7)"},
+	}, request: func(in input) (string, string, any) {
+		return http.MethodPost, "/verify/" + url.PathEscape(in.args[0]), in.body
+	}, render: verified, long: true},
 	{words: []string{"targets", "remove"}, args: []string{"id"}, needsYes: func(input) bool { return true }, request: named(http.MethodDelete, "/targets")},
 	{words: []string{"models", "add"}, args: []string{"name"}, flags: modelFlags, request: add("/models", "name")},
 	{words: []string{"models", "list"}, request: get("/models")},
@@ -397,7 +403,7 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 		return exitUsage
 	}
 	method, path, body := cmd.request(in)
-	return call(ctx, name, in, method, path, body, cmd.render, cmd.save, stdout, stderr)
+	return call(ctx, name, in, method, path, body, cmd.render, cmd.save, cmd.long, stdout, stderr)
 }
 
 // match returns the command whose words lead args, and the arguments after them.

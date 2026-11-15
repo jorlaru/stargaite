@@ -347,18 +347,27 @@ func (h *handler) admit(rq *request) *domain.Error {
 }
 
 // scopeNames are rq's admission scopes in Admit's order: key, alias,
-// instance.
+// instance; the instance alone for a request without an alias, a verify
+// call, which passes no key or alias limit (RSN-9).
 func scopeNames(rq *request) []string {
+	if rq.model == nil {
+		return []string{"global"}
+	}
 	return []string{"key:" + rq.key.Name, "model:" + rq.alias, "global"}
 }
 
 // budgets are the budgets of rq's key, alias and instance, in that order,
 // as rq's snapshot declares them, each with the revision its never counter
-// started at (phase-3 design section 8).
+// started at (phase-3 design section 8); the instance's alone without an
+// alias, as scopeNames.
 func budgets(rq *request) []admission.Budget {
 	names := scopeNames(rq)
+	specs := []*domain.Budget{rq.snap.Settings.Budget}
+	if rq.model != nil {
+		specs = []*domain.Budget{rq.key.Spec.Budget, rq.model.Spec.Budget, rq.snap.Settings.Budget}
+	}
 	var bs []admission.Budget
-	for i, b := range []*domain.Budget{rq.key.Spec.Budget, rq.model.Spec.Budget, rq.snap.Settings.Budget} {
+	for i, b := range specs {
 		if b != nil {
 			bs = append(bs, admission.Budget{Scope: names[i], Spec: *b, Since: rq.snap.NeverSince[names[i]]})
 		}

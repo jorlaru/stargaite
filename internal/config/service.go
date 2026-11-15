@@ -32,6 +32,17 @@ type State struct {
 	// "model:<alias>") whose budget is never, the revision its counter
 	// started at: its budget_totals row (LIM-2). Only Commit sets it.
 	NeverSince map[string]int64
+	// Verified is, by target id, the last successful targets verify: the
+	// targets columns verified_at and verified_version (RSN-9). Only
+	// Service.Verified adds an entry; Commit drops the entry of a target it
+	// changes, as writeChange clears its columns.
+	Verified map[string]Verification
+}
+
+// Verification is the stored result of a successful targets verify (RSN-9).
+type Verification struct {
+	At      int64  `json:"verified_at"` // Unix ms: targets.verified_at
+	Version string `json:"verified_version"`
 }
 
 // KeySecret is one secret of a key: the SHA-256 of the full token, never the
@@ -128,7 +139,7 @@ func Open(ctx context.Context, st *store.Store, env func() Env, now func() time.
 		}
 	}
 	e := env()
-	findings := append(Validate(&state.Doc), CheckResolved(ctx, &state.Doc, nil, e)...)
+	findings := slices.Concat(Validate(&state.Doc), CheckResolved(ctx, &state.Doc, nil, e), Unverified(&state.Doc, state.Verified))
 	s := &Service{st: st, env: env, now: now, state: state}
 	s.snap.Store(build(state, e, findings))
 	return s, nil
@@ -172,11 +183,24 @@ func (s *Service) Commit(ctx context.Context, ch Change) (Result, error) {
 	if err != nil {
 		return Result{}, internal(err)
 	}
+	// A stored verification goes with any change of its target or of the
+	// target's provider, as writeChange clears the columns (RSN-9).
+	changed := map[string]bool{}
+	for _, e := range diff {
+		changed[e.Kind+" "+e.Name] = true
+	}
+	next.Verified = maps.Clone(old.Verified)
+	for id := range next.Verified {
+		if provider, _, _ := domain.SplitTarget(id); changed[KindTarget+" "+id] || changed[KindProvider+" "+provider] {
+			delete(next.Verified, id)
+		}
+	}
 
 	// 4. Validate the whole document; resolve every credential and the URLs
-	// this change sets, with a fresh read of the env file.
+	// this change sets, with a fresh read of the env file; then the chat
+	// targets never verified (RSN-9).
 	env := s.env()
-	findings := append(Validate(&next.Doc), CheckResolved(ctx, &next.Doc, setURLs(old, next), env)...)
+	findings := slices.Concat(Validate(&next.Doc), CheckResolved(ctx, &next.Doc, setURLs(old, next), env), Unverified(&next.Doc, next.Verified))
 
 	// 5. An error finding refuses a change. A change with an empty diff that
 	// keeps the document's version (which no diff entry shows) alters
@@ -225,6 +249,79 @@ func (s *Service) Commit(ctx context.Context, ch Change) (Result, error) {
 		res.Secrets = issued
 	}
 	return res, nil
+}
+
+// Verified records a verify run under Commit's mutex (RSN-9, SEC-7): one
+// audit row always, action "targets verify <id>", resource the target, result
+// verified, failed (a run that was not all 2xx) or stale (a successful run
+// whose target or provider no longer equals t and p), new_value summary, the
+// calls without their bodies; the columns only when verified. No revision: a
+// stored result changes no declaration, so the snapshot is republished as a
+// shallow copy with the new map and the target_unverified findings again.
+func (s *Service) Verified(ctx context.Context, id string, t domain.Target, p domain.Provider, ok bool, at time.Time, version, summary string) (stored bool, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	provider, _, _ := domain.SplitTarget(id)
+	same := func(a, b any) bool {
+		x, errX := Encode(a)
+		y, errY := Encode(b)
+		return errX == nil && errY == nil && bytes.Equal(x, y)
+	}
+	cur, okT := s.state.Doc.Targets[id]
+	curP, okP := s.state.Doc.Providers[provider]
+	result := "failed"
+	switch {
+	case ok && okT && okP && same(cur, t) && same(curP, p):
+		result, stored = "verified", true
+	case ok:
+		result = "stale"
+	}
+	err = s.st.Write(ctx, func(tx *sql.Tx) error {
+		if stored {
+			if _, err := tx.Exec("UPDATE targets SET verified_at = ?, verified_version = ? WHERE id = ?", at.UnixMilli(), version, id); err != nil {
+				return err
+			}
+		}
+		return insertAudit(tx, Change{Summary: "targets verify " + id, Kind: KindTarget, Name: id}, "", "", nil, []byte(summary), result, 0, s.now().UnixMilli())
+	})
+	if err != nil || !stored {
+		return false, err
+	}
+	state, snap := *s.state, *s.Snapshot()
+	state.Verified = maps.Clone(s.state.Verified)
+	if state.Verified == nil {
+		state.Verified = map[string]Verification{}
+	}
+	state.Verified[id] = Verification{At: at.UnixMilli(), Version: version}
+	snap.Verified = state.Verified
+	snap.Findings = append(slices.DeleteFunc(slices.Clone(snap.Findings), func(f domain.Finding) bool { return f.Code == codeUnverified }),
+		Unverified(snap.Doc, snap.Verified)...)
+	s.state = &state
+	s.snap.Store(&snap)
+	return true, nil
+}
+
+// Verification is the stored result of target id's last successful verify.
+func (s *Service) Verification(id string) (Verification, bool) {
+	v, ok := s.Snapshot().Verified[id]
+	return v, ok
+}
+
+// codeUnverified is the code of the RSN-9 warning.
+const codeUnverified = "target_unverified"
+
+// Unverified is the RSN-9 warning target_unverified for each chat target of
+// d without a stored result in v, by id. Open, Commit and Check append it;
+// validate -f, which has no store, does not (phase-4 design section 15 point
+// 33).
+func Unverified(d *domain.Document, v map[string]Verification) []domain.Finding {
+	var r report
+	for _, id := range slices.Sorted(maps.Keys(d.Targets)) {
+		if _, ok := v[id]; !ok && d.Targets[id].Kind == domain.KindChat {
+			r.warn("RSN-9", codeUnverified, "targets/"+id, "", "this chat target was never checked against its live provider: run targets verify on it")
+		}
+	}
+	return r
 }
 
 // neverSince is the NeverSince of next, committed after old at its new

@@ -12,10 +12,19 @@ import (
 	"github.com/jorlaru/stargaite/internal/domain"
 )
 
-// targetView is a target as a read shows it: its id and its declaration.
+// targetView is a target as a read shows it: its id, its declaration and
+// its stored verification, when it has one (RSN-9).
 type targetView struct {
 	ID string `json:"id"`
 	domain.Target
+	VerifiedAt      int64  `json:"verified_at,omitzero"` // Unix ms
+	VerifiedVersion string `json:"verified_version,omitzero"`
+}
+
+// view is target id of snap as a read shows it.
+func view(snap *config.Snapshot, id string) targetView {
+	v := snap.Verified[id]
+	return targetView{id, snap.Doc.Targets[id], v.At, v.Version}
 }
 
 // modelView is a model alias as a read shows it: its name and its declaration.
@@ -72,10 +81,10 @@ func mergeTarget(t *domain.Target, patch jsontext.Value) error {
 }
 
 func (s *server) listTargets(w http.ResponseWriter, _ *http.Request) {
-	doc := s.cfg.Snapshot().Doc
+	snap := s.cfg.Snapshot()
 	list := []targetView{}
-	for _, id := range slices.Sorted(maps.Keys(doc.Targets)) {
-		list = append(list, targetView{id, doc.Targets[id]})
+	for _, id := range slices.Sorted(maps.Keys(snap.Doc.Targets)) {
+		list = append(list, view(snap, id))
 	}
 	write(w, http.StatusOK, struct {
 		Targets []targetView `json:"targets"`
@@ -85,12 +94,12 @@ func (s *server) listTargets(w http.ResponseWriter, _ *http.Request) {
 // showTarget reads {id...}: a target id holds "/", sent as is or escaped.
 func (s *server) showTarget(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	t, ok := s.cfg.Snapshot().Doc.Targets[id]
-	if !ok {
+	snap := s.cfg.Snapshot()
+	if _, ok := snap.Doc.Targets[id]; !ok {
 		s.fail(w, noTarget(id))
 		return
 	}
-	write(w, http.StatusOK, targetView{id, t})
+	write(w, http.StatusOK, view(snap, id))
 }
 
 // addTarget is "targets add": the body is the declaration plus id. The new
@@ -119,7 +128,7 @@ func (s *server) addTarget(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	write(w, http.StatusCreated, written{res, targetView{id, spec}})
+	write(w, http.StatusCreated, written{res, targetView{ID: id, Target: spec}})
 }
 
 // setTarget merges the patch into the stored declaration, but for the
@@ -147,7 +156,7 @@ func (s *server) setTarget(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	write(w, http.StatusOK, written{res, targetView{id, spec}})
+	write(w, http.StatusOK, written{res, targetView{ID: id, Target: spec}})
 }
 
 // removeTarget deletes a target. One that an alias still lists is refused by

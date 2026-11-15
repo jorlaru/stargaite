@@ -57,6 +57,7 @@ type server struct {
 	limits  *admission.State
 	spans   *telemetry.Exporter
 	backup  func(ctx context.Context) (*os.File, error)
+	verify  func(ctx context.Context, target string, maxOutput *int64) (domain.Verification, *domain.Error)
 
 	mu        sync.Mutex // guards the two fields below
 	refusedAt time.Time  // when the last refusal line was logged
@@ -110,6 +111,8 @@ var routes = []route{
 	{"POST /admin/v1/telemetry/test", (*server).testTelemetry},
 	{"POST /admin/v1/secrets/reload", (*server).reloadSecrets},
 	{"POST /admin/v1/backup", (*server).sendBackup},
+	// Its own resource (kick-off section 13.2): {id...} must end the pattern.
+	{"POST /admin/v1/verify/{id...}", (*server).verifyTarget},
 }
 
 // Deps is what the admin listener needs from serve.
@@ -121,11 +124,13 @@ type Deps struct {
 	Admission *admission.State                            // the data plane's, whose quota windows usage quota shows
 	Spans     *telemetry.Exporter                         // the exporter telemetry test sends through and telemetry status reads
 	Backup    func(ctx context.Context) (*os.File, error) // store.Store.Backup
+	// Verify is api.Verify over the data plane's Deps (RSN-9).
+	Verify func(ctx context.Context, target string, maxOutput *int64) (domain.Verification, *domain.Error)
 }
 
 // Handler returns the admin listener's handler.
 func Handler(d Deps) http.Handler {
-	s := &server{cfg: d.Config, keyHash: d.KeyHash, log: d.Log, usage: d.Usage, limits: d.Admission, spans: d.Spans, backup: d.Backup}
+	s := &server{cfg: d.Config, keyHash: d.KeyHash, log: d.Log, usage: d.Usage, limits: d.Admission, spans: d.Spans, backup: d.Backup, verify: d.Verify}
 	mux := http.NewServeMux()
 	for _, rt := range routes {
 		mux.HandleFunc(rt.pattern, func(w http.ResponseWriter, r *http.Request) { rt.handle(s, w, r) })

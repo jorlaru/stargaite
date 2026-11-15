@@ -36,6 +36,7 @@ curl -sS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:4000/he
 ./stargaite models add embed --target mock/mock-embed
 ./stargaite keys create my-agent --model fast --model embed --rpm-limit 60
 ./stargaite models explain fast
+./stargaite targets verify mock/mock
 ./stargaite telemetry set --otlp-endpoint http://127.0.0.1:4010 --allow-private-network
 ./stargaite telemetry test
 curl -s http://127.0.0.1:4000/v1/models -H "Authorization: Bearer sk-stargaite-..."
@@ -54,7 +55,11 @@ an alias. `keys create` limits the key to 60 requests a minute, allows it both a
 prints the client key once: paste it in place of `sk-stargaite-...` in the three `curl` calls. `models explain` shows what the alias would send, without calling
 the provider: per target, the effort and output-cap layers, the list of changes, the URL, the headers without the
 credential and the body, which for the minimal request it explains by default are the bytes the chat completion below
-sends (`--body <file>` explains a request of your own; `--json` gives each body's exact bytes). `telemetry set` points
+sends (`--body <file>` explains a request of your own; `--json` gives each body's exact bytes). `targets verify` then
+calls the target for real, once per reasoning level it declares (once with no reasoning control for `mock/mock`, which
+declares none), prints for each call the effort sent, the provider's status, the reasoning and output tokens and the
+exact body sent, then `verified: mock/mock, the result is stored`; until a chat target is verified, `validate` warns
+about it (see [Targets verify](#targets-verify)). `telemetry set` points
 the OTLP exporter at the mock provider, which also accepts trace exports, and `telemetry test` sends it one span and
 prints `credentials: resolved · reachable: yes · authorized: yes · span: accepted (200) · trace_id=…` (see
 [Telemetry](#telemetry)). The first `curl` lists
@@ -64,8 +69,9 @@ see them), and its span reaches the mock provider within the 2 s of a batch; the
 `embed` and gets the mock provider's vector, byte for byte.
 `usage show --by model` then sums the last hour from the store per alias: for `fast` one request, the tokens the mock
 provider reported (1 input, 2 output) and their cost at the target's prices, 0.000005 USD; for `embed` one request,
-1 input token, 0 output and 0.000001 USD. `backup` writes a checked copy of the store, both
-requests included, to `backup.db` with mode `0600` and prints its size (see [Backup and restore](#backup-and-restore)).
+1 input token, 0 output and 0.000001 USD; and on the first row, under the alias `-` (none), the verify call, recorded
+under the key `_verify` with the same tokens and cost as `fast`. `backup` writes a checked copy of the store, the three
+records included, to `backup.db` with mode `0600` and prints its size (see [Backup and restore](#backup-and-restore)).
 Both processes log JSON lines to the terminal; `kill %1 %2` stops them.
 `./stargaite --help` lists every command, and each one accepts `--json`, never prompts, and exits `0` on success, `1`
 on failure and `2` on wrong usage; `remove`, `keys revoke` and `apply --prune` (unless `--dry-run`) need `--yes`.
@@ -251,6 +257,26 @@ input tokens are `usage.prompt_tokens`, else `usage.total_tokens`, and its outpu
 array, as TEI sends, or Cohere's `meta`) is estimated from the bytes sent and priced by the target's table, and a
 provider `cost_report` wins over the table. Search units are not recorded: a target billed by them is priced by its
 `cost_report`, or approximately by its token prices.
+
+## Targets verify
+
+`./stargaite targets verify <target> [--max-output-tokens n]` checks a chat target against its live provider, with
+the provider's own credential: one call per level the target declares (`--level`, in order), then one at `none` when
+it declares `--can-disable=true`, or a single call with no reasoning control when it declares neither; an `on` level
+is sent as `medium`. Each call sends the fixed prompt "What is 17 × 23? Answer with the number only." through the same
+build as live traffic, so the body printed is the exact one sent, translated toward an `anthropic` target. The only
+output cap sent is `--max-output-tokens`, written under the target's `output_cap_param` (`max_tokens` toward
+`anthropic`) and listed as added; it is required for an `anthropic` target and may not exceed the target's
+`max_output_tokens`. For each call it prints the level asked, the effort sent, the provider's status, the reasoning
+and output tokens and the body, then `verified` or `failed`; it exits `0` only when every call answered `2xx`, and
+`--json` gives every body's exact bytes. The calls cost tokens: they are recorded under the key `_verify` with an
+empty alias, count toward the global budget and the provider's quota (and are refused, `402` or `429`, when either is
+exhausted), and pass no key or alias limit; they neither open nor obey a target's circuit. A successful run is stored
+with its date and the proxy version, which `targets show` and `targets list` print as `verified_at` (Unix
+milliseconds) and `verified_version`, and `validate` warns about every chat target without one (`validate -f`, with no
+store, does not); any change of the target or of its provider clears it. Every run is audited, `verified`, `failed`,
+or `stale` when the target changed while it ran, and none writes a revision. The server bounds the run by its own
+write deadline, the number of calls times `total_ms` plus 5 s, so the CLI waits without its 90 s timeout.
 
 ## Resilience
 

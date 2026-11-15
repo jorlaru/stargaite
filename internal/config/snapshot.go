@@ -29,6 +29,9 @@ type Snapshot struct {
 	// NeverSince is, by scope, the revision the counter of a never budget
 	// started at (State.NeverSince): admission.Budget.Since.
 	NeverSince map[string]int64
+	// Verified is State.Verified: by target id, the last successful
+	// targets verify (RSN-9).
+	Verified map[string]Verification
 	// Exporter is the OTLP exporter as published, nil without an
 	// otlp_endpoint; the exporter reads it per batch (phase-3 design section 10).
 	Exporter *Exporter
@@ -187,6 +190,7 @@ func build(st *State, env Env, findings []domain.Finding) *Snapshot {
 		Keys:       make(map[string]*Key, len(d.Keys)),
 		Findings:   findings,
 		NeverSince: st.NeverSince,
+		Verified:   st.Verified,
 		Exporter:   exporter(d.Settings.Telemetry, env, st.Revision),
 		secrets:    make(map[string]secret, len(st.Secrets)),
 	}

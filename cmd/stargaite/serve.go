@@ -199,7 +199,8 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 	if code == 0 {
 		// Every request context derives from base: cancelling it stops the
 		// requests still running when the grace ends, and flight counts the
-		// inference requests whose done has not run yet. Retention and the
+		// inference requests whose done has not run yet and the verify runs
+		// (phase-4 design section 8, stop order). Retention and the
 		// store check run on bg once the proxy is ready, counted by
 		// background (kick-off section 14.3).
 		base, halt := context.WithCancelCause(context.Background())
@@ -209,9 +210,14 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 			background.Go(func() { retain(bg, st, cfg, log) })
 			background.Go(func() { checkStore(bg, st, log, counters) })
 		}
+		// One data plane: a verify run goes through the same Flight, writer,
+		// admission state, counters and exporter as traffic (RSN-9), and
+		// halt stops its call like any other.
+		d := api.Deps{Config: cfg, Log: log, Clients: clients, Flight: &flight, Usage: records, Admission: limits, Counters: counters, Spans: spans, Version: cli.Version}
 		if err := runServers(ctx, base, log, tlsConfig, attrs, ready, []listener{
-			{"admin", *adminAddr, admin.Handler(admin.Deps{Config: cfg, KeyHash: keyHash, Log: log, Usage: st.Read(), Admission: limits, Spans: spans, Backup: st.Backup})},
-			{"data", *dataAddr, api.Handler(api.Deps{Config: cfg, Log: log, Clients: clients, Flight: &flight, Usage: records, Admission: limits, Counters: counters, Spans: spans, Version: cli.Version})},
+			{"admin", *adminAddr, admin.Handler(admin.Deps{Config: cfg, KeyHash: keyHash, Log: log, Usage: st.Read(), Admission: limits, Spans: spans,
+				Backup: st.Backup, Verify: api.Verify(d)})},
+			{"data", *dataAddr, api.Handler(d)},
 		}); err != nil {
 			log.Error("server failed", "error", err.Error())
 			code = 1

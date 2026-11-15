@@ -47,7 +47,8 @@ var client = &http.Client{
 }
 
 // untimed is client without its timeout, for a command whose server bounds
-// the call by a longer write deadline of its own (backup: 15 minutes).
+// the call by a longer write deadline of its own (backup: 15 minutes;
+// targets verify: k × (total_ms + 5 s) for k calls).
 var untimed = &http.Client{Transport: client.Transport, CheckRedirect: client.CheckRedirect}
 
 func direct() *http.Transport {
@@ -184,9 +185,10 @@ func parent(body map[string]any, path []string) map[string]any {
 
 // call sends the one request of a command and prints the answer, through
 // rowRender when it is not nil; save, when it is not nil, takes a 2xx
-// answer instead, and the request goes without the client timeout.
+// answer instead. With save, or long, the request goes without the client
+// timeout.
 func call(ctx context.Context, name string, in input, method, path string, body any, rowRender func(io.Writer, []byte) error,
-	save func(input, *http.Response, io.Writer) error, stdout, stderr io.Writer) int {
+	save func(input, *http.Response, io.Writer) error, long bool, stdout, stderr io.Writer) int {
 	base := cmp.Or(*in.flags["admin-url"], in.getenv("STARGAITE_ADMIN_URL"), defaultAdminURL)
 	if u, err := url.Parse(base); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		say(stderr, "%s: the admin URL %q is not an http or https URL\n", name, base)
@@ -258,7 +260,7 @@ func call(ctx context.Context, name string, in input, method, path string, body 
 		req.Header.Set("Content-Type", contentType)
 	}
 	c := client
-	if save != nil {
+	if save != nil || long {
 		c = untimed
 	}
 	resp, err := c.Do(req)
@@ -300,17 +302,18 @@ func failed(name string, in input, e *domain.Error, stdout, stderr io.Writer) in
 // show prints an answer: the body unchanged with --json, otherwise rendered
 // for a person, through the row's own renderer when it has one, an error on
 // stderr. A 2xx answer is exit 0, unless it holds error findings, as validate
-// does on an invalid configuration.
+// does on an invalid configuration, or ok false, as a failed targets verify.
 func show(name string, in input, resp *http.Response, answer []byte, rowRender func(io.Writer, []byte) error, stdout, stderr io.Writer) int {
 	var findings struct {
 		Findings []domain.Finding `json:"findings"`
 		Outcome  string           `json:"outcome"` // of telemetry test
+		OK       *bool            `json:"ok"`      // of targets verify
 	}
-	_ = json.Unmarshal(answer, &findings) // only the findings and outcome of a success matter here
+	_ = json.Unmarshal(answer, &findings) // only the findings, outcome and ok of a success matter here
 	ok := resp.StatusCode/100 == 2
 	code := exitOK
 	if !ok || slices.ContainsFunc(findings.Findings, func(f domain.Finding) bool { return f.Severity == domain.SeverityError }) ||
-		findings.Outcome != "" && findings.Outcome != "accepted" {
+		findings.Outcome != "" && findings.Outcome != "accepted" || findings.OK != nil && !*findings.OK {
 		code = exitFailure
 	}
 
@@ -494,6 +497,58 @@ func explained(w io.Writer, answer []byte) error {
 			}
 			line("body", printable(b.Body))
 		}
+	}
+	return nil
+}
+
+// verified renders the answer of targets verify (RSN-9): one block per call,
+// a blank line between blocks, with the level asked, the effort sent, the
+// provider's status, the reasoning and output tokens, the error when there is
+// one, and the exact body sent; then verified or failed, and whether the
+// result was stored. Text from the server is printable() like every rendered
+// value; --json has the exact bytes of each body.
+func verified(w io.Writer, answer []byte) error {
+	var v struct {
+		Target string `json:"target"`
+		OK     bool   `json:"ok"`
+		Stored bool   `json:"stored"`
+		Calls  []struct {
+			Effort          string        `json:"effort"`
+			EffortSent      *string       `json:"effort_sent"`
+			Status          int           `json:"status"`
+			ReasoningTokens *int64        `json:"reasoning_tokens"`
+			OutputTokens    int64         `json:"output_tokens"`
+			Body            string        `json:"body"`
+			Error           *domain.Error `json:"error"`
+		} `json:"calls"`
+	}
+	if err := json.Unmarshal(answer, &v); err != nil {
+		return err
+	}
+	line := func(name, value string) { say(w, "%-12s%s\n", name, value) }
+	for _, c := range v.Calls {
+		line("effort", cmp.Or(printable(c.Effort), "- (no reasoning control)"))
+		line("sent", layer(c.EffortSent))
+		status := "-" // no answer: refused before the provider, or cut
+		if c.Status != 0 {
+			status = strconv.Itoa(c.Status)
+		}
+		line("status", status)
+		line("reasoning", layer(c.ReasoningTokens))
+		line("output", strconv.FormatInt(c.OutputTokens, 10))
+		if c.Error != nil {
+			line("error", printable(c.Error.Code+": "+c.Error.Message))
+		}
+		line("body", printable(c.Body))
+		say(w, "\n")
+	}
+	switch {
+	case v.OK && v.Stored:
+		say(w, "verified: %s, the result is stored\n", printable(v.Target))
+	case v.OK:
+		say(w, "verified: %s, but the target changed during the run, so the result is not stored\n", printable(v.Target))
+	default:
+		say(w, "failed: %s, not every call answered 2xx\n", printable(v.Target))
 	}
 	return nil
 }

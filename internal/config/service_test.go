@@ -84,6 +84,10 @@ func change(summary string, f func(*State)) Change {
 
 var hash1, hash2 = sha256.Sum256([]byte("token-1")), sha256.Sum256([]byte("token-2"))
 
+// unverified is the RSN-9 warning on the seed's chat target, which no
+// verify run has checked (phase-4 design section 11).
+const unverified = "warning RSN-9 target_unverified targets/p/m "
+
 // seed declares one of each resource: provider p, target p/m, alias fast,
 // key k with one secret.
 func seed(s *State) {
@@ -190,7 +194,7 @@ func TestCommitRows(t *testing.T) {
 		`model fast created  {"targets":["p/m"]}`,
 		`key k created  {"models":["fast"]}`,
 	})
-	if res.Revision != 1 || !res.Changed || len(res.Findings) != 0 || res.Secrets["k"] != "the-token" {
+	if res.Revision != 1 || !res.Changed || !slices.Equal(summary(res.Findings), []string{unverified}) || res.Secrets["k"] != "the-token" {
 		t.Errorf("result %+v", res)
 	}
 	snap := s.Snapshot()
@@ -253,7 +257,7 @@ func TestCommitRows(t *testing.T) {
 			if !errors.As(err, &de) || de.Code != r.code || de.Status == http.StatusInternalServerError {
 				t.Errorf("%s (dry run %v): error %v", r.ch.Summary, dry, err)
 			}
-			if r.code == domain.CodeInvalidRequest && (len(de.Findings) != 1 || de.Findings[0].Code != "unknown_target") {
+			if r.code == domain.CodeInvalidRequest && (len(de.Findings) != 2 || de.Findings[0].Code != "unknown_target" || summary(de.Findings)[1] != unverified) {
 				t.Errorf("findings %+v", de.Findings)
 			}
 		}
@@ -615,7 +619,7 @@ func TestCredentialResolution(t *testing.T) {
 		seed(st)
 		return nil, nil
 	}})
-	if got := summary(res.Findings); !slices.Equal(got, []string{"warning OPS-6 credential_unresolved providers/p api_key_env"}) {
+	if got := summary(res.Findings); !slices.Equal(got, []string{"warning OPS-6 credential_unresolved providers/p api_key_env", unverified}) {
 		t.Errorf("dry run findings %q", got)
 	}
 	if n := len(rows(t, st, "SELECT * FROM audit")); n != 0 {
@@ -623,7 +627,7 @@ func TestCredentialResolution(t *testing.T) {
 	}
 
 	commit(t, s, change("providers add p", seed))
-	if p := s.Snapshot().Providers["p"]; !p.Disabled || len(s.Snapshot().Findings) != 1 {
+	if p := s.Snapshot().Providers["p"]; !p.Disabled || len(s.Snapshot().Findings) != 2 || summary(s.Snapshot().Findings)[1] != unverified {
 		t.Errorf("unresolved credential: provider %+v, findings %v", p, s.Snapshot().Findings)
 	}
 	if err := os.WriteFile(envFile, []byte("P_API_KEY="+secretValue+"\n"), 0o600); err != nil {
@@ -633,7 +637,7 @@ func TestCredentialResolution(t *testing.T) {
 		t.Errorf("revision %d", res.Revision)
 	}
 	p := s.Snapshot().Providers["p"]
-	if p.Disabled || p.Credential == (transport.Secret{}) || len(s.Snapshot().Findings) != 0 {
+	if p.Disabled || p.Credential == (transport.Secret{}) || !slices.Equal(summary(s.Snapshot().Findings), []string{unverified}) {
 		t.Errorf("after the env file changed: provider %+v, findings %v", p, s.Snapshot().Findings)
 	}
 }
@@ -1072,5 +1076,113 @@ func TestOpenWritesNeverRows(t *testing.T) {
 	s = openService(t, st, testEnv(t, nil))
 	if got := neverRows(t, st); !slices.Equal(got, []string{"key:k 2 1.5"}) || s.Snapshot().NeverSince["key:k"] != 2 {
 		t.Errorf("after a second open: rows %q, NeverSince %v", got, s.Snapshot().NeverSince)
+	}
+}
+
+// TestUnverified: the RSN-9 warning names every chat target without a
+// stored result, in id order, and no target of another kind.
+func TestUnverified(t *testing.T) {
+	d := &domain.Document{Targets: map[string]domain.Target{
+		"p/b": {Kind: domain.KindChat}, "p/a": {Kind: domain.KindChat}, "p/e": {Kind: domain.KindEmbeddings}, "p/r": {Kind: domain.KindRerank}, "p/v": {Kind: domain.KindChat},
+	}}
+	got := summary(Unverified(d, map[string]Verification{"p/v": {At: testNow, Version: "v"}, "p/e": {}}))
+	if !slices.Equal(got, []string{"warning RSN-9 target_unverified targets/p/a ", "warning RSN-9 target_unverified targets/p/b "}) {
+		t.Errorf("findings %q", got)
+	}
+}
+
+// TestVerified: Service.Verified audits every run (SEC-7) and stores only a
+// successful one on an unchanged target and provider, without a revision; the
+// published snapshot carries it and loses the warning; it survives a restart;
+// a change of the target or of its provider clears it, in the store and in
+// the snapshot (RSN-9, phase-4 design section 6).
+func TestVerified(t *testing.T) {
+	dir := t.TempDir()
+	st := openStore(t, dir)
+	s := openService(t, st, testEnv(t, map[string]string{"P_API_KEY": secretValue}))
+	commit(t, s, change("apply", func(st *State) {
+		seed(st)
+		st.Doc.Targets["p/n"] = domain.Target{Kind: domain.KindChat}
+	}))
+	snap := s.Snapshot()
+	spec, provider := snap.Targets["p/m"].Spec, snap.Providers["p"].Spec
+	at := time.UnixMilli(testNow + 5)
+	verify := func(id string, t0 domain.Target, ok bool) bool {
+		t.Helper()
+		stored, err := s.Verified(context.Background(), id, t0, provider, ok, at, "v1", `[{"effort":""}]`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return stored
+	}
+	columns := func() []string {
+		t.Helper()
+		return rows(t, st, "SELECT id, verified_at, verified_version FROM targets ORDER BY id")
+	}
+
+	if verify("p/m", spec, false) || verify("p/m", domain.Target{Kind: domain.KindChat, MaxOutputTokens: 9}, true) {
+		t.Fatal("a failed or a stale run was stored")
+	}
+	// The target unchanged but its provider not: stale too, nothing written.
+	other := provider
+	other.BaseURL = "https://other.invalid"
+	if stored, err := s.Verified(context.Background(), "p/m", spec, other, true, at, "v1", `[{"effort":""}]`); err != nil || stored {
+		t.Fatalf("a run on a changed provider: stored %v, error %v", stored, err)
+	}
+	wantRows(t, "columns after the stale runs", columns(), []string{"p/m - -", "p/n - -"})
+	if !verify("p/m", spec, true) {
+		t.Fatal("a successful run on the unchanged target was not stored")
+	}
+	wantRows(t, "audit", rows(t, st, auditQuery+" LIMIT -1 OFFSET 5"), []string{
+		fmt.Sprintf(`admin targets verify p/m target p/m - [{"effort":""}] failed - %d`, testNow),
+		fmt.Sprintf(`admin targets verify p/m target p/m - [{"effort":""}] stale - %d`, testNow),
+		fmt.Sprintf(`admin targets verify p/m target p/m - [{"effort":""}] stale - %d`, testNow),
+		fmt.Sprintf(`admin targets verify p/m target p/m - [{"effort":""}] verified - %d`, testNow),
+	})
+	wantRows(t, "columns", columns(), []string{fmt.Sprintf("p/m %d v1", testNow+5), "p/n - -"})
+	got := s.Snapshot()
+	if v, ok := s.Verification("p/m"); !ok || v != (Verification{At: testNow + 5, Version: "v1"}) || got.Revision != snap.Revision ||
+		!slices.Equal(summary(got.Findings), []string{"warning RSN-9 target_unverified targets/p/n "}) {
+		t.Errorf("published: %+v %v, revision %d, findings %q", v, ok, got.Revision, summary(got.Findings))
+	}
+	if n := len(rows(t, st, "SELECT * FROM revisions")); n != 1 {
+		t.Errorf("%d revisions: verify writes none", n)
+	}
+	if got := summary(s.Check(context.Background())); !slices.Equal(got, []string{"warning RSN-9 target_unverified targets/p/n "}) {
+		t.Errorf("Check %q", got)
+	}
+
+	// A restart loads the columns.
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	st = openStore(t, dir)
+	s = openService(t, st, testEnv(t, map[string]string{"P_API_KEY": secretValue}))
+	if v, ok := s.Verification("p/m"); !ok || v.At != testNow+5 || !slices.Equal(summary(s.Snapshot().Findings), []string{"warning RSN-9 target_unverified targets/p/n "}) {
+		t.Errorf("after a restart: %+v %v, findings %q", v, ok, summary(s.Snapshot().Findings))
+	}
+
+	// Changes elsewhere keep it; a change of the target clears it; so does
+	// one of its provider, for every target of that provider.
+	commit(t, s, change("models set fast", func(st *State) { edit(st.Doc.Models, "fast", func(m *domain.Model) { m.RPMLimit = 5 }) }))
+	if _, ok := s.Verification("p/m"); !ok {
+		t.Error("a change of an alias cleared the result")
+	}
+	commit(t, s, change("targets set p/m", func(st *State) { edit(st.Doc.Targets, "p/m", func(t *domain.Target) { t.MaxOutputTokens = 100 }) }))
+	if _, ok := s.Verification("p/m"); ok {
+		t.Error("a change of the target kept the result")
+	}
+	wantRows(t, "columns after the target change", columns(), []string{"p/m - -", "p/n - -"})
+	spec = s.Snapshot().Targets["p/m"].Spec
+	if !verify("p/m", spec, true) || !verify("p/n", s.Snapshot().Targets["p/n"].Spec, true) {
+		t.Fatal("runs not stored")
+	}
+	commit(t, s, change("providers set p", func(st *State) { edit(st.Doc.Providers, "p", func(p *domain.Provider) { p.GenAIProvider = "x" }) }))
+	if _, ok := s.Verification("p/m"); ok || len(s.Snapshot().Verified) != 0 {
+		t.Errorf("a change of the provider kept results: %v", s.Snapshot().Verified)
+	}
+	wantRows(t, "columns after the provider change", columns(), []string{"p/m - -", "p/n - -"})
+	if got := summary(s.Snapshot().Findings); !slices.Equal(got, []string{"warning RSN-9 target_unverified targets/p/m ", "warning RSN-9 target_unverified targets/p/n "}) {
+		t.Errorf("findings %q", got)
 	}
 }

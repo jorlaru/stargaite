@@ -382,7 +382,7 @@ func TestListTargetsAndModels(t *testing.T) {
 	}
 	var one targetView
 	decode(t, f.do(t, http.MethodGet, "/admin/v1/targets/openrouter/qwen/qwen-3.6-flash", nil), http.StatusOK, &one)
-	if !reflect.DeepEqual(one, targetView{"openrouter/qwen/qwen-3.6-flash", doc.Targets["openrouter/qwen/qwen-3.6-flash"]}) {
+	if !reflect.DeepEqual(one, targetView{ID: "openrouter/qwen/qwen-3.6-flash", Target: doc.Targets["openrouter/qwen/qwen-3.6-flash"]}) {
 		t.Errorf("show %+v", one)
 	}
 }

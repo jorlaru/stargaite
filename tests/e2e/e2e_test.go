@@ -50,6 +50,9 @@ var (
 // then checks what it left: the first answer of the chat completion with its
 // PAR-9 headers and the one call the provider got (AC-04), the embeddings
 // answer byte for byte with its call (AC-46), /v1/models with the new key,
+// targets verify mock/mock verified and stored, its call byte-equal to the
+// one the mock got and recorded under _verify, the warning gone from
+// validate, before and after a restart (AC-47),
 // usage show with the two requests by alias, their tokens and their
 // price_table costs (AC-33, AC-46), telemetry test accepted by the mock as
 // OTLP receiver, which got the test span (AC-24), then the request spans of
@@ -76,6 +79,7 @@ func TestQuickStart(t *testing.T) {
 		trace    string // the trace id of the chat completion
 		embTrace string // the trace id of the embeddings request
 		backedUp bool   // the backup opened with integrity_check ok
+		verified string // what targets verify printed
 	)
 	cli := func(args ...string) string {
 		t.Helper()
@@ -106,9 +110,9 @@ func TestQuickStart(t *testing.T) {
 			srv = start(t, bin, env, fields[1:len(fields)-1]...)
 		case fields[0] == "./stargaite" && fields[1] == "usage" && srv != nil:
 			// A record reaches the store within a batch's 50 ms: the line runs
-			// again until it shows both requests.
+			// again until it shows both requests and the verify call.
 			for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
-				if shown = cli(fields[1:]...); strings.Count(shown, "pay_per_use") == 2 || time.Now().After(deadline) {
+				if shown = cli(fields[1:]...); strings.Count(shown, "pay_per_use") == 3 || time.Now().After(deadline) {
 					break
 				}
 			}
@@ -119,6 +123,11 @@ func TestQuickStart(t *testing.T) {
 				t.Errorf("%s printed %q", line, out)
 			}
 			backedUp = checkBackup(t, file)
+		case fields[0] == "./stargaite" && fields[1] == "targets" && fields[2] == "verify" && srv != nil:
+			// cli requires exit 0: every call answered 2xx (RSN-9).
+			if verified = cli(fields[1:]...); !strings.HasSuffix(verified, "\nverified: mock/mock, the result is stored\n") {
+				t.Errorf("%s printed %q", line, verified)
+			}
 		case fields[0] == "./stargaite" && fields[1] == "telemetry" && fields[2] == "test" && srv != nil:
 			// AC-24: the mock, as OTLP receiver, accepts the test span.
 			if tested = cli(fields[1:]...); !acceptedLine.MatchString(tested) {
@@ -173,14 +182,16 @@ func TestQuickStart(t *testing.T) {
 			t.Fatalf("a quick start line this test does not run: %q", line)
 		}
 	}
-	if srv == nil || mock == nil || token == "" || !answered || !embedded || shown == "" || tested == "" || !backedUp {
-		t.Fatalf("the quick start did not start the proxy and the mock provider, create a key, test the exporter, get both answers, show the usage and back up")
+	if srv == nil || mock == nil || token == "" || !answered || !embedded || shown == "" || tested == "" || !backedUp || verified == "" {
+		t.Fatalf("the quick start did not start the proxy and the mock provider, create a key, verify the target, test the exporter, get both answers, show the usage and back up")
 	}
-	// By alias: the chat completion's usage, 1 input and 2 output tokens, at 1
-	// and 2 USD per million, an output median and p90 of 2; the embeddings
-	// request's, 1 input token and 0 output, at 1 USD per million; no length
-	// finish, no empty answer and no reasoning reported.
-	if !regexp.MustCompile(`(?m)\Awindow \S+ to \S+, from the records\n.*\npay_per_use +embed +1 +0 +1 +0 +0 +0 +0 +0 +0\.000001 +0 +0 +0 +0 +0 +- +- *\n` +
+	// By alias: the verify call under the empty alias, shown "-", with the tokens and
+	// cost of the chat completion; the chat completion's usage, 1 input and 2
+	// output tokens, at 1 and 2 USD per million, an output median and p90 of
+	// 2; the embeddings request's, 1 input token and 0 output, at 1 USD per
+	// million; no length finish, no empty answer and no reasoning reported.
+	if !regexp.MustCompile(`(?m)\Awindow \S+ to \S+, from the records\n.*\npay_per_use +- +1 +0 +1 +0 +0 +2 +0 +0 +0\.000005 +0 +0 +0 +2 +2 +- +- *\n` +
+		`pay_per_use +embed +1 +0 +1 +0 +0 +0 +0 +0 +0\.000001 +0 +0 +0 +0 +0 +- +- *\n` +
 		`pay_per_use +fast +1 +0 +1 +0 +0 +2 +0 +0 +0\.000005 +0 +0 +0 +2 +2 +- +- *$`).MatchString(shown) {
 		t.Errorf("usage show printed:\n%s", shown)
 	}
@@ -196,13 +207,22 @@ func TestQuickStart(t *testing.T) {
 				CostUSD                               *float64 `json:"cost_usd"`
 			}
 		}
-		out := cli("usage", "show", "--since", "1h", "--json")
+		out := cli("usage", "show", "--since", "1h", "--key", "my-agent", "--json")
 		if err := json.Unmarshal([]byte(out), &rep); err != nil || rep.Source != "records" || len(rep.Groups) != 1 {
 			t.Fatalf("usage show --json: %s", out)
 		}
 		if g := rep.Groups[0]; g.Billing != "pay_per_use" || g.Requests != 2 || g.Errors != 0 || g.Estimated != 0 || g.Unpriced != 0 ||
 			g.Input != 2 || g.Output != 2 || g.CostUSD == nil || *g.CostUSD != 6e-6 {
 			t.Errorf("usage show --json: %s", out)
+		}
+		// The verify call, under the reserved key (RSN-9).
+		out = cli("usage", "show", "--since", "1h", "--key", "_verify", "--json")
+		if err := json.Unmarshal([]byte(out), &rep); err != nil || len(rep.Groups) != 1 {
+			t.Fatalf("usage show --key _verify --json: %s", out)
+		}
+		if g := rep.Groups[0]; g.Billing != "pay_per_use" || g.Requests != 1 || g.Errors != 0 || g.Estimated != 0 || g.Input != 1 || g.Output != 2 ||
+			g.CostUSD == nil || *g.CostUSD <= 0 {
+			t.Errorf("usage show --key _verify --json: %s", out)
 		}
 		// AC-35: the medians of two windows, by key, alias and effort sent,
 		// from the local store alone.
@@ -220,15 +240,15 @@ func TestQuickStart(t *testing.T) {
 			Previous *window `json:"previous"`
 		}
 		out = cli("usage", "show", "--since", "1h", "--by", "key,model,effort-sent", "--compare-previous", "--json")
-		if err := json.Unmarshal([]byte(out), &compared); err != nil || compared.Source != "records" || len(compared.Groups) != 2 ||
+		if err := json.Unmarshal([]byte(out), &compared); err != nil || compared.Source != "records" || len(compared.Groups) != 3 ||
 			compared.Previous == nil || compared.Previous.Source != "records" || len(compared.Previous.Groups) != 0 {
 			t.Fatalf("usage show --compare-previous --json: %s", out)
 		}
 		for i, want := range []struct {
-			model string
-			p50   int64
-		}{{"embed", 0}, {"fast", 2}} {
-			if g := compared.Groups[i]; g.Key != "my-agent" || g.Model != want.model || g.EffortSent != "-" || g.OutputP50 == nil || *g.OutputP50 != want.p50 {
+			key, model string
+			p50        int64
+		}{{"_verify", "", 2}, {"my-agent", "embed", 0}, {"my-agent", "fast", 2}} {
+			if g := compared.Groups[i]; g.Key != want.key || g.Model != want.model || g.EffortSent != "-" || g.OutputP50 == nil || *g.OutputP50 != want.p50 {
 				t.Errorf("usage show --compare-previous --json: %s", out)
 			}
 		}
@@ -271,11 +291,31 @@ func TestQuickStart(t *testing.T) {
 			break
 		}
 	}
-	if len(calls) != 2 || calls[0].Path != "/chat/completions" ||
-		string(calls[0].Body) != `{"model":"mock","messages":[{"role":"user","content":"hi"}]}` || calls[0].Header.Values("Authorization") != nil ||
-		calls[1].Path != "/embeddings" || string(calls[1].Body) != `{"model":"mock-embed","input":"hi"}` || calls[1].Header.Values("Authorization") != nil {
+	// The verify call came first, the body it printed byte for byte.
+	verifyBody := `{"model":"mock","messages":[{"role":"user","content":"What is 17 × 23? Answer with the number only."}]}`
+	if len(calls) != 3 || calls[0].Path != "/chat/completions" || string(calls[0].Body) != verifyBody || calls[0].Header.Values("Authorization") != nil ||
+		calls[1].Path != "/chat/completions" ||
+		string(calls[1].Body) != `{"model":"mock","messages":[{"role":"user","content":"hi"}]}` || calls[1].Header.Values("Authorization") != nil ||
+		calls[2].Path != "/embeddings" || string(calls[2].Body) != `{"model":"mock-embed","input":"hi"}` || calls[2].Header.Values("Authorization") != nil {
 		t.Fatalf("the mock received %+v", calls)
 	}
+	if !strings.Contains(verified, "\nbody        "+verifyBody+"\n") || !strings.HasPrefix(verified, "effort      - (no reasoning control)\nsent        -\nstatus      200\n") {
+		t.Errorf("targets verify printed %q", verified)
+	}
+	verification := func() {
+		t.Helper()
+		var shown struct {
+			VerifiedAt      int64  `json:"verified_at"`
+			VerifiedVersion string `json:"verified_version"`
+		}
+		if out := cli("targets", "show", "mock/mock", "--json"); json.Unmarshal([]byte(out), &shown) != nil || shown.VerifiedAt <= 0 || shown.VerifiedVersion == "" {
+			t.Errorf("targets show: %s", out)
+		}
+		if out := cli("validate", "--json"); strings.Contains(out, "target_unverified") {
+			t.Errorf("validate after the verify: %s", out)
+		}
+	}
+	verification()
 	if len(exports) < 2 || exports[0].Header.Get("Content-Type") != "application/json" || !json.Valid(exports[0].Body) ||
 		!strings.Contains(string(exports[0].Body), `"name":"stargaite telemetry test"`) || !strings.Contains(string(exports[0].Body), `{"stringValue":"_telemetry"}`) ||
 		!strings.Contains(string(exports[0].Body), `"traceId":"`+acceptedLine.FindStringSubmatch(tested)[1]+`"`) {
@@ -297,7 +337,7 @@ func TestQuickStart(t *testing.T) {
 		Targets []struct{ Target, Body string }
 	}
 	if out := cli("models", "explain", "fast", "--json"); json.Unmarshal([]byte(out), &explained) != nil || len(explained.Targets) != 1 ||
-		explained.Targets[0].Target != "mock/mock" || explained.Targets[0].Body != string(calls[0].Body) {
+		explained.Targets[0].Target != "mock/mock" || explained.Targets[0].Body != string(calls[1].Body) {
 		t.Errorf("models explain answered %s", out)
 	}
 	before := cli("export")
@@ -331,13 +371,15 @@ func TestQuickStart(t *testing.T) {
 		t.Errorf("%d calls to the mock after the stop, %d before", n, len(calls)+len(exports))
 	}
 	// OPS-9: each provider call and each request logged once, with the key and the alias.
-	if strings.Count(log, `"msg":"attempt"`) != 2 || !strings.Contains(log, `"key":"my-agent","alias":"fast","attempts":1,"status":200`) ||
+	if strings.Count(log, `"msg":"attempt"`) != 3 || !strings.Contains(log, `"key":"_verify","attempts":1,"status":200`) ||
+		!strings.Contains(log, `"key":"my-agent","alias":"fast","attempts":1,"status":200`) ||
 		!strings.Contains(log, `"key":"my-agent","alias":"embed","attempts":1,"status":200`) {
 		t.Errorf("log:\n%s", log)
 	}
 	srv = start(t, bin, env, "serve")
 	models()
 	usage()
+	verification()
 	if after := cli("export"); after != before {
 		t.Errorf("export after the restart:\n%s\nbefore:\n%s", after, before)
 	}
@@ -359,8 +401,8 @@ func TestQuickStart(t *testing.T) {
 }
 
 // checkBackup reports whether the backup at file has mode 0600 and opens
-// read-only with integrity_check ok, an empty foreign_key_check and the two
-// usage records of the quick start (ADR-018).
+// read-only with integrity_check ok, an empty foreign_key_check and the
+// three usage records of the quick start (ADR-018).
 func checkBackup(t *testing.T, file string) bool {
 	t.Helper()
 	if info, err := os.Stat(file); err != nil || info.Mode().Perm() != 0o600 {
@@ -375,7 +417,7 @@ func checkBackup(t *testing.T, file string) bool {
 	var integrity string
 	var violations, records int
 	if err := db.QueryRow("SELECT (SELECT integrity_check FROM pragma_integrity_check), (SELECT COUNT(*) FROM pragma_foreign_key_check), (SELECT COUNT(*) FROM usage)").
-		Scan(&integrity, &violations, &records); err != nil || integrity != "ok" || violations != 0 || records != 2 {
+		Scan(&integrity, &violations, &records); err != nil || integrity != "ok" || violations != 0 || records != 3 {
 		t.Errorf("the backup: integrity_check %q, %d foreign key violations, %d records, error %v", integrity, violations, records, err)
 		return false
 	}

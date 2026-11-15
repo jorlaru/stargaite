@@ -338,6 +338,25 @@ func TestLevels(t *testing.T) {
 	}
 }
 
+// TestVerifyLevels: one call per declared level, then none only when
+// can_disable is true; with neither, one call without reasoning control (RSN-9).
+func TestVerifyLevels(t *testing.T) {
+	for _, tc := range []struct {
+		r    *Reasoning
+		want []string
+	}{
+		{nil, []string{""}},
+		{&Reasoning{Dialect: DialectReasoningEffort, Levels: []string{"low"}}, []string{"low"}},
+		{&Reasoning{Dialect: DialectReasoningEffort, Levels: []string{"low"}, CanDisable: new(false)}, []string{"low"}},
+		{&Reasoning{Dialect: DialectReasoningEffort, Levels: []string{"low", "high"}, CanDisable: new(true)}, []string{"low", "high", "none"}},
+		{&Reasoning{Dialect: DialectReasoningEffort, CanDisable: new(true)}, []string{"none"}},
+	} {
+		if got := VerifyLevels(tc.r); !slices.Equal(got, tc.want) {
+			t.Errorf("%+v: %q, want %q", tc.r, got, tc.want)
+		}
+	}
+}
+
 // Each default is written here in the unit the kick-off states it in.
 func TestDefaults(t *testing.T) {
 	numbers := []struct {

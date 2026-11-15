@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -16,11 +17,13 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jorlaru/stargaite/internal/admin"
 	"github.com/jorlaru/stargaite/internal/admission"
+	"github.com/jorlaru/stargaite/internal/api"
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/store"
 	"github.com/jorlaru/stargaite/internal/telemetry"
@@ -75,8 +78,17 @@ func adminServer(t *testing.T) map[string]string {
 		defer cancel()
 		spans.Close(ctx)
 	})
+	// targets verify runs on a data plane of its own whose clients resolve
+	// no name, so no call leaves the host.
+	limits, writer := admission.New(cfg.Now, records.Seeder(st.Read(), log)), records.NewWriter(st.Write, log)
+	t.Cleanup(func() { writer.Close(context.Background()) }) // before the store closes
+	noDNS := func(context.Context, string) ([]netip.Addr, error) {
+		return nil, errors.New("no name is resolved in tests")
+	}
+	verify := api.Verify(api.Deps{Config: cfg, Log: log, Clients: [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)},
+		Flight: &sync.WaitGroup{}, Usage: writer, Admission: limits, Counters: &records.Counters{}, Spans: spans, Version: "test"})
 	srv := httptest.NewServer(admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(testKey)), Log: log, Usage: st.Read(),
-		Admission: admission.New(cfg.Now, records.Seeder(st.Read(), log)), Spans: spans, Backup: st.Backup}))
+		Admission: limits, Spans: spans, Backup: st.Backup, Verify: verify}))
 	t.Cleanup(srv.Close)
 	return map[string]string{"STARGAITE_ADMIN_URL": srv.URL, "STARGAITE_ADMIN_KEY": testKey}
 }
@@ -138,9 +150,13 @@ func TestCommandWalk(t *testing.T) {
 			{[]string{"walk@/up/model-1.5", "--kind", "chat", "--capabilities", "tools=true", "--max-output-tokens", "1000", "--level", "low", "--level", "high", "--can-disable"}, 0},
 			{[]string{"walk@/up/model-1.5", "--kind", "chat"}, 1}, {[]string{"nope/x", "--kind", "chat"}, 1},
 		},
-		"targets list":   {{nil, 0}},
-		"targets show":   {{[]string{"walk@/up/model-1.5"}, 0}, {[]string{"walk@/nope"}, 1}},
-		"targets set":    {{[]string{"walk@/up/model-1.5", "--reasoning-on", `{"thinking":{"type":"enabled"}}`, "--level="}, 0}, {[]string{"walk@/up/model-1.5", "--kind", "image"}, 1}},
+		"targets list": {{nil, 0}},
+		"targets show": {{[]string{"walk@/up/model-1.5"}, 0}, {[]string{"walk@/nope"}, 1}},
+		"targets set":  {{[]string{"walk@/up/model-1.5", "--reasoning-on", `{"thinking":{"type":"enabled"}}`, "--level="}, 0}, {[]string{"walk@/up/model-1.5", "--kind", "image"}, 1}},
+		// No name resolves in the walk, so the call fails: the run is failed,
+		// audited and exits 1; the cap and the target are refused before any
+		// call.
+		"targets verify": {{[]string{"walk@/up/model-1.5"}, 1}, {[]string{"walk@/up/model-1.5", "--max-output-tokens", "1001"}, 1}, {[]string{"walk@/nope"}, 1}},
 		"targets remove": {{[]string{"walk@/up/model-1.5", "--yes"}, 0}, {[]string{"walk@/nope", "--yes"}, 1}},
 		"models add": {
 			{[]string{"m@", "--target", "walk@/created", "--effort", "low", "--effort-mode", "forced", "--max-output-tokens", "100"}, 0},
@@ -325,6 +341,8 @@ func TestRequests(t *testing.T) {
 		{[]string{"targets", "set", "p/a b%c/./d", "--level="}, "PATCH", "/admin/v1/targets/p%2Fa%20b%25c%2F.%2Fd", `{"reasoning":{"levels":null}}`},
 		{[]string{"targets", "set", "p/m", "--level", "x", "--level=", "--level", "y", "--reasoning-on="}, "PATCH", "/admin/v1/targets/p%2Fm", `{"reasoning":{"levels":["y"],"on":null}}`},
 		{[]string{"targets", "remove", "p/m", "--yes"}, "DELETE", "/admin/v1/targets/p%2Fm", ""},
+		{[]string{"targets", "verify", "p/a b%c/./d"}, "POST", "/admin/v1/verify/p%2Fa%20b%25c%2F.%2Fd", `{}`},
+		{[]string{"targets", "verify", "p/m", "--max-output-tokens", "64"}, "POST", "/admin/v1/verify/p%2Fm", `{"max_output_tokens":64}`},
 		{[]string{"models", "list"}, "GET", "/admin/v1/models", ""},
 		{
 			[]string{"models", "add", "fast", "--target", "a/b", "--target", "c/d", "--require", "tools", "--effort", "medium", "--effort-mode", "default",
@@ -611,6 +629,69 @@ body        {}
 `
 	if r.code != 0 || r.stdout != want {
 		t.Errorf("exit %d, stderr %q, stdout\n%s\nwant\n%s", r.code, r.stderr, r.stdout, want)
+	}
+}
+
+// TestVerifyRender: targets verify prints one block per call, then verified
+// or failed; it exits 0 only when every call answered 2xx (ok), with --json
+// too, and text from the server never reaches the terminal raw.
+func TestVerifyRender(t *testing.T) {
+	calls := `"calls":[{"effort":"low","effort_sent":"low","status":200,"reasoning_tokens":10,"output_tokens":12,"body":"{\"model\":\"m\",\"reasoning_effort\":\"low\"}","request_id":"A"},` +
+		`{"effort":"","effort_sent":null,"status":0,"reasoning_tokens":null,"output_tokens":0,"body":"{}\n","request_id":"B",` +
+		`"error":{"message":"the global budget is exhausted","type":"billing_error","code":"budget_exceeded"}}]`
+	blocks := `effort      low
+sent        low
+status      200
+reasoning   10
+output      12
+body        {"model":"m","reasoning_effort":"low"}
+
+effort      - (no reasoning control)
+sent        -
+status      -
+reasoning   -
+output      0
+error       budget_exceeded: the global budget is exhausted
+body        "{}\n"
+
+`
+	for _, tc := range []struct {
+		answer, last string
+		code         int
+	}{
+		{`{"target":"p/m","ok":true,"stored":true,` + calls + `}`, "verified: p/m, the result is stored\n", 0},
+		{`{"target":"p/m","ok":true,"stored":false,` + calls + `}`, "verified: p/m, but the target changed during the run, so the result is not stored\n", 0},
+		{`{"target":"p/m","ok":false,"stored":false,` + calls + `}`, "failed: p/m, not every call answered 2xx\n", 1},
+	} {
+		_, vars := recorder(t, http.StatusOK, tc.answer+"\n")
+		if r := runMain(vars, "targets", "verify", "p/m"); r.code != tc.code || r.stdout != blocks+tc.last {
+			t.Errorf("exit %d, stderr %q, stdout\n%s\nwant\n%s", r.code, r.stderr, r.stdout, blocks+tc.last)
+		}
+		if r := runMain(vars, "targets", "verify", "p/m", "--json"); r.code != tc.code || r.stdout != tc.answer+"\n" {
+			t.Errorf("--json: exit %d, stdout %q", r.code, r.stdout)
+		}
+	}
+}
+
+// TestVerifyUntimed: targets verify goes without the client timeout, since
+// the server bounds the run by k × (total_ms + 5 s): an answer that comes
+// after the timed client's timeout still reaches the operator.
+func TestVerifyUntimed(t *testing.T) {
+	timeout := client.Timeout
+	client.Timeout = 50 * time.Millisecond
+	t.Cleanup(func() { client.Timeout = timeout })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"target":"p/m","ok":true,"stored":true,"calls":[]}`+"\n")
+	}))
+	t.Cleanup(srv.Close)
+	vars := map[string]string{"STARGAITE_ADMIN_URL": srv.URL, "STARGAITE_ADMIN_KEY": testKey}
+	if r := runMain(vars, "targets", "verify", "p/m"); r.code != 0 || r.stdout != "verified: p/m, the result is stored\n" {
+		t.Errorf("exit %d, stdout %q, stderr %q", r.code, r.stdout, r.stderr)
+	}
+	if r := runMain(vars, "targets", "show", "p/m"); r.code != 1 {
+		t.Errorf("targets show past the timeout: exit %d, stdout %q: the timed client applies to it", r.code, r.stdout)
 	}
 }
 

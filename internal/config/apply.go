@@ -83,8 +83,9 @@ func (s *Service) Apply(ctx context.Context, file *domain.Document, prune, dryRu
 
 // Check is "validate" on the published configuration: the checks of a change,
 // with every outbound URL resolved, so it gives the verdict validate -f gives
-// on the exported file (design section 13, point 14).
+// on the exported file (design section 13, point 14), plus the chat targets
+// never verified, which only the store knows (RSN-9).
 func (s *Service) Check(ctx context.Context) []domain.Finding {
-	doc := s.Snapshot().Doc
-	return append(Validate(doc), CheckResolved(ctx, doc, OutboundURLs(doc), s.env())...)
+	snap := s.Snapshot()
+	return slices.Concat(Validate(snap.Doc), CheckResolved(ctx, snap.Doc, OutboundURLs(snap.Doc), s.env()), Unverified(snap.Doc, snap.Verified))
 }

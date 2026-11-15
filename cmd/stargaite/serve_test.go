@@ -1740,6 +1740,8 @@ func TestSecretsReload(t *testing.T) {
 		return out
 	}
 	const invalid = "retention.audit_months"
+	// The chat target m/m was never verified (RSN-9).
+	const unverified = "warning target_unverified  this chat target was never checked against its live provider: run targets verify on it"
 	findings := func(stdout string) (config.Result, []string) {
 		t.Helper()
 		var res config.Result
@@ -1764,6 +1766,7 @@ func TestSecretsReload(t *testing.T) {
 	if code != 1 || res.Revision != ready.Revision || res.Changed || len(res.Diff) != 0 || !slices.Equal(got, []string{
 		"error invalid_value " + invalid + " " + invalid + " must not be negative",
 		"warning credential_unresolved api_key_env M_KEY does not resolve",
+		unverified,
 	}) {
 		t.Errorf("reload without the variable: exit %d, %+v, findings %q", code, res, got)
 	}
@@ -1782,7 +1785,7 @@ func TestSecretsReload(t *testing.T) {
 	}
 	code, stdout = reload("--json")
 	res, got = findings(stdout)
-	if code != 1 || res.Revision != ready.Revision || res.Changed || !slices.Equal(got, []string{"error invalid_value " + invalid + " " + invalid + " must not be negative"}) {
+	if code != 1 || res.Revision != ready.Revision || res.Changed || !slices.Equal(got, []string{"error invalid_value " + invalid + " " + invalid + " must not be negative", unverified}) {
 		t.Errorf("reload with the variable: exit %d, %+v, findings %q", code, res, got)
 	}
 	if code := post(); code != http.StatusOK {

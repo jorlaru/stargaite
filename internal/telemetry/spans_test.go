@@ -3,10 +3,12 @@ package telemetry
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"flag"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -288,4 +290,29 @@ func TestBuild(t *testing.T) {
 	if !bytes.Equal(got, want) {
 		t.Errorf("Build differs from testdata/spans.json (go test -update rewrites it after a reviewed change):\n%s", got)
 	}
+}
+
+// traceparentShape is the W3C Trace Context Level 1 header as Parse reads
+// it: version, trace id, parent id, flags, and after them, for a version
+// above 00, a "-" and anything.
+var traceparentShape = regexp.MustCompile(`(?s)^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}(-.*)?$`)
+
+// FuzzParse: Parse accepts exactly one traceparent value of the strict
+// shape, not version ff, version 00 at exactly 55 characters, neither id all
+// zero, and returns its ids as a remote parent; two values are never
+// accepted (TEL-6, phase-4 design section 9). Its seeds are under
+// testdata/fuzz/FuzzParse.
+func FuzzParse(f *testing.F) {
+	f.Fuzz(func(t *testing.T, v string) {
+		c, ok := Parse([]string{v})
+		m := traceparentShape.FindStringSubmatch(v)
+		valid := m != nil && m[1] != "ff" && (m[1] != "00" || len(v) == 55) &&
+			m[2] != strings.Repeat("0", 32) && m[3] != strings.Repeat("0", 16)
+		if ok != valid || ok && (hex.EncodeToString(c.Trace[:]) != m[2] || hex.EncodeToString(c.Parent[:]) != m[3] || !c.Remote) {
+			t.Fatalf("%q: %+v %v, want valid %v", v, c, ok, valid)
+		}
+		if _, ok := Parse([]string{v, v}); ok {
+			t.Fatalf("%q twice accepted", v)
+		}
+	})
 }

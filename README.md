@@ -462,3 +462,15 @@ filtered by key, alias and target, the cost of each `pay_per_use` trace equal to
 the ingestion version header can pass go test's default 10 minutes). Neither suite is part of `make ci`;
 maintainers run both before a release that changes the span schema or the exporter, and the contract suite before a
 preset loses its `untested` mark.
+
+### Hardening
+
+`tests/adversarial`, part of `make ci`, sends hostile input to the data plane and the admin API on every endpoint it
+applies to: malformed, invalid UTF-8, deeply nested and repeated-key bodies, oversized bodies, revoked and malformed
+keys, unknown aliases, incompatible targets, fragmented and truncated streams, split and unclosed think tags, SSRF
+addresses, redirects and DNS rebinding, budget and quota races, oversized and gzip-bomb answers, credentials echoed by
+a provider, control bytes in logged values and a flood of bad tokens. `TestServeAdversarial` in `cmd/stargaite` checks
+the server options on raw sockets: request smuggling forms, header size and count limits, slow headers, a client that
+stops reading and one that disconnects. `make ci` replays every fuzz seed under `testdata/fuzz`; `make fuzz` runs
+each fuzz target for `FUZZTIME` (60 s by default, `make fuzz FUZZTIME=5m`), and a finding, written under the
+package's `testdata/fuzz`, is committed as a seed with its fix.

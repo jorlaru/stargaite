@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("bad line 0\nbad line 1\nbad line 2\nbad line 3\nbad line 4\nbad line 5\nbad line 6\nbad line 7\nbad line 8\nbad line 9\nbad line 10\nbad line 11\nbad line 12\nbad line 13\n")

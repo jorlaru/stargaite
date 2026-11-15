@@ -153,3 +153,27 @@ func (c *countWriter) Write(p []byte) (int, error) { c.n++; return c.w.Write(p) 
 type errWriter struct{ err error }
 
 func (e errWriter) Write([]byte) (int, error) { return 0, e.err }
+
+// FuzzEventReader: whatever the upstream bytes and the bound, no event holds
+// more than the bound (its name and data, or a comment's text), each event
+// consumes input, and the reader ends with io.EOF, io.ErrUnexpectedEOF or
+// ErrEventTooLarge (phase-4 design section 9). Its seeds are under
+// testdata/fuzz/FuzzEventReader.
+func FuzzEventReader(f *testing.F) {
+	f.Fuzz(func(t *testing.T, stream []byte, bound uint16) {
+		r := NewEventReader(bytes.NewReader(stream), int64(bound))
+		for n := 0; ; n++ {
+			e, err := r.Next()
+			switch {
+			case err == io.EOF || err == io.ErrUnexpectedEOF || errors.Is(err, ErrEventTooLarge):
+				return
+			case err != nil:
+				t.Fatalf("error %v", err)
+			case len(e.Name)+len(e.Data) > int(bound):
+				t.Fatalf("an event of %d bytes over a bound of %d", len(e.Name)+len(e.Data), bound)
+			case n >= len(stream):
+				t.Fatalf("event %d from %d bytes", n+1, len(stream))
+			}
+		}
+	})
+}

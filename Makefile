@@ -18,7 +18,7 @@ b4d8f17068b35ee6060cc2f69a16fb48740d706fbba81661c318649c114a6998  golangci-lint-
 endef
 export LINT_SHA256
 
-.PHONY: ci check tools ci-container image image-test
+.PHONY: ci check tools ci-container image image-test fuzz
 
 # Tools and checks run with an empty environment, so none can lean on an ambient credential.
 ci:
@@ -38,6 +38,19 @@ check:
 	go test -race ./...
 
 tools: $(BIN)/golangci-lint $(BIN)/govulncheck
+
+# Outside make ci, which replays the committed seeds: every Fuzz target of the
+# repository runs for FUZZTIME, once per package and target. -fuzz is a regular
+# expression, hence the anchors (FuzzStream would also match FuzzChatStream).
+# A finding is written under the package's testdata/fuzz: commit it as a seed
+# with the fix.
+FUZZTIME ?= 60s
+fuzz:
+	@grep -rHo --include='*_test.go' '^func Fuzz[A-Za-z0-9_]*' . | sort -u | while IFS=: read -r file fn; do \
+		dir=./$${file#./}; dir=$${dir%/*}; name=$${fn#func }; \
+		echo "fuzz $$dir $$name"; \
+		go test -run '^$$' -fuzz "^$$name\$$" -fuzztime $(FUZZTIME) "$$dir" || exit 1; \
+	done
 
 # The checksum line is looked up before the download: no line for this system, no download.
 $(BIN)/golangci-lint:

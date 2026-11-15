@@ -2,6 +2,8 @@ package transport
 
 import (
 	"net/netip"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -382,4 +384,47 @@ func TestCheckURL(t *testing.T) {
 			}
 		})
 	}
+}
+
+// FuzzCheckURL: no URL CheckURL accepts reaches what SEC-4 refuses: its
+// scheme is http or https without userinfo; a host literal classifies
+// Public, or Private with allow_private_network, never Forbidden; a host
+// name is no IPv4 address in a spelling resolvers accept (inet_aton's
+// numbers) and is not localhost unless allow_private_network is set; plain
+// http needs it too (phase-4 design section 9). Its seeds are under
+// testdata/fuzz/FuzzCheckURL.
+func FuzzCheckURL(f *testing.F) {
+	f.Fuzz(func(t *testing.T, raw string, allowPrivate bool) {
+		if CheckURL(raw, allowPrivate) != nil {
+			return
+		}
+		u, err := url.Parse(raw)
+		if err != nil || u.Scheme != "http" && u.Scheme != "https" || u.User != nil || u.Scheme == "http" && !allowPrivate {
+			t.Fatalf("%q accepted: %v", raw, err)
+		}
+		host := u.Hostname()
+		if addr, err := netip.ParseAddr(host); err == nil {
+			if c := Classify(addr); c == Forbidden || c == Private && !allowPrivate {
+				t.Fatalf("%q accepted, its address of class %d", raw, c)
+			}
+			return
+		}
+		name := strings.ToLower(strings.TrimSuffix(host, "."))
+		if inetAton(host) || !allowPrivate && (name == "localhost" || strings.HasSuffix(name, ".localhost")) {
+			t.Fatalf("%q accepted, host %q", raw, host)
+		}
+	})
+}
+
+// inetAton reports whether host is an IPv4 address as inet_aton reads one:
+// one to four parts, each a number in decimal, octal or hex, with the
+// trailing dot of a fully qualified name.
+func inetAton(host string) bool {
+	parts := strings.Split(strings.TrimSuffix(host, "."), ".")
+	for _, p := range parts {
+		if _, err := strconv.ParseUint(p, 0, 32); err != nil {
+			return false
+		}
+	}
+	return len(parts) <= 4
 }

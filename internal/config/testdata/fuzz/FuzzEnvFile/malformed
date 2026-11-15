@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("=novalue\n1BAD=x\nCTRL=a\x01b\nno-equals\nexport X=1\n")

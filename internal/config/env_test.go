@@ -7,10 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // planted marks every byte of an env file that must stay out of a finding:
@@ -266,6 +269,35 @@ func TestNewEnv(t *testing.T) {
 		env := NewEnv(environ, "", func(context.Context, string) ([]netip.Addr, error) { return []netip.Addr{addr}, nil })
 		if got, err := env.Resolve(context.Background(), "host.example"); err != nil || len(got) != 1 || got[0] != addr {
 			t.Errorf("Resolve = %v, %v", got, err)
+		}
+	})
+}
+
+// findingText is every message readEnvFile writes about the file's
+// content: a line number or a count, never the line (OPS-6).
+var findingText = regexp.MustCompile(`^(line [0-9]+ of the env file (is not NAME=value and was skipped|has its value in quotes, and the quotes are part of the value)|[0-9]+ more lines of the env file are not NAME=value and were skipped)$`)
+
+// FuzzEnvFile: whatever the env file holds, its findings hold no content of
+// it, each message one of the fixed texts, and it yields only valid names
+// with values of valid UTF-8 without control characters or white space
+// around them (phase-4 design section 9). Its seeds are under
+// testdata/fuzz/FuzzEnvFile.
+func FuzzEnvFile(f *testing.F) {
+	path := filepath.Join(f.TempDir(), "env") // a fuzzing process calls the target one input at a time
+	f.Fuzz(func(t *testing.T, content []byte) {
+		if err := os.WriteFile(path, content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		vars, findings := readEnvFile(path)
+		for _, fd := range findings {
+			if !findingText.MatchString(fd.Message) || fd.Resource != "env_file" || fd.Field != "" {
+				t.Fatalf("finding %+v", fd)
+			}
+		}
+		for name, value := range vars {
+			if !envName.MatchString(name) || !utf8.ValidString(value) || strings.ContainsFunc(value, unicode.IsControl) || value != strings.TrimSpace(value) {
+				t.Fatalf("%q=%q", name, value)
+			}
 		}
 	})
 }

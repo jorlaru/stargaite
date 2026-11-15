@@ -793,8 +793,8 @@ func TestPlantedSecret(t *testing.T) {
 	send("opted echoing 400", "", 400, want{input: messages, status: "the provider answered 400"})
 
 	// The provider credential in a prompt, echoed in a synchronous answer and
-	// in a stream event: redacted in both attributes, as every relayed byte is
-	// (the synchronous body reaches the client as mapped, so the echo shows).
+	// in a stream event: redacted in both attributes and in what the client
+	// gets, as every relayed byte is (SEC-5).
 	key := planted + "MOCK_KEY"
 	leaky := `{"model":"fast","messages":[{"role":"user","content":"` + key + `"}]`
 	redacted := `[{"role":"user","content":"[redacted]"}]`
@@ -802,10 +802,10 @@ func TestPlantedSecret(t *testing.T) {
 		`"choices":[{"index":0,"message":{"role":"assistant","content":"` + key + `"},"finish_reason":"stop"}],` +
 		`"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}`)})
 	w = f.traffic("/v1/chat/completions", token, leaky+`}`)
-	if w.Code != 200 || !strings.Contains(w.Body.String(), key) {
+	if w.Code != 200 || strings.Contains(w.Body.String(), key) || !strings.Contains(w.Body.String(), `"content":"[redacted]"`) {
 		t.Fatalf("echoing sync: %d %s", w.Code, w.Body)
 	}
-	wants[w.Header().Get(traceHeader)] = want{input: redacted, output: strings.ReplaceAll(w.Body.String(), key, "[redacted]")}
+	wants[w.Header().Get(traceHeader)] = want{input: redacted, output: w.Body.String()}
 	mock.Script(mockprovider.Step{Chunks: sse(chunk(key), "[DONE]")})
 	w = f.traffic("/v1/chat/completions", token, leaky+`,"stream":true}`)
 	if w.Code != 200 || !strings.Contains(w.Body.String(), "[redacted]") {

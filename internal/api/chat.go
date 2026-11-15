@@ -566,14 +566,17 @@ func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *c
 		if int64(len(body)) > limit {
 			relayErr = fmt.Errorf("the response is larger than max_response_bytes, %d", limit)
 		} else if answer, a.obs, relayErr = rl.sync(body, h.Config.Now()); relayErr == nil {
+			// The provider credential never reaches a response (SEC-5), as
+			// each streamed event is redacted; usage was observed before.
+			answer = []byte(t.Provider.Credential.Redact(string(answer)))
 			a.complete = true // a write to a gone client below loses nothing of what was observed
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			a.written = true
 			if _, err = w.Write(answer); err != nil {
 				err = fmt.Errorf("%w: %v", errClientGone, err)
-			} else if rq.content { // redacted whole, so no cut leaves a part of the credential
-				a.capture([]byte(t.Provider.Credential.Redact(string(answer))), rq.snap.Settings.Telemetry.ContentMaxBytes)
+			} else if rq.content { // redacted whole above, so no cut leaves a part of the credential
+				a.capture(answer, rq.snap.Settings.Telemetry.ContentMaxBytes)
 			}
 		}
 	}
@@ -819,6 +822,10 @@ func message(status int, body []byte) string {
 func (h *handler) finish(rq *request, a *attempt) {
 	a.ended = h.Config.Now()
 	h.breakers.Release(a.target.ID, a.gen, a.end.breaker)
+	// The provider's own text that the record, the log and the spans carry,
+	// without its credential (SEC-5).
+	a.obs.ResponseModel = a.target.Provider.Credential.Redact(a.obs.ResponseModel)
+	a.obs.FinishReason = a.target.Provider.Credential.Redact(a.obs.FinishReason)
 	a.rec = usage.NewRecord(h.usageCall(rq, a))
 	tokens := a.rec.InputTokens + a.rec.OutputTokens
 	h.Admission.Tokens(tokens, a.ended, scopeNames(rq)...)

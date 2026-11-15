@@ -1,0 +1,2 @@
+go test fuzz v1
+string("sk-stargaite-abcdefghij23-aaaaaaaaaaaaaaaaaaaaaaaaaa234567zzzzzzzzzzzzzzzzzzzz")

@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"usage\":{\"prompt_tokens\":1.5,\"total_tokens\":2}}")

@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("K=\xff\xfe\nL= spaced \n")

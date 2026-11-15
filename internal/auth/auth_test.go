@@ -104,3 +104,19 @@ func TestParse(t *testing.T) {
 		}
 	}
 }
+
+// tokenShape is a client key: the prefix, 12 and 52 characters of the
+// lowercase base32 alphabet (SEC-1).
+var tokenShape = regexp.MustCompile(`^sk-stargaite-([a-z2-7]{12})-[a-z2-7]{52}$`)
+
+// FuzzToken: Parse accepts exactly the tokens of the client key shape and
+// returns their public id (phase-4 design section 9). Its seeds are under
+// testdata/fuzz/FuzzToken.
+func FuzzToken(f *testing.F) {
+	f.Fuzz(func(t *testing.T, token string) {
+		id, ok := Parse(token)
+		if m := tokenShape.FindStringSubmatch(token); ok != (m != nil) || ok && id != m[1] {
+			t.Fatalf("%q: %q %v", token, id, ok)
+		}
+	})
+}

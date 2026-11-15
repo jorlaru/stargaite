@@ -1,8 +1,11 @@
 package openai
 
 import (
+	"bytes"
+	"encoding/json"
 	"math"
 	"reflect"
+	"strconv"
 	"testing"
 
 	"github.com/jorlaru/stargaite/internal/domain"
@@ -228,4 +231,40 @@ func TestObserveUsage(t *testing.T) {
 			t.Errorf("%q: no error", body)
 		}
 	}
+}
+
+// FuzzObserveUsage: an embeddings or rerank answer ObserveUsage accepts is
+// valid JSON whose top level is an object, relayed byte for byte, with no
+// output or reasoning tokens and, as input, usage.prompt_tokens, else
+// usage.total_tokens, when either is an integer (phase-4 design section 9).
+// Its seeds are under testdata/fuzz/FuzzObserveUsage.
+func FuzzObserveUsage(f *testing.F) {
+	f.Fuzz(func(t *testing.T, body []byte) {
+		out, o, err := ObserveUsage(&domain.Provider{}, body)
+		if err != nil {
+			if out != nil {
+				t.Fatalf("%q: an answer with the error %v", body, err)
+			}
+			return
+		}
+		var v map[string]any
+		d := json.NewDecoder(bytes.NewReader(body))
+		d.UseNumber()
+		if !json.Valid(body) || d.Decode(&v) != nil || !bytes.Equal(out, body) {
+			t.Fatalf("%q accepted as %q", body, out)
+		}
+		usage, _ := v["usage"].(map[string]any)
+		var want *domain.Usage
+		for _, name := range []string{"prompt_tokens", "total_tokens"} {
+			if n, ok := usage[name].(json.Number); ok {
+				if in, err := strconv.ParseInt(string(n), 10, 64); err == nil {
+					want = &domain.Usage{Input: in}
+					break
+				}
+			}
+		}
+		if !reflect.DeepEqual(o.Usage, want) {
+			t.Fatalf("%q: usage %+v, want %+v", body, o.Usage, want)
+		}
+	})
 }

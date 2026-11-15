@@ -33,20 +33,22 @@ import (
 	"github.com/jorlaru/stargaite/internal/usage"
 )
 
-// The servers' read and write timeouts (SEC-6). A data-plane request clears
-// its read deadline once its body is read and moves its write deadline per
-// provider call (phase-2 design section 10). On a stop signal, requests in
-// flight get shutdownGrace to finish (RES-6); those still running are then
-// stopped, drainWait bounds the wait for them to end, and flushWait the
-// usage writer's flush, before the store closes, and exportWait the
-// exporter's last sends (phase-3 design section 11). Tests lower them.
+// The servers' header, read and write timeouts (SEC-6). A data-plane
+// request clears its read deadline once its body is read and moves its
+// write deadline per provider call (phase-2 design section 10). On a stop
+// signal, requests in flight get shutdownGrace to finish (RES-6); those
+// still running are then stopped, drainWait bounds the wait for them to
+// end, and flushWait the usage writer's flush, before the store closes, and
+// exportWait the exporter's last sends (phase-3 design section 11). Tests
+// lower them.
 var (
-	serverReadTimeout  = 60 * time.Second
-	serverWriteTimeout = 60 * time.Second
-	shutdownGrace      = 30 * time.Second
-	drainWait          = 5 * time.Second
-	flushWait          = 10 * time.Second
-	exportWait         = 5 * time.Second
+	serverReadHeaderTimeout = 10 * time.Second
+	serverReadTimeout       = 60 * time.Second
+	serverWriteTimeout      = 60 * time.Second
+	shutdownGrace           = 30 * time.Second
+	drainWait               = 5 * time.Second
+	flushWait               = 10 * time.Second
+	exportWait              = 5 * time.Second
 )
 
 // Retention runs retainRun retainFirst after the ready line, then every
@@ -404,7 +406,7 @@ func runServers(ctx, base context.Context, log *slog.Logger, tlsConfig *tls.Conf
 		srvs[i] = &http.Server{
 			Handler:           l.handler,
 			TLSConfig:         tlsConfig,
-			ReadHeaderTimeout: 10 * time.Second,
+			ReadHeaderTimeout: serverReadHeaderTimeout,
 			ReadTimeout:       serverReadTimeout,
 			WriteTimeout:      serverWriteTimeout,
 			IdleTimeout:       120 * time.Second,

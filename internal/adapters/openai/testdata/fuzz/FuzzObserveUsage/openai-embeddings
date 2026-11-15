@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("{\"object\":\"list\",\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[0,0.5]}],\"model\":\"m\",\"usage\":{\"prompt_tokens\":3,\"total_tokens\":3}}")

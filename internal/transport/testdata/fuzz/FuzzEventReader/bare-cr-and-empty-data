@@ -1,0 +1,3 @@
+go test fuzz v1
+[]byte("data:\r\rdata\n\n:\n\ndata: \x00\xff\n\n")
+uint16(0)

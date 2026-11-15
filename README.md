@@ -109,6 +109,38 @@ window reads): a window that starts earlier is answered from the daily sums, ove
 counts and percentiles they do not hold (shown as `-`), and cannot be grouped by effort sent.
 `--json` gives the same as JSON, with each window's `source` (`records` or `daily`), `since` and `until`.
 
+## Prices one table cannot express
+
+A target's price table holds four prices in USD per million tokens (input, output, cache read, cache write) and the
+date they were read (`as_of`); a missing cache price is charged at the input price, and reasoning tokens at the output
+price, since they are part of it. A provider's `cost_report`, its own figure in the response, always wins over the
+table, so it is the first answer to every shape below whenever the provider reports one. Otherwise the cost of a call
+is the table's, and drifts from the invoice as follows; where a budget must not be passed, choose the price that errs
+high.
+
+- **Tiered and long-context prices.** Some providers reprice a whole request above a context size, or charge by
+  volume tiers. The table has one price per kind of token: set the upper tier's prices to keep budgets safe (the
+  records then overstate shorter requests), or the tier most requests fall in, knowing the others are off by the ratio
+  between the tiers.
+- **Cached input.** Cache reads and writes have their own prices. Cache writes priced by how long the entry lives
+  (five minutes or one hour, for example) share one `cache_write_per_million`: set the price of the duration your
+  clients ask for, or the higher one. A provider that reports no cache tokens has them charged as plain input.
+- **Batch discounts.** stargaite makes synchronous and streamed calls only, never a provider's batch API, so batch
+  prices never apply; discounts applied later on the invoice (volume, commitments, credits) are not seen either, and
+  the records state the list price.
+- **Service tiers, fast modes, residency and peak hours.** A multiplier the provider applies per request or by time
+  of day (up to twice the price) has no column: price the target at the rate it can be charged most, or keep the
+  standard price and know the records understate those calls.
+- **Per-request and per-call fees.** A fee per request, per tool call (web search, code execution) or per image is
+  not in the table: the tokens are priced and the fee is not, so the records understate by the fees; `usage show`
+  gives the requests per key and alias to add a per-request fee to.
+- **Subscription plans.** A flat-fee plan is a provider with `--billing subscription` and the windows of its plan
+  (see [Quotas](#quotas)): its calls have no cost and no budget counts them, and its quota windows limit them instead.
+- **Search units.** Rerank billed by search units (see [Rerank](#rerank)) is priced by its `cost_report`, or
+  approximately by its token prices over the reported or estimated tokens.
+- **Dated price changes.** A table has one `as_of`: on the day a new price applies, `targets set <target> --pricing
+  ...` replaces it, which is audited like every change. Records keep the cost computed when they were written.
+
 ## Limits
 
 A key and an alias can each limit requests per minute (`--rpm-limit`), tokens per minute (`--tpm-limit`: the input
@@ -437,6 +469,13 @@ not seen through a mount of the file itself. To have stargaite terminate TLS its
 which must then also be valid for `localhost`. If it is not, add `--add-host <cert name>:127.0.0.1` to `docker run`
 and use `--admin-url https://<cert name>:4001`; a certificate from a public CA needs no `SSL_CERT_FILE`.
 
+**Container resources.** Request 50m CPU and 64 Mi of memory, and limit it to 1000m CPU and 256 Mi. On one CPU, as
+that limit gives it, the benchmark measured no CPU at rest, 23 to 36 MB of
+RSS at rest, 33 MB with 100 open streams and 62.5 MB with 500, and 0.3 of a CPU at 1,000 synchronous requests per
+second (see [docs/benchmark.md](docs/benchmark.md)). Raise the CPU request with steady traffic, about 0.3 CPU per
+1,000 requests per second, and the memory limit with `max_body_bytes` and `max_response_bytes`, since each request
+in flight may hold a body and an answer of up to those sizes.
+
 ## Development
 
 `make ci` runs every check (format, vet, tidy, lint, vulnerability scan, four cross-builds, `go test -race ./...`,
@@ -474,3 +513,40 @@ the server options on raw sockets: request smuggling forms, header size and coun
 stops reading and one that disconnects. `make ci` replays every fuzz seed under `testdata/fuzz`; `make fuzz` runs
 each fuzz target for `FUZZTIME` (60 s by default, `make fuzz FUZZTIME=5m`), and a finding, written under the
 package's `testdata/fuzz`, is committed as a seed with its fix.
+
+### Benchmark
+
+`make bench` (Linux) builds the binary and the mock provider into `BENCHDIR` (`$TMPDIR/stargaite-bench` by default)
+and runs `tests/benchmark` against them: both as processes on loopback, the proxy with `GOMAXPROCS=1` and pinned to
+one CPU with `taskset` when present, as the container's 1000m CPU limit gives it. It measures every target of kick-off
+section 18 that a benchmark can (added latency, throughput, memory, start-up, cancellation, a configuration change at
+scale and the recovery time) and prints one JSON document (to the file `STARGAITE_BENCH_OUT` names, else standard
+output) and a table; it exits `1` for every missed target that [docs/benchmark.md](docs/benchmark.md) does not list as
+an accepted deviation. `make bench-container` runs it inside the Go image. It is not part of `make ci`, which only
+compiles and lints it. [docs/benchmark.md](docs/benchmark.md) holds the method and the last figures.
+
+## Release checklist
+
+Before tagging a release, a maintainer runs each of these with their own keys and accounts, nothing private, and
+fixes or documents what fails:
+
+1. `make ci-container`, and the hosted workflow on a fork with no secret configured (PUB-5).
+2. `make image-test`: the image builds, starts on a read-only root, bootstraps its admin key and stops with exit `0`.
+3. `make fuzz` (`FUZZTIME=60s` by default); a finding is committed as a seed with its fix.
+4. `make bench`, then a review of [docs/benchmark.md](docs/benchmark.md): the figures, the host and the commit
+   updated, and every miss listed as an accepted deviation with its figure, reason and date (AC-52).
+5. `tests/contract` with its `STARGAITE_CONTRACT_*` variables (see [Development](#development)) against each preset
+   whose `untested` mark is to go, and the live-safe parts against each of the first ten presets of
+   `./stargaite providers presets`, with the preset notes checked against each provider's current documentation
+   (AC-53).
+6. `tests/langfuse` with its variables, before a release that changes the span schema or the exporter (AC-30).
+7. The official OpenAI and Anthropic client SDKs, unmodified, against the mock provider through the proxy, changing
+   only the base URL, the key and the model name: a chat completion with each, and against `/v1/messages` a tool loop
+   with thinking enabled (AC-01, AC-02).
+8. A search of every file and every commit message, in every revision, for the name of an organisation or a person
+   that develops, deploys or uses the product and for data of a particular infrastructure
+   (`git grep -I -e <pattern> $(git rev-list --all)` for file contents, and `git log --all --format=%B` for commit
+   messages) (PUB-2).
+9. The quick start on a clean machine: clone, build, start, an answer from `/health/ready`, then every line of
+   [Quick start](#quick-start) with the mock provider (PUB-3; `tests/e2e` runs it in `make ci`).
+10. A review of the repository and all its documentation for English (PUB-8).

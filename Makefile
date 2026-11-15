@@ -18,7 +18,7 @@ b4d8f17068b35ee6060cc2f69a16fb48740d706fbba81661c318649c114a6998  golangci-lint-
 endef
 export LINT_SHA256
 
-.PHONY: ci check tools ci-container image image-test fuzz
+.PHONY: ci check tools ci-container image image-test fuzz bench bench-container
 
 # Tools and checks run with an empty environment, so none can lean on an ambient credential.
 ci:
@@ -51,6 +51,25 @@ fuzz:
 		echo "fuzz $$dir $$name"; \
 		go test -run '^$$' -fuzz "^$$name\$$" -fuzztime $(FUZZTIME) "$$dir" || exit 1; \
 	done
+
+# Outside make ci, the benchmark of kick-off section 18 (AC-52; Linux): the
+# binary and the mock are built into BENCHDIR, and tests/benchmark runs both
+# as processes, the proxy with GOMAXPROCS=1, pinned to CPU 0 when taskset is
+# present. STARGAITE_BENCH_OUT=<file> writes the JSON document there instead
+# of standard output. A missed target fails unless docs/benchmark.md lists it
+# as an accepted deviation; review that file after each run.
+BENCHDIR ?= $(or $(TMPDIR),/tmp)/stargaite-bench
+bench:
+	@mkdir -p "$(BENCHDIR)"
+	CGO_ENABLED=0 go build -trimpath -o "$(BENCHDIR)/stargaite" ./cmd/stargaite
+	CGO_ENABLED=0 go build -trimpath -o "$(BENCHDIR)/mockprovider" ./tests/mockprovider/cmd/mockprovider
+	STARGAITE_BENCH=1 STARGAITE_BENCH_DIR="$(BENCHDIR)" STARGAITE_BENCH_OUT="$(abspath $(STARGAITE_BENCH_OUT))" \
+		go test -count=1 -v -run '^TestBenchmark$$' -timeout 60m ./tests/benchmark
+
+# The same inside the Go image; a relative STARGAITE_BENCH_OUT lands in the
+# clone. No docker inside it, so the image size is not measured there.
+bench-container:
+	docker run --rm --user "$$(id -u):$$(id -g)" -e HOME=/tmp -e STARGAITE_BENCH_OUT -v "$(CURDIR)":/src -w /src $(GO_IMAGE) make bench
 
 # The checksum line is looked up before the download: no line for this system, no download.
 $(BIN)/golangci-lint:

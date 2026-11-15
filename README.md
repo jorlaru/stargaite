@@ -1,28 +1,91 @@
-# stargaite
+# StargAIte
 
-An inference proxy for LLM providers: one OpenAI-compatible endpoint in front of many providers, with model aliases,
-client keys, budgets and limits, all held in an embedded store and changed through an admin API. One static binary,
-one data directory. MIT licensed.
+**A small, self-hosted LLM inference proxy that tells the truth about what it sends.**
 
-**Status: phase 2 complete.** What works today: the store, the admin API and the CLI, providers (with eighteen
-built-in presets), targets, model aliases, client keys with rotation and revocation, `export`/`apply`/`validate`,
-`models explain`, `GET /v1/models`, and `POST /v1/chat/completions`, synchronous and streamed, toward providers of
-the `openai` protocol and of the `anthropic` protocol (translated to the Messages API), and `POST /v1/messages`,
-synchronous and streamed, toward providers of the `anthropic` protocol, `POST /v1/embeddings` toward embeddings
-targets of the `openai` protocol (see [Embeddings](#embeddings)) and `POST /v1/rerank` toward a provider's
-`rerank_url` (see [Rerank](#rerank)), with the parameter contract and reasoning
-control of the alias, timeouts, fallback across an alias's targets, a circuit breaker per target, cancellation when a
-client goes away and a graceful stop (see [Resilience](#resilience)). Phase 3 has begun: every provider call leaves a
-usage record with its tokens and cost, and `usage show` sums them (see [Usage](#usage)); keys and aliases have rate
-and parallel limits (see [Limits](#limits)), USD budgets (see [Budgets](#budgets)) and subscription quotas (see
-[Quotas](#quotas)); every request a key sends leaves spans in the configured OTLP backend (see [Telemetry](#telemetry)). The full specification is [kick-off.md](kick-off.md); the designs are
-[docs/design/phase-1.md](docs/design/phase-1.md), [docs/design/phase-2.md](docs/design/phase-2.md) and
-[docs/design/phase-3.md](docs/design/phase-3.md).
+[![ci](https://github.com/jorlaru/stargaite/actions/workflows/ci.yml/badge.svg)](https://github.com/jorlaru/stargaite/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+Your agents and applications call one OpenAI- or Anthropic-compatible endpoint with a model alias such as `smart`.
+StargAIte resolves the alias to a provider and a model, translates the parameters that providers name differently,
+falls back to the next model when one fails, counts what every call cost and refuses to spend past the limits you set.
+It shows exactly what it sent, before and after. It is one static binary with one data directory, configured from
+its CLI: no UI, no external database, no restart to change anything.
+
+## The problem it solves
+
+- **Every consumer is coupled to a provider.** Changing a provider, an endpoint or a model means touching every agent,
+  workflow and service that calls it. With StargAIte they call an alias, and what is behind it changes in one place.
+- **Gateways rewrite requests in silence.** A gateway that drops a "not supported" parameter or injects an output cap
+  nobody asked for is how a reasoning effort never reaches the provider, or how reasoning eats the cap and the answer
+  comes back empty. StargAIte never changes a request without listing the change, and never sends an output cap that
+  neither the client nor the alias asked for.
+- **Traces show the intent, not what was sent.** StargAIte records the requested, the alias's and the sent value of
+  every control, read from the final body that left for the provider.
+- **Costs are guessed.** StargAIte takes the cost from the provider's own figure or from the prices you declare, and
+  leaves it empty, flagged as unpriced, otherwise. A flat-fee subscription plan is metered in its own requests and
+  tokens per window, never with an invented price.
+- **Operating the gateway is a project of its own.** A UI, an external database and a restart for each change are
+  more than many deployments need. StargAIte keeps its configuration and usage in an embedded store and publishes
+  every change atomically, while requests keep flowing.
+
+## What makes it different
+
+| | |
+|---|---|
+| **The alias is a contract** | Clients name an alias; it lists up to three targets (provider and model) in order, its reasoning effort, output cap, limits and budget. Swap a target and no client changes. |
+| **No silent changes** | Every parameter added, dropped or translated is listed in the `x-stargaite-params-changed` response header, the usage record and the span. `x-stargaite-target` and `x-stargaite-reasoning-effort` say who answered and with which effort. |
+| **See it before you send it** | `stargaite models explain <alias>` prints the exact URL, headers (without the credential) and body each target would receive, without calling it. `stargaite targets verify <target>` calls the provider for real at each reasoning level and shows the tokens it spent. |
+| **Reasoning effort under control** | One scale (`none` to `max`), translated into seven provider dialects (`reasoning_effort`, `reasoning: {effort}`, `thinking` toggles and budgets, Anthropic's adaptive effort). An alias sets its effort as a default the client may override, or forces it. |
+| **Honest cost and hard limits** | Per key and per alias: requests and tokens per minute, requests in flight, USD budgets (daily, monthly or running) and shares of a subscription plan's windows. A request past any of them is refused before a provider is called. |
+| **Telemetry that is easy to trust** | OTLP/HTTP spans to Langfuse, an OpenTelemetry Collector or any OTLP backend, with no vendor SDK. `stargaite telemetry test` sends a real span and names what failed. Prometheus metrics on the admin API. |
+| **Small and fast** | A 26.5 MB image, 23 to 36 MB of memory at rest, under 0.5 ms of added median latency and 1,000 requests per second on one CPU ([docs/benchmark.md](docs/benchmark.md)). |
+| **Built to be run by an agent too** | No command ever prompts; every one accepts `--json` and exits `0`, `1` or `2`. A whole configuration is exported and applied as YAML. |
+| **Safe defaults** | Listeners on loopback, TLS required beyond it, credentials referenced by environment variable and never stored, client keys stored as hashes, outbound addresses checked against private networks at every connection, online backups. |
+
+**Endpoints.** `POST /v1/chat/completions` (OpenAI Chat Completions, synchronous and streamed, toward OpenAI-style
+providers or translated to Anthropic's Messages API), `POST /v1/messages` (Anthropic Messages, thinking and tool loops
+included), `POST /v1/embeddings`, `POST /v1/rerank` (Cohere, Jina, Voyage or TEI shapes, passed through) and
+`GET /v1/models`. Any client that lets you set the base URL works unmodified: the official OpenAI and Anthropic SDKs,
+workflow tools, `curl`.
+
+**Providers.** Eighteen presets fill in the base URL, protocol, credential variable and billing for you: `openai`,
+`anthropic`, `openrouter`, `deepinfra`, `minimax`, `zai`, `moonshot`, `dashscope`, `ollama`, `tei`, `deepseek`,
+`gemini`, `xai`, `mistral`, `groq`, `together`, `fireworks` and `cerebras` (`stargaite providers presets` shows them,
+with an `untested` mark on those not yet run against the live service). Any other OpenAI- or Anthropic-compatible
+endpoint, local servers such as Ollama, vLLM or TEI included, is one `providers add` with `--protocol` and
+`--base-url`.
+
+## How it works
+
+```mermaid
+flowchart LR
+  C["Agent or app<br/>(any OpenAI or Anthropic client)"] -- "client key + alias smart" --> S["StargAIte<br/>data plane :4000"]
+  S -- "first target" --> P1["provider A / model"]
+  S -. "fallback" .-> P2["provider B / model"]
+  S --> T["OTLP backend"]
+  O["Operator: stargaite CLI"] --> A["admin API :4001"] --> S
+```
+
+Four kinds of resource, all managed with the CLI:
+
+- **Provider**: where and how to call: base URL, protocol (`openai` or `anthropic`), the name of the environment
+  variable that holds its credential, and how it bills (`pay_per_use`, `subscription` or `none`).
+- **Target**: one model of a provider, written `<provider>/<model>`, such as `openai/gpt-5-mini`, with its prices, its
+  reasoning levels and what it can do.
+- **Model alias**: the name clients send as `model`. It lists its targets, primary first, and may set an effort, an
+  output cap, limits and a budget.
+- **Key**: a client credential (`sk-stargaite-…`), shown once when created, allowed a list of aliases, with its own
+  limits and budget. Keys are rotated and revoked without touching anything else.
+
+The `stargaite` binary is both the server (`stargaite serve`) and its CLI, which talks to the admin API on
+`127.0.0.1:4001` with the admin key that `serve` generates on its first start.
 
 ## Quick start
 
-From a clone of this repository, with Go 1.27.4 or later. The mock provider in `tests/mockprovider` stands in for a real
-one, so no account or credential is needed and no file is edited by hand. `tests/e2e` runs this block line by line.
+Try every feature in a few minutes, with no account and no credential: the mock provider in `tests/mockprovider`
+stands in for a real one. You need a clone of this repository and Go 1.27.4 or later (to run it with Docker instead,
+see [Deploy with Docker](#deploy-with-docker)). Run the block line by line from the clone; `tests/e2e` runs exactly
+these lines in `make ci`, so they work as written.
 
 ```sh
 go build -o stargaite ./cmd/stargaite
@@ -47,39 +110,190 @@ curl -s http://127.0.0.1:4001/admin/v1/metrics -H "Authorization: Bearer $(cat d
 ./stargaite backup backup.db
 ```
 
-The mock provider listens on `127.0.0.1:4010`; `serve` puts the data plane on `127.0.0.1:4000`, the admin API on
-`127.0.0.1:4001` and the store in `./data`, and the health check waits until it is up. The mock provider is billed per
-use: `models add` also creates the target `mock/mock` (with a warning that it has no prices yet), and `targets set`
-gives it a price in USD per million input and output tokens. `targets add` declares a second model of the mock
-provider, `mock/mock-embed`, as an embeddings target priced per million input tokens, and `models add embed` makes it
-an alias. `keys create` limits the key to 60 requests a minute, allows it both aliases and
-prints the client key once: paste it in place of `sk-stargaite-...` in the three `curl` calls. `models explain` shows what the alias would send, without calling
-the provider: per target, the effort and output-cap layers, the list of changes, the URL, the headers without the
-credential and the body, which for the minimal request it explains by default are the bytes the chat completion below
-sends (`--body <file>` explains a request of your own; `--json` gives each body's exact bytes). `targets verify` then
-calls the target for real, once per reasoning level it declares (once with no reasoning control for `mock/mock`, which
-declares none), prints for each call the effort sent, the provider's status, the reasoning and output tokens and the
-exact body sent, then `verified: mock/mock, the result is stored`; until a chat target is verified, `validate` warns
-about it (see [Targets verify](#targets-verify)). `telemetry set` points
-the OTLP exporter at the mock provider, which also accepts trace exports, and `telemetry test` sends it one span and
-prints `credentials: resolved · reachable: yes · authorized: yes · span: accepted (200) · trace_id=…` (see
-[Telemetry](#telemetry)). The first `curl` lists
-the aliases `embed` and `fast`; the second sends a chat completion to `fast` and gets the mock provider's answer, with
-the response headers `x-stargaite-request-id`, `x-stargaite-trace-id` and `x-stargaite-target` (add `-i` to `curl` to
-see them), and its span reaches the mock provider within the 2 s of a batch; the third sends an embeddings request to
-`embed` and gets the mock provider's vector, byte for byte. The fourth `curl` reads the metrics from the admin API
-with the admin key, in the Prometheus text format: among them `stargaite_requests_total{key="my-agent",model="fast",status="200"} 1`
-(see [Metrics](#metrics)).
-`usage show --by model` then sums the last hour from the store per alias: for `fast` one request, the tokens the mock
-provider reported (1 input, 2 output) and their cost at the target's prices, 0.000005 USD; for `embed` one request,
-1 input token, 0 output and 0.000001 USD; and on the first row, under the alias `-` (none), the verify call, recorded
-under the key `_verify` with the same tokens and cost as `fast`. `backup` writes a checked copy of the store, the three
-records included, to `backup.db` with mode `0600` and prints its size (see [Backup and restore](#backup-and-restore)).
-Both processes log JSON lines to the terminal; `kill %1 %2` stops them.
-`./stargaite --help` lists every command, and each one accepts `--json`, never prompts, and exits `0` on success, `1`
-on failure and `2` on wrong usage; `remove`, `keys revoke` and `apply --prune` (unless `--dry-run`) need `--yes`.
+What each step does:
 
-## Usage
+1. **Start.** The mock provider listens on `127.0.0.1:4010`. `serve` puts the data plane on `127.0.0.1:4000`, the
+   admin API on `127.0.0.1:4001` and everything else in `./data`, including the admin key it generates on its first
+   start (`data/admin.key`, which the CLI reads). The health check waits until it is up.
+2. **Configure.** `providers add` declares the mock as a provider billed per use. `models add fast` creates the alias
+   `fast` and its target `mock/mock`, warning that the target has no prices yet; `targets set` gives it prices in USD
+   per million input and output tokens. `targets add` and `models add embed` do the same for an embeddings model.
+3. **Issue a key.** `keys create` allows the key both aliases, limits it to 60 requests a minute and prints the client
+   key once: paste it in place of `sk-stargaite-...` in the three `curl` calls.
+4. **Look before sending.** `models explain fast` prints, per target, the effort and output-cap decisions, the list of
+   changes, the URL, the headers without the credential and the exact body the chat completion below will send.
+   `targets verify` calls the target for real and stores the result (see [Targets verify](#targets-verify)).
+5. **Connect telemetry.** `telemetry set` points the OTLP exporter at the mock, which also accepts traces, and
+   `telemetry test` sends one span and prints
+   `credentials: resolved · reachable: yes · authorized: yes · span: accepted (200) · trace_id=…`.
+6. **Call it.** The first `curl` lists the aliases `embed` and `fast`; the second gets the mock's chat answer, with the
+   headers `x-stargaite-request-id`, `x-stargaite-trace-id` and `x-stargaite-target` (add `-i` to see them); the third
+   gets the mock's embedding vector, byte for byte. The fourth reads the Prometheus metrics with the admin key, such as
+   `stargaite_requests_total{key="my-agent",model="fast",status="200"} 1`.
+7. **Account and back up.** `usage show --by model` sums the last hour per alias: for `fast` one request, 1 input and
+   2 output tokens and 0.000005 USD; for `embed` one request and 0.000001 USD; and, under the alias `-`, the verify
+   call, recorded under the key `_verify`. `backup` writes a checked copy of the store to `backup.db` with mode `0600`.
+
+Both processes log JSON lines to the terminal; `kill %1 %2` stops them. `./stargaite --help` lists every command, and
+`./stargaite <command> --help` its flags.
+
+## Deploy with Docker
+
+The image is built from this repository: a static binary on a distroless base, run as a non-root user on a read-only
+root file system, with its data on a volume. You need Docker with Compose.
+
+**1. Get the code and add your provider credentials.** Credentials go in a file named `.env` next to `compose.yaml`,
+one `NAME=value` line per credential, using the variable names of the presets (`OPENAI_API_KEY`,
+`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, …; `providers presets` lists them all). Git and the image build both
+ignore `.env`. Write it with an editor rather than `echo`, so the key stays out of your shell history:
+
+```sh
+git clone https://github.com/jorlaru/stargaite.git
+cd stargaite
+touch .env && chmod 600 .env
+"${EDITOR:-vi}" .env
+```
+
+```ini
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+**2. Start it.**
+
+```sh
+docker compose up -d --build
+curl -sS --retry 10 --retry-all-errors --retry-delay 1 http://127.0.0.1:4000/health/ready
+```
+
+The data plane is published on `127.0.0.1:4000` of the host. The admin API never leaves the container; the CLI inside
+it administers the proxy with the admin key generated in the volume. A shell alias saves typing (run it from the clone,
+where `compose.yaml` is):
+
+```sh
+alias stargaite='docker compose exec stargaite /stargaite'
+```
+
+**3. Configure a provider, an alias and a key.** Replace the model ids with ones your provider offers, and the prices
+with its current list prices (USD per million tokens):
+
+```sh
+stargaite providers add openai
+stargaite models add smart --target openai/gpt-5-mini --effort medium --effort-mode default
+stargaite targets set openai/gpt-5-mini --pricing input_per_million=0.25,output_per_million=2,as_of=2026-11-15
+stargaite targets verify openai/gpt-5-mini
+stargaite keys create my-app --model smart --rpm-limit 120 --budget limit_usd=20,reset_interval=monthly
+```
+
+`providers add openai` takes everything from the `openai` preset; its credential resolves from `OPENAI_API_KEY` in
+`.env` (`providers show openai` says `credential: resolved`). `models add` creates the alias and its target, with a
+default effort of `medium` that a client may override. `targets verify` makes one real, cheap call to check the
+target. `keys create` prints the client key once: store it in your application's secrets. Each change prints the diff
+it published and any findings: a `warning` is advice and the change is applied; an `error` refuses the change and
+names what to fix (for example, a key with a budget needs prices on every target it can reach, and an alias with an
+`anthropic` target needs `--max-output-tokens`).
+
+**4. Point your application at it** (see [Connect your clients](#connect-your-clients)): base URL
+`http://127.0.0.1:4000/v1`, the `sk-stargaite-…` key, and `smart` as the model.
+
+**Day two.**
+
+- **Reach it from other machines.** Put a TLS reverse proxy (Caddy, nginx, Traefik) in front of port 4000, or mount a
+  certificate and replace `--behind-tls-proxy` with `--tls-cert` and `--tls-key` in `compose.yaml` (see
+  [Listeners, TLS and the container](#listeners-tls-and-the-container)). Plain HTTP outside loopback is refused.
+- **Change a credential.** Edit `.env`, then `docker compose up -d`: the container is recreated with the new value
+  and requests in flight are given time to finish (`stop_grace_period`). Configuration and usage live in the volume
+  and survive it.
+- **Upgrade.** `git pull && docker compose up -d --build`. The store migrates itself on start.
+- **Back up.** `stargaite backup /data/backup.db` writes a checked copy while traffic flows;
+  `docker compose cp stargaite:/data/backup.db ./backup.db` copies it out (see [Backup and restore](#backup-and-restore)).
+- **Watch it.** `docker compose logs -f stargaite` shows its JSON log; `stargaite usage show` and
+  `stargaite telemetry set` cover spend and traces (see [Everyday operations](#everyday-operations)).
+- **Size it.** Request 50m of CPU and 64 Mi of memory and allow 1000m and 256 Mi
+  (see [Container resources](#listeners-tls-and-the-container)).
+
+Without Docker, the same runs from the binary: `go build -o stargaite ./cmd/stargaite`, then
+`./stargaite serve --data-dir /var/lib/stargaite --env-file /etc/stargaite/env` under your service manager, with the
+env file readable only by the user that runs it. An env file is read again on `stargaite secrets reload`, so a
+credential rotates without a restart (see [Provider credentials](#provider-credentials)).
+
+## Connect your clients
+
+Any OpenAI- or Anthropic-compatible client works by changing three things: the base URL, the API key (an
+`sk-stargaite-…` key) and the model (an alias).
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:4000/v1", api_key="sk-stargaite-...")
+reply = client.chat.completions.create(model="smart", messages=[{"role": "user", "content": "Hello"}])
+print(reply.choices[0].message.content)
+```
+
+```python
+from anthropic import Anthropic
+
+client = Anthropic(base_url="http://127.0.0.1:4000", api_key="sk-stargaite-...")
+reply = client.messages.create(model="claude", max_tokens=1024, messages=[{"role": "user", "content": "Hello"}])
+print(reply.content[0].text)
+```
+
+```sh
+curl http://127.0.0.1:4000/v1/chat/completions -H "Authorization: Bearer sk-stargaite-..." \
+  -d '{"model":"smart","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+```
+
+The Anthropic example needs an alias with an `anthropic` target, such as
+`stargaite providers add anthropic` and
+`stargaite models add claude --target anthropic/<model> --max-output-tokens 8192`. Streaming, tools, structured output
+and reasoning effort (`reasoning_effort` on chat completions, `output_config.effort` on messages) pass through as the
+alias allows. Every answer carries `x-stargaite-request-id`, `x-stargaite-target` (who answered),
+`x-stargaite-trace-id`, and, when they apply, `x-stargaite-reasoning-effort` (the effort sent) and
+`x-stargaite-params-changed` (what the proxy changed). An error names its cause in `x-stargaite-error-code`, such as
+`rate_limit_exceeded` or `budget_exceeded`.
+
+## Everyday operations
+
+| Task | Command |
+|---|---|
+| List the provider presets | `stargaite providers presets` |
+| Add a provider from a preset, or any compatible endpoint | `stargaite providers add openrouter` · `stargaite providers add local --protocol openai --base-url http://127.0.0.1:8000/v1 --allow-private-network --billing none` |
+| Add a fallback model to an alias | `stargaite targets add anthropic/<model> --kind chat`, then `stargaite models set smart --target openai/<model> --target anthropic/<model> --max-output-tokens 8192` |
+| See what an alias would send | `stargaite models explain smart` · `stargaite models explain smart --effort none` |
+| Declare a target's reasoning levels | `stargaite targets set openai/<model> --level low --level medium --level high --can-disable=false` |
+| Create, rotate and revoke a client key | `stargaite keys create my-app --model smart` · `stargaite keys rotate my-app` · `stargaite keys revoke my-app --yes` |
+| Limit and budget a key | `stargaite keys set my-app --rpm-limit 60 --max-parallel-requests 4 --budget limit_usd=10,reset_interval=daily` |
+| Meter a subscription plan | `stargaite providers set <name> --billing subscription --quota 5h:requests=1000` · `stargaite usage quota` |
+| See usage and cost | `stargaite usage show --since 24h --by key,model` |
+| Send traces to Langfuse | `stargaite telemetry set --preset langfuse --otlp-endpoint https://<host>/api/public/otel` · `stargaite telemetry test` |
+| Check the whole configuration | `stargaite validate` |
+| Save and apply the configuration as YAML | `stargaite export > config.yaml` · `stargaite apply -f config.yaml --dry-run` · `stargaite apply -f config.yaml` |
+| Back up the store | `stargaite backup <file>` |
+
+Every command accepts `--json`, never prompts, and exits `0` on success, `1` on failure and `2` on wrong usage;
+`remove`, `keys revoke` and `apply --prune` (unless `--dry-run`) need `--yes`. Each change is published atomically, at
+a new revision, and audited; requests in flight finish on the configuration they started with.
+
+## Status
+
+Phases 1 to 4 of the specification are built: every feature above works and is tested (`make ci`), and the figures of
+[docs/benchmark.md](docs/benchmark.md) are measured. No release is tagged and no image is published yet, so build it
+from this repository. Presets marked `untested` have not been run against their live service. The specification is
+[kick-off.md](kick-off.md); the designs of each phase are in [docs/design](docs/design).
+
+## Reference
+
+The details of each part, for operators who need the exact behaviour:
+[Usage](#usage) · [Prices one table cannot express](#prices-one-table-cannot-express) · [Limits](#limits) ·
+[Budgets](#budgets) · [Quotas](#quotas) · [Telemetry](#telemetry) · [Metrics](#metrics) ·
+[Anthropic clients](#anthropic-clients) · [Embeddings](#embeddings) · [Rerank](#rerank) ·
+[Targets verify](#targets-verify) · [Resilience](#resilience) ·
+[The admin key and the data directory](#the-admin-key-and-the-data-directory) ·
+[Backup and restore](#backup-and-restore) · [Provider credentials](#provider-credentials) ·
+[Listeners, TLS and the container](#listeners-tls-and-the-container) · [Development](#development) ·
+[Release checklist](#release-checklist).
+
+### Usage
 
 Every provider call leaves one usage record in the store, whether it succeeded, failed or was cut short, and a request
 that fell back leaves one per attempt: the key, the alias, the target, the model the provider answered with (flagged
@@ -109,7 +323,7 @@ window reads): a window that starts earlier is answered from the daily sums, ove
 counts and percentiles they do not hold (shown as `-`), and cannot be grouped by effort sent.
 `--json` gives the same as JSON, with each window's `source` (`records` or `daily`), `since` and `until`.
 
-## Prices one table cannot express
+### Prices one table cannot express
 
 A target's price table holds four prices in USD per million tokens (input, output, cache read, cache write) and the
 date they were read (`as_of`); a missing cache price is charged at the input price, and reasoning tokens at the output
@@ -125,7 +339,7 @@ high.
 - **Cached input.** Cache reads and writes have their own prices. Cache writes priced by how long the entry lives
   (five minutes or one hour, for example) share one `cache_write_per_million`: set the price of the duration your
   clients ask for, or the higher one. A provider that reports no cache tokens has them charged as plain input.
-- **Batch discounts.** stargaite makes synchronous and streamed calls only, never a provider's batch API, so batch
+- **Batch discounts.** StargAIte makes synchronous and streamed calls only, never a provider's batch API, so batch
   prices never apply; discounts applied later on the invoice (volume, commitments, credits) are not seen either, and
   the records state the list price.
 - **Service tiers, fast modes, residency and peak hours.** A multiplier the provider applies per request or by time
@@ -141,7 +355,7 @@ high.
 - **Dated price changes.** A table has one `as_of`: on the day a new price applies, `targets set <target> --pricing
   ...` replaces it, which is audited like every change. Records keep the cost computed when they were written.
 
-## Limits
+### Limits
 
 A key and an alias can each limit requests per minute (`--rpm-limit`), tokens per minute (`--tpm-limit`: the input
 plus output tokens of the provider calls that ended in the last minute, as recorded) and requests in flight
@@ -157,7 +371,7 @@ until it ends, a stream until its last event, and gives them back on an error, a
 are counted in steps of one second, so a window may hold up to a second more than 60 s of traffic, never less, and
 counts start empty after a restart.
 
-## Budgets
+### Budgets
 
 A key, an alias and the instance can each have a USD budget: `--budget limit_usd=5,reset_interval=daily` on
 `keys create|set`, `models add|set` and `settings set` (`daily` and `monthly` start again at 00:00 UTC, on day 1 for
@@ -171,7 +385,7 @@ is bounded only when it sets `max_parallel_requests` and its targets cap output.
 each per period. Spend survives a restart, as it is rebuilt from the stored records; a `never` budget's total starts
 at zero when it is set or its interval changes, and is kept when only its limit changes.
 
-## Quotas
+### Quotas
 
 A `subscription` provider (a flat-fee plan) declares the windows of its plan, each limited in requests, tokens or both:
 `providers add|set <name> --billing subscription --quota 5h:requests=1000 --quota 7d:tokens=5000000`. A key may use a
@@ -192,9 +406,9 @@ traffic only: a plan also used by other clients, or whose provider resets on a c
 provider's own `429` authoritative, and that `429` moves the request to the next target like any other. `validate` warns
 when a window is longer than `retention.usage_days`, whose records the rebuild reads.
 
-## Telemetry
+### Telemetry
 
-stargaite exports spans over OTLP/HTTP with the JSON encoding to any backend that accepts it; there is no vendor SDK
+StargAIte exports spans over OTLP/HTTP with the JSON encoding to any backend that accepts it; there is no vendor SDK
 and no second export path. `./stargaite telemetry set --otlp-endpoint <url>` sets the endpoint, always in full: spans go
 to `<url>/v1/traces`. Credentials are references, never values: `--basic-auth-env USER_VAR:PASSWORD_VAR` composes the
 `Authorization: Basic` header from two variables and `--header-env NAME=VAR` sends a header read from a variable, both
@@ -203,7 +417,7 @@ sends a static header that carries no secret, and `Authorization`, `Proxy-Author
 refused there. A plain HTTP, loopback or private endpoint needs `--allow-private-network`; the address is checked again
 at every connection and redirects are never followed. `--preset langfuse` fills in
 `--basic-auth-env LANGFUSE_PUBLIC_KEY:LANGFUSE_SECRET_KEY` and the header `x-langfuse-ingestion-version: 4`, which
-explicit flags override; give the endpoint as `https://<host>/api/public/otel`. Langfuse shows the cost stargaite
+explicit flags override; give the endpoint as `https://<host>/api/public/otel`. Langfuse shows the cost StargAIte
 sends; for a call without one (`subscription`, `none` or unpriced) it shows a cost of its own, from its price table and
 the returned model, which no record has.
 
@@ -243,7 +457,7 @@ by `stargaite.content.truncated` when cut, with the provider credential redacted
 may quote the prompt, never enters a span status, opt-in or not, and nothing of the content reaches a log or a usage
 record.
 
-## Metrics
+### Metrics
 
 `GET /admin/v1/metrics` on the admin listener answers the Prometheus text format, always as
 `Content-Type: text/plain; version=0.0.4; charset=utf-8` whatever `Accept` asks, which any Prometheus scrapes. It
@@ -291,7 +505,7 @@ scrape_configs:
       - targets: ["127.0.0.1:4001"]
 ```
 
-## Anthropic clients
+### Anthropic clients
 
 `POST /v1/messages` is the Anthropic Messages API, served by targets of the `anthropic` protocol: an Anthropic SDK
 works with its base URL set to the data plane (`http://127.0.0.1:4000`), a client key as its API key and an alias as
@@ -303,7 +517,7 @@ use the Anthropic envelope, `{"type":"error","error":{"type":...,"message":"<cod
 the `x-stargaite-error-code` header. A target of the `openai` protocol is skipped, so an alias with no other answers
 `422 endpoint_not_supported`. `./stargaite models explain <alias> --endpoint messages` shows the bytes it would send.
 
-## Embeddings
+### Embeddings
 
 `POST /v1/embeddings` is the OpenAI Embeddings API, served by targets of kind `embeddings` on providers of the `openai`
 protocol, at the provider's `base_url` plus `/embeddings`: an OpenAI SDK works with its base URL set to
@@ -326,7 +540,7 @@ batches can pass `max_response_bytes` (32 MiB by default): 2,048 inputs at 3,072
 vectors alone, and several times more as floats, which answers `502 upstream_error` (the attempt's log line names the
 limit); raise it with `settings set --max-response-bytes <n>`, or send smaller batches.
 
-## Rerank
+### Rerank
 
 `POST /v1/rerank` forwards the body to the `rerank_url` of a rerank target's provider (`providers add <name>
 --protocol openai --rerank-url <url>`, then `targets add <provider>/<model> --kind rerank`), with only `model` replaced
@@ -341,7 +555,7 @@ array, as TEI sends, or Cohere's `meta`) is estimated from the bytes sent and pr
 provider `cost_report` wins over the table. Search units are not recorded: a target billed by them is priced by its
 `cost_report`, or approximately by its token prices.
 
-## Targets verify
+### Targets verify
 
 `./stargaite targets verify <target> [--max-output-tokens n]` checks a chat target against its live provider, with
 the provider's own credential: one call per level the target declares (`--level`, in order), then one at `none` when
@@ -361,7 +575,7 @@ store, does not); any change of the target or of its provider clears it. Every r
 or `stale` when the target changed while it ran, and none writes a revision. The server bounds the run by its own
 write deadline, the number of calls times `total_ms` plus 5 s, so the CLI waits without its 90 s timeout.
 
-## Resilience
+### Resilience
 
 An alias lists up to three targets. A connection failure, a timeout, a `429` or a `5xx` from the provider moves the
 request to the next target, as long as nothing was sent to the client yet; the `x-stargaite-*` headers then describe
@@ -375,7 +589,7 @@ more than 55 s to stop (the 30 s, up to 5 s for the requests stopped to end, up 
 5 s busy timeout for the write in progress, and the 5 s of the spans) before it kills it: `docker stop` waits 10 s
 unless given `-t`.
 
-## The admin key and the data directory
+### The admin key and the data directory
 
 `serve` keeps everything in its data directory (`--data-dir`, else `STARGAITE_DATA_DIR`, else `./data`): the store,
 its lock and, on the first start, a generated admin key in `admin.key` (mode `0600`). The CLI reads the key from that
@@ -386,7 +600,7 @@ One `serve` per data directory: a second one exits `1`. Keep the directory on a 
 `./stargaite export` prints the whole configuration as YAML, and `./stargaite apply -f <file>` applies one;
 `config.example.yaml` is an example input (`./stargaite validate -f config.example.yaml` checks it without a server).
 
-## Backup and restore
+### Backup and restore
 
 `./stargaite backup <file>` asks the running `serve` for a copy of the store and writes it to `<file>`. The copy is
 taken while `serve` keeps serving (`VACUUM INTO`, on a connection of its own) and holds every committed transaction;
@@ -410,7 +624,7 @@ To restore a backup:
 4. Start `serve`. It turns the copy back to WAL mode and runs any newer migration, and budgets and quota windows are
    rebuilt from it, as at every start. Key tokens, aliases and usage are those of the backup.
 
-## Provider credentials
+### Provider credentials
 
 A provider names the variable that holds its credential (`--api-key-env`; a preset names it for you, see
 `./stargaite providers presets`), never the value. `serve` resolves it from its own environment, then from the file
@@ -436,10 +650,10 @@ mv /etc/stargaite/env.new /etc/stargaite/env
 As every command whose answer holds an error finding, it exits `1` when the stored configuration has one (such as a
 value an upgraded binary refuses); the reload is still published.
 
-stargaite ignores `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` in v1: `serve` connects to providers directly, so the
+StargAIte ignores `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` in v1: `serve` connects to providers directly, so the
 check of each outbound address sees the real destination, and the CLI sends the admin key to the admin URL only.
 
-## Listeners, TLS and the container
+### Listeners, TLS and the container
 
 Both listeners default to loopback. A listener outside loopback needs TLS, either `--tls-cert <file> --tls-key <file>`
 (both listeners then serve TLS) or `--behind-tls-proxy`, which states that a trusted front end terminates it;
@@ -463,7 +677,7 @@ administers it with the key in `/data/admin.key`. Pass a credential with `-e OPE
 which copies the variable from your shell without writing its value, or mount the directory that holds the env file,
 readable by uid `65532`, and add `--env-file` after `serve` (`-v /etc/stargaite:/run/stargaite:ro` with
 `--env-file /run/stargaite/env`): mount the directory, not the file, because a file replaced by rename on the host is
-not seen through a mount of the file itself. To have stargaite terminate TLS itself, mount the certificate and its key and give
+not seen through a mount of the file itself. To have StargAIte terminate TLS itself, mount the certificate and its key and give
 `--tls-cert` and `--tls-key` in place of `--behind-tls-proxy`; the admin API then speaks TLS too, so the CLI needs
 `--admin-url https://localhost:4001` and must trust the certificate (`docker exec -e SSL_CERT_FILE=<ca file> ...`),
 which must then also be valid for `localhost`. If it is not, add `--add-host <cert name>:127.0.0.1` to `docker run`
@@ -550,3 +764,7 @@ fixes or documents what fails:
 9. The quick start on a clean machine: clone, build, start, an answer from `/health/ready`, then every line of
    [Quick start](#quick-start) with the mock provider (PUB-3; `tests/e2e` runs it in `make ci`).
 10. A review of the repository and all its documentation for English (PUB-8).
+
+## License
+
+MIT: see [LICENSE](LICENSE).

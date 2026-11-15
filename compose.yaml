@@ -1,0 +1,21 @@
+# StargAIte with Docker Compose: docker compose up -d --build (see README.md).
+# Provider credentials go in .env next to this file (NAME=value lines, never
+# committed); the data plane is published on this host's loopback only.
+services:
+  stargaite:
+    build: .
+    image: stargaite:local
+    command: ["serve", "--listen", "0.0.0.0:4000", "--behind-tls-proxy"]
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - stargaite-data:/data
+    read_only: true
+    restart: unless-stopped
+    stop_grace_period: 60s
+
+volumes:
+  stargaite-data:

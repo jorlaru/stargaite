@@ -2,3 +2,4 @@
 /data/
 /stargaite
 /backup.db*
+/.env

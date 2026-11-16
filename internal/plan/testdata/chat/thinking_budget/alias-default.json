@@ -3,7 +3,7 @@
 		"level": "none",
 		"sent": "none",
 		"source": "alias_default",
-		"changes": "thinking.budget_tokens:added",
+		"changes": "thinking:added",
 		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"thinking\":{\"type\":\"disabled\"}}"
 	},
 	{

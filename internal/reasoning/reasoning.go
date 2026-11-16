@@ -298,6 +298,10 @@ func Translate(c Choice, b *params.Body, ep domain.Endpoint, r *domain.Reasoning
 		}
 	}
 	if changed || deleted {
+		name := changeName(d)
+		if off {
+			name = offName(name, write)
+		}
 		switch {
 		case c.Source == SourceAliasForced && c.Requested != "":
 			e.Changes = append(e.Changes, Change{inName, ActionForced})
@@ -305,8 +309,8 @@ func Translate(c Choice, b *params.Body, ep domain.Endpoint, r *domain.Reasoning
 			e.Changes = append(e.Changes, Change{inName, ActionDropped}) // deleted, and nothing the proxy wrote carries it
 		case c.Source == SourceClient:
 			e.Changes = append(e.Changes, Change{inName, ActionTranslated})
-		case !slices.ContainsFunc(replaced, func(r Change) bool { return r.Name == changeName(d) }):
-			e.Changes = append(e.Changes, Change{changeName(d), ActionAdded}) // unless the replaced member names it
+		case !slices.ContainsFunc(replaced, func(r Change) bool { return r.Name == name }):
+			e.Changes = append(e.Changes, Change{name, ActionAdded}) // unless the replaced member names it
 		}
 	}
 	e.Changes = append(append(e.Changes, replaced...), side...)
@@ -324,6 +328,27 @@ func changeName(d string) string {
 		return "output_config.effort"
 	}
 	return domain.DialectKeys[d][0]
+}
+
+// offName is the PAR-3 name of an off form the alias adds, which may hold no
+// level member: name when the form writes it, else the top-level member that
+// would hold it, else the first member written (thinking: {type: disabled}
+// toward adaptive_effort and thinking_budget).
+func offName(name string, write []member) string {
+	top, sub, nested := strings.Cut(name, ".")
+	for _, m := range write {
+		if m.name != top {
+			continue
+		}
+		if o, err := params.Scan(m.value, nil); !nested || err == nil && slices.Contains(o.Keys(), sub) {
+			return name
+		}
+		return top
+	}
+	if len(write) > 0 {
+		return write[0].name
+	}
+	return name
 }
 
 // deleteEffort deletes the client's effort member, and on messages an

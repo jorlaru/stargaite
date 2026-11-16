@@ -3,7 +3,7 @@
 		"level": "none",
 		"sent": "none",
 		"source": "alias_default",
-		"changes": "protocol:translated,max_tokens:added,output_config.effort:added",
+		"changes": "protocol:translated,max_tokens:added,thinking:added",
 		"body": "{\"model\":\"up-1\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8192,\"thinking\":{\"type\":\"disabled\"}}"
 	},
 	{

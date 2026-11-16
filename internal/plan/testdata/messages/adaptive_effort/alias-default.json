@@ -3,7 +3,7 @@
 		"level": "none",
 		"sent": "none",
 		"source": "alias_default",
-		"changes": "output_config.effort:added",
+		"changes": "thinking:added",
 		"body": "{\"model\":\"up-1\",\"max_tokens\":8192,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":{\"type\":\"object\"}}},\"thinking\":{\"type\":\"disabled\"}}"
 	},
 	{

@@ -656,6 +656,15 @@ func TestMessagesThinking(t *testing.T) {
 			out + `,"temperature":1,"thinking":{"budget_tokens":1024}}`, "thinking.budget_tokens:added,thinking:dropped,temperature:added", "", "budget:1024", "alias_default"},
 		{"without an alias level the adaptive thinking is forwarded", head + `,"thinking":{"type":"adaptive"}}`, domain.ModelReasoning{}, levelled,
 			out + `,"thinking":{"type":"adaptive"}}`, "", "", "", "provider_default"},
+		// An alias's off form is named by the member it writes (PAR-3): the off
+		// form of adaptive_effort and thinking_budget holds no level member.
+		{"an alias none toward adaptive_effort is named as written", head + `}`, domain.ModelReasoning{Effort: "none", Mode: "forced"}, adaptive,
+			out + `,"thinking":{"type":"disabled"}}`, "thinking:added", "", "none", "alias_forced"},
+		{"an alias none toward thinking_budget is named as written", head + `}`, domain.ModelReasoning{Effort: "none", Mode: "default"}, budget,
+			out + `,"thinking":{"type":"disabled"}}`, "thinking:added", "", "none", "alias_default"},
+		{"an alias none toward reasoning_object holds its level member", head + `}`, domain.ModelReasoning{Effort: "none", Mode: "default"},
+			domain.Target{Reasoning: &domain.Reasoning{Dialect: "reasoning_object", Levels: []string{"low"}, CanDisable: new(true)}},
+			out + `,"reasoning":{"effort":"none"}}`, "reasoning.effort:added", "", "none", "alias_default"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			got, skip := run(t, "messages", tt.body, &domain.Model{Reasoning: tt.alias}, tt.target)

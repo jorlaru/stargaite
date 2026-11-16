@@ -322,7 +322,7 @@ func (h *handler) check(w http.ResponseWriter, r *http.Request, rq *request) *do
 		return domain.NewError(domain.CodeModelNotAllowed, fmt.Sprintf("this key may not use model %.200q", alias))
 	}
 	var e *domain.Error
-	rq.client, e = plan.Check(rq.ep, rq.body, &rq.model.Spec)
+	rq.client, e = plan.Check(rq.ep, rq.body, &rq.model.Spec, rq.model.Declared)
 	return e
 }
 
@@ -948,7 +948,8 @@ func (h *handler) count(r *usage.Record) {
 // Its status and code are those of the error the client got, also as the
 // terminal event of a committed stream (so 500 internal_error for a request
 // the shutdown stopped); 499 client_gone when the client went away, whatever
-// was written before; else 200.
+// was written before; else 200. The request line names the parameter of a
+// refused request, when its error has one.
 func (h *handler) done(rq *request) {
 	defer h.Flight.Done()
 	if rq.release != nil {
@@ -982,6 +983,9 @@ func (h *handler) done(rq *request) {
 	attrs = append(attrs, "attempts", n, "status", status)
 	if code != "" {
 		attrs = append(attrs, "code", code)
+	}
+	if rq.err != nil && rq.err.Param != "" {
+		attrs = append(attrs, "param", fmt.Sprintf("%.200s", rq.err.Param))
 	}
 	h.Log.Info("request", append(attrs, "duration_ms", ended.Sub(rq.started).Milliseconds())...)
 }

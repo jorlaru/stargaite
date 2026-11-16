@@ -71,9 +71,10 @@ flowchart LR
 Four kinds of resource, all managed with the CLI:
 
 - **Provider**: where and how to call: base URL, protocol (`openai` or `anthropic`), the name of the environment
-  variable that holds its credential, and how it bills (`pay_per_use`, `subscription` or `none`).
+  variable that holds its credential, how it bills (`pay_per_use`, `subscription` or `none`), and the parameters its
+  models accept beyond the reference or refuse ([Parameters](#parameters)).
 - **Target**: one model of a provider, written `<provider>/<model>`, such as `openai/gpt-5-mini`, with its prices, its
-  reasoning levels and what it can do.
+  reasoning levels, what it can do, and the parameters it accepts or refuses where it differs from its provider.
 - **Model alias**: the name clients send as `model`. It lists its targets, primary first, and may set an effort, an
   output cap, limits and a budget.
 - **Key**: a client credential (`sk-stargaite-…`), shown once when created, allowed a list of aliases, with its own
@@ -262,6 +263,7 @@ alias allows. Every answer carries `x-stargaite-request-id`, `x-stargaite-target
 | Add a provider from a preset, or any compatible endpoint | `stargaite providers add openrouter` · `stargaite providers add local --protocol openai --base-url http://127.0.0.1:8000/v1 --allow-private-network --billing none` |
 | Add a fallback model to an alias | `stargaite targets add anthropic/<model> --kind chat`, then `stargaite models set smart --target openai/<model> --target anthropic/<model> --max-output-tokens 8192` |
 | See what an alias would send | `stargaite models explain smart` · `stargaite models explain smart --effort none` |
+| Let a provider's own parameter through, or remove one | `stargaite providers set openrouter --param provider=forward` · `stargaite targets set anthropic/<model> --param temperature=drop` |
 | Declare a target's reasoning levels | `stargaite targets set openai/<model> --level low --level medium --level high --can-disable=false` |
 | Create, rotate and revoke a client key | `stargaite keys create my-app --model smart` · `stargaite keys rotate my-app` · `stargaite keys revoke my-app --yes` |
 | Limit and budget a key | `stargaite keys set my-app --rpm-limit 60 --max-parallel-requests 4 --budget limit_usd=10,reset_interval=daily` |
@@ -283,17 +285,62 @@ Phases 1 to 4 of the specification are built: every feature above works and is t
 from this repository. Presets marked `untested` have not been run against their live service. The specification is
 [kick-off.md](kick-off.md); the designs of each phase are in [docs/design](docs/design).
 
+**Changes since phase 4.** Providers and targets take `--param` rules ([Parameters](#parameters)); like any provider
+change, a change of a provider's rules clears the stored verification of its targets. A client's output cap toward a
+target that declares `output_cap_param` is now sent under that name: an OpenAI SDK's `max_tokens` toward a target of
+the `openai` preset arrives as `max_completion_tokens`, listed `max_tokens:translated`, and a client's
+`max_completion_tokens` toward one of the `openrouter` preset as `max_tokens`. A `mistral` provider created earlier
+lacks the preset's new rule: `providers set <name> --param output_dimension=forward` adds it. The log line of a refused
+request names the parameter at fault in `param`.
+
 ## Reference
 
 The details of each part, for operators who need the exact behaviour:
-[Usage](#usage) · [Prices one table cannot express](#prices-one-table-cannot-express) · [Limits](#limits) ·
-[Budgets](#budgets) · [Quotas](#quotas) · [Telemetry](#telemetry) · [Metrics](#metrics) ·
+[Parameters](#parameters) · [Usage](#usage) · [Prices one table cannot express](#prices-one-table-cannot-express) ·
+[Limits](#limits) · [Budgets](#budgets) · [Quotas](#quotas) · [Telemetry](#telemetry) · [Metrics](#metrics) ·
 [Anthropic clients](#anthropic-clients) · [Embeddings](#embeddings) · [Rerank](#rerank) ·
 [Targets verify](#targets-verify) · [Resilience](#resilience) ·
 [The admin key and the data directory](#the-admin-key-and-the-data-directory) ·
 [Backup and restore](#backup-and-restore) · [Provider credentials](#provider-credentials) ·
 [Listeners, TLS and the container](#listeners-tls-and-the-container) · [Development](#development) ·
 [Release checklist](#release-checklist).
+
+### Parameters
+
+A body member the endpoint's reference does not list is refused with `400 unknown_parameter` before any provider is
+called, unless a rule names it. A rule is `forward` or `drop`, given as `--param <name>=<forward|drop>` to
+`providers add|set`, `targets add|set` or `models add|set`:
+
+- On a provider (`providers set openrouter --param provider=forward`), it is a fact about every target of the
+  provider: `forward`, the target accepts the member although the reference does not list it, and it is sent
+  unchanged; `drop`, the target does not accept it, and it is removed. One rule serves every alias that reaches the
+  provider.
+- On a target (`targets set anthropic/<model> --param temperature=drop`), the same fact for that model alone; it wins
+  over its provider's rule for the same member.
+- On an alias (`models set <alias> --param <name>=forward`), a policy: `forward` sends an unknown member to every
+  target that states nothing about it; `drop` removes an unknown member, and one a target does not accept, instead of
+  skipping that target.
+
+Between a target's fact and an alias's policy a `drop` wins. A target that refuses a member (one it lists in
+`unsupported_params`, one the translation toward `anthropic` has no equivalent for, or an unknown member no rule lets
+through to it, such as one only another target of the alias declares) is skipped, unless the alias drops the member; with no target left the answer is `422
+unsupported_parameter` naming it. Every forward and drop is listed in `x-stargaite-params-changed`; there is no
+switch that drops whatever a provider does not support, and no wildcard. `validate` refuses a `forward` rule, at any
+level, on a member the proxy itself writes toward a target it applies to (the reasoning dialect's members, the output
+cap, `stream_options`, and toward `anthropic` the members of the translation), a target's `forward` on a member it
+lists in `unsupported_params`, and a provider's or a target's `drop` on `tools`, `tool_choice`, `response_format` or
+`output_config`: a target that cannot honour such a feature declares the capability false instead
+(`--capabilities tools=false`). The log line of a refused request names the member in `param`, which is how to learn
+which rule a client needs. The `mistral` preset forwards `output_dimension`; every other rule is yours to declare.
+
+Toward an `openai` target that declares `output_cap_param`, every output cap is sent under that name: a client's
+`max_tokens` or `max_completion_tokens` becomes one member holding the larger value the client sent, each other name
+listed `translated`; the value never changes. Targets created by `targets add` or `models add` from the `openai`,
+`minimax`, `dashscope`, `groq`, `cerebras` and `openrouter` presets declare one; a target that declares none keeps the
+client's names and gets an alias cap as `max_tokens`; toward `anthropic` every cap is `max_tokens`.
+
+A change of a provider's rules, like any change of the provider, clears the stored [targets verify](#targets-verify)
+result of each of its targets, so `validate` warns about them again; the warning never blocks traffic.
 
 ### Usage
 
@@ -526,21 +573,21 @@ protocol, at the provider's `base_url` plus `/embeddings`: an OpenAI SDK works w
 `http://127.0.0.1:4000/v1`, a client key and an alias as the model. It has every protection of chat: the key and the
 alias, `max_body_bytes`, the limits, budgets and quotas, fallback and the circuit, records and spans. The known body
 members are `input`, `model`, `dimensions`, `encoding_format` and `user`; any other, `stream` included, is refused with
-`400 unknown_parameter` unless the alias has a rule for it (`models set <alias> --param input_type=forward`, for a
-provider field such as `input_type` or `output_dimension`). Only `model` is replaced by the upstream id and the
-alias's rules applied; no output cap or effort is ever sent, whatever the alias declares. The answer is relayed as the
-provider sent it, `float` or `base64` vectors alike. A record's input tokens are the provider's `usage.prompt_tokens`,
-else its `usage.total_tokens`, and its output tokens 0; an answer without `usage` is estimated from the bytes sent, so
-a priced embeddings target (`output_per_million=0`) always moves its budgets. A chat, anthropic or rerank target
-behind an embeddings alias is skipped, and an alias with no other answers `422 endpoint_not_supported`; `validate`
-warns about an alias none of whose targets can serve any endpoint.
+`400 unknown_parameter` unless a [rule](#parameters) names it (`providers set <provider> --param input_type=forward`,
+for a provider field such as `input_type` or `output_dimension`, which the `mistral` preset forwards). Only `model` is
+replaced by the upstream id and the rules applied; no output cap or effort is ever sent, whatever the alias declares.
+The answer is relayed as the provider sent it, `float` or `base64` vectors alike. A record's input tokens are the
+provider's `usage.prompt_tokens`, else its `usage.total_tokens`, and its output tokens 0; an answer without `usage` is
+estimated from the bytes sent, so a priced embeddings target (`output_per_million=0`) always moves its budgets. A
+chat, anthropic or rerank target behind an embeddings alias is skipped, and an alias with no other answers
+`422 endpoint_not_supported`; `validate` warns about an alias none of whose targets can serve any endpoint.
 
 The OpenAI SDKs ask for `encoding_format: base64` when the caller sets none. A provider that refuses it is declared
-with `targets set <target> --unsupported-param encoding_format` and its aliases with
-`--param encoding_format=drop`, so the member is removed toward it and listed in `x-stargaite-params-changed`. Large
-batches can pass `max_response_bytes` (32 MiB by default): 2,048 inputs at 3,072 dimensions return 32 MiB of base64
-vectors alone, and several times more as floats, which answers `502 upstream_error` (the attempt's log line names the
-limit); raise it with `settings set --max-response-bytes <n>`, or send smaller batches.
+with `providers set <provider> --param encoding_format=drop` (or `targets set` for one model), so the member is
+removed toward it and listed in `x-stargaite-params-changed`. Large batches can pass `max_response_bytes` (32 MiB by
+default): 2,048 inputs at 3,072 dimensions return 32 MiB of base64 vectors alone, and several times more as floats,
+which answers `502 upstream_error` (the attempt's log line names the limit); raise it with
+`settings set --max-response-bytes <n>`, or send smaller batches.
 
 ### Rerank
 

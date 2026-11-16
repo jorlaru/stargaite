@@ -124,7 +124,7 @@ func (s *server) explainModel(w http.ResponseWriter, r *http.Request) {
 	}
 	var client *plan.Client
 	if e == nil {
-		client, e = plan.Check(ep, b, &m.Spec)
+		client, e = plan.Check(ep, b, &m.Spec, m.Declared)
 	}
 	if e != nil {
 		s.fail(w, e)

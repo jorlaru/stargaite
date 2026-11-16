@@ -83,17 +83,18 @@ type Telemetry struct {
 
 // Provider is a connection to an inference service.
 type Provider struct {
-	Protocol            string         `json:"protocol,omitempty"`
-	BaseURL             string         `json:"base_url,omitempty"`
-	APIKeyEnv           string         `json:"api_key_env,omitempty"`
-	Billing             string         `json:"billing,omitempty"`
-	Quota               []QuotaWindow  `json:"quota,omitempty"`
-	CostReport          *CostReport    `json:"cost_report,omitzero"`
-	StreamUsage         string         `json:"stream_usage,omitempty"`
-	RerankURL           string         `json:"rerank_url,omitempty"`
-	GenAIProvider       string         `json:"gen_ai_provider,omitempty"`
-	TargetDefaults      TargetDefaults `json:"target_defaults,omitzero"`
-	AllowPrivateNetwork bool           `json:"allow_private_network,omitzero"`
+	Protocol            string            `json:"protocol,omitempty"`
+	BaseURL             string            `json:"base_url,omitempty"`
+	APIKeyEnv           string            `json:"api_key_env,omitempty"`
+	Billing             string            `json:"billing,omitempty"`
+	Quota               []QuotaWindow     `json:"quota,omitempty"`
+	CostReport          *CostReport       `json:"cost_report,omitzero"`
+	StreamUsage         string            `json:"stream_usage,omitempty"`
+	RerankURL           string            `json:"rerank_url,omitempty"`
+	GenAIProvider       string            `json:"gen_ai_provider,omitempty"`
+	TargetDefaults      TargetDefaults    `json:"target_defaults,omitzero"`
+	AllowPrivateNetwork bool              `json:"allow_private_network,omitzero"`
+	Params              map[string]string `json:"params,omitempty"` // parameter name -> rule, a fact about every target of the provider (PAR-2)
 }
 
 // QuotaWindow is one window of a subscription plan ("5h", "7d"), limited in
@@ -120,15 +121,16 @@ type TargetDefaults struct {
 
 // Target is one upstream model at one provider.
 type Target struct {
-	Kind              string       `json:"kind,omitempty"`
-	Capabilities      Capabilities `json:"capabilities,omitzero"`
-	MaxOutputTokens   int64        `json:"max_output_tokens,omitzero"` // the model's own limit
-	OutputCapParam    string       `json:"output_cap_param,omitempty"`
-	Reasoning         *Reasoning   `json:"reasoning,omitzero"`
-	Pricing           *Pricing     `json:"pricing,omitzero"`
-	UnsupportedParams []string     `json:"unsupported_params,omitempty"`
-	ResponseModels    []string     `json:"response_models,omitempty"`
-	InlineThinkTags   bool         `json:"inline_think_tags,omitzero"`
+	Kind              string            `json:"kind,omitempty"`
+	Capabilities      Capabilities      `json:"capabilities,omitzero"`
+	MaxOutputTokens   int64             `json:"max_output_tokens,omitzero"` // the model's own limit
+	OutputCapParam    string            `json:"output_cap_param,omitempty"`
+	Reasoning         *Reasoning        `json:"reasoning,omitzero"`
+	Pricing           *Pricing          `json:"pricing,omitzero"`
+	UnsupportedParams []string          `json:"unsupported_params,omitempty"`
+	ResponseModels    []string          `json:"response_models,omitempty"`
+	InlineThinkTags   bool              `json:"inline_think_tags,omitzero"`
+	Params            map[string]string `json:"params,omitempty"` // parameter name -> rule; wins over the provider's (PAR-2)
 }
 
 // Capabilities are the contractual features of a target. Each has three

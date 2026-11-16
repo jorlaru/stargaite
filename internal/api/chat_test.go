@@ -262,6 +262,106 @@ func TestChatHeaders(t *testing.T) {
 	}
 }
 
+// TestProviderKnowledge runs provider and target rules end to end (PAR-2,
+// PAR-4, PAR-12, phase-5 design C43): a provider forward reaches the provider
+// byte for byte and is listed, and a target drop removes a member, with no
+// alias rule; a target of a provider that never declared the key is skipped
+// for it; an alias none of whose targets declares it answers 400 with no
+// call; a provider drop on a contractual key is refused, naming the
+// capability to declare false instead.
+func TestProviderKnowledge(t *testing.T) {
+	f := newFixture(t)
+	mock := mockprovider.New()
+	srv := httptest.NewServer(mock)
+	t.Cleanup(srv.Close)
+	config := strings.ReplaceAll(`version: 1
+providers:
+  router: { protocol: openai, base_url: MOCK, billing: none, allow_private_network: true, params: { provider: forward } }
+  local: { protocol: openai, base_url: MOCK, billing: none, allow_private_network: true }
+targets:
+  router/m: { kind: chat, params: { temperature: drop } }
+  local/m: { kind: chat }
+models:
+  routed: { targets: [router/m] }
+  second: { targets: [local/m, router/m] }
+  plain: { targets: [local/m] }
+keys:
+  agent: { models: ["*"] }
+`, "MOCK", srv.URL)
+	tokens := f.apply(t, config)
+	auth := "Bearer " + tokens["agent"]
+	const extra = `,"provider":{"order":["a", "b"]},"temperature":0.5`
+	for _, tc := range []struct {
+		alias, target, changed, upstream string
+		status                           int
+	}{
+		{"routed", "router/m", "provider:forwarded,temperature:dropped", chatBody("m", `,"provider":{"order":["a", "b"]}`), 200},
+		{"second", "router/m", "provider:forwarded,temperature:dropped", chatBody("m", `,"provider":{"order":["a", "b"]}`), 200},
+		{"plain", "", "", "", 400},
+	} {
+		before := len(mock.Calls())
+		w := f.chat(auth, chatBody(tc.alias, extra))
+		h, calls := w.Header(), mock.Calls()[before:]
+		if w.Code != tc.status || h.Get(targetHeader) != tc.target || h.Get(changedHeader) != tc.changed {
+			t.Errorf("%s: %d target %q changed %q: %s", tc.alias, w.Code, h.Get(targetHeader), h.Get(changedHeader), w.Body)
+		}
+		switch {
+		case tc.upstream == "" && (len(calls) != 0 || !strings.Contains(w.Body.String(), `"param":"provider","code":"unknown_parameter"`)):
+			t.Errorf("%s: %d calls: %s", tc.alias, len(calls), w.Body)
+		case tc.upstream != "" && (len(calls) != 1 || string(calls[0].Body) != tc.upstream):
+			t.Errorf("%s: calls %+v", tc.alias, calls)
+		}
+	}
+
+	w := call(f.admin, "Bearer "+adminKey, http.MethodPost, "/admin/v1/apply",
+		[]byte(strings.Replace(config, "params: { provider: forward }", "params: { tools: drop }", 1)))
+	if w.Code == http.StatusOK || !strings.Contains(w.Body.String(), "capabilities.tools") {
+		t.Errorf("a provider drop on tools: %d %s", w.Code, w.Body)
+	}
+}
+
+// TestRefusalLine: the request line of a refused request names the parameter
+// at fault (OPS-9); a served one names none; the client's 400 is unchanged.
+func TestRefusalLine(t *testing.T) {
+	f := newFixture(t)
+	mock := mockprovider.New()
+	srv := httptest.NewServer(mock)
+	t.Cleanup(srv.Close)
+	tokens := f.apply(t, strings.Replace(chatConfig, "MOCK", srv.URL, 1))
+	auth := "Bearer " + tokens["agent"]
+	for _, tc := range []struct {
+		body, param, answer string
+	}{
+		{chatBody("plain", `,"x_other":1`), "x_other",
+			`{"error":{"message":"Unknown parameter: 'x_other'.","type":"invalid_request_error","param":"x_other","code":"unknown_parameter"}}`},
+		{chatBody("notools", `,"tools":[{"type":"function","function":{"name":"f"}}]`), "tools", ""},
+		{chatBody("plain", ""), "", mockReply},
+	} {
+		w := f.chat(auth, tc.body)
+		if tc.answer != "" && strings.TrimSpace(w.Body.String()) != tc.answer {
+			t.Errorf("answer %s, want %s", w.Body, tc.answer)
+		}
+		type requestLine struct {
+			Msg       string
+			Param     *string
+			RequestID string `json:"request_id"`
+		}
+		var line requestLine
+		for _, l := range strings.Split(strings.TrimSpace(f.log.String()), "\n") {
+			if err := json.Unmarshal([]byte(l), &line); err == nil && line.Msg == "request" && line.RequestID == w.Header().Get(domain.RequestIDHeader) {
+				break
+			}
+			line = requestLine{}
+		}
+		switch {
+		case line.Msg == "":
+			t.Errorf("%s: no request line", tc.body)
+		case tc.param == "" && line.Param != nil, tc.param != "" && (line.Param == nil || *line.Param != tc.param):
+			t.Errorf("%s: param %v, want %q", tc.body, line.Param, tc.param)
+		}
+	}
+}
+
 // TestChatLimits: a body over max_body_bytes is 413 before anything else is
 // read (LIM-6), and a 2xx over max_response_bytes is 502 (RES-4).
 func TestChatLimits(t *testing.T) {

@@ -9,7 +9,9 @@
 // phase-3 design section 17, point 9): stream_usage and gen_ai_provider stay
 // undeclared where the documentation does not settle them, and deepinfra
 // declares no cost report, because the cost its examples carry is an estimate,
-// not the billed figure USE-6 trusts.
+// not the billed figure USE-6 trusts. Only mistral carries a params rule, the
+// output_dimension kick-off section 7.2 states; any other waits for its
+// provider's documentation to be re-read and a contract run.
 // No preset sets allow_private_network.
 package presets
 
@@ -81,6 +83,7 @@ var Catalog = []Preset{
 	{Name: "mistral", Untested: true, Provider: domain.Provider{
 		Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.mistral.ai/v1", APIKeyEnv: "MISTRAL_API_KEY", Billing: domain.BillingPayPerUse,
 		StreamUsage: domain.StreamUsageNative, GenAIProvider: "mistral",
+		Params: map[string]string{"output_dimension": domain.ParamForward}, // embeddings (kick-off section 7.2)
 	}},
 	{Name: "groq", Untested: true, Provider: domain.Provider{
 		Protocol: domain.ProtocolOpenAI, BaseURL: "https://api.groq.com/openai/v1", APIKeyEnv: "GROQ_API_KEY", Billing: domain.BillingPayPerUse,

@@ -48,7 +48,7 @@ func runTo(t *testing.T, ep domain.Endpoint, p *domain.Provider, body string, m 
 	if e != nil {
 		t.Fatalf("scan %s: %+v", body, e)
 	}
-	c, de := Check(ep, b, m)
+	c, de := Check(ep, b, m, nil)
 	if de != nil {
 		t.Fatalf("check %s: %+v", body, de)
 	}
@@ -278,8 +278,9 @@ func TestProviderDefault(t *testing.T) {
 }
 
 // TestCaps is the PAR-6 table of AC-10: a cap is sent only from the client or
-// the alias, never lowered, under the client's own names or the target's
-// output_cap_param toward openai and as max_tokens toward anthropic.
+// the alias, never lowered; toward openai every cap under the output_cap_param
+// a target declares, else a client's under its own names and an alias's as
+// max_tokens; as max_tokens toward anthropic.
 func TestCaps(t *testing.T) {
 	const msgs = `"messages":[{"role":"user","content":"hi"}]`
 	for _, tt := range []struct {
@@ -300,8 +301,24 @@ func TestCaps(t *testing.T) {
 			`{"model":"up-1",` + msgs + `,"max_tokens":1000}`, "max_tokens:added", -1, 1000, "", 1000},
 		{"alias cap under output_cap_param", "chat", `{"model":"a",` + msgs + `}`, 1000, domain.Target{OutputCapParam: "max_completion_tokens"},
 			`{"model":"up-1",` + msgs + `,"max_completion_tokens":1000}`, "max_completion_tokens:added", -1, 1000, "", 1000},
-		{"client cap kept under its name", "chat", `{"model":"a",` + msgs + `,"max_tokens":500}`, 1000, domain.Target{OutputCapParam: "max_completion_tokens"},
-			`{"model":"up-1",` + msgs + `,"max_tokens":500}`, "", 500, 500, "", 1000},
+		// K3: toward a declared output_cap_param the client's cap is one member under that name.
+		{"client cap under the declared name", "chat", `{"model":"a",` + msgs + `,"max_tokens":500}`, 1000, domain.Target{OutputCapParam: "max_completion_tokens"},
+			`{"model":"up-1",` + msgs + `,"max_completion_tokens":500}`, "max_tokens:translated", 500, 500, "", 1000},
+		{"both names toward a declared name: the larger under it", "chat", `{"model":"a",` + msgs + `,"max_tokens":900,"max_completion_tokens":300}`, 1000,
+			domain.Target{OutputCapParam: "max_completion_tokens"},
+			`{"model":"up-1",` + msgs + `,"max_completion_tokens":900}`, "max_tokens:translated", 900, 900, "", 1000},
+		{"both names toward a declared max_tokens", "chat", `{"model":"a",` + msgs + `,"max_tokens":300,"max_completion_tokens":900}`, 0,
+			domain.Target{OutputCapParam: "max_tokens"},
+			`{"model":"up-1",` + msgs + `,"max_tokens":900}`, "max_completion_tokens:translated", 900, 900, "", 0},
+		{"client max_completion_tokens toward a declared max_tokens", "chat", `{"model":"a",` + msgs + `,"max_completion_tokens":50}`, 0,
+			domain.Target{OutputCapParam: "max_tokens"},
+			`{"model":"up-1",` + msgs + `,"max_tokens":50}`, "max_completion_tokens:translated", 50, 50, "", 0},
+		{"client cap under a custom declared name", "chat", `{"model":"a",` + msgs + `,"max_tokens":77}`, 0, domain.Target{OutputCapParam: "max_new_tokens"},
+			`{"model":"up-1",` + msgs + `,"max_new_tokens":77}`, "max_tokens:translated", 77, 77, "", 0},
+		{"client cap already under the declared name", "chat", `{"model":"a",` + msgs + `,"max_completion_tokens":500}`, 1000, domain.Target{OutputCapParam: "max_completion_tokens"},
+			`{"model":"up-1",` + msgs + `,"max_completion_tokens":500}`, "", 500, 500, "", 1000},
+		{"undeclared: the client cap keeps its name", "chat", `{"model":"a",` + msgs + `,"max_completion_tokens":500}`, 1000, domain.Target{},
+			`{"model":"up-1",` + msgs + `,"max_completion_tokens":500}`, "", 500, 500, "", 1000},
 		{"client cap equal to the alias cap", "chat", `{"model":"a",` + msgs + `,"max_completion_tokens":1000}`, 1000, domain.Target{},
 			`{"model":"up-1",` + msgs + `,"max_completion_tokens":1000}`, "", 1000, 1000, "", 1000},
 		{"both names: the larger is requested, both forwarded", "chat", `{"model":"a",` + msgs + `,"max_tokens":900,"max_completion_tokens":300}`, 1000, domain.Target{},
@@ -331,6 +348,9 @@ func TestCaps(t *testing.T) {
 		{"one client cap member dropped by PAR-12: the other is forwarded", "chat", `{"model":"a",` + msgs + `,"max_tokens":900,"max_completion_tokens":300}`, 1000,
 			domain.Target{UnsupportedParams: []string{"max_tokens"}},
 			`{"model":"up-1",` + msgs + `,"max_completion_tokens":300}`, "max_tokens:dropped", 900, 300, "", 1000},
+		{"one client cap member dropped by PAR-12, toward a declared name: the larger value under it", "chat", `{"model":"a",` + msgs + `,"max_tokens":900,"max_completion_tokens":300}`, 1000,
+			domain.Target{OutputCapParam: "max_completion_tokens", UnsupportedParams: []string{"max_tokens"}},
+			`{"model":"up-1",` + msgs + `,"max_completion_tokens":900}`, "max_tokens:dropped,max_completion_tokens:translated", 900, 900, "", 1000},
 		{"one client cap member dropped by PAR-12, no alias cap: the requested cap is checked", "chat", `{"model":"a",` + msgs + `,"max_tokens":900,"max_completion_tokens":300}`, 0,
 			domain.Target{MaxOutputTokens: 500, UnsupportedParams: []string{"max_tokens"}},
 			"", "", 0, 0, "max_output_tokens_exceeded", 0},
@@ -417,7 +437,7 @@ func TestSkips(t *testing.T) {
 			if e != nil {
 				t.Fatal(e)
 			}
-			c, de := Check(tt.ep, b, tt.m)
+			c, de := Check(tt.ep, b, tt.m, nil)
 			if de != nil {
 				t.Fatal(de)
 			}
@@ -530,12 +550,137 @@ func TestRules(t *testing.T) {
 	}
 }
 
+// TestTargetRules is the predicate of phase-5 design section 4.1 (PAR-2,
+// PAR-12): the rule of the target, else of its provider, is a fact about the
+// target, the alias's a policy, and between the two a drop wins; a key no
+// rule lets through toward this target skips it. Check takes every key the
+// target and its provider declare, and the one another target declares.
+func TestTargetRules(t *testing.T) {
+	const msgs = `"messages":[{"role":"user","content":"hi"}]`
+	type rules = map[string]string
+	fwd, drop := domain.ParamForward, domain.ParamDrop
+	for _, tt := range []struct {
+		name                    string
+		ep                      domain.Endpoint
+		anthropic               bool
+		usage                   string // the provider's stream_usage
+		extra                   string // members after messages, or after input on embeddings
+		provider, target, alias rules
+		unsupported             []string
+		elsewhere               string // a key another target of the alias declares
+		want, changes, skip     string // want: the members sent after messages; "-" for any body
+	}{
+		{name: "reference key, no rule", extra: `,"temperature":0.5`, want: `,"temperature":0.5`},
+		{name: "reference key, an alias drop alone", extra: `,"temperature":0.5`, alias: rules{"temperature": drop}, want: `,"temperature":0.5`},
+		{name: "reference key, a target drop", extra: `,"temperature":0.5,"top_p":1`, target: rules{"temperature": drop}, want: `,"top_p":1`, changes: "temperature:dropped"},
+		{name: "reference key, a provider drop", extra: `,"temperature":0.5`, provider: rules{"temperature": drop}, alias: rules{"temperature": fwd}, want: ``, changes: "temperature:dropped"},
+		{name: "reference key, a target forward over a provider drop", extra: `,"temperature":0.5`, provider: rules{"temperature": drop}, target: rules{"temperature": fwd},
+			want: `,"temperature":0.5`},
+		{name: "reference key, unsupported", extra: `,"temperature":0.5`, unsupported: []string{"temperature"}, skip: "temperature"},
+		{name: "reference key, unsupported and an alias drop", extra: `,"temperature":0.5`, unsupported: []string{"temperature"}, alias: rules{"temperature": drop},
+			want: ``, changes: "temperature:dropped"},
+		{name: "unknown key, a provider forward", extra: `,"x_p":{"a":[1, 2]}`, provider: rules{"x_p": fwd}, want: `,"x_p":{"a":[1, 2]}`, changes: "x_p:forwarded"},
+		{name: "unknown key, a target forward and an alias forward", extra: `,"x_p":1`, target: rules{"x_p": fwd}, alias: rules{"x_p": fwd}, want: `,"x_p":1`, changes: "x_p:forwarded"},
+		{name: "unknown key, a target forward over a provider drop", extra: `,"x_p":1`, provider: rules{"x_p": drop}, target: rules{"x_p": fwd}, want: `,"x_p":1`, changes: "x_p:forwarded"},
+		{name: "unknown key, a provider forward and an alias drop", extra: `,"x_p":1`, provider: rules{"x_p": fwd}, alias: rules{"x_p": drop}, want: ``, changes: "x_p:dropped"},
+		{name: "unknown key, a target drop and an alias forward", extra: `,"x_p":1`, target: rules{"x_p": drop}, alias: rules{"x_p": fwd}, want: ``, changes: "x_p:dropped"},
+		{name: "unknown key, a provider drop", extra: `,"x_p":1`, provider: rules{"x_p": drop}, want: ``, changes: "x_p:dropped"},
+		{name: "unknown key, an alias forward", extra: `,"x_p":1`, alias: rules{"x_p": fwd}, want: `,"x_p":1`, changes: "x_p:forwarded"},
+		{name: "unknown key, an alias drop", extra: `,"x_p":1`, alias: rules{"x_p": drop}, want: ``, changes: "x_p:dropped"},
+		{name: "unknown key another target declares", extra: `,"x_p":1`, elsewhere: "x_p", skip: "x_p"},
+		{name: "unknown key another target declares, a provider forward on another key", extra: `,"x_p":1`, provider: rules{"x_q": fwd}, elsewhere: "x_p", skip: "x_p"},
+		{name: "no equivalent toward anthropic, a target forward", anthropic: true, extra: `,"max_tokens":10,"seed":1`, target: rules{"seed": fwd}, skip: "seed"},
+		{name: "no equivalent toward anthropic, a provider drop", anthropic: true, extra: `,"max_tokens":10,"seed":1`, provider: rules{"seed": drop},
+			want: "-", changes: "protocol:translated,seed:dropped"},
+		{name: "embeddings, a provider forward", ep: domain.EndpointEmbeddings, extra: `,"output_dimension":256`, provider: rules{"output_dimension": fwd},
+			want: `,"output_dimension":256`, changes: "output_dimension:forwarded"},
+		{name: "embeddings, a target drop", ep: domain.EndpointEmbeddings, extra: `,"encoding_format":"base64"`, target: rules{"encoding_format": drop},
+			want: ``, changes: "encoding_format:dropped"},
+		// The proxy's own include_usage asks the same refuses as the client's member.
+		{name: "stream_options dropped at a request provider", usage: domain.StreamUsageRequest, extra: `,"stream":true,"stream_options":{"include_usage":false}`,
+			target: rules{"stream_options": drop}, want: `,"stream":true`, changes: "stream_options:dropped"},
+		{name: "stream_options dropped by the provider, not written", usage: domain.StreamUsageRequest, extra: `,"stream":true`,
+			provider: rules{"stream_options": drop}, want: `,"stream":true`},
+		{name: "stream_options written at a request provider (control)", usage: domain.StreamUsageRequest, extra: `,"stream":true,"stream_options":{"include_usage":false}`,
+			want: `,"stream":true,"stream_options":{"include_usage":true}`, changes: "stream_options:translated"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ep, protocol := cmp.Or(tt.ep, domain.EndpointChat), domain.ProtocolOpenAI
+			if tt.anthropic {
+				protocol = domain.ProtocolAnthropic
+			}
+			p := &domain.Provider{Protocol: protocol, BaseURL: "https://api.example.com/v1", StreamUsage: tt.usage, Params: tt.provider}
+			tg := domain.Target{Kind: domain.KindChat, UnsupportedParams: tt.unsupported, Params: tt.target}
+			head := `{"model":"a",` + msgs
+			if ep == domain.EndpointEmbeddings {
+				tg.Kind, head = domain.KindEmbeddings, `{"model":"a","input":"x"`
+			}
+			declared := map[string]bool{tt.elsewhere: tt.elsewhere != ""}
+			for k := range tt.provider {
+				declared[k] = true
+			}
+			for k := range tt.target {
+				declared[k] = true
+			}
+			s, _, _ := schema(ep)
+			b, e := params.Scan([]byte(head+tt.extra+"}"), s.Walk)
+			if e != nil {
+				t.Fatal(e)
+			}
+			m := &domain.Model{Params: tt.alias}
+			c, de := Check(ep, b, m, declared)
+			if de != nil {
+				t.Fatal(de)
+			}
+			out, skip := Build(Input{Endpoint: ep, Body: b, Model: m, Upstream: "up-1", Target: &tg, Provider: p, Client: c})
+			if tt.skip != "" {
+				if out != nil || skip == nil || skip.Code != domain.CodeUnsupportedParameter || skip.Param != tt.skip {
+					t.Fatalf("got %+v, %+v; want a skip on %s", out, skip, tt.skip)
+				}
+				return
+			}
+			if skip != nil {
+				t.Fatal(skip)
+			}
+			want := strings.Replace(head, `"a"`, `"up-1"`, 1) + tt.want + "}"
+			if tt.want == "-" {
+				want = string(out.Body)
+				if bytes.Contains(out.Body, []byte(`"seed"`)) {
+					t.Errorf("seed sent: %s", out.Body)
+				}
+			}
+			if string(out.Body) != want || Header(out.Changes) != tt.changes {
+				t.Errorf("got %s %q, want %s %q", out.Body, Header(out.Changes), want, tt.changes)
+			}
+		})
+	}
+}
+
+// TestCheckDeclared: a key a rule of a target or of its provider names passes
+// Check; one nobody declared is 400 unknown_parameter with its name; nil
+// declared refuses it (the proxy's own bodies).
+func TestCheckDeclared(t *testing.T) {
+	b, e := params.Scan([]byte(`{"model":"a","messages":[{"role":"user","content":"hi"}],"provider":{"order":["x"]}}`), params.Chat.Walk)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if _, de := Check(domain.EndpointChat, b, nil, map[string]bool{"provider": true}); de != nil {
+		t.Errorf("declared: %+v", de)
+	}
+	for _, declared := range []map[string]bool{{"transforms": true}, nil} {
+		if _, de := Check(domain.EndpointChat, b, &domain.Model{}, declared); de == nil || de.Code != domain.CodeUnknownParameter || de.Param != "provider" ||
+			de.Message != "Unknown parameter: 'provider'." {
+			t.Errorf("declared %v: %+v", declared, de)
+		}
+	}
+}
+
 // TestQuoting: the upstream id and a level from the declarations are quoted as
 // JSON, whatever characters a valid configuration lets them hold.
 func TestQuoting(t *testing.T) {
 	b, _ := params.Scan([]byte(chatBody("")), params.Chat.Walk)
 	m := &domain.Model{Reasoning: domain.ModelReasoning{Effort: "high", Mode: "default"}}
-	c, _ := Check("chat", b, m)
+	c, _ := Check("chat", b, m, nil)
 	tg := domain.Target{Kind: domain.KindChat, Reasoning: &domain.Reasoning{Dialect: "reasoning_effort", Map: map[string]string{"high": "h\a"}}}
 	out, skip := Build(Input{Endpoint: "chat", Body: b, Model: m, Upstream: "p/m\a\U000E0001", Target: &tg, Provider: openai, Client: c})
 	if skip != nil {
@@ -555,7 +700,7 @@ func TestURLAndHeaders(t *testing.T) {
 	}
 	s, _, _ := schema("messages")
 	b, _ := params.Scan([]byte(messagesBody("")), s.Walk)
-	c, _ := Check("messages", b, nil)
+	c, _ := Check("messages", b, nil, nil)
 	tg := domain.Target{Kind: domain.KindChat}
 	for _, tt := range []struct {
 		in            http.Header
@@ -751,7 +896,7 @@ func TestCheck(t *testing.T) {
 		if se != nil {
 			t.Fatalf("%s: %+v", tt.body, se)
 		}
-		c, e := Check(tt.ep, b, rules)
+		c, e := Check(tt.ep, b, rules, nil)
 		if c != nil || e == nil || e.Code != tt.code || e.Param != tt.param || e.Status != tt.status {
 			t.Errorf("%s %s: got %+v, want %s %s", tt.ep, tt.body, e, tt.code, tt.param)
 		}
@@ -780,7 +925,7 @@ func TestCheckReads(t *testing.T) {
 		if se != nil {
 			t.Fatal(se)
 		}
-		c, e := Check(tt.ep, b, &domain.Model{MaxOutputTokens: 10, Params: map[string]string{"x_tag": "forward"}})
+		c, e := Check(tt.ep, b, &domain.Model{MaxOutputTokens: 10, Params: map[string]string{"x_tag": "forward"}}, nil)
 		if e != nil {
 			t.Fatalf("%s: %+v", tt.body, e)
 		}
@@ -788,7 +933,7 @@ func TestCheckReads(t *testing.T) {
 			t.Errorf("%s: got %+v cap %d", tt.body, c, *c.Cap)
 		}
 	}
-	if _, e := Check("unknown", nil, nil); e == nil || e.Code != "internal_error" {
+	if _, e := Check("unknown", nil, nil, nil); e == nil || e.Code != "internal_error" {
 		t.Errorf("an endpoint not served: %+v", e)
 	}
 }
@@ -955,7 +1100,7 @@ func TestCheckEmbeddings(t *testing.T) {
 		{`{"model":"a","input":"hi","max_tokens":1}`, "max_tokens"},
 		{`{"model":"a","input":"hi","reasoning_effort":"low"}`, "reasoning_effort"},
 	} {
-		c, e := Check(domain.EndpointEmbeddings, scan(tt.body), rules)
+		c, e := Check(domain.EndpointEmbeddings, scan(tt.body), rules, nil)
 		if c != nil || e == nil || e.Code != "unknown_parameter" || e.Param != tt.param || e.Status != 400 {
 			t.Errorf("%s: got %+v, %+v", tt.body, c, e)
 		}
@@ -964,7 +1109,7 @@ func TestCheckEmbeddings(t *testing.T) {
 		`{"model":"a","input":"hi","dimensions":"x","encoding_format":7,"user":null,"input_type":"q"}`,
 		`{"model":"a"}`,
 	} {
-		c, e := Check(domain.EndpointEmbeddings, scan(body), rules)
+		c, e := Check(domain.EndpointEmbeddings, scan(body), rules, nil)
 		if e != nil || c == nil || *c != (Client{}) {
 			t.Errorf("%s: got %+v, %+v", body, c, e)
 		}
@@ -991,7 +1136,7 @@ func TestCheckRerank(t *testing.T) {
 		if e != nil {
 			t.Fatalf("%s: %+v", body, e)
 		}
-		c, de := Check(domain.EndpointRerank, b, strict)
+		c, de := Check(domain.EndpointRerank, b, strict, nil)
 		if de != nil || c == nil || *c != (Client{}) {
 			t.Errorf("%s: got %+v, %+v", body, c, de)
 		}

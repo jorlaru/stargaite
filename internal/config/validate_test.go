@@ -546,6 +546,39 @@ func TestValidate(t *testing.T) {
 		{"PAR-2 rule outside the enumeration", func(d *domain.Document) {
 			edit(d.Models, "fast", func(m *domain.Model) { m.Params["enable_search"] = "keep" })
 		}, []string{"error PAR-2 invalid_value models/fast params.enable_search"}},
+		// Provider and target rules (phase-5 design C43).
+		{"PAR-2 provider and target rules outside the enumeration", func(d *domain.Document) {
+			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.Params = map[string]string{"provider": "keep"} })
+			edit(d.Targets, qw, func(t *domain.Target) { t.Params = map[string]string{"transforms": ""} })
+		}, []string{"error PAR-2 invalid_value providers/openrouter params.provider", "error PAR-2 required targets/" + qw + " params.transforms"}},
+		{"PAR-2 a provider forward naming a target's dialect key", func(d *domain.Document) {
+			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.Params = map[string]string{"reasoning": "forward", "provider": "forward"} })
+		}, []string{"error PAR-2 param_collision providers/openrouter params.reasoning"}},
+		{"PAR-2 the target's own rule replaces its provider's forward", func(d *domain.Document) {
+			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.Params = map[string]string{"reasoning": "forward"} })
+			edit(d.Targets, qw, func(t *domain.Target) { t.Params = map[string]string{"reasoning": "drop"} })
+		}, nil},
+		{"PAR-2 a target forward naming its cap parameter", func(d *domain.Document) {
+			edit(d.Targets, qw, func(t *domain.Target) { t.Params = map[string]string{"max_tokens": "forward"} })
+		}, []string{"error PAR-2 param_collision targets/" + qw + " params.max_tokens"}},
+		{"PAR-12 a target forward on a key it lists unsupported", func(d *domain.Document) {
+			edit(d.Targets, qw, func(t *domain.Target) {
+				t.Params, t.UnsupportedParams = map[string]string{"top_k": "forward"}, []string{"top_k"}
+			})
+		}, []string{"error PAR-12 invalid_value targets/" + qw + " params.top_k"}},
+		{"PAR-4 a provider or target drop on a contractual key", func(d *domain.Document) {
+			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.Params = map[string]string{"tools": "drop"} })
+			edit(d.Targets, sn, func(t *domain.Target) { t.Params = map[string]string{"response_format": "drop"} })
+		}, []string{"error PAR-4 invalid_value providers/openrouter params.tools", "error PAR-4 invalid_value targets/" + sn + " params.response_format"}},
+		{"PAR-4 a provider drop on another key, an alias drop on a contractual key", func(d *domain.Document) {
+			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.Params = map[string]string{"temperature": "drop"} })
+			edit(d.Models, "fast", func(m *domain.Model) { m.Params["tools"] = "drop" })
+		}, nil},
+		{"PAR-2 a target drop on a key the proxy writes", func(d *domain.Document) {
+			edit(d.Targets, qw, func(t *domain.Target) {
+				t.Params = map[string]string{"max_tokens": "drop", "stream_options": "drop", "reasoning": "drop"}
+			})
+		}, nil},
 		{"RSN-5 effort outside the scale", func(d *domain.Document) {
 			edit(d.Models, "fast", func(m *domain.Model) { m.Reasoning.Effort = "default" })
 		}, []string{"error RSN-5 invalid_value models/fast reasoning.effort"}},

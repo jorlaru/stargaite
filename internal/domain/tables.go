@@ -105,6 +105,17 @@ const (
 	DefaultDialect        = DialectNone  // RSN-2: a target that declares no dialect sends no reasoning control
 )
 
+// ContractParams maps each top-level key PAR-4 reads a contractual feature
+// from (params.Detect) to the capability it carries. A provider or a target
+// never declares drop for one: a target that cannot honour the feature
+// declares the capability false (PAR-2, PAR-4).
+var ContractParams = map[string]string{
+	"tools":           CapabilityTools,
+	"tool_choice":     CapabilityTools,
+	"response_format": CapabilityStructuredOutput,
+	"output_config":   CapabilityStructuredOutput,
+}
+
 var nameSyntax = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 // ValidName reports whether s can name a provider, a model alias or a key.

@@ -1185,4 +1185,24 @@ func TestVerified(t *testing.T) {
 	if got := summary(s.Snapshot().Findings); !slices.Equal(got, []string{"warning RSN-9 target_unverified targets/p/m ", "warning RSN-9 target_unverified targets/p/n "}) {
 		t.Errorf("findings %q", got)
 	}
+
+	// A rule of the alias keeps it; a rule of the provider clears it for every
+	// target of the provider (phase-5 design C43).
+	provider = s.Snapshot().Providers["p"].Spec
+	if !verify("p/m", s.Snapshot().Targets["p/m"].Spec, true) || !verify("p/n", s.Snapshot().Targets["p/n"].Spec, true) {
+		t.Fatal("runs not stored")
+	}
+	commit(t, s, change("models set fast", func(st *State) {
+		edit(st.Doc.Models, "fast", func(m *domain.Model) { m.Params = map[string]string{"x_tag": "forward"} })
+	}))
+	if len(s.Snapshot().Verified) != 2 {
+		t.Errorf("a rule of an alias cleared results: %v", s.Snapshot().Verified)
+	}
+	commit(t, s, change("providers set p", func(st *State) {
+		edit(st.Doc.Providers, "p", func(p *domain.Provider) { p.Params = map[string]string{"x_tag": "forward"} })
+	}))
+	if len(s.Snapshot().Verified) != 0 {
+		t.Errorf("a rule of the provider kept results: %v", s.Snapshot().Verified)
+	}
+	wantRows(t, "columns after the provider rule", columns(), []string{"p/m - -", "p/n - -"})
 }

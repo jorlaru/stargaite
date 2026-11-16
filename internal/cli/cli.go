@@ -115,6 +115,7 @@ var providerFlags = []flagSpec{
 	{"gen-ai-provider", kindString, "gen_ai_provider", "the provider's well-known name for telemetry"},
 	{"target-defaults", kindStringPairs, "target_defaults", "dialect=<dialect>,output_cap_param=<name>: what a new target starts with"},
 	{"allow-private-network", kindBool, "allow_private_network", "allow plain HTTP, loopback and private addresses"},
+	{"param", kindStringPairs, "params", "<parameter>=<forward|drop>: what every target of the provider accepts beyond the reference, or refuses"},
 }
 
 // targetFlags are the fields of a target (kick-off section 6), with the
@@ -123,7 +124,7 @@ var targetFlags = []flagSpec{
 	{"kind", kindString, "kind", "chat, embeddings or rerank"},
 	{"capabilities", kindTypedPairs, "capabilities", "tools=<true|false>,structured_output=...,strict_schema=...,vision=..."},
 	{"max-output-tokens", kindNumber, "max_output_tokens", "the model's own output limit"},
-	{"output-cap-param", kindString, "output_cap_param", "the parameter an alias cap is sent as toward an openai target"},
+	{"output-cap-param", kindString, "output_cap_param", "the parameter every cap is sent as toward an openai target"},
 	{"dialect", kindString, "reasoning.dialect", "the reasoning dialect"},
 	{"level", kindList, "reasoning.levels", "a level the provider accepts, repeated in scale order"},
 	{"can-disable", kindBool, "reasoning.can_disable", "whether reasoning can be turned off"},
@@ -135,6 +136,7 @@ var targetFlags = []flagSpec{
 	{"unsupported-param", kindList, "unsupported_params", "a parameter the target does not accept, repeated"},
 	{"response-model", kindList, "response_models", "a model name the provider may answer with, repeated"},
 	{"inline-think-tags", kindBool, "inline_think_tags", "remove <think> blocks from the visible content"},
+	{"param", kindStringPairs, "params", "<parameter>=<forward|drop>: what the target accepts beyond the reference, or refuses; wins over its provider's"},
 }
 
 // modelFlags are the fields of a model alias (kick-off section 6).

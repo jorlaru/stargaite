@@ -141,7 +141,10 @@
 		"api_key_env": "MISTRAL_API_KEY",
 		"billing": "pay_per_use",
 		"stream_usage": "native",
-		"gen_ai_provider": "mistral"
+		"gen_ai_provider": "mistral",
+		"params": {
+			"output_dimension": "forward"
+		}
 	},
 	{
 		"name": "groq",

@@ -62,6 +62,23 @@ func (r *report) nonNegative(rule, resource, field string, v int64) {
 	}
 }
 
+// rules checks the params of an alias, or with fact those of a provider or
+// a target (PAR-2): each rule is forward or drop; a fact never drops a key
+// that carries a contractual feature (PAR-4), nor forwards one the same
+// target lists in unsupported.
+func (r *report) rules(resource string, rules map[string]string, fact bool, unsupported []string) {
+	for _, k := range slices.Sorted(maps.Keys(rules)) {
+		r.oneOf("PAR-2", resource, "params."+k, rules[k], true, domain.ParamForward, domain.ParamDrop)
+		switch c := domain.ContractParams[k]; {
+		case fact && c != "" && rules[k] == domain.ParamDrop:
+			r.fail("PAR-4", "invalid_value", resource, "params."+k,
+				"a drop rule may not name %s, which carries a contractual feature: declare capabilities.%s false instead", k, c)
+		case rules[k] == domain.ParamForward && slices.Contains(unsupported, k):
+			r.fail("PAR-12", "invalid_value", resource, "params."+k, "a forward rule may not name %.64q, which unsupported_params lists", k)
+		}
+	}
+}
+
 func (r *report) budget(resource, field string, b *domain.Budget) {
 	if b == nil {
 		return
@@ -322,6 +339,7 @@ func validateProvider(r *report, name string, p domain.Provider, usageDays int64
 	}
 	r.oneOf("USE-8", res, "stream_usage", p.StreamUsage, false, domain.StreamUsageRequest, domain.StreamUsageNative, domain.StreamUsageNone)
 	r.oneOf("RSN-2", res, "target_defaults.dialect", p.TargetDefaults.Dialect, false, slices.Sorted(maps.Keys(domain.DialectKeys))...)
+	r.rules(res, p.Params, true, nil)
 }
 
 func validateTarget(r *report, doc *domain.Document, id string, scopes map[string]string) {
@@ -334,6 +352,23 @@ func validateTarget(r *report, doc *domain.Document, id string, scopes map[strin
 	}
 	r.oneOf("OPS-5", res, "kind", t.Kind, true, domain.KindChat, domain.KindEmbeddings, domain.KindRerank)
 	r.nonNegative("PAR-6", res, "max_output_tokens", t.MaxOutputTokens)
+	r.rules(res, t.Params, true, t.UnsupportedParams)
+	// A forward rule of the target, or one of its provider that the target
+	// does not replace, may not name a key the proxy writes toward it (PAR-2).
+	p, ok := doc.Providers[provider]
+	if ok {
+		keys := written(t, p.Protocol)
+		for _, k := range slices.Sorted(maps.Keys(t.Params)) {
+			if t.Params[k] == domain.ParamForward && slices.Contains(keys, k) {
+				r.fail("PAR-2", "param_collision", res, "params."+k, "a forward rule may not name %.64q: the proxy writes it toward target %s", k, id)
+			}
+		}
+		for _, k := range slices.Sorted(maps.Keys(p.Params)) {
+			if t.Params[k] == "" && p.Params[k] == domain.ParamForward && slices.Contains(keys, k) {
+				r.fail("PAR-2", "param_collision", "providers/"+provider, "params."+k, "a forward rule may not name %.64q: the proxy writes it toward target %s", k, id)
+			}
+		}
+	}
 
 	if rs := t.Reasoning; rs != nil {
 		validateReasoning(r, res, rs)
@@ -359,7 +394,6 @@ func validateTarget(r *report, doc *domain.Document, id string, scopes map[strin
 	}
 
 	// USE-12: a pay-per-use target that nothing can price.
-	p, ok := doc.Providers[provider]
 	if !ok || p.Billing != domain.BillingPayPerUse || t.Pricing != nil {
 		return
 	}
@@ -514,9 +548,7 @@ func validateModel(r *report, doc *domain.Document, name string) {
 		r.fail("RSN-5", "required", res, "reasoning.effort", "reasoning.mode needs a reasoning.effort")
 	}
 	r.nonNegative("PAR-6", res, "max_output_tokens", m.MaxOutputTokens)
-	for _, p := range slices.Sorted(maps.Keys(m.Params)) {
-		r.oneOf("PAR-2", res, "params."+p, m.Params[p], true, domain.ParamForward, domain.ParamDrop)
-	}
+	r.rules(res, m.Params, false, nil)
 	r.scope(res, m.Budget, m.RPMLimit, m.TPMLimit, m.MaxParallelRequests, m.TraceSampleRate)
 	if len(m.Targets) > 3 {
 		return // refused as too_many_targets: a long list costs no more than that one finding

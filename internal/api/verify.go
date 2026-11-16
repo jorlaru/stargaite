@@ -93,7 +93,7 @@ func Verify(d Deps) func(ctx context.Context, target string, maxOutput *int64) (
 				return refused("level %.64q cannot be sent: %s", level, pe.Message)
 			}
 			var e *domain.Error
-			if p.client, e = plan.Check(domain.EndpointChat, p.body, m); e != nil {
+			if p.client, e = plan.Check(domain.EndpointChat, p.body, m, nil); e != nil { // the proxy's own body has no unknown key
 				return domain.Verification{}, e
 			}
 			var skip *plan.Skip

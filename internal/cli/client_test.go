@@ -325,6 +325,8 @@ func TestRequests(t *testing.T) {
 		},
 		{[]string{"providers", "set", "local", "--quota=", "--quota", "1d:requests=5"}, "PATCH", "/admin/v1/providers/local", `{"quota":[{"requests":5,"window":"1d"}]}`},
 		{[]string{"providers", "set", "local", "--allow-private-network="}, "PATCH", "/admin/v1/providers/local", `{"allow_private_network":null}`},
+		{[]string{"providers", "set", "local", "--param", "provider=forward", "--param", "seed=drop", "--param", "x="}, "PATCH", "/admin/v1/providers/local",
+			`{"params":{"provider":"forward","seed":"drop","x":null}}`},
 		{[]string{"providers", "remove", "local", "--yes"}, "DELETE", "/admin/v1/providers/local", ""},
 		{[]string{"targets", "list"}, "GET", "/admin/v1/targets", ""},
 		{
@@ -340,6 +342,7 @@ func TestRequests(t *testing.T) {
 		{[]string{"targets", "show", "openrouter/qwen/qwen-3.6-flash"}, "GET", "/admin/v1/targets/openrouter%2Fqwen%2Fqwen-3.6-flash", ""},
 		{[]string{"targets", "set", "p/a b%c/./d", "--level="}, "PATCH", "/admin/v1/targets/p%2Fa%20b%25c%2F.%2Fd", `{"reasoning":{"levels":null}}`},
 		{[]string{"targets", "set", "p/m", "--level", "x", "--level=", "--level", "y", "--reasoning-on="}, "PATCH", "/admin/v1/targets/p%2Fm", `{"reasoning":{"levels":["y"],"on":null}}`},
+		{[]string{"targets", "set", "p/m", "--param", "temperature=drop"}, "PATCH", "/admin/v1/targets/p%2Fm", `{"params":{"temperature":"drop"}}`},
 		{[]string{"targets", "remove", "p/m", "--yes"}, "DELETE", "/admin/v1/targets/p%2Fm", ""},
 		{[]string{"targets", "verify", "p/a b%c/./d"}, "POST", "/admin/v1/verify/p%2Fa%20b%25c%2F.%2Fd", `{}`},
 		{[]string{"targets", "verify", "p/m", "--max-output-tokens", "64"}, "POST", "/admin/v1/verify/p%2Fm", `{"max_output_tokens":64}`},

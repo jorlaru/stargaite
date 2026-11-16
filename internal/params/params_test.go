@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/jorlaru/stargaite/internal/domain"
 )
 
 // bs writes test bodies: "~" stands for a backslash, so escapes such as
@@ -419,6 +421,41 @@ func TestDetect(t *testing.T) {
 		}
 		if got := Detect(c.ep, b); got != c.want {
 			t.Errorf("%s %s: got %+v, want %+v", c.ep, c.body, got, c.want)
+		}
+	}
+
+	// Every feature but vision is read under a key of domain.ContractParams,
+	// which no provider or target may drop (PAR-4): without those keys, a
+	// body using every feature uses vision alone.
+	for ep, body := range map[string]string{
+		"chat": `{"tools":[{"function":{"strict":true}}],"tool_choice":"auto","response_format":{"type":"json_schema","json_schema":{"strict":true}},` +
+			`"messages":[{"content":[{"type":"image_url"}]}]}`,
+		"messages": `{"tools":[{"name":"t","strict":true}],"tool_choice":{"type":"auto"},"output_config":{"format":{"type":"json_schema"}},` +
+			`"messages":[{"content":[{"type":"image"}]}]}`,
+	} {
+		s := map[string]Schema{"chat": Chat, "messages": Messages}[ep]
+		b, e := Scan(bs(body), s.Walk)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if got := Detect(ep, b); got != (Features{Tools: true, Structured: true, Strict: true, Vision: true}) {
+			t.Fatalf("%s: every feature: got %+v", ep, got)
+		}
+		var ops []Op
+		for k := range domain.ContractParams {
+			if _, ok := b.Get(k); ok {
+				ops = append(ops, Op{Path: []string{k}})
+			}
+		}
+		raw, err := b.Edit(ops...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b, e = Scan(raw, s.Walk); e != nil {
+			t.Fatal(e)
+		}
+		if got := Detect(ep, b); got != vision {
+			t.Errorf("%s without the contractual keys: got %+v, want vision alone", ep, got)
 		}
 	}
 }

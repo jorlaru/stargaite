@@ -53,13 +53,15 @@ func capNames(ep domain.Endpoint) []string {
 
 // Check refuses a request before any target is tried (design section 5), for
 // a body scanned with the inbound walk of ep and the alias m, which may be
-// nil: an unknown top-level key without a rule, a type the proxy reads, an
+// nil: an unknown top-level key that no rule names, of the alias or in
+// declared (every key a rule of the alias's targets or their providers names;
+// nil refuses more, never less), a type the proxy reads, an
 // effort off the scale (RSN-11), a cap above the alias's (PAR-6). On
 // embeddings only the unknown key is refused, and the Client is empty: no
 // stream, effort, cap or feature (phase-4 design section 4). Rerank has no
 // schema: nothing is refused and the Client is empty, so a stream member is
 // forwarded and the answer read whole (phase-4 design section 5).
-func Check(ep domain.Endpoint, b *params.Body, m *domain.Model) (*Client, *domain.Error) {
+func Check(ep domain.Endpoint, b *params.Body, m *domain.Model, declared map[string]bool) (*Client, *domain.Error) {
 	if ep == domain.EndpointRerank {
 		return &Client{}, nil
 	}
@@ -69,7 +71,7 @@ func Check(ep domain.Endpoint, b *params.Body, m *domain.Model) (*Client, *domai
 	}
 	m = cmp.Or(m, &domain.Model{})
 	for _, k := range b.Keys() {
-		if !s.Known[k] && m.Params[k] == "" {
+		if !s.Known[k] && m.Params[k] == "" && !declared[k] {
 			e := domain.NewError(domain.CodeUnknownParameter, fmt.Sprintf("Unknown parameter: '%.200s'.", k))
 			e.Param = k
 			return nil, e
@@ -273,7 +275,7 @@ func Header(cs []Change) string {
 }
 
 // Build edits the inbound body for one target (design section 5): the
-// endpoint, PAR-4, the protocol mapping, the alias's rules and PAR-12, the
+// endpoint, PAR-4, the protocol mapping, the rules and PAR-12, the
 // cap, the reasoning edit and its side keys, and on a native chat stream the
 // include_usage a request provider needs (USE-8), in the order of Changes. Drops
 // are applied first, so the mapping, the cap and the reasoning edit see the
@@ -323,7 +325,7 @@ func Build(in Input) (*Outgoing, *Skip) {
 		translatedBody, noEquivalent, untranslatable = anthropic.FromChat(b)
 		out.Changes = append(out.Changes, Change{Name: "protocol", Action: reasoning.ActionTranslated})
 	}
-	drops, changes, skip := rules(b, m, t, s, noEquivalent)
+	drops, changes, skip := rules(b, m, t, p, s, noEquivalent)
 	if skip != nil {
 		return nil, skip
 	}
@@ -355,22 +357,38 @@ func Build(in Input) (*Outgoing, *Skip) {
 	}
 	ops := []params.Op{{Path: []string{"model"}, Value: model}}
 
-	capName := "max_tokens" // every cap toward anthropic (PAR-6)
+	capName, declared := "max_tokens", false // every cap toward anthropic (PAR-6)
 	if p.Protocol == domain.ProtocolOpenAI {
-		capName = cmp.Or(t.OutputCapParam, domain.DefaultOutputCapParam)
+		capName, declared = cmp.Or(t.OutputCapParam, domain.DefaultOutputCapParam), t.OutputCapParam != ""
 	}
 	// The requested cap is the client's even when a drop rule removed its
 	// members: it is checked and sent as is, and the alias cap only fills in
-	// for a client that sent none.
+	// for a client that sent none. Toward a target that declares its cap's
+	// name, the client's cap is one member under that name, holding the larger
+	// value the client sent; each member under another name is listed
+	// translated, or the declared name when a rule dropped them all.
 	switch kept, _ := largest(b, capNames(ep)); {
 	case c.Cap == nil && m.MaxOutputTokens > 0:
 		ops = append(ops, params.Op{Path: []string{capName}, Value: strconv.AppendInt(nil, m.MaxOutputTokens, 10)})
 		out.Changes = append(out.Changes, Change{Name: capName, Action: reasoning.ActionAdded})
 	case c.Cap != nil && m.MaxOutputTokens == 0 && t.MaxOutputTokens > 0 && *c.Cap > t.MaxOutputTokens:
 		return nil, &Skip{Code: domain.CodeMaxOutputTokensExceeded}
-	case c.Cap != nil && kept == nil: // every client cap member was dropped (PAR-12)
-		ops = append(ops, params.Op{Path: []string{capName}, Value: strconv.AppendInt(nil, *c.Cap, 10)})
-		out.Changes = append(out.Changes, Change{Name: capName, Action: reasoning.ActionTranslated})
+	case c.Cap != nil && (declared || kept == nil):
+		v := strconv.AppendInt(nil, *c.Cap, 10)
+		renamed := false
+		for _, name := range capNames(ep) {
+			if _, ok := b.Get(name); ok && name != capName {
+				ops = append(ops, params.Op{Path: []string{name}})
+				out.Changes = append(out.Changes, Change{Name: name, Action: reasoning.ActionTranslated})
+				renamed = true
+			}
+		}
+		if sent, _ := b.Get(capName); renamed || string(sent) != string(v) {
+			ops = append(ops, params.Op{Path: []string{capName}, Value: v})
+			if !renamed {
+				out.Changes = append(out.Changes, Change{Name: capName, Action: reasoning.ActionTranslated})
+			}
+		}
 	}
 
 	choice := reasoning.Resolve(c.Effort, m.Reasoning)
@@ -383,10 +401,9 @@ func Build(in Input) (*Outgoing, *Skip) {
 
 	// USE-8: a request provider streams usage only when asked. An explicit
 	// false of the client is a changed value, absent it is an addition (phase-3
-	// design section 17 point 21); a target that declares stream_options
-	// unsupported is not sent it.
-	if native && ep == domain.EndpointChat && c.Stream && !c.Usage && p.StreamUsage == domain.StreamUsageRequest &&
-		!slices.Contains(t.UnsupportedParams, "stream_options") {
+	// design section 17 point 21); a target that refuses stream_options, by
+	// either declaration, is not sent it.
+	if native && ep == domain.EndpointChat && c.Stream && !c.Usage && p.StreamUsage == domain.StreamUsageRequest && !refuses(t, p, "stream_options") {
 		action := reasoning.ActionAdded
 		if _, ok := b.Get("stream_options", "include_usage"); ok {
 			action = reasoning.ActionTranslated
@@ -430,24 +447,37 @@ func Build(in Input) (*Outgoing, *Skip) {
 	return out, nil
 }
 
-// rules applies the alias's params rules and PAR-12 to the top-level keys of
-// b toward t, in body order: a key t lists unsupported, or one with no
-// equivalent on the translated path, skips t unless a drop rule removes it;
-// a drop rule removes an unknown key too; a forward rule lets an unknown key
-// through. Each removal is an op of drops, and each is listed with every
-// forward in changes (PAR-2, PAR-3).
-func rules(b *params.Body, m *domain.Model, t *domain.Target, s params.Schema, noEquivalent []string) (drops []params.Op, changes []Change, skip *Skip) {
+// refuses is the one answer to "does t, of provider p, take k": no when t,
+// else p, declares k drop, or t lists k in unsupported_params (PAR-12). rules
+// and the proxy's own stream_options write read it.
+func refuses(t *domain.Target, p *domain.Provider, k string) bool {
+	return cmp.Or(t.Params[k], p.Params[k]) == domain.ParamDrop || slices.Contains(t.UnsupportedParams, k)
+}
+
+// rules applies the rules of the target, its provider and the alias, and
+// PAR-12, to the top-level keys of b toward t, in body order (PAR-2). The
+// target's rule, else its provider's, is a fact about t; the alias's is a
+// policy; between the two a drop wins. A key is removed when the fact is
+// drop, or when the policy is drop and t refuses the key or it is unknown;
+// else a key t refuses, or one with no equivalent on the translated path,
+// skips t; a reference key is unchanged; an unknown key is sent when a rule
+// forwards it, and skips t when none does. Each removal is an op of drops,
+// and each is listed with every forward in changes (PAR-3).
+func rules(b *params.Body, m *domain.Model, t *domain.Target, p *domain.Provider, s params.Schema, noEquivalent []string) (drops []params.Op, changes []Change, skip *Skip) {
 	for _, k := range b.Keys() {
-		rule := m.Params[k]
-		unsupported := slices.Contains(t.UnsupportedParams, k) || slices.Contains(noEquivalent, k)
+		fact, policy, known := cmp.Or(t.Params[k], p.Params[k]), m.Params[k], s.Known[k]
+		refused := refuses(t, p, k) || slices.Contains(noEquivalent, k)
 		switch {
-		case unsupported && rule != domain.ParamDrop:
-			return nil, nil, &Skip{Code: domain.CodeUnsupportedParameter, Param: k}
-		case rule == domain.ParamDrop && (!s.Known[k] || unsupported):
+		case fact == domain.ParamDrop || policy == domain.ParamDrop && (refused || !known):
 			drops = append(drops, params.Op{Path: []string{k}})
 			changes = append(changes, Change{Name: k, Action: reasoning.ActionDropped})
-		case rule == domain.ParamForward && !s.Known[k]:
+		case refused:
+			return nil, nil, &Skip{Code: domain.CodeUnsupportedParameter, Param: k}
+		case known:
+		case fact == domain.ParamForward || policy == domain.ParamForward:
 			changes = append(changes, Change{Name: k, Action: "forwarded"})
+		default: // a key another target of the alias declared (PAR-12)
+			return nil, nil, &Skip{Code: domain.CodeUnsupportedParameter, Param: k}
 		}
 	}
 	return drops, changes, nil
@@ -457,7 +487,7 @@ func rules(b *params.Body, m *domain.Model, t *domain.Target, s params.Schema, n
 // embeddings target of the openai protocol, called at base_url +
 // /embeddings, or a rerank target of the openai protocol whose provider has
 // a rerank_url, called there; any other target is skipped. On embeddings the
-// alias's rules and PAR-12 apply as on chat; rerank applies none. Only
+// rules and PAR-12 apply as on chat; rerank applies none. Only
 // "model" is replaced besides them, which PAR-3 does not list. No cap, effort
 // or include_usage is ever written, so the source is provider_default (RSN-6)
 // and every other layer is nil.
@@ -480,7 +510,7 @@ func passthrough(in Input) (*Outgoing, *Skip) {
 	}
 	ops := []params.Op{{Path: []string{"model"}, Value: model}}
 	if in.Endpoint == domain.EndpointEmbeddings {
-		drops, changes, skip := rules(in.Body, cmp.Or(in.Model, &domain.Model{}), t, params.Embeddings, nil)
+		drops, changes, skip := rules(in.Body, cmp.Or(in.Model, &domain.Model{}), t, p, params.Embeddings, nil)
 		if skip != nil {
 			return nil, skip // 422 unsupported_parameter when no target is left
 		}

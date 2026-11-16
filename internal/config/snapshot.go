@@ -122,11 +122,13 @@ type Target struct {
 }
 
 // Model is an alias as published, with its targets in order: the primary,
-// then the fallbacks.
+// then the fallbacks. Declared holds every parameter a rule of those targets
+// or of their providers names, which plan.Check lets through (PAR-2).
 type Model struct {
-	Name    string
-	Spec    domain.Model
-	Targets []*Target
+	Name     string
+	Spec     domain.Model
+	Targets  []*Target
+	Declared map[string]bool
 }
 
 // Key is a client key as published. Its secrets are not reachable from it:
@@ -218,10 +220,16 @@ func build(st *State, env Env, findings []domain.Finding) *Snapshot {
 		s.Targets[id] = &Target{ID: id, Upstream: upstream, Spec: spec, Provider: s.Providers[provider]}
 	}
 	for name, spec := range d.Models {
-		m := &Model{Name: name, Spec: spec}
+		m := &Model{Name: name, Spec: spec, Declared: map[string]bool{}}
 		for _, id := range spec.Targets {
 			if t := s.Targets[id]; t != nil {
 				m.Targets = append(m.Targets, t)
+				for k := range t.Spec.Params {
+					m.Declared[k] = true
+				}
+				for k := range t.Provider.Spec.Params {
+					m.Declared[k] = true
+				}
 			}
 		}
 		s.Models[name] = m

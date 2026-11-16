@@ -57,7 +57,8 @@ type requestPair struct {
 
 // TestFromChat is the chat-to-Messages golden of design section 7, in
 // testdata/from-chat.json: every row of the mapping table, the members
-// absorbed and the keys with no equivalent. Every body is valid JSON.
+// absorbed, the off values, cache_control, the advisory detail and the keys
+// with no equivalent (phase-5 design C46). Every body is valid JSON.
 func TestFromChat(t *testing.T) {
 	const hi = `"messages":[{"role":"user","content":"hi"}]`
 	const fn = `{"type":"function","function":{"name":"get_weather","description":"Weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}},"strict":true}}`
@@ -94,10 +95,33 @@ func TestFromChat(t *testing.T) {
 			`"stream_options":{"include_usage":true},"seed":null,"user":null}`},
 		{"a stream", `{"model":"fast",` + hi + `,"stream":true,"stream_options":{"include_usage":true}}`},
 		{"forwarded members in the client's order, after the mapped ones", `{"x_b":{"k":[1,2]},"model":"fast",` + hi + `,"x_a":"v\u0061l","temperature":1}`},
-		{"keys with no equivalent", `{"model":"fast",` + hi + `,"n":2,"logprobs":true,"top_logprobs":2,"logit_bias":{},"frequency_penalty":0,` +
-			`"presence_penalty":0,"seed":1,"prediction":{},"audio":{},"modalities":["text"],"verbosity":"low","web_search_options":{},"moderation":{},` +
-			`"prompt_cache_key":"k","prompt_cache_options":{},"prompt_cache_retention":"24h","store":true,"metadata":{},"service_tier":"auto",` +
+		{"off values are absent", `{"model":"fast",` + hi + `,"n":1,"logprobs":false,"store":false,"frequency_penalty":0,"presence_penalty":0,` +
+			`"service_tier":"\u0061uto","modalities":[ "text" ],"logit_bias":{ }}`},
+		{"zero penalties spelled 0.0 and -0", `{"model":"fast",` + hi + `,"frequency_penalty":0.0,"presence_penalty":-0}`},
+		{"zero penalties spelled 0e0 and -0.0E+2", `{"model":"fast",` + hi + `,"frequency_penalty":0e0,"presence_penalty":-0.0E+2}`},
+		{"values with meaning have no equivalent", `{"model":"fast",` + hi + `,"n":2,"logprobs":true,"top_logprobs":2,"logit_bias":{"1":2},"frequency_penalty":0.5,` +
+			`"presence_penalty":"0","seed":1,"prediction":{},"audio":{},"modalities":["text","audio"],"verbosity":"low","web_search_options":{},"moderation":{},` +
+			`"prompt_cache_key":"k","prompt_cache_options":{},"prompt_cache_retention":"24h","store":true,"metadata":{},"service_tier":"flex",` +
 			`"user":"u","safety_identifier":"s","functions":[],"function_call":"auto"}`},
+		{"cache_control on content parts, a tool and a tool message, copied as sent; null is absent", `{"model":"fast","messages":[` +
+			`{"role":"system","content":[{"type":"text","text":"rules","cache_control":{"type":"ephemeral","ttl":"1h"}}]},` +
+			`{"role":"user","content":[{"type":"text","text":"see","cache_control":null},` +
+			`{"type":"image_url","image_url":{"url":"https://example.com/a.png"},"cache_control":{"type":"ephemeral"}}]},` +
+			`{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]},` +
+			`{"role":"tool","tool_call_id":"call_1","content":"18 C","cache_control":{"type":"ephemeral"}}],` +
+			`"tools":[{"type":"function","function":{"name":"get_weather"},"cache_control":{"type":"ephemeral"}}]}`},
+		{"a tool message's name is redundant", `{"model":"fast","messages":[{"role":"user","content":"hi"},` +
+			`{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"now","arguments":"{}"}}]},` +
+			`{"role":"tool","tool_call_id":"call_1","name":"now","content":"noon"}]}`},
+		{"empty arguments are a call without arguments", `{"model":"fast","messages":[{"role":"user","content":"hi"},` +
+			`{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"now","arguments":""}},` +
+			`{"id":"call_2","type":"function","function":{"name":"now","arguments":" \n "}}]}]}`},
+		{"a tool result with an image", `{"model":"fast","messages":[{"role":"user","content":"draw"},` +
+			`{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"render","arguments":"{}"}}]},` +
+			`{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"done"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]}]}`},
+		{"detail auto is advisory", `{"model":"fast","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png","detail":"auto"}}]}]}`},
+		{"detail low is advisory", `{"model":"fast","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png","detail":"low"}}]}]}`},
+		{"detail high is advisory", `{"model":"fast","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png","detail":"high"}}]}]}`},
 		{"custom tools, allowed_tools and json_object", `{"model":"fast",` + hi + `,"tools":[` + fn + `,{"type":"custom","custom":{"name":"c"}}],` +
 			`"tool_choice":{"type":"allowed_tools","allowed_tools":{"mode":"auto","tools":[]}},"response_format":{"type":"json_object"}}`},
 	} {
@@ -130,18 +154,19 @@ func TestFromChatUntranslatable(t *testing.T) {
 		{user(`"x"`), "messages[1].content[1]"},
 		{`{"model":"a","messages":[{"role":"user","content":7}]}`, "messages[0].content"},
 		{`{"model":"a","messages":[{"role":"user","name":"ann","content":"hi"}]}`, "messages[0].name"},
+		{`{"model":"a","messages":[{"role":"user","content":"hi"},{"role":"assistant","name":"bot","content":"yes"}]}`, "messages[1].name"},
+		{`{"model":"a","messages":[{"role":"system","name":"ops","content":"x"},{"role":"user","content":"hi"}]}`, "messages[0].name"},
 		{`{"model":"a","messages":[{"role":"user","content":"hi"},{"role":"assistant","content":null,"refusal":"no"}]}`, "messages[1].refusal"},
 		{`{"model":"a","messages":[{"role":"assistant","content":null,"function_call":{"name":"f","arguments":"{}"}}]}`, "messages[0].function_call"},
 		{`{"model":"a","messages":[{"role":"assistant","content":[{"type":"refusal","refusal":"no"}]}]}`, "messages[0].content[0]"},
 		{call(`"[1,2]"`), "messages[1].tool_calls[0].function.arguments"},
-		{call(`""`), "messages[1].tool_calls[0].function.arguments"},
 		{call(`"{\"a\":"`), "messages[1].tool_calls[0].function.arguments"},
 		{call(`"{\"a\":1,\"a\":2}"`), "messages[1].tool_calls[0].function.arguments"},
 		{call(`{"a":1}`), "messages[1].tool_calls[0].function.arguments"},
 		{`{"model":"a","messages":[{"role":"assistant","tool_calls":[{"id":"c","type":"custom","custom":{"name":"f","input":"x"}}]}]}`, "messages[0].tool_calls[0]"},
 		{`{"model":"a","messages":[{"role":"function","name":"f","content":"x"}]}`, "messages[0].role"},
 		{`{"model":"a","messages":[{"role":"tool","content":"x"}]}`, "messages[0].tool_call_id"},
-		{`{"model":"a","messages":[{"role":"tool","tool_call_id":"c","content":[{"type":"image_url","image_url":{"url":"https://e.com/a.png"}}]}]}`, "messages[0].content[0]"},
+		{`{"model":"a","messages":[{"role":"tool","tool_call_id":"c","content":[{"type":"image_url","image_url":{"url":"ftp://e.com/a.png"}}]}]}`, "messages[0].content[0].image_url.url"},
 		{`{"model":"a","messages":[{"role":"system","content":[{"type":"image_url","image_url":{"url":"https://e.com/a.png"}}]},{"role":"user","content":"hi"}]}`, "messages[0].content[0]"},
 		{`{"model":"a","messages":[{"role":"user","content":"hi"}],"response_format":{"type":"json_schema","json_schema":{"name":"r"}}}`, "response_format.json_schema.schema"},
 		{`{"model":"a","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"description":"d"}}]}`, "tools[0].function.name"},

@@ -65,8 +65,23 @@
 		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"temperature\":1,\"x_b\":{\"k\":[1,2]},\"x_a\":\"v\\u0061l\"}"
 	},
 	{
-		"name": "keys with no equivalent",
-		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"n\":2,\"logprobs\":true,\"top_logprobs\":2,\"logit_bias\":{},\"frequency_penalty\":0,\"presence_penalty\":0,\"seed\":1,\"prediction\":{},\"audio\":{},\"modalities\":[\"text\"],\"verbosity\":\"low\",\"web_search_options\":{},\"moderation\":{},\"prompt_cache_key\":\"k\",\"prompt_cache_options\":{},\"prompt_cache_retention\":\"24h\",\"store\":true,\"metadata\":{},\"service_tier\":\"auto\",\"user\":\"u\",\"safety_identifier\":\"s\",\"functions\":[],\"function_call\":\"auto\"}",
+		"name": "off values are absent",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"n\":1,\"logprobs\":false,\"store\":false,\"frequency_penalty\":0,\"presence_penalty\":0,\"service_tier\":\"\\u0061uto\",\"modalities\":[ \"text\" ],\"logit_bias\":{ }}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+	},
+	{
+		"name": "zero penalties spelled 0.0 and -0",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"frequency_penalty\":0.0,\"presence_penalty\":-0}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+	},
+	{
+		"name": "zero penalties spelled 0e0 and -0.0E+2",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"frequency_penalty\":0e0,\"presence_penalty\":-0.0E+2}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+	},
+	{
+		"name": "values with meaning have no equivalent",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"n\":2,\"logprobs\":true,\"top_logprobs\":2,\"logit_bias\":{\"1\":2},\"frequency_penalty\":0.5,\"presence_penalty\":\"0\",\"seed\":1,\"prediction\":{},\"audio\":{},\"modalities\":[\"text\",\"audio\"],\"verbosity\":\"low\",\"web_search_options\":{},\"moderation\":{},\"prompt_cache_key\":\"k\",\"prompt_cache_options\":{},\"prompt_cache_retention\":\"24h\",\"store\":true,\"metadata\":{},\"service_tier\":\"flex\",\"user\":\"u\",\"safety_identifier\":\"s\",\"functions\":[],\"function_call\":\"auto\"}",
 		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
 		"no_equivalent": [
 			"n",
@@ -93,6 +108,41 @@
 			"functions",
 			"function_call"
 		]
+	},
+	{
+		"name": "cache_control on content parts, a tool and a tool message, copied as sent; null is absent",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"rules\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}]},{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"see\",\"cache_control\":null},{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.com/a.png\"},\"cache_control\":{\"type\":\"ephemeral\"}}]},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":\"18 C\",\"cache_control\":{\"type\":\"ephemeral\"}}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_weather\"},\"cache_control\":{\"type\":\"ephemeral\"}}]}",
+		"messages": "{\"model\":\"fast\",\"system\":[{\"type\":\"text\",\"text\":\"rules\",\"cache_control\":{\"type\":\"ephemeral\",\"ttl\":\"1h\"}}],\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"see\"},{\"type\":\"image\",\"source\":{\"type\":\"url\",\"url\":\"https://example.com/a.png\"},\"cache_control\":{\"type\":\"ephemeral\"}}]},{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"get_weather\",\"input\":{}}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call_1\",\"content\":\"18 C\",\"cache_control\":{\"type\":\"ephemeral\"}}]}],\"tools\":[{\"name\":\"get_weather\",\"input_schema\":{\"type\":\"object\"},\"cache_control\":{\"type\":\"ephemeral\"}}]}"
+	},
+	{
+		"name": "a tool message's name is redundant",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"now\",\"arguments\":\"{}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"name\":\"now\",\"content\":\"noon\"}]}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"now\",\"input\":{}}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call_1\",\"content\":\"noon\"}]}]}"
+	},
+	{
+		"name": "empty arguments are a call without arguments",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"now\",\"arguments\":\"\"}},{\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"now\",\"arguments\":\" \\n \"}}]}]}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"},{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"now\",\"input\":{}},{\"type\":\"tool_use\",\"id\":\"call_2\",\"name\":\"now\",\"input\":{}}]}]}"
+	},
+	{
+		"name": "a tool result with an image",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"draw\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"render\",\"arguments\":\"{}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_1\",\"content\":[{\"type\":\"text\",\"text\":\"done\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KGgo=\"}}]}]}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":\"draw\"},{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"render\",\"input\":{}}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call_1\",\"content\":[{\"type\":\"text\",\"text\":\"done\"},{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"iVBORw0KGgo=\"}}]}]}]}"
+	},
+	{
+		"name": "detail auto is advisory",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.com/a.png\",\"detail\":\"auto\"}}]}]}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"url\",\"url\":\"https://example.com/a.png\"}}]}]}"
+	},
+	{
+		"name": "detail low is advisory",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.com/a.png\",\"detail\":\"low\"}}]}]}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"url\",\"url\":\"https://example.com/a.png\"}}]}]}"
+	},
+	{
+		"name": "detail high is advisory",
+		"chat": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.com/a.png\",\"detail\":\"high\"}}]}]}",
+		"messages": "{\"model\":\"fast\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"url\",\"url\":\"https://example.com/a.png\"}}]}]}"
 	},
 	{
 		"name": "custom tools, allowed_tools and json_object",

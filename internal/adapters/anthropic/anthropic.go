@@ -45,6 +45,26 @@ type message struct {
 // lists the top-level keys with no faithful equivalent (PAR-12), in body
 // order; untranslatable is the JSON path of the first content that cannot
 // be translated, "" when none.
+//
+// Every chat member FromChat reads has exactly one outcome (kick-off section
+// 7.1, phase-5 design section 6), and nothing it reads is removed silently:
+//   - its equivalent: mapped, carried by protocol:translated;
+//   - absent at the value that turns its feature off: n 1, logprobs and store
+//     false, frequency_penalty and presence_penalty 0, service_tier "auto",
+//     modalities ["text"], logit_bias {} (off);
+//   - redundant, carried by another member: a tool message's name, which
+//     tool_call_id carries;
+//   - advisory, a hint about how much work the provider spends on an input it
+//     receives whole, which Messages leaves to the provider: image_url.detail
+//     alone, whatever its value; a member enters this list only by meeting
+//     that criterion;
+//   - none: a top-level key is listed in noEquivalent, which skips the target
+//     unless a drop rule reaches it (PAR-12); a nested member, such as name on
+//     a user, assistant or system message, makes the request untranslatable.
+//
+// Nested members the chat reference does not define are not carried, except
+// cache_control, which Messages defines with the same name and meaning on the
+// block a content part, a tool or a tool message maps to (cached).
 func FromChat(b *params.Body) (body []byte, noEquivalent []string, untranslatable string) {
 	var model, maxTokens, stop, stream, temperature, topP, effort, tools, format []byte
 	var choice string // the tool_choice members, without braces; "" when absent
@@ -85,8 +105,8 @@ func FromChat(b *params.Body) (body []byte, noEquivalent []string, untranslatabl
 			effort = v
 		case "parallel_tool_calls":
 			parallel = string(v) != "false"
-		case "n", "logprobs", "store": // only their defaults have an equivalent: none
-			if string(v) != map[string]string{"n": "1", "logprobs": "false", "store": "false"}[k] {
+		case "n", "logprobs", "store", "frequency_penalty", "presence_penalty", "service_tier", "modalities", "logit_bias":
+			if !off(k, v) {
 				noEquivalent = append(noEquivalent, k)
 			}
 		case "tools":
@@ -141,6 +161,29 @@ func FromChat(b *params.Body) (body []byte, noEquivalent []string, untranslatabl
 	return append(out, '}'), noEquivalent, untranslatable
 }
 
+// off reports whether the chat member k holds the value that turns its
+// feature off, which a Messages body says by leaving it out: compared by
+// value, numbers as numbers, strings unescaped, arrays and objects compacted
+// from a copy. Any other value has no equivalent.
+func off(k string, v []byte) bool {
+	switch k {
+	case "n":
+		return string(v) == "1"
+	case "logprobs", "store":
+		return string(v) == "false"
+	case "frequency_penalty", "presence_penalty":
+		f, err := strconv.ParseFloat(string(v), 64)
+		return err == nil && f == 0
+	case "service_tier":
+		s, ok := unquote(v)
+		return ok && s == "auto"
+	case "modalities", "logit_bias":
+		c := jsontext.Value(bytes.Clone(v))
+		return c.Compact() == nil && string(c) == map[string]string{"modalities": `["text"]`, "logit_bias": "{}"}[k]
+	}
+	return false
+}
+
 // fromMessages maps the chat messages: system and developer messages become
 // the top-level system blocks, in order; consecutive tool messages become
 // one user turn of tool_result blocks, which a user message right after them
@@ -160,6 +203,9 @@ func fromMessages(b *params.Body) (system, msgs []byte, path string) {
 			return nil, nil, p + ".role"
 		}
 		for _, n := range []string{"name", "refusal", "function_call", "audio"} {
+			if n == "name" && role == "tool" {
+				continue // redundant: tool_call_id identifies the call
+			}
 			if v, ok := b.Get("messages", at, n); ok && string(v) != "null" {
 				return nil, nil, p + "." + n
 			}
@@ -213,13 +259,13 @@ func fromMessages(b *params.Body) (system, msgs []byte, path string) {
 			}
 			result := content
 			if len(content) == 0 || content[0] != '"' {
-				blocks, bad := parts(b, at, false)
+				blocks, bad := parts(b, at, true)
 				if bad != "" {
 					return nil, nil, bad
 				}
 				result = list(blocks)
 			}
-			block := fmt.Appendf(nil, `{"type":"tool_result","tool_use_id":%s,"content":%s}`, id, result)
+			block := cached(fmt.Appendf(nil, `{"type":"tool_result","tool_use_id":%s,"content":%s}`, id, result), b, "messages", at)
 			if last != nil && last.results {
 				last.blocks = append(last.blocks, block)
 				break
@@ -280,13 +326,14 @@ func parts(b *params.Body, at string, images bool) (blocks [][]byte, bad string)
 		if block == nil {
 			return nil, p + "[" + pj + "]"
 		}
-		blocks = append(blocks, block)
+		blocks = append(blocks, cached(block, b, "messages", at, "content", pj))
 	}
 }
 
 // image maps an image_url part: a data: URI of a supported type to a base64
-// source, an http(s) URL to a url source; detail has no equivalent and is
-// dropped. nil when the URL is neither.
+// source, an http(s) URL to a url source. detail is advisory (FromChat): the
+// image is sent whole and the provider chooses its resolution. nil when the
+// URL is neither.
 func image(b *params.Body, at, pj string) []byte {
 	raw, _ := b.Get("messages", at, "content", pj, "image_url", "url")
 	u, ok := unquote(raw)
@@ -307,7 +354,8 @@ func image(b *params.Body, at, pj string) []byte {
 }
 
 // toolUses maps the tool_calls of assistant messages[at] to tool_use blocks;
-// the arguments must be a JSON object, which becomes the input.
+// the arguments must be a JSON object, which becomes the input, or empty, a
+// call without arguments, which becomes {} (as ToChat gives "{}" for {}).
 func toolUses(b *params.Body, at string) (blocks [][]byte, bad string) {
 	for j := 0; ; j++ {
 		pj := strconv.Itoa(j)
@@ -323,7 +371,10 @@ func toolUses(b *params.Body, at string) (blocks [][]byte, bad string) {
 		raw, _ := b.Get("messages", at, "tool_calls", pj, "function", "arguments")
 		args, ok := unquote(raw)
 		input := bytes.TrimSpace([]byte(args))
-		if !ok || len(input) == 0 || input[0] != '{' || !jsontext.Value(input).IsValid() {
+		if ok && len(input) == 0 {
+			input = []byte("{}")
+		}
+		if !ok || input[0] != '{' || !jsontext.Value(input).IsValid() {
 			return nil, p + ".function.arguments"
 		}
 		blocks = append(blocks, fmt.Appendf(nil, `{"type":"tool_use","id":%s,"name":%s,"input":%s}`, id, name, input))
@@ -359,7 +410,7 @@ func fromTools(b *params.Body) (tools []byte, custom bool, bad string) {
 			member("input_schema", schema), member("strict", get(b, "tools", pj, "function", "strict"))} {
 			t = appendMember(t, m)
 		}
-		all = append(all, append(t, '}'))
+		all = append(all, cached(append(t, '}'), b, "tools", pj))
 	}
 	return list(all), custom, bad
 }
@@ -376,6 +427,17 @@ func fromToolChoice(b *params.Body, v []byte) (string, bool) {
 		return "", false
 	}
 	return `"type":"tool","name":` + string(name), true
+}
+
+// cached is block, a JSON object FromChat built, with the cache_control
+// member of the chat object at path copied as sent; block unchanged when that
+// member is absent or null.
+func cached(block []byte, b *params.Body, path ...string) []byte {
+	v, ok := b.Get(slices.Concat(path, []string{"cache_control"})...)
+	if !ok || string(v) == "null" {
+		return block
+	}
+	return append(appendMember(block[:len(block)-1], member("cache_control", v)), '}')
 }
 
 // member is "name":v; nil when v is nil.

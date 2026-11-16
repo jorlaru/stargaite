@@ -762,6 +762,9 @@ func TestChatAnthropic(t *testing.T) {
 		{"a 200 that is not a Messages answer", "claude", "", &mockprovider.Step{Body: []byte(`{"choices":[]}`)},
 			502, "upstream_error", "", "not usable", "anth/claude-up", "/v1/messages"},
 		{"no equivalent", "claude", `,"seed":1`, nil, 422, "unsupported_parameter", "seed", "", "", ""},
+		{"n above 1", "claude", `,"n":2`, nil, 422, "unsupported_parameter", "n", "", "", ""},
+		{"json_object", "claude", `,"response_format":{"type":"json_object"}`, nil, 422, "unsupported_parameter", "response_format", "", "", ""},
+		{"the OpenAI SDK's off values", "claude", `,"frequency_penalty":0,"presence_penalty":0,"service_tier":"auto","logit_bias":{}`, nil, 200, "", "", "", "anth/claude-up", "/v1/messages"},
 		{"untranslatable content", "claude", `,"messages":[{"role":"user","name":"ann","content":"hi"}]`, nil, 422, "unsupported_parameter", "messages[0].name", "", "", ""},
 		{"a stream toward the anthropic target", "claude", `,"stream":true`, nil, 200, "", "", "", "anth/claude-up", "/v1/messages"},
 		{"a stream toward the first of both protocols", "both", `,"stream":true`, nil, 200, "", "", "", "anth/claude-up", "/v1/messages"},
@@ -792,5 +795,15 @@ func TestChatAnthropic(t *testing.T) {
 				t.Errorf("envelope %s", w.Body)
 			}
 		})
+	}
+
+	// cache_control on a text part reaches the provider on its block, so
+	// prompt caching works through chat (phase-5 design C46).
+	before := len(mock.Calls())
+	w := f.chat(auth, `{"model":"claude","messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]}`)
+	calls := mock.Calls()[before:]
+	const sent = `"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]`
+	if w.Code != http.StatusOK || len(calls) != 1 || !strings.Contains(string(calls[0].Body), sent) {
+		t.Errorf("cache_control: %d %s; calls %+v", w.Code, w.Body, calls)
 	}
 }

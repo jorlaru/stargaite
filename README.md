@@ -306,6 +306,16 @@ record carries that status and no tokens. The provider's text in an error answer
 warning for a refused credential is now `provider refused the target`, with the status alone, and the text is on the
 attempt's log line as `provider_message`. An answer that a retry would only repeat carries `x-should-retry: false`.
 
+Toward an `anthropic` target, a chat member at the value that turns its feature off is now left out instead of
+skipping the target: `frequency_penalty` and `presence_penalty` 0, `service_tier` `"auto"`, `modalities` `["text"]`
+and `logit_bias` `{}`, as `n` 1 and `logprobs` and `store` false already were, so an OpenAI SDK's defaults reach
+the target. `cache_control` on a content part, a tool or a tool message is copied onto the block it becomes, so prompt
+caching works through chat; a tool message may carry images and a `name`, and a tool call with empty `arguments` is
+sent as a call without arguments. `image_url.detail` is still not sent: the image goes whole and the provider chooses
+its resolution. Values with meaning, such as `seed`, a non-zero penalty, `n` above 1, `json_object`, another
+`service_tier` or a non-empty `logit_bias`, still skip the target unless a `drop` rule reaches them, and a `name` on
+a user, assistant or system message still makes the request untranslatable for it.
+
 ## Reference
 
 The details of each part, for operators who need the exact behaviour:

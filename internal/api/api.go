@@ -78,7 +78,7 @@ var ErrStopping = errors.New("server stopping")
 type handler struct {
 	Deps
 	refused  refusals // failed authentications
-	upstream refusals // a provider refusing the operator's credential (401, 403)
+	upstream refusals // a provider refusing the target for the operator's reason (401, 402, 403, 404)
 	breakers *routing.Breakers
 }
 
@@ -187,11 +187,15 @@ func (h *handler) models(w http.ResponseWriter, r *http.Request) {
 }
 
 // fail writes e in the envelope of ep (kick-off section 15), with its
-// Retry-After header when it has one: the OpenAI envelope, or on
-// /v1/messages the Anthropic one with the code in x-stargaite-error-code.
+// Retry-After header when it has one and x-should-retry: false when it is
+// final: the OpenAI envelope, or on /v1/messages the Anthropic one with the
+// code in x-stargaite-error-code.
 func fail(w http.ResponseWriter, ep domain.Endpoint, e *domain.Error) {
 	if e.RetryAfter != "" {
 		w.Header().Set("Retry-After", e.RetryAfter)
+	}
+	if e.Final {
+		w.Header().Set("X-Should-Retry", "false")
 	}
 	if ep == domain.EndpointMessages {
 		w.Header().Set(errorCodeHeader, e.Code)

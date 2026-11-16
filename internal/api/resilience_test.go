@@ -16,9 +16,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
-	"github.com/jorlaru/stargaite/internal/adapters/anthropic"
-	"github.com/jorlaru/stargaite/internal/adapters/openai"
+	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
 	"github.com/jorlaru/stargaite/internal/routing"
 	"github.com/jorlaru/stargaite/internal/transport"
@@ -144,7 +144,10 @@ func TestFaultMatrix(t *testing.T) {
 			{name: "500", first: "bad", step: &mockprovider.Step{Status: 500}, status: 502, code: "upstream_error", eligible: true},
 			{name: "529", first: "bad", step: &mockprovider.Step{Status: 529}, status: 502, code: "upstream_error", eligible: true},
 			{name: "400", first: "bad", step: &mockprovider.Step{Status: 400, Body: []byte(`{"error":{"message":"no"}}`)}, status: 400, code: "upstream_error"},
-			{name: "401", first: "bad", step: &mockprovider.Step{Status: 401}, status: 502, code: "upstream_auth_error"},
+			{name: "401", first: "bad", step: &mockprovider.Step{Status: 401}, status: 502, code: "upstream_auth_error", eligible: true},
+			{name: "402", first: "bad", step: &mockprovider.Step{Status: 402}, status: 502, code: "upstream_error", eligible: true},
+			{name: "403", first: "bad", step: &mockprovider.Step{Status: 403}, status: 502, code: "upstream_auth_error", eligible: true},
+			{name: "404", first: "bad", step: &mockprovider.Step{Status: 404, Body: []byte(`{"error":{"message":"no such model"}}`)}, status: 502, code: "upstream_error", eligible: true},
 			{name: "302", first: "bad", step: &mockprovider.Step{Status: 302, Header: http.Header{"Location": {"http://127.0.0.1:1/"}}}, status: 502, code: "upstream_error"},
 		} {
 			f.stream = stream
@@ -156,6 +159,12 @@ func TestFaultMatrix(t *testing.T) {
 		fault{name: "hang in the body", first: "bad", step: &mockprovider.Step{Body: []byte(`{"choices":[`), Hang: true}, status: 504, code: "upstream_timeout", eligible: true},
 		fault{name: "cut in the body", first: "bad", step: &mockprovider.Step{Body: []byte(`{"choices":[`), Cut: true}, status: 502, code: "upstream_error", eligible: true},
 		fault{name: "oversized body", first: "bad", step: &mockprovider.Step{Body: []byte(big)}, status: 502, code: "upstream_error"},
+		fault{name: "a 200 with code 502", first: "bad", step: &mockprovider.Step{Body: []byte(`{"error":{"code":502,"message":"no provider"}}`)},
+			status: 502, code: "upstream_error", eligible: true},
+		fault{name: "a 200 with code 400", first: "bad", step: &mockprovider.Step{Body: []byte(`{"error":{"code":400,"message":"bad input"}}`)},
+			status: 400, code: "upstream_error"},
+		fault{name: "a 200 with an error and no code", first: "bad", step: &mockprovider.Step{Body: []byte(`{"error":{"message":"something"}}`)},
+			status: 502, code: "upstream_error"},
 
 		fault{name: "delay past the first byte", stream: true, first: "bad", step: &mockprovider.Step{Chunks: sse(chunk("a"), "[DONE]"), Delay: 600 * time.Millisecond},
 			status: 504, code: "upstream_timeout", eligible: true},
@@ -170,11 +179,13 @@ func TestFaultMatrix(t *testing.T) {
 		fault{name: "an anthropic api_error event first", stream: true, first: "badanth", step: &mockprovider.Step{Chunks: anthError("api_error")},
 			status: 502, code: "upstream_error", eligible: true},
 		fault{name: "an anthropic rate_limit_error event first", stream: true, first: "badanth", step: &mockprovider.Step{Chunks: anthError("rate_limit_error")},
-			status: 502, code: "upstream_error", eligible: true},
+			status: 429, code: "upstream_error", eligible: true},
 		fault{name: "an anthropic invalid_request_error event first", stream: true, first: "badanth", step: &mockprovider.Step{Chunks: anthError("invalid_request_error")},
-			status: 502, code: "upstream_error"},
+			status: 400, code: "upstream_error"},
 		fault{name: "an openai error chunk first", stream: true, first: "bad", step: &mockprovider.Step{Chunks: sse(`{"error":{"message":"boom","type":"server_error"}}`)},
 			status: 502, code: "upstream_error"},
+		fault{name: "an openai error chunk with code 502 first", stream: true, first: "bad", step: &mockprovider.Step{Chunks: sse(`{"error":{"message":"boom","code":502}}`)},
+			status: 502, code: "upstream_error", eligible: true},
 		fault{name: "an oversized event first", stream: true, first: "bad", step: &mockprovider.Step{Chunks: sse(big)}, status: 502, code: "upstream_error"},
 		fault{name: "cut after the commit", stream: true, first: "bad", step: &mockprovider.Step{Chunks: [][]byte{[]byte(first)}, Cut: true},
 			status: 200, code: "upstream_error", eligible: true, committed: true},
@@ -245,7 +256,12 @@ func TestFaultMatrix(t *testing.T) {
 						h.Get(targetHeader) != f.first+"/m" {
 						t.Errorf("%d %s %v, %d calls to good/m", resp.StatusCode, got, h, goodCalls)
 					}
-					if want := map[bool]string{true: "3"}[f.status == 429]; h.Get("Retry-After") != want {
+					// A 429 keeps the provider's Retry-After, when it sent one.
+					want := ""
+					if f.status == 429 {
+						want = f.step.Header.Get("Retry-After")
+					}
+					if h.Get("Retry-After") != want {
 						t.Errorf("Retry-After %q", h.Get("Retry-After"))
 					}
 				}
@@ -474,64 +490,312 @@ func TestSyncSlowClient(t *testing.T) {
 	}
 }
 
-// TestClassify is classify per row of design section 10's table.
+// TestClassify is classify, through settle, per source of a status and per
+// class of phase-5 design section 5.1: the status line, an error object with
+// a status in place of an answer (OpenAI's code, Anthropic's documented type)
+// and one without. Each row asserts the attempt's effective status, the
+// verdict (eligible, breaker, operator, final) and the error answered when no
+// target is left: its code, status and message. The client gone, the
+// shutdown, the timers and a 2xx relayed are the controls.
 func TestClassify(t *testing.T) {
 	refused := &net.OpError{Op: "dial", Err: errors.New("connection refused")}
-	body := []byte(`{"error":{"message":"bad thing"}}`)
+	body := []byte(`{"error":{"message":"bad thing sk-planted"}}`)
 	retry := http.Header{"Retry-After": {"9"}}
+	coded := func(status int) error { return &domain.ProviderError{Status: status, Message: "bad thing sk-planted"} }
+	typed := func(typ string, status int) error {
+		return &domain.ProviderError{Type: typ, Status: status, Message: "bad thing sk-planted"}
+	}
 	for _, tc := range []struct {
-		name         string
-		stream       bool
-		status       int
-		cause, relay error
-		eligible     bool
-		breaker      routing.Verdict
-		code         string // "" for no error
-		errStatus    int
-		message      string
+		name            string
+		stream          bool
+		status          int // the status line
+		cause, relay    error
+		effective       int
+		eligible        bool
+		breaker         routing.Verdict
+		operator, final bool
+		code            string // "" for no error
+		errStatus       int
+		message         string
 	}{
-		{name: "2xx relayed", status: 200, breaker: routing.Pass},
+		{name: "2xx relayed", status: 200, effective: 200, breaker: routing.Pass},
 		{name: "dial refused", cause: refused, eligible: true, breaker: routing.Fail, code: "upstream_error", errStatus: 502, message: "the provider call failed"},
 		{name: "connect timer", cause: errConnectTimeout, eligible: true, breaker: routing.Fail, code: "upstream_timeout", errStatus: 504, message: "connect timeout"},
-		{name: "idle timer in a stream", stream: true, status: 200, cause: errIdleTimeout, eligible: true, breaker: routing.Fail, code: "upstream_timeout", errStatus: 504},
-		{name: "429", status: 429, eligible: true, breaker: routing.Fail, code: "upstream_error", errStatus: 429, message: "the provider answered 429"},
-		{name: "500", status: 500, eligible: true, breaker: routing.Fail, code: "upstream_error", errStatus: 502},
-		{name: "529", status: 529, eligible: true, breaker: routing.Fail, code: "upstream_error", errStatus: 502, message: "the provider answered 529"},
-		{name: "sync body cut", status: 200, cause: io.ErrUnexpectedEOF, eligible: true, breaker: routing.Fail, code: "upstream_error", errStatus: 502, message: "the provider call failed"},
-		{name: "stream cut", stream: true, status: 200, cause: errStreamEnded, eligible: true, breaker: routing.Fail, code: "upstream_error", errStatus: 502, message: "the provider's stream failed"},
-		{name: "anthropic overloaded_error event", stream: true, status: 200, relay: &anthropic.ErrorEvent{Type: "overloaded_error", Status: 529},
-			eligible: true, breaker: routing.Fail, code: "upstream_error", errStatus: 502, message: "the provider's stream reported an error"},
-		{name: "anthropic timeout_error event", stream: true, status: 200, relay: &anthropic.ErrorEvent{Type: "timeout_error", Status: 504},
+		{name: "idle timer in a stream", stream: true, status: 200, effective: 200, cause: errIdleTimeout, eligible: true, breaker: routing.Fail, code: "upstream_timeout", errStatus: 504},
+		{name: "sync body cut", status: 200, effective: 200, cause: io.ErrUnexpectedEOF, eligible: true, breaker: routing.Fail, code: "upstream_error", errStatus: 502, message: "the provider call failed"},
+		{name: "stream cut", stream: true, status: 200, effective: 200, cause: errStreamEnded, eligible: true, breaker: routing.Fail, code: "upstream_error", errStatus: 502, message: "the provider's stream failed"},
+
+		// Transient.
+		{name: "429", status: 429, effective: 429, eligible: true, breaker: routing.Fail, code: "upstream_error", errStatus: 429, message: "the provider answered 429"},
+		{name: "500", status: 500, effective: 500, eligible: true, breaker: routing.Fail, code: "upstream_error", errStatus: 502},
+		{name: "529", status: 529, effective: 529, eligible: true, breaker: routing.Fail, code: "upstream_error", errStatus: 502, message: "the provider answered 529"},
+		{name: "code 502 inside a 200", status: 200, relay: coded(502), effective: 502, eligible: true, breaker: routing.Fail, code: "upstream_error", errStatus: 502, message: "the provider answered 502"},
+		{name: "code 429 inside a 200", status: 200, relay: coded(429), effective: 429, eligible: true, breaker: routing.Fail, code: "upstream_error", errStatus: 429, message: "the provider answered 429"},
+		{name: "openai chunk with code 503", stream: true, status: 200, relay: coded(503), effective: 503, eligible: true, breaker: routing.Fail, code: "upstream_error", errStatus: 502},
+		{name: "anthropic overloaded_error event", stream: true, status: 200, relay: typed("overloaded_error", 529), effective: 529,
+			eligible: true, breaker: routing.Fail, code: "upstream_error", errStatus: 502, message: "the provider answered 529"},
+		{name: "anthropic timeout_error event", stream: true, status: 200, relay: typed("timeout_error", 504), effective: 504,
 			eligible: true, breaker: routing.Fail, code: "upstream_error", errStatus: 502},
-		{name: "anthropic invalid_request_error event", stream: true, status: 200, relay: &anthropic.ErrorEvent{Type: "invalid_request_error", Status: 400},
-			breaker: routing.Pass, code: "upstream_error", errStatus: 502},
-		{name: "anthropic event of an unknown type", stream: true, status: 200, relay: &anthropic.ErrorEvent{Type: "new_error"},
-			breaker: routing.Pass, code: "upstream_error", errStatus: 502},
-		{name: "openai error chunk", stream: true, status: 200, relay: &openai.ErrorChunk{Message: "boom"}, breaker: routing.Pass, code: "upstream_error", errStatus: 502},
-		{name: "400", status: 400, breaker: routing.Pass, code: "upstream_error", errStatus: 400, message: "bad thing"},
-		{name: "404", status: 404, breaker: routing.Pass, code: "upstream_error", errStatus: 404, message: "bad thing"},
-		{name: "413", status: 413, breaker: routing.Pass, code: "upstream_error", errStatus: 413},
-		{name: "422", status: 422, breaker: routing.Pass, code: "upstream_error", errStatus: 422},
-		{name: "401", status: 401, breaker: routing.Pass, code: "upstream_auth_error", errStatus: 502, message: "the provider refused the operator's credential"},
-		{name: "403", status: 403, breaker: routing.Pass, code: "upstream_auth_error", errStatus: 502},
-		{name: "302", status: 302, breaker: routing.Pass, code: "upstream_error", errStatus: 502, message: "the provider answered 302"},
-		{name: "409", status: 409, breaker: routing.Pass, code: "upstream_error", errStatus: 502},
-		{name: "2xx not usable", status: 200, relay: errors.New("not JSON"), breaker: routing.Pass, code: "upstream_error", errStatus: 502, message: "not usable"},
-		{name: "2xx not a stream", stream: true, status: 200, relay: errNotStream, breaker: routing.Pass, code: "upstream_error", errStatus: 502, message: "not an event stream"},
-		{name: "oversized event", stream: true, status: 200, relay: transport.ErrEventTooLarge, breaker: routing.Pass, code: "upstream_error", errStatus: 502, message: "stream failed"},
-		{name: "client gone", stream: true, status: 200, cause: errClientGone, breaker: routing.None},
-		{name: "shutdown", stream: true, status: 200, cause: ErrStopping, breaker: routing.None, code: "internal_error", errStatus: 500, message: "server stopping"},
+
+		// The operator's.
+		{name: "401", status: 401, effective: 401, eligible: true, breaker: routing.Pass, operator: true, final: true, code: "upstream_auth_error", errStatus: 502,
+			message: "the provider refused the operator's credential"},
+		{name: "403", status: 403, effective: 403, eligible: true, breaker: routing.Pass, operator: true, final: true, code: "upstream_auth_error", errStatus: 502},
+		{name: "402", status: 402, effective: 402, eligible: true, breaker: routing.Pass, operator: true, final: true, code: "upstream_error", errStatus: 502,
+			message: "the provider answered 402"},
+		{name: "404", status: 404, effective: 404, eligible: true, breaker: routing.Pass, operator: true, final: true, code: "upstream_error", errStatus: 502,
+			message: "the provider answered 404"},
+		{name: "code 401 inside a 200", status: 200, relay: coded(401), effective: 401, eligible: true, breaker: routing.Pass, operator: true, final: true,
+			code: "upstream_auth_error", errStatus: 502},
+		{name: "anthropic billing_error event", stream: true, status: 200, relay: typed("billing_error", 402), effective: 402, eligible: true, breaker: routing.Pass,
+			operator: true, final: true, code: "upstream_error", errStatus: 502, message: "the provider answered 402"},
+
+		// The client's: the provider's text, redacted.
+		{name: "400", status: 400, effective: 400, breaker: routing.Pass, final: true, code: "upstream_error", errStatus: 400, message: "bad thing [redacted]"},
+		{name: "413", status: 413, effective: 413, breaker: routing.Pass, final: true, code: "upstream_error", errStatus: 413},
+		{name: "422", status: 422, effective: 422, breaker: routing.Pass, final: true, code: "upstream_error", errStatus: 422},
+		{name: "code 400 inside a 200", status: 200, relay: coded(400), effective: 400, breaker: routing.Pass, final: true, code: "upstream_error", errStatus: 400,
+			message: "bad thing [redacted]"},
+		{name: "anthropic invalid_request_error event", stream: true, status: 200, relay: typed("invalid_request_error", 400), effective: 400,
+			breaker: routing.Pass, final: true, code: "upstream_error", errStatus: 400, message: "bad thing [redacted]"},
+
+		// Nobody can tell.
+		{name: "302", status: 302, effective: 302, breaker: routing.Pass, code: "upstream_error", errStatus: 502, message: "the provider answered 302"},
+		{name: "409", status: 409, effective: 409, breaker: routing.Pass, code: "upstream_error", errStatus: 502},
+		{name: "408", status: 408, effective: 408, breaker: routing.Pass, code: "upstream_error", errStatus: 502},
+		{name: "an error object without a status", status: 200, relay: coded(0), effective: 200, breaker: routing.Pass, code: "upstream_error", errStatus: 502,
+			message: "the provider reported an error in place of an answer"},
+		{name: "an anthropic event of an unknown type", stream: true, status: 200, relay: &domain.ProviderError{Message: "new_error: x"}, effective: 200,
+			breaker: routing.Pass, code: "upstream_error", errStatus: 502, message: "the provider's stream reported an error"},
+		{name: "2xx not usable", status: 200, effective: 200, relay: errors.New("not JSON"), breaker: routing.Pass, code: "upstream_error", errStatus: 502, message: "not usable"},
+		{name: "2xx not a stream", stream: true, status: 200, effective: 200, relay: errNotStream, breaker: routing.Pass, code: "upstream_error", errStatus: 502, message: "not an event stream"},
+		{name: "oversized event", stream: true, status: 200, effective: 200, relay: transport.ErrEventTooLarge, breaker: routing.Pass, code: "upstream_error", errStatus: 502, message: "stream failed"},
+
+		{name: "client gone", stream: true, status: 200, effective: 200, cause: errClientGone, breaker: routing.None},
+		{name: "shutdown", stream: true, status: 200, effective: 200, cause: ErrStopping, breaker: routing.None, code: "internal_error", errStatus: 500, message: "server stopping"},
 		{name: "shutdown before an answer", cause: ErrStopping, breaker: routing.None, code: "internal_error", errStatus: 500, message: "server stopping"},
 	} {
-		v := classify(tc.stream, tc.status, tc.cause, retry, body, tc.relay)
-		if v.eligible != tc.eligible || v.breaker != tc.breaker || (v.err == nil) != (tc.code == "") {
-			t.Errorf("%s: %+v", tc.name, v)
+		a := &attempt{status: tc.status, target: &config.Target{Provider: &config.Provider{Credential: transport.NewSecret("sk-planted")}}}
+		settle(context.Background(), a, tc.stream, retry, body, tc.cause, tc.relay)
+		v := a.end
+		if a.status != tc.effective || v.eligible != tc.eligible || v.breaker != tc.breaker || v.operator != tc.operator || v.final != tc.final ||
+			(v.err == nil) != (tc.code == "") {
+			t.Errorf("%s: status %d, %+v", tc.name, a.status, v)
 			continue
 		}
 		if v.err != nil && (v.err.Code != tc.code || v.err.Status != tc.errStatus || !strings.Contains(v.err.Message, tc.message) ||
-			(v.err.RetryAfter == "9") != (tc.status == 429)) {
+			strings.Contains(v.err.Message, "sk-planted") || (v.err.RetryAfter == "9") != (tc.effective == 429)) {
 			t.Errorf("%s: %+v", tc.name, v.err)
 		}
+		// The provider's text reaches the client for the client's class only.
+		if v.err != nil && strings.Contains(v.err.Message, "bad thing") != (tc.final && !tc.operator) {
+			t.Errorf("%s: message %q", tc.name, v.err.Message)
+		}
+	}
+}
+
+// TestBreakerClasses is RES-2 by class (phase-5 design section 5.1): a
+// transient fault counts, so five 200s whose error object states 502 open
+// bad/m's circuit; the operator's faults (401, 402, 403, 404), the client's
+// (400) and a 2xx the relay cannot use do not, ten of each within the window
+// leaving the circuit closed.
+func TestBreakerClasses(t *testing.T) {
+	s, _, _ := newResilience(t)
+	ask := func() int {
+		resp, _ := s.post(t, chatBody("bad-one", ""))
+		return resp.StatusCode
+	}
+	for _, step := range []mockprovider.Step{{Status: 401}, {Status: 402}, {Status: 403}, {Status: 404}, {Status: 400}, {Body: []byte("oops")}} {
+		s.pastWindow()
+		for n := range 10 {
+			s.mock.Script(step)
+			if status := ask(); status == 503 {
+				t.Fatalf("%d %s, failure %d: the circuit opened", step.Status, step.Body, n+1)
+			}
+		}
+		before := len(s.mock.Calls())
+		if status := ask(); status != 200 || len(s.mock.Calls()) != before+1 {
+			t.Fatalf("%d %s: then %d", step.Status, step.Body, status)
+		}
+	}
+	s.pastWindow()
+	for n := range 5 {
+		s.mock.Script(mockprovider.Step{Body: []byte(`{"error":{"code":502,"message":"no provider"}}`)})
+		if status := ask(); status != 502 {
+			t.Fatalf("coded 502, failure %d: %d", n+1, status)
+		}
+	}
+	before := len(s.mock.Calls())
+	if status := ask(); status != 503 || len(s.mock.Calls()) != before {
+		t.Fatalf("after five coded 502s: %d, %d calls", status, len(s.mock.Calls())-before)
+	}
+}
+
+// TestShouldRetry is the request's retry hint (kick-off section 15, phase-5
+// design section 5.1): x-should-retry: false when every target the request
+// reached refused it for the client's or the operator's reason and none was
+// passed over dynamically; absent whenever a new request may meet another
+// answer, and on the proxy's own refusals, which never carry it.
+func TestShouldRetry(t *testing.T) {
+	s, good, _ := newResilience(t)
+	tools := `,"tools":[{"type":"function","function":{"name":"f"}}]`
+	for _, tc := range []struct {
+		name, alias, extra string
+		bad, good          *mockprovider.Step
+		status             int
+		final              bool
+	}{
+		{"a single 401", "bad-one", "", &mockprovider.Step{Status: 401}, nil, 502, true},
+		{"a single 400", "bad-one", "", &mockprovider.Step{Status: 400}, nil, 400, true},
+		{"a 404 then a statically skipped target", "bad-notools", tools, &mockprovider.Step{Status: 404}, nil, 502, true},
+		{"a 200 with code 401", "bad-one", "", &mockprovider.Step{Body: []byte(`{"error":{"code":401}}`)}, nil, 502, true},
+
+		{"429", "bad-one", "", &mockprovider.Step{Status: 429}, nil, 429, false},
+		{"500", "bad-one", "", &mockprovider.Step{Status: 500}, nil, 502, false},
+		{"a timer", "bad-one", "", &mockprovider.Step{Delay: 600 * time.Millisecond}, nil, 504, false},
+		{"408", "bad-one", "", &mockprovider.Step{Status: 408}, nil, 502, false},
+		{"an unusable 2xx", "bad-one", "", &mockprovider.Step{Body: []byte("oops")}, nil, 502, false},
+		{"the proxy's own refusal", "bad-one", `,"enable_search":true`, nil, nil, 400, false},
+		{"a served fallback", "bad-two", "", &mockprovider.Step{Status: 500}, nil, 200, false},
+		{"a committed stream", "bad-one", `,"stream":true`, &mockprovider.Step{Chunks: sse(chunk("a"), `{"error":{"code":400,"message":"no"}}`)}, nil, 200, false},
+		{"503 then 401", "bad-two", "", &mockprovider.Step{Status: 503}, &mockprovider.Step{Status: 401}, 502, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s.pastWindow()
+			if tc.bad != nil {
+				s.mock.Script(*tc.bad)
+			}
+			if tc.good != nil {
+				good.Script(*tc.good)
+			}
+			resp, got := s.post(t, chatBody(tc.alias, tc.extra))
+			if resp.StatusCode != tc.status || (resp.Header.Get("X-Should-Retry") == "false") != tc.final || len(resp.Header.Values("X-Should-Retry")) > 1 {
+				t.Errorf("%d %v: %s", resp.StatusCode, resp.Header, got)
+			}
+		})
+	}
+	// A 401 then an open circuit: good/notools refuses, bad/m's circuit is
+	// open, which reopens in 20 s.
+	s.pastWindow()
+	for range 5 {
+		s.mock.Script(mockprovider.Step{Status: 500})
+		s.post(t, chatBody("bad-one", ""))
+	}
+	good.Script(mockprovider.Step{Status: 401})
+	before := len(s.mock.Calls())
+	if resp, got := s.post(t, chatBody("notools-bad", "")); resp.StatusCode != 502 || resp.Header.Get("X-Should-Retry") != "" || len(s.mock.Calls()) != before {
+		t.Errorf("a 401 then an open circuit: %d %v: %s", resp.StatusCode, resp.Header, got)
+	}
+}
+
+// TestOperatorWarn is the operator's alert (phase-5 design section 5.1): a
+// 402 inside a stream before the commit writes the one WARN, rate-limited,
+// with the status alone, and its record carries that status; two targets
+// refusing inside one limiter window each leave their text, redacted and cut
+// to 2,000 characters, on their attempt line. The client's 400 writes no WARN
+// and no provider_message.
+func TestOperatorWarn(t *testing.T) {
+	s, good, _ := newResilience(t)
+	type line struct {
+		Msg, Target, Cause string
+		Status, Refusals   int
+		ProviderMessage    string `json:"provider_message"`
+	}
+	read := func(from int) (warns, attempts []line) {
+		for raw := range strings.SplitSeq(strings.TrimSpace(s.log.String()[from:]), "\n") {
+			var l line
+			if err := json.Unmarshal([]byte(raw), &l); err != nil {
+				t.Fatalf("log line %s", raw)
+			}
+			switch l.Msg {
+			case "provider refused the target":
+				warns = append(warns, l)
+			case "attempt":
+				attempts = append(attempts, l)
+			}
+		}
+		return warns, attempts
+	}
+
+	s.pastWindow()
+	from := len(s.log.String())
+	s.mock.Script(mockprovider.Step{Chunks: sse(`{"error":{"code":402,"message":"` + account + `, key ` + planted + `BAD_KEY"}}`)})
+	resp, got := s.post(t, chatBody("bad-one", `,"stream":true`))
+	if resp.StatusCode != 502 || !strings.Contains(got, `"message":"the provider answered 402","type":"api_error","code":"upstream_error"`) ||
+		strings.Contains(got, account) {
+		t.Fatalf("a 402 in a stream: %d %s", resp.StatusCode, got)
+	}
+	warns, attempts := read(from)
+	if len(warns) != 1 || warns[0].Status != 402 || warns[0].Target != "bad/m" || warns[0].Refusals != 1 || len(attempts) != 1 ||
+		attempts[0].Status != 402 || attempts[0].ProviderMessage != account+", key [redacted]" {
+		t.Errorf("a 402 in a stream: warns %+v, attempts %+v", warns, attempts)
+	}
+	// Its record carries the effective status, so no tokens (USE-8).
+	if r := s.stored(t, 1)[0]; r.Status != 402 || r.Input+r.Output != 0 || r.TokensSource != "provider" || str(r.ErrorType) != "upstream_error" {
+		t.Errorf("record %+v", r)
+	}
+
+	// Within the same window: no WARN, both texts on their attempt lines.
+	from = len(s.log.String())
+	long := strings.Repeat("x", 2100) // within max_response_bytes
+	s.mock.Script(mockprovider.Step{Status: 401, Body: []byte(`{"error":{"message":"bad key ` + planted + `BAD_KEY"}}`)})
+	good.Script(mockprovider.Step{Status: 403, Body: []byte(`{"type":"error","error":{"type":"permission_error","message":"` + long + `"}}`)})
+	if resp, got := s.post(t, chatBody("bad-two", "")); resp.StatusCode != 502 || !strings.Contains(got, `"code":"upstream_auth_error"`) {
+		t.Fatalf("two refusals: %d %s", resp.StatusCode, got)
+	}
+	warns, attempts = read(from)
+	if len(warns) != 0 || len(attempts) != 2 || attempts[0].ProviderMessage != "bad key [redacted]" || attempts[1].ProviderMessage != long[:2000] {
+		t.Errorf("two refusals: warns %+v, attempts %+v", warns, attempts)
+	}
+
+	// The client's 400, past the window: neither.
+	s.pastWindow()
+	from = len(s.log.String())
+	s.mock.Script(mockprovider.Step{Status: 400, Body: []byte(`{"error":{"message":"bad input"}}`)})
+	if resp, got := s.post(t, chatBody("bad-one", "")); resp.StatusCode != 400 || !strings.Contains(got, "bad input") {
+		t.Fatalf("a 400: %d %s", resp.StatusCode, got)
+	}
+	if warns, attempts = read(from); len(warns) != 0 || len(attempts) != 1 || attempts[0].ProviderMessage != "" {
+		t.Errorf("a 400: warns %+v, attempts %+v", warns, attempts)
+	}
+}
+
+// TestProviderMessage is the provider's text (kick-off section 15, phase-5
+// design C45): read from error.message, a string error, a top-level message
+// or detail; redacted, then cut to 2,000 characters, never splitting one, so
+// a credential across the cut leaves no prefix of itself. A detail that is
+// not a string and a body that is not JSON give the fixed text.
+func TestProviderMessage(t *testing.T) {
+	const credential = "sk-planted-credential"
+	cases := []struct{ name, body, want string }{
+		{"error.message", `{"error":{"message":"one"}}`, "one"},
+		{"a string error", `{"error":"two"}`, "two"},
+		{"a top-level message", `{"message":"three"}`, "three"},
+		{"a top-level detail", `{"detail":"four"}`, "four"},
+		{"an empty error.message, then detail", `{"error":{"message":""},"detail":"five"}`, "five"},
+		{"two-byte characters", `{"error":{"message":"` + strings.Repeat("é", 512<<10) + `"}}`, strings.Repeat("é", 2000)},
+		{"a credential across the cut", `{"error":{"message":"` + strings.Repeat("a", 1995) + credential + `"}}`, strings.Repeat("a", 1995) + "[reda"},
+		{"a detail list", `{"detail":[{"loc":["body"],"msg":"field required"}]}`, "the provider answered 422"},
+		{"not JSON", `<html>bad gateway</html>`, "the provider answered 422"},
+	}
+	for _, tc := range cases {
+		a := &attempt{status: 422, target: &config.Target{Provider: &config.Provider{Credential: transport.NewSecret(credential)}}}
+		settle(context.Background(), a, false, http.Header{}, []byte(tc.body), nil, nil)
+		if a.end.err == nil || a.end.err.Message != tc.want || !utf8.ValidString(a.end.err.Message) || strings.Contains(a.end.err.Message, "sk-pl") {
+			t.Errorf("%s: %+v", tc.name, a.end.err)
+		}
+	}
+	// The same text, from an error in place of an answer.
+	a := &attempt{status: 200, target: &config.Target{Provider: &config.Provider{Credential: transport.NewSecret(credential)}}}
+	settle(context.Background(), a, false, http.Header{}, nil, nil, &domain.ProviderError{Status: 400, Message: strings.Repeat("a", 1995) + credential})
+	if a.status != 400 || a.text != strings.Repeat("a", 1995)+"[reda" || a.end.err.Message != a.text {
+		t.Errorf("in place of an answer: %d %q %+v", a.status, a.text, a.end.err)
+	}
+	// Never from any other 2xx body: it may be part of an answer (OPS-9).
+	a = &attempt{status: 200, target: &config.Target{Provider: &config.Provider{Credential: transport.NewSecret(credential)}}}
+	settle(context.Background(), a, false, http.Header{}, []byte(`{"message":"part of an answer","detail":"x"}`), nil, errors.New("not usable"))
+	if a.text != "" {
+		t.Errorf("a 2xx body: %q", a.text)
 	}
 }
 

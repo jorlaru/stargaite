@@ -359,6 +359,7 @@ func TestChatStreamFaults(t *testing.T) {
 		code, message string // the envelope's, before the commit
 		body          string // the client's bytes, after the commit
 		cause         string
+		request       string // in the request line, when set
 	}{
 		{name: "an answer that is not a stream", step: mockprovider.Step{Body: []byte(mockReply), Header: http.Header{"Content-Type": {"application/json"}}},
 			status: 502, code: "upstream_error", message: "the provider's answer is not an event stream", cause: "not an event stream"},
@@ -395,6 +396,16 @@ func TestChatStreamFaults(t *testing.T) {
 			status: 200, body: first + terminal("the provider did not answer in time: idle timeout", "upstream_timeout"), cause: "idle timeout"},
 		{name: "an error chunk after the commit", step: mockprovider.Step{Chunks: sse(chunk("a"), leaked, "[DONE]")},
 			status: 200, body: first + terminal("the provider's stream reported an error", "upstream_error"), cause: account + ", key [redacted]"},
+		// A regression guard (phase-5 design C45): a status in an OpenAI
+		// chunk names no type, so the terminal event keeps the fixed message.
+		{name: "an error chunk with code 503 after the commit", step: mockprovider.Step{Chunks: sse(chunk("a"), `{"error":{"code":503,"message":"`+account+`"}}`, "[DONE]")},
+			status: 200, body: first + terminal("the provider's stream reported an error", "upstream_error"), cause: account},
+		// A regression guard (phase-5 design C45): after the commit the
+		// terminal event and the request line stay as they were, whatever
+		// status the chunk states.
+		{name: "an error chunk with code 400 after the commit", step: mockprovider.Step{Chunks: sse(chunk("a"), `{"error":{"code":400,"message":"`+account+`"}}`, "[DONE]")},
+			status: 200, body: first + terminal("the provider's stream reported an error", "upstream_error"), cause: account,
+			request: `"status":502,"code":"upstream_error"`},
 		{name: "an event over max_response_bytes after the commit", step: mockprovider.Step{Chunks: sse(chunk("a"), big)},
 			status: 200, body: first + terminal("the provider's stream failed", "upstream_error"), cause: "larger than max_response_bytes"},
 		{name: "a chunk that is not JSON", step: mockprovider.Step{Chunks: sse(chunk("a"), "oops")},
@@ -426,8 +437,9 @@ func TestChatStreamFaults(t *testing.T) {
 			}
 			log := s.log.String()
 			line := log[strings.LastIndex(log, `"msg":"attempt"`):]
-			if strings.Contains(line, `"cause":"`) != (tc.cause != "") || !strings.Contains(line, tc.cause) || strings.Contains(log, planted) {
-				t.Errorf("attempt line %s", line)
+			if strings.Contains(line, `"cause":"`) != (tc.cause != "") || !strings.Contains(line, tc.cause) || strings.Contains(log, planted) ||
+				!strings.Contains(line, tc.request) {
+				t.Errorf("attempt and request lines %s", line)
 			}
 		})
 	}
@@ -772,12 +784,15 @@ func TestChatAnthropicStreamFaults(t *testing.T) {
 		code, message string // the envelope's, before the commit
 		body          string // the client's bytes, after the commit
 		cause         string
+		request       string // in the request line, when set
 	}{
 		{name: "an error event first", step: mockprovider.Step{Chunks: events("error", overloaded)},
-			status: 502, code: "upstream_error", message: "the provider's stream reported an error", cause: `\"overloaded_error\", status 529: Overloaded [redacted]`},
+			status: 502, code: "upstream_error", message: "the provider answered 529",
+			cause: `"status":529,"duration_ms":0,"cause":"the provider answered 200: ` + inBand + ` (type \"overloaded_error\", status 529)","provider_message":"Overloaded [redacted]"`},
 		{name: "a ping, then an error event", step: mockprovider.Step{Chunks: events("ping", `{"type":"ping"}`, "error",
 			`{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}`)},
-			status: 502, code: "upstream_error", message: "the provider's stream reported an error", cause: `\"invalid_request_error\", status 400: bad`},
+			status: 400, code: "upstream_error", message: "bad",
+			cause: `"status":400,"duration_ms":0,"cause":"the provider answered 200: ` + inBand + ` (type \"invalid_request_error\", status 400)","first_byte_ms"`},
 		{name: "content before message_start", step: mockprovider.Step{Chunks: events("content_block_delta", textDelta("a"))},
 			status: 502, code: "upstream_error", message: "the provider's stream failed", cause: "an event of the stream"},
 		{name: "provider 529", step: mockprovider.Step{Status: 529, Body: []byte(overloaded)},
@@ -791,10 +806,18 @@ func TestChatAnthropicStreamFaults(t *testing.T) {
 		{name: "an error event after the commit", step: mockprovider.Step{Chunks: events("message_start", messageStart, "content_block_start", textStart,
 			"content_block_delta", textDelta("a"), "error", leaked, "message_stop", messageStop)},
 			status: 200, body: role + text("a") + terminal("the provider's stream failed: overloaded_error", "upstream_error"),
-			cause: `\"overloaded_error\", status 529: ` + account + `, key [redacted]`},
+			cause: `"status":200,"duration_ms":0,"cause":"` + inBand + ` (type \"overloaded_error\", status 529)","provider_message":"` + account + `, key [redacted]"`},
 		{name: "an unknown error event after the commit", step: mockprovider.Step{Chunks: events("message_start", messageStart,
 			"error", `{"type":"error","error":{"type":"a_new_error","message":"`+account+`"}}`)},
-			status: 200, body: role + terminal("the provider's stream reported an error", "upstream_error"), cause: `\"a_new_error\": ` + account},
+			status: 200, body: role + terminal("the provider's stream reported an error", "upstream_error"),
+			cause: `"cause":"` + inBand + `","provider_message":"a_new_error: ` + account + `"`},
+		// A regression guard (phase-5 design C45): after the commit the
+		// terminal event and the request line stay as they were, whatever
+		// status the type stands for.
+		{name: "an invalid_request_error event after the commit", step: mockprovider.Step{Chunks: events("message_start", messageStart,
+			"error", `{"type":"error","error":{"type":"invalid_request_error","message":"`+account+`"}}`)},
+			status: 200, body: role + terminal("the provider's stream failed: invalid_request_error", "upstream_error"), cause: account,
+			request: `"status":502,"code":"upstream_error"`},
 		{name: "cut after the commit", step: mockprovider.Step{Chunks: events("message_start", messageStart), Cut: true},
 			status: 200, body: role + terminal("the provider's stream failed", "upstream_error"), cause: "unexpected EOF"},
 		{name: "ended before message_stop", step: mockprovider.Step{Chunks: events("message_start", messageStart)},
@@ -828,8 +851,9 @@ func TestChatAnthropicStreamFaults(t *testing.T) {
 			}
 			log := s.log.String()
 			line := log[strings.LastIndex(log, `"msg":"attempt"`):]
-			if strings.Contains(line, `"cause":"`) != (tc.cause != "") || !strings.Contains(line, tc.cause) || strings.Contains(log, planted) {
-				t.Errorf("attempt line %s", line)
+			if strings.Contains(line, `"cause":"`) != (tc.cause != "") || !strings.Contains(line, tc.cause) || strings.Contains(log, planted) ||
+				!strings.Contains(line, tc.request) {
+				t.Errorf("attempt and request lines %s", line)
 			}
 		})
 	}

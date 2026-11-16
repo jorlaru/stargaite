@@ -1,6 +1,9 @@
 package domain
 
-import "net/http"
+import (
+	"fmt"
+	"net/http"
+)
 
 // Severities of a finding: an error refuses a change, a warning never blocks.
 const (
@@ -72,14 +75,43 @@ type Error struct {
 	Param    string    `json:"param,omitempty"`
 	Code     string    `json:"code"`
 	Findings []Finding `json:"findings,omitempty"`
-	// RetryAfter is written as the Retry-After header by both envelopes: the
-	// provider's own value on a 429 passed through (RES-1).
+	// RetryAfter and Final are the two retry hints both envelopes write as
+	// headers. RetryAfter is Retry-After: the provider's own value on a 429
+	// passed through (RES-1). Final is x-should-retry: false: every target the
+	// request reached refused it for the client's or the operator's reason and
+	// none was passed over for a reason time clears, so a new request would
+	// meet the same refusals (kick-off section 15).
 	RetryAfter string `json:"-"`
+	Final      bool   `json:"-"`
 }
 
 // Error returns the message, so a *Error travels as an ordinary error until
 // the listener writes it.
 func (e *Error) Error() string { return e.Message }
+
+// ProviderError is an error a provider reported in place of an answer: in a
+// 2xx body, or as an event or chunk of a stream (RES-2). Status is the status
+// the provider states for it, 0 when it states none: an integer error.code
+// from 400 to 599, or the status Anthropic documents for its error type.
+// Type is set only by the anthropic adapter and only to a type Anthropic
+// documents: it is the one provider word that may cross to a client. Message
+// is the provider's text, which may name its account or echo the credential:
+// the relay reads it once, redacted and bounded, and Error never holds it.
+type ProviderError struct {
+	Status        int
+	Type, Message string
+}
+
+func (e *ProviderError) Error() string {
+	s := "the provider reported an error in place of an answer"
+	switch {
+	case e.Type != "":
+		return fmt.Sprintf("%s (type %q, status %d)", s, e.Type, e.Status)
+	case e.Status != 0:
+		return fmt.Sprintf("%s (status %d)", s, e.Status)
+	}
+	return s
+}
 
 // NewError returns the error of code with the status and type the error model
 // fixes for it. A code outside the list above becomes an internal error, so a
@@ -119,15 +151,13 @@ func NewError(code, message string) *Error {
 
 // UpstreamError is the error answered for a provider's own status once no
 // target is left (kick-off section 15): code upstream_error with the
-// provider's status and the type of that status for 400, 404, 413, 422 and
-// 429, else 502. retryAfter is kept on a 429 only.
+// provider's status and the type of that status for 400, 413, 422 and 429,
+// else 502. retryAfter is kept on a 429 only.
 func UpstreamError(status int, message, retryAfter string) *Error {
 	e := NewError(CodeUpstreamError, message)
 	switch status {
 	case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnprocessableEntity:
 		e.Status, e.Type = status, "invalid_request_error"
-	case http.StatusNotFound:
-		e.Status, e.Type = status, "not_found_error"
 	case http.StatusTooManyRequests:
 		e.Status, e.Type, e.RetryAfter = status, "rate_limit_error", retryAfter
 	}

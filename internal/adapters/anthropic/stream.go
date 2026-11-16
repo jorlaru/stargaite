@@ -43,52 +43,56 @@ func NewChatStream(t *domain.Target, p *domain.Provider, includeUsage bool, now 
 }
 
 // statuses are the HTTP statuses Anthropic documents for its error types,
-// which classify an error event read before the commit (section 15 point 15);
-// after it, only a type listed here reaches the client.
+// which classify an error read in place of an answer (RES-2); after the
+// commit, only a type listed here reaches the client.
 var statuses = map[string]int{
 	"invalid_request_error": 400, "authentication_error": 401, "billing_error": 402, "permission_error": 403, "not_found_error": 404,
 	"conflict_error": 409, "request_too_large": 413, "rate_limit_error": 429, "api_error": 500, "timeout_error": 504, "overloaded_error": 529,
 }
 
-// ErrorEvent is an error event of a Messages stream: an event named error,
-// or data with a top-level error member that is not null. ChatStream does
-// not emit it: before the commit it is not relayed, after it the relay
-// writes the terminal event of the inbound format, which may name Type when
-// Status is not 0. Message is the provider's text, which may name its
-// account or echo the credential: it goes only to the attempt's cause.
-type ErrorEvent struct {
-	Type, Message string
-	Status        int // the status Anthropic documents for Type; 0 for a type it does not list
-}
-
-func (e *ErrorEvent) Error() string {
-	if e.Status == 0 {
-		return fmt.Sprintf("the provider's stream reported %q: %s", e.Type, e.Message)
+// inBand is the error a provider put in a body or an event in place of an
+// answer (RES-2): an event named error, data whose type is error, or a
+// top-level error member that is not null; nil otherwise. Status and Type
+// are those of statuses for a listed error.type; for any other, both stay
+// empty and the provider's type leads the message. The message is
+// error.message or a string error.
+func inBand(b *params.Body, name string) *domain.ProviderError {
+	if v, ok := b.Get("error"); name != "error" && str(b, "type") != "error" && (!ok || string(v) == "null") {
+		return nil
 	}
-	return fmt.Sprintf("the provider's stream reported %q, status %d: %s", e.Type, e.Status, e.Message)
+	e := &domain.ProviderError{Message: str(b, "error", "message") + str(b, "error")}
+	t := str(b, "error", "type")
+	if s, ok := statuses[t]; ok {
+		e.Status, e.Type = s, t
+	} else if t != "" {
+		e.Message = t + ": " + e.Message
+	}
+	return e
 }
 
 // Event translates one event, named by its event field (else by the data's
-// type, which Anthropic sends with both), and emits the chat
-// chunks it gives: message_start the first chunk, with the role; the text of
-// a text block, through its own think-tag stripper toward a target that
-// declares inline_think_tags, each piece whose visible text is not empty; a
-// tool_use block's opening delta, its index counting tool calls only, then
-// each input_json_delta as an arguments fragment; message_stop the finish
-// chunk with the mapped finish_reason, the usage chunk when the client asked
-// for it, and [DONE], after which it returns io.EOF; ping the comment ": ping"
-// (named Comment). Thinking, signature and redacted_thinking content,
+// type, which Anthropic sends with both), and emits the chat chunks it gives:
+// message_start the first chunk, with the role; the text of a text block,
+// through its own think-tag stripper toward a target that declares
+// inline_think_tags, each piece whose visible text is not empty; a tool_use
+// block's opening delta, its index counting tool calls only, then each
+// input_json_delta as an arguments fragment; message_stop the finish chunk with
+// the mapped finish_reason, the usage chunk when the client asked for it, and
+// [DONE], after which it returns io.EOF; ping the comment ": ping" (named
+// Comment). Thinking, signature and redacted_thinking content,
 // content_block_stop, message_delta and an unknown event emit nothing, but a
-// stripper's held bytes go out when its block stops, and a tool_use block
-// whose partial_json fragments were all empty gets the arguments "{}" when it
-// stops, as ToChat gives (a missing stop is taken at the next
-// content_block_start or message_stop). It returns *ErrorEvent;
-// an error for data that is not a JSON object, repeats a key in an object it
-// reads, lacks a member it needs, or comes before message_start; or emit's
+// stripper's held bytes go out when its block stops, and a tool_use block whose
+// partial_json fragments were all empty gets the arguments "{}" when it stops,
+// as ToChat gives (a missing stop is taken at the next content_block_start or
+// message_stop). It returns the *domain.ProviderError of inBand for an error
+// event, which it does not emit: before the commit it is not relayed, after it
+// the relay writes the terminal event of the inbound format, which may name its
+// Type; an error for data that is not a JSON object, repeats a key in an object
+// it reads, lacks a member it needs, or comes before message_start; or emit's
 // error. Observed: the response model, the provider's own stop_reason, the
-// usage of message_start updated by each message_delta, the visible bytes,
-// the tool calls, whether a think block was removed and the latest cost at
-// the provider's cost_report path.
+// usage of message_start updated by each message_delta, the visible bytes, the
+// tool calls, whether a think block was removed and the latest cost at the
+// provider's cost_report path.
 func (s *ChatStream) Event(name string, data []byte, emit func(name string, data []byte) error) error {
 	b, e := params.Scan(data, s.walk)
 	if e != nil {
@@ -97,11 +101,10 @@ func (s *ChatStream) Event(name string, data []byte, emit func(name string, data
 	if c := params.Cost(b, s.cost.Path, s.cost.USDPerUnit); c != nil {
 		s.obs.Cost = c
 	}
-	name = cmp.Or(name, str(b, "type")) // the event field, else the data's type, which Anthropic sends with both
-	if v, ok := b.Get("error"); name == "error" || ok && string(v) != "null" {
-		t := str(b, "error", "type")
-		return &ErrorEvent{Type: t, Message: str(b, "error", "message") + str(b, "error"), Status: statuses[t]}
+	if pe := inBand(b, name); pe != nil {
+		return pe
 	}
+	name = cmp.Or(name, str(b, "type")) // the event field, else the data's type, which Anthropic sends with both
 	index := string(get(b, "index"))
 	switch name {
 	case "ping":

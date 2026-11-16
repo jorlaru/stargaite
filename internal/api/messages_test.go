@@ -533,7 +533,8 @@ func TestMessagesStreamFaults(t *testing.T) {
 		cause   string
 	}{
 		{name: "an error event first", step: mockprovider.Step{Chunks: events("error", overloaded)}, status: 502,
-			message: "upstream_error: the provider's stream reported an error", cause: `\"overloaded_error\", status 529: Overloaded [redacted]`},
+			message: "upstream_error: the provider answered 529",
+			cause:   `"status":529,"duration_ms":0,"cause":"the provider answered 200: ` + inBand + ` (type \"overloaded_error\", status 529)","provider_message":"Overloaded [redacted]"`},
 		{name: "an event named colon", step: mockprovider.Step{Chunks: events(":", start)}, status: 502,
 			message: "upstream_error: the provider's stream failed", cause: `an event named`},
 		{name: "an event name with a CR", step: mockprovider.Step{Chunks: events("ping\revent: content_block_delta", `{"type":"ping"}`)}, status: 502,
@@ -545,9 +546,15 @@ func TestMessagesStreamFaults(t *testing.T) {
 		{name: "a ping commits", step: mockprovider.Step{Chunks: events("ping", `{"type":"ping"}`, "message_start", start, "message_stop", messageStop)},
 			status: 200, body: ev("ping", `{"type":"ping"}`, "message_start", start, "message_stop", messageStop)},
 		{name: "a documented error event after the commit keeps its type", step: mockprovider.Step{Chunks: events("message_start", start, "error", leaked, "message_stop", messageStop)},
-			status: 200, body: ev("message_start", start) + upstream("overloaded_error"), cause: `\"overloaded_error\", status 529: ` + account + `, key [redacted]`},
+			status: 200, body: ev("message_start", start) + upstream("overloaded_error"),
+			cause: `"status":200,"duration_ms":0,"cause":"` + inBand + ` (type \"overloaded_error\", status 529)","provider_message":"` + account + `, key [redacted]"`},
 		{name: "an unknown error event after the commit is api_error", step: mockprovider.Step{Chunks: events("message_start", start, "error", unknown, "message_stop", messageStop)},
-			status: 200, body: ev("message_start", start) + upstream("api_error"), cause: `\"a_new_error\": ` + account},
+			status: 200, body: ev("message_start", start) + upstream("api_error"), cause: `"cause":"` + inBand + `","provider_message":"a_new_error: ` + account + `"`},
+		// A regression guard (phase-5 design C45): the type crosses, and the
+		// message keeps upstream_error whatever status the type stands for.
+		{name: "an authentication_error event after the commit", step: mockprovider.Step{Chunks: events("message_start", start,
+			"error", `{"type":"error","error":{"type":"authentication_error","message":"`+account+`"}}`)},
+			status: 200, body: ev("message_start", start) + upstream("authentication_error"), cause: account},
 		{name: "cut after the commit", step: mockprovider.Step{Chunks: events("message_start", start), Cut: true},
 			status: 200, body: ev("message_start", start) + own("upstream_error", "the provider's stream failed"), cause: "unexpected EOF"},
 		{name: "ended before message_stop", step: mockprovider.Step{Chunks: events("message_start", start)},

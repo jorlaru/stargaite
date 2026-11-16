@@ -23,13 +23,19 @@ import (
 // (USE-3), the visible bytes of the text blocks, the tool_use blocks and
 // whether a block was removed. The error says the body is not a JSON object,
 // repeats a key in an object it reads, or holds a text block whose text is
-// not a string: a 2xx that is not relayed. Observed also has the cost at p's
-// cost_report path.
+// not a string: a 2xx that is not relayed; it is the *domain.ProviderError of
+// inBand for a body that holds an error and no content. Observed also has the
+// cost at p's cost_report path.
 func Observe(t *domain.Target, p *domain.Provider, body []byte) ([]byte, domain.Observed, error) {
 	cr := report(p)
 	b, e := params.Scan(body, params.Reply(params.MessagesReply, cr.Path))
 	if e != nil {
 		return nil, domain.Observed{}, errors.New(e.Message)
+	}
+	if _, ok := b.Get("content"); !ok {
+		if pe := inBand(b, ""); pe != nil {
+			return nil, domain.Observed{}, pe
+		}
 	}
 	o := domain.Observed{ResponseModel: str(b, "model"), FinishReason: str(b, "stop_reason"), Cost: params.Cost(b, cr.Path, cr.USDPerUnit)}
 	var ops []params.Op
@@ -87,23 +93,23 @@ func NewStream(t *domain.Target, p *domain.Provider) *Stream {
 	return &Stream{think: t.InlineThinkTags, cost: cr, walk: params.Reply(params.MessagesReply, cr.Path)}
 }
 
-// Event re-emits one event under its own name with its data unchanged, ping
-// and unknown types included, dispatched by its event field, else by the
-// data's type. Toward a target that declares inline_think_tags, the text of
-// a text block, at its content_block_start and in each text_delta, goes
-// through the block's own stripper and is re-encoded only when the stripper
-// changed it; an event whose text becomes empty is still sent, with "", and
-// the held bytes go out in one text_delta of the block's index when it stops
-// (or at the next content_block_start or message_stop, if the stop is
-// missing). message_stop is emitted, then Event returns io.EOF. It returns
-// *ErrorEvent for an error event, which it does not emit; an error for data
-// that is not a JSON object or repeats a key in an object it reads, a text
-// that is not a string, an event named ":", the name the relay keeps for
-// comments, or an event whose name holds a CR, which a client that ends
-// lines at a bare CR would read as further lines; or emit's error. Observed: the response model, the provider's own
-// stop_reason, the usage of message_start updated by each message_delta, the
-// visible text, the tool_use blocks, whether a think block was removed and
-// the latest cost at the provider's cost_report path.
+// Event re-emits one event under its own name with its data unchanged, ping and
+// unknown types included, dispatched by its event field, else by the data's
+// type. Toward a target that declares inline_think_tags, the text of a text
+// block, at its content_block_start and in each text_delta, goes through the
+// block's own stripper and is re-encoded only when the stripper changed it; an
+// event whose text becomes empty is still sent, with "", and the held bytes go
+// out in one text_delta of the block's index when it stops (or at the next
+// content_block_start or message_stop, if the stop is missing). message_stop is
+// emitted, then Event returns io.EOF. It returns the *domain.ProviderError of
+// inBand for an error event, which it does not emit; an error for data that is
+// not a JSON object or repeats a key in an object it reads, a text that is not
+// a string, an event named ":", the name the relay keeps for comments, or an
+// event whose name holds a CR, which a client that ends lines at a bare CR
+// would read as further lines; or emit's error. Observed: the response model,
+// the provider's own stop_reason, the usage of message_start updated by each
+// message_delta, the visible text, the tool_use blocks, whether a think block
+// was removed and the latest cost at the provider's cost_report path.
 func (s *Stream) Event(name string, data []byte, emit func(name string, data []byte) error) error {
 	if name == Comment || strings.ContainsRune(name, '\r') {
 		return errors.New(`an event of the stream: an event named ":" or with a CR in its name`)
@@ -115,11 +121,10 @@ func (s *Stream) Event(name string, data []byte, emit func(name string, data []b
 	if c := params.Cost(b, s.cost.Path, s.cost.USDPerUnit); c != nil {
 		s.obs.Cost = c
 	}
-	kind := cmp.Or(name, str(b, "type"))
-	if v, ok := b.Get("error"); kind == "error" || ok && string(v) != "null" {
-		t := str(b, "error", "type")
-		return &ErrorEvent{Type: t, Message: str(b, "error", "message") + str(b, "error"), Status: statuses[t]}
+	if pe := inBand(b, name); pe != nil {
+		return pe
 	}
+	kind := cmp.Or(name, str(b, "type"))
 	switch kind {
 	case "message_start":
 		s.obs.ResponseModel = str(b, "message", "model")

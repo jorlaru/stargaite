@@ -56,8 +56,8 @@ func TestStream(t *testing.T) {
 		{`{"error":{"message":"overloaded","type":"server_error"}}`, "overloaded"},
 		{`{"error":"plain text"}`, "plain text"},
 	} {
-		var chunk *ErrorChunk
-		if err := s.Event("", []byte(tc.data), emit); !errors.As(err, &chunk) || chunk.Message != tc.message {
+		var chunk *domain.ProviderError
+		if err := s.Event("", []byte(tc.data), emit); !errors.As(err, &chunk) || *chunk != (domain.ProviderError{Message: tc.message}) {
 			t.Errorf("%s: %v", tc.data, err)
 		}
 	}

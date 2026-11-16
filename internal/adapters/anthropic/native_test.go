@@ -3,6 +3,7 @@ package anthropic
 import (
 	"encoding/json"
 	"encoding/json/jsontext"
+	"errors"
 	"io"
 	"regexp"
 	"strings"
@@ -174,5 +175,54 @@ func TestCost(t *testing.T) {
 		if o.Cost == nil || *o.Cost != 0.5 {
 			t.Errorf("%s stream: %v", name, o.Cost)
 		}
+	}
+}
+
+// TestObserveInBand is RES-2 on the anthropic protocol (phase-5 design C45):
+// an error in place of an answer, a body or event of type error or with a
+// top-level error, is a *domain.ProviderError for Observe, ToChat and both
+// streams; a type Anthropic documents gives its status and is the one word
+// kept as Type, any other type stays inside the message, and an integer
+// error.code is not read. An answer that also carries error is an answer.
+func TestObserveInBand(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		want       domain.ProviderError
+	}{
+		{"overloaded_error", `{"type":"error","error":{"type":"overloaded_error","message":"words"}}`,
+			domain.ProviderError{Status: 529, Type: "overloaded_error", Message: "words"}},
+		{"invalid_request_error without a top-level type", `{"error":{"type":"invalid_request_error","message":"words"}}`,
+			domain.ProviderError{Status: 400, Type: "invalid_request_error", Message: "words"}},
+		{"billing_error", `{"type":"error","error":{"type":"billing_error","message":"words"}}`,
+			domain.ProviderError{Status: 402, Type: "billing_error", Message: "words"}},
+		{"an undocumented type", `{"type":"error","error":{"type":"a_new_error","message":"words"}}`, domain.ProviderError{Message: "a_new_error: words"}},
+		{"a string error", `{"error":"words"}`, domain.ProviderError{Message: "words"}},
+		{"type error alone", `{"type":"error"}`, domain.ProviderError{}},
+		{"an integer code", `{"error":{"code":502,"message":"words"}}`, domain.ProviderError{Message: "words"}},
+	} {
+		check := func(where string, err error) {
+			t.Helper()
+			var pe *domain.ProviderError
+			if !errors.As(err, &pe) || *pe != tc.want || strings.Contains(err.Error(), "words") {
+				t.Errorf("%s, %s: %v", tc.name, where, err)
+			}
+		}
+		_, _, err := Observe(&domain.Target{}, &domain.Provider{}, []byte(tc.body))
+		check("Observe", err)
+		_, _, err = ToChat(&domain.Target{}, &domain.Provider{}, []byte(tc.body), time.Unix(1, 0))
+		check("ToChat", err)
+		emit := func(string, []byte) error { t.Fatal("emitted"); return nil }
+		check("Stream", NewStream(&domain.Target{}, &domain.Provider{}).Event("", []byte(tc.body), emit))
+		check("ChatStream", NewChatStream(&domain.Target{}, &domain.Provider{}, false, time.Now).Event("", []byte(tc.body), emit))
+	}
+	answer := `{"id":"msg_1","model":"claude-x","content":[{"type":"text","text":"hi"}],"error":{"type":"api_error","message":"words"}}`
+	if got, _, err := Observe(&domain.Target{}, &domain.Provider{}, []byte(answer)); err != nil || string(got) != answer {
+		t.Errorf("Observe of an answer with an error: %s %v", got, err)
+	}
+	if got, _, err := ToChat(&domain.Target{}, &domain.Provider{}, []byte(answer), time.Unix(1, 0)); err != nil || !strings.Contains(string(got), `"content":"hi"`) {
+		t.Errorf("ToChat of an answer with an error: %s %v", got, err)
+	}
+	if _, _, err := Observe(&domain.Target{}, &domain.Provider{}, []byte(`{"error":null}`)); err != nil {
+		t.Errorf("a null error: %v", err)
 	}
 }

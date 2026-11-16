@@ -506,7 +506,9 @@ var finish = map[string]string{
 // Observed keeps the provider's own stop_reason (USE-3). The error says the
 // body is not a Messages answer: not a JSON object, a key repeated in an
 // object read, no id, model or content array, or a malformed text or
-// tool_use block. Observed also has the cost at p's cost_report path.
+// tool_use block; it is the *domain.ProviderError of inBand for a body that
+// holds an error and no content, as Observe's. Observed also has the cost at
+// p's cost_report path.
 func ToChat(t *domain.Target, p *domain.Provider, body []byte, now time.Time) ([]byte, domain.Observed, error) {
 	cr := report(p)
 	b, e := params.Scan(body, params.Reply(params.MessagesReply, cr.Path))
@@ -514,6 +516,9 @@ func ToChat(t *domain.Target, p *domain.Provider, body []byte, now time.Time) ([
 		return nil, domain.Observed{}, errors.New(e.Message)
 	}
 	id, model, content := get(b, "id"), get(b, "model"), get(b, "content")
+	if pe := inBand(b, ""); len(content) == 0 && pe != nil {
+		return nil, domain.Observed{}, pe
+	}
 	if len(id) == 0 || id[0] != '"' || len(model) == 0 || model[0] != '"' || len(content) == 0 || content[0] != '[' {
 		return nil, domain.Observed{}, errors.New("the answer has no id, model or content array")
 	}

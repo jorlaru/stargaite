@@ -3,9 +3,11 @@ package openai
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"math"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/jorlaru/stargaite/internal/domain"
@@ -267,4 +269,63 @@ func FuzzObserveUsage(f *testing.F) {
 			t.Fatalf("%q: usage %+v, want %+v", body, o.Usage, want)
 		}
 	})
+}
+
+// TestObserveInBand is RES-2 on the openai protocol (phase-5 design C45): an
+// error object in place of an answer, in a chat body, an embeddings or rerank
+// body or a chunk, is a *domain.ProviderError whose status is an integer
+// error.code from 400 to 599 and whose type stays empty; an answer that also
+// carries error is still an answer, and a code outside the range, or not an
+// integer, gives no status.
+func TestObserveInBand(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		want       domain.ProviderError
+	}{
+		{"code 502", `{"error":{"code":502,"message":"no provider"}}`, domain.ProviderError{Status: 502, Message: "no provider"}},
+		{"code 400", `{"error":{"code":400,"message":"bad","type":"invalid_request_error"}}`, domain.ProviderError{Status: 400, Message: "bad"}},
+		{"code 401", `{"error":{"code":401,"message":"key"}}`, domain.ProviderError{Status: 401, Message: "key"}},
+		{"no code", `{"error":{"message":"words"}}`, domain.ProviderError{Message: "words"}},
+		{"a string error", `{"error":"plain"}`, domain.ProviderError{Message: "plain"}},
+		{"code 200", `{"error":{"code":200,"message":"words"}}`, domain.ProviderError{Message: "words"}},
+		{"code as a string", `{"error":{"code":"502","message":"words"}}`, domain.ProviderError{Message: "words"}},
+		{"code 99", `{"error":{"code":99,"message":"words"}}`, domain.ProviderError{Message: "words"}},
+		{"code 600", `{"error":{"code":600,"message":"words"}}`, domain.ProviderError{Message: "words"}},
+	} {
+		check := func(where string, err error) {
+			t.Helper()
+			var pe *domain.ProviderError
+			if !errors.As(err, &pe) || *pe != tc.want || strings.Contains(err.Error(), tc.want.Message) {
+				t.Errorf("%s, %s: %v", tc.name, where, err)
+			}
+		}
+		_, _, err := Observe(&domain.Target{}, &domain.Provider{}, []byte(tc.body))
+		check("Observe", err)
+		_, _, err = ObserveUsage(&domain.Provider{}, []byte(tc.body))
+		check("ObserveUsage", err)
+		err = NewStream(&domain.Target{}, &domain.Provider{}, false).Event("", []byte(tc.body), func(string, []byte) error {
+			t.Fatal("emitted")
+			return nil
+		})
+		check("Event", err)
+	}
+	// An answer that also carries an error object is an answer.
+	for _, body := range []string{
+		`{"model":"m","choices":[{"message":{"content":"hi"}}],"error":{"code":502,"message":"words"}}`,
+		`{"error":null,"choices":[{"message":{"content":"hi"}}]}`,
+		`{"error":null}`,
+	} {
+		if got, _, err := Observe(&domain.Target{}, &domain.Provider{}, []byte(body)); err != nil || string(got) != body {
+			t.Errorf("Observe %s: %s %v", body, got, err)
+		}
+	}
+	for _, body := range []string{
+		`{"data":[{"embedding":[0.1]}],"error":{"code":502,"message":"words"}}`,
+		`{"results":[{"index":0,"relevance_score":0.5}],"error":{"code":502}}`,
+		`{"error":null}`,
+	} {
+		if got, _, err := ObserveUsage(&domain.Provider{}, []byte(body)); err != nil || string(got) != body {
+			t.Errorf("ObserveUsage %s: %s %v", body, got, err)
+		}
+	}
 }

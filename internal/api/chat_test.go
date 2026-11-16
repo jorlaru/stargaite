@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -138,8 +140,8 @@ func TestChatHeaders(t *testing.T) {
 
 		{name: "provider 400", key: "agent", body: chatBody("plain", ""), step: &mockprovider.Step{Status: 400, Body: []byte(`{"error":{"message":"bad thing"}}`)},
 			status: 400, code: "upstream_error", target: "mock/up-2", upstream: chatBody("up-2", ""), message: "bad thing"},
-		{name: "provider 404", key: "agent", body: chatBody("plain", ""), step: &mockprovider.Step{Status: 404}, status: 404, code: "upstream_error",
-			target: "mock/up-2", upstream: chatBody("up-2", ""), message: "the provider answered 404"},
+		{name: "provider 404", key: "agent", body: chatBody("plain", ""), step: &mockprovider.Step{Status: 404, Body: []byte(`{"error":{"message":"no model up-2"}}`)},
+			status: 502, code: "upstream_error", target: "mock/up-2", upstream: chatBody("up-2", ""), message: "the provider answered 404"},
 		{name: "provider 422", key: "agent", body: chatBody("plain", ""), step: &mockprovider.Step{Status: 422, Body: []byte(`{"error":{"message":"too long"}}`)},
 			status: 422, code: "upstream_error", target: "mock/up-2", upstream: chatBody("up-2", ""), message: "too long"},
 		{name: "provider 429 naming the account", key: "agent", body: chatBody("plain", ""), step: &mockprovider.Step{Status: 429, Header: http.Header{"Retry-After": {"3"}},
@@ -235,26 +237,43 @@ func TestChatHeaders(t *testing.T) {
 			t.Errorf("the log holds %q", secret)
 		}
 	}
+	// The operator's refusals (404, 401, 403) leave one WARN within the
+	// limiter's window, with the status alone; each of them and each
+	// transient fault (429, 500) leaves the provider's text, redacted, on its
+	// attempt line (phase-5 design C45). The client's 400 and 422 texts reach
+	// the client, not the attempt line.
 	var attempts, requests, refused int
+	var texts []string
 	for _, line := range strings.Split(strings.TrimSpace(log), "\n") {
-		var l struct{ Msg, RequestID, TraceID, Key, Message string }
+		var l struct {
+			Msg, RequestID, TraceID, Key, Message string
+			Status                                int
+			ProviderMessage                       string `json:"provider_message"`
+		}
 		if err := json.Unmarshal([]byte(strings.ReplaceAll(line, "_id", "ID")), &l); err != nil || l.RequestID == "" || len(line) > 2000 {
 			t.Errorf("log line %s", line)
 		}
 		switch l.Msg {
 		case "attempt":
 			attempts++
+			if l.ProviderMessage != "" {
+				texts = append(texts, strconv.Itoa(l.Status)+" "+l.ProviderMessage)
+			}
 		case "request":
 			requests++
-		case "provider refused the credential":
+		case "provider refused the target":
 			refused++
-			if !strings.Contains(l.Message, "bad key [redacted]") {
+			if l.Status != 404 || strings.Contains(line, "no model") {
 				t.Errorf("refusal line %s", line)
 			}
 		}
 	}
 	if calls := len(mock.Calls()); attempts != calls || requests != 30 || refused != 1 {
 		t.Errorf("%d attempt lines for %d calls, %d request lines, %d refusal lines", attempts, calls, requests, refused)
+	}
+	if want := []string{"404 no model up-2", "429 Rate limit reached in organization org-operator: Limit 30000",
+		"401 bad key [redacted]", "403 bad key [redacted]", "500 bad key [redacted]"}; !slices.Equal(texts, want) {
+		t.Errorf("provider texts on the attempt lines %q", texts)
 	}
 	if !strings.Contains(log, `"msg":"attempt"`) || !strings.Contains(log, `"usage":{"input":1,"cache_read":0,"cache_write":0,"output":2}`) ||
 		!strings.Contains(log, `"response_model":"mock","finish_reason":"stop"`) || !strings.Contains(log, `"alias":"fast","attempts":1,"status":200`) {

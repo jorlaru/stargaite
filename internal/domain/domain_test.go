@@ -495,16 +495,17 @@ func TestNewError(t *testing.T) {
 	}
 }
 
-// TestUpstreamError: a provider's own 400, 404, 413, 422 and 429 keep their
-// status with the type of section 15, everything else is 502; Retry-After is
-// kept on a 429 only, and never encoded in the body.
+// TestUpstreamError: a provider's own 400, 413, 422 and 429 keep their status
+// with the type of section 15, everything else is 502, a 404 included (the
+// operator's to fix, phase-5 design C45); Retry-After is kept on a 429 only,
+// and never encoded in the body.
 func TestUpstreamError(t *testing.T) {
 	for _, tt := range []struct {
 		status, want int
 		typ, retry   string
 	}{
 		{400, 400, "invalid_request_error", ""},
-		{404, 404, "not_found_error", ""},
+		{404, 502, "api_error", ""},
 		{413, 413, "invalid_request_error", ""},
 		{422, 422, "invalid_request_error", ""},
 		{429, 429, "rate_limit_error", "7"},

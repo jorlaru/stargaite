@@ -193,14 +193,14 @@ func TestChatStreamErrors(t *testing.T) {
 		{"error", `{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}`, "rate_limit_error", "slow down", 429},
 		{"error", `{"type":"error","error":{"type":"timeout_error","message":"late"}}`, "timeout_error", "late", 504},
 		{"error", `{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}`, "invalid_request_error", "bad", 400},
-		{"error", `{"type":"error","error":{"type":"a_new_error","message":"new"}}`, "a_new_error", "new", 0},
+		{"error", `{"type":"error","error":{"type":"a_new_error","message":"new"}}`, "", "a_new_error: new", 0},
 		{"message_delta", `{"type":"message_delta","error":"plain text"}`, "", "plain text", 0},
 		{"", `{"type":"error","error":{"type":"overloaded_error","message":"no event field"}}`, "overloaded_error", "no event field", 529},
 	} {
 		s := NewChatStream(&domain.Target{}, &domain.Provider{}, true, clock)
-		var e *ErrorEvent
+		var e *domain.ProviderError
 		if err := s.Event(tc.name, []byte(tc.data), func(string, []byte) error { t.Fatal("emitted"); return nil }); !errors.As(err, &e) ||
-			*e != (ErrorEvent{Type: tc.typ, Message: tc.message, Status: tc.status}) || !strings.Contains(err.Error(), tc.message) {
+			*e != (domain.ProviderError{Type: tc.typ, Message: tc.message, Status: tc.status}) || strings.Contains(err.Error(), tc.message) {
 			t.Errorf("%s: %v", tc.data, err)
 		}
 	}

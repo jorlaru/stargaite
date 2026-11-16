@@ -297,6 +297,15 @@ request names the parameter at fault in `param`. Providers take the four timeout
 ([Resilience](#resilience)); a provider that declares none behaves as before, and like any provider change a change
 of its timeouts clears the stored verification of its targets.
 
+A provider's `401`, `402`, `403` or `404`, and an error object that states one of them or a `429` or `5xx` inside a
+`2xx` answer or before a stream's first event, now move the request to the alias's next target, so an alias whose
+first provider is out of credit or refuses the key is served by its fallback ([Resilience](#resilience)). With no
+target left, a provider's `404` is `502 upstream_error` with a fixed message instead of the provider's `404` and text,
+and a `2xx` that only holds an error object is answered by its status instead of being relayed as a success; its
+record carries that status and no tokens. The provider's text in an error answer is cut to 2,000 characters; the
+warning for a refused credential is now `provider refused the target`, with the status alone, and the text is on the
+attempt's log line as `provider_message`. An answer that a retry would only repeat carries `x-should-retry: false`.
+
 ## Reference
 
 The details of each part, for operators who need the exact behaviour:
@@ -631,10 +640,27 @@ timeout.
 
 ### Resilience
 
-An alias lists up to three targets. A connection failure, a timeout, a `429` or a `5xx` from the provider moves the
-request to the next target, as long as nothing was sent to the client yet; the `x-stargaite-*` headers then describe
-the target that answered. Five such failures of a target within 30 s open its circuit for 20 s, during which it is
-passed over. A stream that fails after its first event ends with one error event in the format of its endpoint. When
+An alias lists up to three targets. What a provider's failure does depends on who must act on it, and as long as
+nothing was sent to the client yet a failure that allows it moves the request to the next target; the
+`x-stargaite-*` headers then describe the target that answered:
+
+| Provider failure | Next target | Counts toward the circuit | Answer when no target is left |
+|---|---|---|---|
+| Connection failure, timeout, cut, `429`, any `5xx` | yes | yes | `504 upstream_timeout` for a timeout, the `429` with its `Retry-After`, else `502 upstream_error` |
+| `401`, `402`, `403`, `404`: the account, model id or URL the target declares | yes | no | `502 upstream_auth_error` (`401`, `403`) or `502 upstream_error` (`402`, `404`), the provider's text only in the log |
+| `400`, `413`, `422`: the request itself | no | no | the provider's status and text, at most 2,000 characters |
+| Anything else: a `2xx` that is not a usable answer, a `3xx`, another status | no | no | `502 upstream_error` |
+
+A `2xx` whose body, or whose stream before its first event reached the client, holds an error object in place of an
+answer is classified by the status that object states (an integer `error.code` from 400 to 599, or the status
+Anthropic documents for its error type), and one that states none as an answer the proxy cannot use. Each attempt's
+log line carries the provider's text, credential redacted and cut to 2,000 characters, wherever the client does not
+get it, and a `401`, `402`, `403` or `404` also logs `provider refused the target` as a warning, at most once per
+10 s. An answer carries `x-should-retry: false` when every target the request reached refused it for one of these
+two reasons, the request's or the target's declaration, and none was passed over for an open circuit, a budget or a
+quota: a new request would meet the same refusals. Five failures that count within 30 s open a target's circuit for
+20 s, during which it is passed over. A stream that fails after its first event ends with one error event in the
+format of its endpoint, which never carries the provider's text. When
 a client goes away, the provider call is cancelled at once. On `SIGTERM` (or `Ctrl-C`) `serve` stops accepting
 connections and gives the requests in flight up to 30 s to finish; any still running then gets `500 internal_error`
 with the message `server stopping`, as an error answer or as the stream's error event, and `serve` writes the pending

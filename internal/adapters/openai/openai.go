@@ -24,12 +24,18 @@ import (
 // bytes of every message content, the tool calls and whether a block was
 // removed, and the cost at p's cost_report path. The error says the body is
 // not a JSON object or repeats a key in an object it reads, a 2xx that is not
-// relayed (design section 10).
+// relayed (design section 10); it is the *domain.ProviderError of inBand for
+// a body with an error object and no choices[0].
 func Observe(t *domain.Target, p *domain.Provider, body []byte) ([]byte, domain.Observed, error) {
 	cr := report(p)
 	b, e := params.Scan(body, params.Reply(params.ChatReply, cr.Path))
 	if e != nil {
 		return nil, domain.Observed{}, errors.New(e.Message)
+	}
+	if _, ok := b.Get("choices", "0"); !ok {
+		if pe := inBand(b); pe != nil {
+			return nil, domain.Observed{}, pe
+		}
 	}
 	o := domain.Observed{ResponseModel: str(b, "model"), Cost: params.Cost(b, cr.Path, cr.USDPerUnit)}
 	var ops []params.Op
@@ -76,12 +82,20 @@ func Observe(t *domain.Target, p *domain.Provider, body []byte) ([]byte, domain.
 // usage object is absent, not an object or holds neither integer, so the
 // record estimates (USE-8). The error says the body is not a JSON object or
 // repeats a key in an object it reads: a 2xx that is not relayed, classified
-// as Observe's is (phase-2 design section 10, settled in C37).
+// as Observe's is (phase-2 design section 10, settled in C37); or the
+// *domain.ProviderError of inBand for a body with an error object and
+// neither data nor results.
 func ObserveUsage(p *domain.Provider, body []byte) ([]byte, domain.Observed, error) {
 	cr := report(p)
-	b, e := params.Scan(body, params.Reply([][]string{{"usage"}}, cr.Path))
+	b, e := params.Scan(body, params.Reply([][]string{{"usage"}, {"error"}}, cr.Path))
 	if e != nil {
 		return nil, domain.Observed{}, errors.New(e.Message)
+	}
+	_, data := b.Get("data")
+	if _, results := b.Get("results"); !data && !results {
+		if pe := inBand(b); pe != nil {
+			return nil, domain.Observed{}, pe
+		}
 	}
 	o := domain.Observed{ResponseModel: str(b, "model"), Cost: params.Cost(b, cr.Path, cr.USDPerUnit)}
 	in, ok := integer(b, "usage", "prompt_tokens")
@@ -92,6 +106,22 @@ func ObserveUsage(p *domain.Provider, body []byte) ([]byte, domain.Observed, err
 		o.Usage = &domain.Usage{Input: in}
 	}
 	return body, o, nil
+}
+
+// inBand is the error a provider put in a body or a chunk in place of an
+// answer (RES-2): the top-level error member when present and not null; nil
+// otherwise. Status is an integer error.code from 400 to 599, else 0; the
+// message is error.message or a string error. Type stays empty: no OpenAI
+// word crosses to a client.
+func inBand(b *params.Body) *domain.ProviderError {
+	if v, ok := b.Get("error"); !ok || string(v) == "null" {
+		return nil
+	}
+	e := &domain.ProviderError{Message: str(b, "error", "message") + str(b, "error")}
+	if c, ok := integer(b, "error", "code"); ok && c >= 400 && c <= 599 {
+		e.Status = int(c)
+	}
+	return e
 }
 
 // quote is the op that sets the string at path to s, re-encoded. s comes

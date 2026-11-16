@@ -43,36 +43,30 @@ func NewStream(t *domain.Target, p *domain.Provider, includeUsage bool) *Stream 
 	return s
 }
 
-// ErrorChunk is a chunk with a top-level error member, the in-stream error
-// the OpenAI SDKs read. Event does not emit it: before the commit it is not
-// relayed, after it the relay writes its own terminal event in its place.
-// Message is the provider's text, which may name its account or echo the
-// credential: it goes only to the attempt's cause.
-type ErrorChunk struct{ Message string }
-
-func (e *ErrorChunk) Error() string { return "the provider's stream reported an error: " + e.Message }
-
 // Event observes the data of one event and emits it; the event name, which
 // OpenAI does not send, is ignored. It returns io.EOF once [DONE] is emitted,
-// the end of the stream; *ErrorChunk; an error for data that is not a JSON
-// object or repeats a key in an object it reads; or emit's error. Observed:
-// the first response model, the finish reason of choice 0, the visible bytes
-// of every delta's content, each tool call once, whether a think block was
+// the end of the stream; the *domain.ProviderError of inBand for a chunk with a
+// top-level error member, the in-stream error the OpenAI SDKs read, which it
+// does not emit (before the commit it is not relayed, after it the relay writes
+// its own terminal event in its place); an error for data that is not a JSON
+// object or repeats a key in an object it reads; or emit's error. Observed: the
+// first response model, the finish reason of choice 0, the visible bytes of
+// every delta's content, each tool call once, whether a think block was
 // removed, the latest usage that is not null, which arrives when the client
-// asked for it (stream_options.include_usage) or the provider sends it
-// unasked, and the latest cost at the provider's cost_report path. A chunk
-// with no choice and a usage object that only the proxy asked for (NewStream)
-// is observed and not emitted; a "usage": null on any other chunk is relayed.
+// asked for it (stream_options.include_usage) or the provider sends it unasked,
+// and the latest cost at the provider's cost_report path. A chunk with no
+// choice and a usage object that only the proxy asked for (NewStream) is
+// observed and not emitted; a "usage": null on any other chunk is relayed.
 //
-// Toward a target that declares inline_think_tags, each choice's delta
-// content goes through its own reasoning.Stripper and is re-encoded only when
-// the visible text differs; every other byte of the chunk is kept. A chunk
-// whose content becomes empty is still emitted with "content":"". The text a
-// stripper holds back goes out with the choice's next content, or in the
-// chunk that carries the choice's finish_reason (as a content member added to
-// its delta when it has none), or, for a choice that never had one, in one
-// chunk emitted before [DONE]: the last chunk read, with its choices replaced
-// by the released text and its usage removed.
+// Toward a target that declares inline_think_tags, each choice's delta content
+// goes through its own reasoning.Stripper and is re-encoded only when the
+// visible text differs; every other byte of the chunk is kept. A chunk whose
+// content becomes empty is still emitted with "content":"". The text a stripper
+// holds back goes out with the choice's next content, or in the chunk that
+// carries the choice's finish_reason (as a content member added to its delta
+// when it has none), or, for a choice that never had one, in one chunk emitted
+// before [DONE]: the last chunk read, with its choices replaced by the released
+// text and its usage removed.
 func (s *Stream) Event(_ string, data []byte, emit func(name string, data []byte) error) error {
 	if string(data) == "[DONE]" {
 		if err := s.release(emit); err != nil {
@@ -87,8 +81,8 @@ func (s *Stream) Event(_ string, data []byte, emit func(name string, data []byte
 	if e != nil {
 		return errors.New("a chunk of the stream: " + e.Message)
 	}
-	if v, ok := b.Get("error"); ok && string(v) != "null" {
-		return &ErrorChunk{Message: str(b, "error", "message") + str(b, "error")}
+	if pe := inBand(b); pe != nil {
+		return pe
 	}
 	if s.obs.ResponseModel == "" {
 		s.obs.ResponseModel = str(b, "model")

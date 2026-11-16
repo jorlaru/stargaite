@@ -105,10 +105,10 @@ dominates is not measured. Both are listed below as accepted deviations, up to 2
 
 ## Outbound connection reuse
 
-Phase-4 design section 15, point 29: the outbound transport keeps Go's `DefaultMaxIdleConnsPerHost` of 2. With it,
-the throughput run leaves 2,870, 3,110 and 3,188 sockets in `TIME_WAIT` toward the mock over three runs
-(`throughput_time_wait`), so connections churn. A run with `MaxIdleConnsPerHost: 100` in `transport.NewClient` left
-none, but did not change throughput or P99:
+Phase-4 design section 15, point 29: the run recorded here used an outbound transport with Go's
+`DefaultMaxIdleConnsPerHost` of 2. With it, the throughput run left 2,870, 3,110 and 3,188 sockets in `TIME_WAIT`
+toward the mock over three runs (`throughput_time_wait`), so connections churned. A run with
+`MaxIdleConnsPerHost: 100` in `transport.NewClient` left none, but did not change throughput or P99:
 
 | | Default (three runs) | `MaxIdleConnsPerHost: 100` |
 |---|---|---|
@@ -118,8 +118,21 @@ none, but did not change throughput or P99:
 | `latency_sync_p99_ms` | 2.087; 1.902; 2.090 | 2.016 |
 | `latency_native_stream_p99_ms` | 2.250; 2.164; 2.151 | 2.161 |
 
-Churn does not hurt throughput or P99 on loopback, so `transport.NewClient` is unchanged. Over a real network, where
-each new connection costs a TLS handshake, the finding may differ; this benchmark does not measure it.
+Churn does not hurt throughput or P99 on loopback, where a new connection costs nothing measurable, so phase 4 left
+`transport.NewClient` unchanged. Phase 5 (design step C48) reverses that: toward a provider each new connection is
+also a lookup and a TLS handshake, and a proxy sends the calls of many clients to a handful of hosts. Measured on
+2026-11-16 in the pinned Go image, on loopback, with two waves of parallel calls to one host, each wave held until
+all its calls are in flight:
+
+| | Go's default, 2 idle per host | `MaxIdleConnsPerHost: 100` |
+|---|---|---|
+| New connections, two waves of 16 plain HTTP calls (`TestClientPool`) | 16, then 14 | 16, then 0 |
+| TLS handshakes, two waves of 100 calls | 198 for 200 calls | 100 for 200 calls |
+
+`transport.NewClient` now keeps up to 100 idle connections per host and closes one left idle for 90 s, the value of
+Go's `DefaultTransport`. No figure was measured over a real network. The run recorded here predates the change: its
+`throughput_time_wait` is Go's default, and a new run is expected to show the 0 of the `MaxIdleConnsPerHost: 100` run
+above (not run again).
 
 ## Container resources
 

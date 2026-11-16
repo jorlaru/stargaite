@@ -11,6 +11,8 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -189,6 +191,62 @@ func TestClientDialBackstop(t *testing.T) {
 	tr := NewClient(false, answer(t)).Transport.(*http.Transport)
 	if tr.TLSHandshakeTimeout != time.Minute || dialer(false).Timeout != time.Minute {
 		t.Errorf("TLS handshake %v, dial %v", tr.TLSHandshakeTimeout, dialer(false).Timeout)
+	}
+}
+
+// C48: a second wave of parallel calls to one host reuses the connections
+// the first opened, and an idle connection is closed after 90 s.
+func TestClientPool(t *testing.T) {
+	const wave = 16
+	var opened atomic.Int64
+	var inFlight sync.WaitGroup
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		// Every call of a wave holds its connection until all are in flight,
+		// or until its client gave up, so a failure cannot hang the test.
+		inFlight.Done()
+		all := make(chan struct{})
+		go func() { inFlight.Wait(); close(all) }()
+		select {
+		case <-all:
+		case <-r.Context().Done():
+		}
+	}))
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			opened.Add(1)
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+	_, port, _ := net.SplitHostPort(srv.Listener.Addr().String())
+	c := NewClient(true, answer(t, "127.0.0.1"))
+	c.Timeout = 5 * time.Second
+	for i, want := range []int64{wave, 0} {
+		before := opened.Load()
+		inFlight.Add(wave)
+		var calls sync.WaitGroup
+		for range wave {
+			calls.Go(func() {
+				// The answer has no body, so its connection is back in the
+				// pool, or closed, before Get returns.
+				resp, err := c.Get("http://" + host + ":" + port + "/")
+				if err != nil {
+					t.Error(err)
+					return
+				}
+				_ = resp.Body.Close()
+			})
+		}
+		calls.Wait()
+		if t.Failed() {
+			return
+		}
+		if n := opened.Load() - before; n != want {
+			t.Errorf("wave %d opened %d connections, want %d", i+1, n, want)
+		}
+	}
+	if d := c.Transport.(*http.Transport).IdleConnTimeout; d != 90*time.Second {
+		t.Errorf("idle timeout %v, want 90s", d)
 	}
 }
 

@@ -323,6 +323,12 @@ already did: a client that starts its next request on reading it no longer meets
 `429 parallel_limit_exceeded`. Every earlier event is still sent as it arrives, so a client that starts on a native
 finish-reason chunk, before the terminator, can still meet it.
 
+Outbound connections, to providers and to the telemetry endpoint, are now kept for reuse up to 100 per host, each
+closed after 90 s idle, instead of Go's default of 2: parallel calls to one provider reuse the connections earlier
+calls opened rather than paying a lookup, a connection and a TLS handshake each
+([docs/benchmark.md](docs/benchmark.md#outbound-connection-reuse)). A kept connection that the provider has closed
+fails as any connection failure does ([Resilience](#resilience)).
+
 ## Reference
 
 The details of each part, for operators who need the exact behaviour:

@@ -17,11 +17,16 @@ import (
 // Private while allowPrivate is false, and dials an address literal; the
 // dialer checks again the address actually connected to. Proxy variables are
 // ignored, redirects are returned as responses, certificates are verified.
-// Each call has its own connection pool. Deadlines come from the request's
-// context. The transport keeps a dial going after its request gave up, for a
-// later request, so the dial and the TLS handshake also have a backstop of
-// their own (dialBackstop), far above any connect timeout (RES-3): a provider
-// that accepts and never completes the handshake cannot hold a dial forever.
+// Each call has its own connection pool, sized for a proxy that sends many
+// calls at once to few hosts: it keeps up to 100 idle connections per host
+// and closes one left idle for 90 s, Go's DefaultTransport value, so a second
+// wave of parallel calls reuses what the first opened instead of a new
+// lookup, connection and TLS handshake each. Deadlines come from the
+// request's context. The transport keeps a dial going after its request gave
+// up, for a later request, so the dial and the TLS handshake also have a
+// backstop of their own (dialBackstop), far above any connect timeout
+// (RES-3): a provider that accepts and never completes the handshake cannot
+// hold a dial forever.
 func NewClient(allowPrivate bool, resolve Resolver) *http.Client {
 	if resolve == nil {
 		panic("transport: NewClient needs a resolver")
@@ -29,6 +34,8 @@ func NewClient(allowPrivate bool, resolve Resolver) *http.Client {
 	d := dialer(allowPrivate)
 	return &http.Client{
 		Transport: &http.Transport{
+			MaxIdleConnsPerHost: 100,
+			IdleConnTimeout:     90 * time.Second,
 			TLSHandshakeTimeout: dialBackstop,
 			Proxy:               nil, // SEC-4: the check would see the proxy's address
 			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {

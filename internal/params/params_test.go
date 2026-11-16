@@ -3,6 +3,7 @@ package params
 import (
 	"bytes"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -249,6 +250,26 @@ func TestBoundHeadroom(t *testing.T) {
 	}
 	if v, ok := rb.Get("output_config", "effort"); !ok || string(v) != `"high"` {
 		t.Errorf("read back %s, %v", v, ok)
+	}
+}
+
+// TestScanAllocs: the decoder reads the body in place, so scanning a chat
+// body whose one message holds a 1 MiB string allocates at most 64 KiB
+// (LIM-6). The index of the members the walk reads is not bounded here.
+func TestScanAllocs(t *testing.T) {
+	raw := []byte(`{"model":"m","messages":[{"role":"user","content":"` + strings.Repeat("a", 1<<20) + `"}]}`)
+	if _, e := Scan(raw, Chat.Walk); e != nil {
+		t.Fatalf("Scan: %+v", e)
+	}
+	const runs = 10
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	for range runs {
+		Scan(raw, Chat.Walk)
+	}
+	runtime.ReadMemStats(&after)
+	if n := (after.TotalAlloc - before.TotalAlloc) / runs; n > 64<<10 {
+		t.Errorf("one scan of a 1 MiB body allocated %d bytes, want at most %d", n, 64<<10)
 	}
 }
 

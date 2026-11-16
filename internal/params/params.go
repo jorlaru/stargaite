@@ -101,9 +101,10 @@ func walkTrie(walk [][]string) trie {
 }
 
 // scan indexes raw along t, at most limit members and elements; a negative
-// limit is no bound.
+// limit is no bound. The decoder parses a bytes.Buffer in place, without
+// writing to it, where it would copy a reader's bytes.
 func scan(raw []byte, t trie, limit int) (*Body, *Error) {
-	d := jsontext.NewDecoder(bytes.NewReader(raw), jsontext.AllowDuplicateNames(true))
+	d := jsontext.NewDecoder(bytes.NewBuffer(raw), jsontext.AllowDuplicateNames(true))
 	if d.PeekKind() != '{' {
 		return nil, &Error{Code: "invalid_request", Message: "the body must be a JSON object"}
 	}

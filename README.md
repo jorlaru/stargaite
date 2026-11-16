@@ -338,6 +338,11 @@ answer, such as one cut by a timer, now has no cost and counts as unpriced inste
 as before, it charges no budget. One that never reached the provider, such as a refused connection, keeps its cost of
 0.
 
+A request body is now read in place each time the proxy scans it: a scan no longer copies the values it reads past, so
+scanning a body whose megabyte is one long message allocates a few KB where it allocated about 4 MB. The index of the
+members the proxy reads costs what it did, so a body of many short messages can still cost several times its size
+per scan.
+
 ## Reference
 
 The details of each part, for operators who need the exact behaviour:

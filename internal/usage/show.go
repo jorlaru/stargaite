@@ -21,8 +21,9 @@ type Query struct {
 
 // Group is one row of usage show: the sums over the records of one billing
 // mode and one value of each grouped column, the others empty. The counts
-// and percentiles that usage_daily does not hold are nil in a daily window:
-// absent, never zero.
+// and percentiles that usage_daily does not hold are nil in a daily window,
+// and the reasoning tokens and the cost are nil where no record reported
+// them: absent, never zero (USE-9).
 type Group struct {
 	Billing      string   `json:"billing"`
 	Key          string   `json:"key,omitempty"`
@@ -39,7 +40,7 @@ type Group struct {
 	CacheRead    int64    `json:"cache_read_tokens"`
 	CacheWrite   int64    `json:"cache_write_tokens"`
 	Output       int64    `json:"output_tokens"`
-	Reasoning    int64    `json:"reasoning_tokens"`
+	Reasoning    *int64   `json:"reasoning_tokens,omitempty"`
 	CostUSD      *float64 `json:"cost_usd,omitempty"` // pay_per_use groups with a known cost only (USE-7)
 	OutputP50    *int64   `json:"output_tokens_p50,omitempty"`
 	OutputP90    *int64   `json:"output_tokens_p90,omitempty"`
@@ -71,7 +72,7 @@ var byColumn = map[string]string{"key": "key_name", "model": "model", "target": 
 const recordsText = `SELECT %[1]s, COUNT(*), COUNT(error_type), SUM(tokens_source = 'estimated'),
 	SUM(billing = 'pay_per_use' AND cost_usd IS NULL), SUM(IFNULL(finish_reason, '') IN ('length', 'max_tokens', 'model_context_window_exceeded')),
 	SUM(content_empty), SUM(input_tokens), SUM(cache_read_tokens), SUM(cache_write_tokens), SUM(output_tokens),
-	SUM(IFNULL(reasoning_tokens, 0)), SUM(cost_usd),
+	SUM(reasoning_tokens), SUM(cost_usd),
 	MAX(CASE WHEN ok AND o = (n + 1) / 2 THEN output_tokens END), MAX(CASE WHEN ok AND o = (9 * n + 9) / 10 THEN output_tokens END),
 	MAX(CASE WHEN ok AND r = (nr + 1) / 2 THEN reasoning_tokens END), MAX(CASE WHEN ok AND r = (9 * nr + 9) / 10 THEN reasoning_tokens END)
 FROM (SELECT *, ROW_NUMBER() OVER (PARTITION BY %[1]s, ok ORDER BY output_tokens) AS o, COUNT(*) OVER (PARTITION BY %[1]s, ok) AS n,
@@ -171,9 +172,7 @@ func window(ctx context.Context, db *sql.DB, q Query, cols []string, since, unti
 		if err := rows.Scan(dest...); err != nil {
 			return Report{}, err
 		}
-		// usage_daily adds a NULL cost as 0, so a daily sum of 0 may be an
-		// unpriced call: no figure rather than an invented one.
-		if cost.Valid && g.Billing == domain.BillingPayPerUse && (records || cost.Float64 != 0) {
+		if cost.Valid && g.Billing == domain.BillingPayPerUse {
 			g.CostUSD = &cost.Float64
 		}
 		rep.Groups = append(rep.Groups, g)

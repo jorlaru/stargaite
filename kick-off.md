@@ -424,10 +424,10 @@ All `proposed`. The usage store is the official record. It is local, durable and
 | USE-3 | Tokens are always recorded, with or without a price. `input_tokens` is the total input, cache tokens included; `cache_read_tokens` and `cache_write_tokens` are parts of it. `output_tokens` is the total output the provider bills, reasoning included; `reasoning_tokens` is the part spent on reasoning, empty when the provider does not report it. No total adds a part twice. On chat completions over the `openai` protocol, `output_tokens` is the larger of `completion_tokens` and `total_tokens` minus `prompt_tokens`, because some providers leave reasoning out of `completion_tokens`; `reasoning_tokens` is only what the provider reports. On embeddings and rerank, `input_tokens` is `usage.prompt_tokens`, else `usage.total_tokens`, and `output_tokens` is 0, because some providers report only the total. The provider's `finish_reason` is recorded too |
 | USE-4 | Each record carries the key name, the model alias, the target, the upstream model id sent and the `model` the provider returned. A returned model that starts with neither the upstream id nor one of the target's `response_models` is flagged as a mismatch and counted |
 | USE-5 | Each record carries the requested, alias and sent values of effort and output cap, the list of parameter changes, the proxy version and the configuration revision |
-| USE-6 | Cost is in USD and carries its source: `provider` (read from the provider's response at its `cost_report` path) or `price_table` (computed from the target's declared prices and the recorded tokens; a missing cache price is the input price). The provider's figure wins over the price table; when a response carries no provider figure, the price table is used, also over estimated tokens. Without a report and without prices the cost is empty and the source is `none`: it is never guessed. A separate field says whether the tokens came from the provider or were estimated (USE-8) |
+| USE-6 | Cost is in USD and carries its source: `provider` (read from the provider's response at its `cost_report` path) or `price_table` (computed from the target's declared prices and the recorded tokens; a missing cache price is the input price). The provider's figure wins over the price table; when a response carries no provider figure, the price table is used, also over estimated tokens. Without a report and without prices the cost is empty and the source is `none`: it is never guessed. A call whose request reached the provider and that got no answer has no cost either. A separate field says whether the tokens came from the provider or were estimated (USE-8) |
 | USE-7 | Records of `subscription` and `none` providers have no cost. They never enter a USD total or a USD budget, and are reported separately in requests and tokens |
 | USE-8 | In streaming, the usage block is obtained as each provider needs it (`stream_usage`): `request` sets `stream_options.include_usage` in the outgoing body, listed as added, or as translated when the client sent `include_usage: false`, and the proxy consumes the final usage chunk when the client did not ask for it; `native` expects usage without asking; `none` means it is not available; undeclared asks for nothing. If a call answered `2xx` and either no usage arrives or its answer did not end cleanly (for example, the client disconnected), tokens are estimated as the bytes of the input the provider received (the translated body on a translated path) and of the visible output divided by four, rounded up; parts the provider did report are kept, the output is the larger of the reported and the estimated one, and the record is marked `tokens_source: estimated`. A call whose effective status (RES-2) is not `2xx` records zero tokens, with `tokens_source: provider` |
-| USE-9 | `stargaite usage show` answers from the local store alone. It filters by `--key`, `--model` and `--target`, groups by any combination of key, model, target and effort sent (`--by key,model,effort-sent`), over a time window, with `--compare-previous` for the window before it. For each group: requests (provider calls: a request that fell back counts once per attempt), tokens by type, cost, median and 90th percentile of reasoning and output tokens over the successful records that reported them, responses with `finish_reason=length` and responses with empty visible content (no text and no tool call). Percentiles and grouping by effort come from the records, so they exist only within the usage retention; for older windows it returns the sums of the daily aggregates. `stargaite usage quota` shows each subscription window |
+| USE-9 | `stargaite usage show` answers from the local store alone. It filters by `--key`, `--model` and `--target`, groups by any combination of key, model, target and effort sent (`--by key,model,effort-sent`), over a time window, with `--compare-previous` for the window before it. For each group: requests (provider calls: a request that fell back counts once per attempt), tokens by type (a count no record reported is shown as absent, never as 0, in the records and in the daily aggregates alike), cost, median and 90th percentile of reasoning and output tokens over the successful records that reported them, responses with `finish_reason=length` and responses with empty visible content (no text and no tool call). Percentiles and grouping by effort come from the records, so they exist only within the usage retention; for older windows it returns the sums of the daily aggregates. `stargaite usage quota` shows each subscription window |
 | USE-10 | Records go through a single writer in batches (100 records or 50 ms, whichever comes first), each batch committed with `synchronous = FULL`. After three consecutive failed commits the store is unavailable and the writer retries every 5 s. Meanwhile `pay_per_use` targets are ineligible (`503 usage_store_unavailable` when no other target is left), `subscription` and `none` targets keep serving, quota counters keep counting in memory, and records wait in the writer's bounded queue. A record that cannot wait (the queue is full, or the process is stopping) is written as one structured log line at critical level, with no content: it is never lost silently, but it is absent from the counters rebuilt at start |
 | USE-11 | Retention is finite by default and enforced by the process itself, once a day, in small batches, with no external scheduler: usage records 90 days, daily aggregates 36 months, audit 24 months. Usage records are kept for at least the longest quota window, which the rebuild of LIM-8 reads. The values are settings: `settings show` prints them, and `export` when they were declared. The running total of a `never` budget is kept in its own counter and is not subject to retention |
 | USE-12 | A `pay_per_use` target with neither declared prices nor a provider `cost_report` produces records without cost, which no budget can see. A change is refused when such a target can be reached from a scope that has a budget (the instance, a key or an alias); otherwise `validate` warns. A target priced only by its provider's `cost_report` cannot price a response whose report never arrived (an aborted stream): `validate` warns that it has no prices to fall back on. Every `pay_per_use` record left without a cost is counted in a metric of unpriced requests |
@@ -1105,8 +1105,8 @@ CREATE TABLE usage_daily (                -- updated in the same transaction as 
     cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
     cache_write_tokens  INTEGER NOT NULL DEFAULT 0,
     output_tokens       INTEGER NOT NULL DEFAULT 0,
-    reasoning_tokens    INTEGER NOT NULL DEFAULT 0,
-    cost_usd            REAL NOT NULL DEFAULT 0,
+    reasoning_tokens    INTEGER,          -- NULL when no record of the row reported it (migration 003)
+    cost_usd            REAL,             -- NULL when no record of the row reported it (migration 003)
     PRIMARY KEY (day, key_name, model, target)
 );
 
@@ -1153,6 +1153,32 @@ CREATE TABLE usage_daily (
     cost_usd            REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (day, key_name, model, target, billing)   -- a provider whose billing changes keeps its rows apart
 );
+```
+
+```sql
+-- Migration 003: a figure no record reported is NULL in usage_daily
+
+ALTER TABLE usage_daily RENAME TO usage_daily_002;
+CREATE TABLE usage_daily (
+    day                 TEXT NOT NULL,
+    key_name            TEXT NOT NULL,
+    model               TEXT NOT NULL,
+    target              TEXT NOT NULL,
+    billing             TEXT NOT NULL,
+    requests            INTEGER NOT NULL DEFAULT 0,
+    errors              INTEGER NOT NULL DEFAULT 0,
+    input_tokens        INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens       INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens    INTEGER,          -- NULL when no record of the row reported it
+    cost_usd            REAL,             -- NULL when no record of the row reported it
+    PRIMARY KEY (day, key_name, model, target, billing)   -- a provider whose billing changes keeps its rows apart
+);
+INSERT INTO usage_daily SELECT day, key_name, model, target, billing, requests, errors, input_tokens, cache_read_tokens,
+    cache_write_tokens, output_tokens, NULLIF(reasoning_tokens, 0), NULLIF(cost_usd, 0)
+    FROM usage_daily_002;             -- an old 0 cannot be told from an unknown, so it becomes unknown
+DROP TABLE usage_daily_002;
 ```
 
 A `never` budget declared before migration 002 gets its `budget_totals` row, at the current revision, when the

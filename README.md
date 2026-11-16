@@ -329,6 +329,15 @@ calls opened rather than paying a lookup, a connection and a TLS handshake each
 ([docs/benchmark.md](docs/benchmark.md#outbound-connection-reuse)). A kept connection that the provider has closed
 fails as any connection failure does ([Resilience](#resilience)).
 
+A figure no record reported is now absent at every level of `usage show` instead of 0 ([Usage](#usage)): reasoning
+tokens where the provider reported none, in the records and in the daily sums alike, so a reported 0 (the evidence
+that effort `none` works) is told apart from no figure; and a daily cost where no call was priced, while a priced 0 is
+now shown. The store's migration 003 makes the daily sums' reasoning tokens and cost nullable and copies each old 0
+as absent, since it cannot be told from an unknown. A `pay_per_use` call whose request reached the provider and got no
+answer, such as one cut by a timer, now has no cost and counts as unpriced instead of costing 0 from the price table;
+as before, it charges no budget. One that never reached the provider, such as a refused connection, keeps its cost of
+0.
+
 ## Reference
 
 The details of each part, for operators who need the exact behaviour:
@@ -390,7 +399,8 @@ the bytes (a quarter of them, rounded up) and marked `estimated`. Toward a provi
 `x-stargaite-params-changed`, and relays that chunk only to a client that asked for it. A provider is billed
 `pay_per_use`, `subscription` or `none`; only `pay_per_use` calls have a cost, read from the response at the provider's
 `cost_report` path when it declares one (OpenRouter and xAI do), else computed from the target's `--pricing`, else left
-empty and counted as unpriced: it is never guessed. Records reach the store in batches within 50 ms; on `SIGTERM` the pending ones are
+empty and counted as unpriced: it is never guessed. A call whose request reached the provider and got no answer, such
+as one cut by a timer, has no cost either. Records reach the store in batches within 50 ms; on `SIGTERM` the pending ones are
 written before the store closes, and a record that cannot be stored is written to the log as one `CRITICAL` line
 instead of being lost. A crash loses at most the records not yet committed. When the store fails three commits in a
 row it is unavailable: `pay_per_use` targets are passed over (`503 usage_store_unavailable` when the alias has no
@@ -401,7 +411,8 @@ writer retries every 5 s; a record that finds the queue full goes to the log as 
 filtered with `--key`, `--model` and `--target` and grouped with `--by key,model,target,effort-sent`: requests,
 errors, each kind of token, estimated calls, the cost of `pay_per_use` calls and the unpriced ones, answers cut at a
 limit (`finish_reason` `length` or the like), empty answers, and the median and 90th percentile of output and
-reasoning tokens over the successful calls whose provider reported them. `--compare-previous` adds the window of the
+reasoning tokens over the successful calls whose provider reported them. A figure no record of a group reported, its
+reasoning tokens or its cost, is absent (`-`), never 0. `--compare-previous` adds the window of the
 same length before it; `--by effort-sent` with it shows whether reasoning tokens move with the effort sent. It reads
 the records within `usage_days` (90 by default; `serve` deletes older ones once a day, keeping those the longest quota
 window reads): a window that starts earlier is answered from the daily sums, over whole UTC days and without the

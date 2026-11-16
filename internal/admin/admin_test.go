@@ -880,13 +880,13 @@ func TestUsageShow(t *testing.T) {
 	}
 	grouped := func(key string) string {
 		return `{"billing":"pay_per_use","key":"` + key + `","effort_sent":"-","requests":1,"errors":0,"estimated":0,"unpriced":0,"length":0,"empty":0,` +
-			`"input_tokens":10,"cache_read_tokens":0,"cache_write_tokens":0,"output_tokens":5,"reasoning_tokens":0,"cost_usd":0.5,"output_tokens_p50":5,"output_tokens_p90":5}`
+			`"input_tokens":10,"cache_read_tokens":0,"cache_write_tokens":0,"output_tokens":5,"cost_usd":0.5,"output_tokens_p50":5,"output_tokens_p90":5}`
 	}
 	for query, want := range map[string]string{
 		"?since=1h&by=key,effort-sent&compare_previous=true": `{"source":"records","since":"2026-09-21T13:13:20Z","until":"2026-09-21T14:13:20Z","groups":[` + grouped("k1") +
 			`],"previous":{"source":"records","since":"2026-09-21T12:13:20Z","until":"2026-09-21T13:13:20Z","groups":[` + grouped("k2") + `]}}`,
 		"?since=2400h&compare_previous=false": `{"source":"daily","since":"2026-06-13T00:00:00Z","until":"2026-09-21T14:13:20Z","groups":[` +
-			`{"billing":"pay_per_use","requests":3,"errors":0,"input_tokens":30,"cache_read_tokens":0,"cache_write_tokens":0,"output_tokens":0,"reasoning_tokens":0}]}`,
+			`{"billing":"pay_per_use","requests":3,"errors":0,"input_tokens":30,"cache_read_tokens":0,"cache_write_tokens":0,"output_tokens":0}]}`,
 	} {
 		w := f.as(t, "Bearer "+testKey, http.MethodGet, "/admin/v1/usage"+query, nil)
 		if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != want {

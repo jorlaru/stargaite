@@ -73,23 +73,23 @@ func TestShow(t *testing.T) {
 		want []Group
 	}{
 		{"by billing", Query{Since: since}, []Group{
-			ranked(pay(Group{Requests: 4, Errors: 1, Estimated: ptr(int64(1)), Unpriced: ptr(int64(1)), Input: 30, CacheRead: 6, Output: 15, Reasoning: 4, CostUSD: ptr(1.25)}), 5, 5, 1, 1),
-			ranked(counted(Group{Billing: domain.BillingSubscription, Requests: 1, Input: 10, CacheRead: 2, Output: 5, Reasoning: 1}), 5, 5, 1, 1),
+			ranked(pay(Group{Requests: 4, Errors: 1, Estimated: ptr(int64(1)), Unpriced: ptr(int64(1)), Input: 30, CacheRead: 6, Output: 15, Reasoning: ptr(int64(4)), CostUSD: ptr(1.25)}), 5, 5, 1, 1),
+			ranked(counted(Group{Billing: domain.BillingSubscription, Requests: 1, Input: 10, CacheRead: 2, Output: 5, Reasoning: ptr(int64(1))}), 5, 5, 1, 1),
 		}},
 		{"by key and model", Query{Since: since, By: []string{"model", "key"}}, []Group{
-			pay(Group{Key: "k", Model: "deep", Requests: 1, Estimated: ptr(int64(1)), Unpriced: ptr(int64(1)), Input: 10, CacheRead: 2, Output: 5, Reasoning: 1}),
-			ranked(pay(Group{Key: "k", Model: "fast", Requests: 3, Errors: 1, Input: 20, CacheRead: 4, Output: 10, Reasoning: 3, CostUSD: ptr(1.25)}), 5, 5, 1, 1),
-			ranked(counted(Group{Billing: domain.BillingSubscription, Key: "other", Model: "fast", Requests: 1, Input: 10, CacheRead: 2, Output: 5, Reasoning: 1}), 5, 5, 1, 1),
+			pay(Group{Key: "k", Model: "deep", Requests: 1, Estimated: ptr(int64(1)), Unpriced: ptr(int64(1)), Input: 10, CacheRead: 2, Output: 5, Reasoning: ptr(int64(1))}),
+			ranked(pay(Group{Key: "k", Model: "fast", Requests: 3, Errors: 1, Input: 20, CacheRead: 4, Output: 10, Reasoning: ptr(int64(3)), CostUSD: ptr(1.25)}), 5, 5, 1, 1),
+			ranked(counted(Group{Billing: domain.BillingSubscription, Key: "other", Model: "fast", Requests: 1, Input: 10, CacheRead: 2, Output: 5, Reasoning: ptr(int64(1))}), 5, 5, 1, 1),
 		}},
 		{"filtered by target", Query{Since: since, Target: "q/m", By: []string{"target"}}, []Group{
-			ranked(pay(Group{Target: "q/m", Requests: 1, Input: 10, CacheRead: 2, Output: 5, Reasoning: 1, CostUSD: ptr(1.0)}), 5, 5, 1, 1),
+			ranked(pay(Group{Target: "q/m", Requests: 1, Input: 10, CacheRead: 2, Output: 5, Reasoning: ptr(int64(1)), CostUSD: ptr(1.0)}), 5, 5, 1, 1),
 		}},
 		{"filtered by key and model", Query{Since: since, Key: "k", Model: "deep"}, []Group{
-			pay(Group{Requests: 1, Estimated: ptr(int64(1)), Unpriced: ptr(int64(1)), Input: 10, CacheRead: 2, Output: 5, Reasoning: 1}),
+			pay(Group{Requests: 1, Estimated: ptr(int64(1)), Unpriced: ptr(int64(1)), Input: 10, CacheRead: 2, Output: 5, Reasoning: ptr(int64(1))}),
 		}},
 		{"a window with nothing", Query{Since: now.Add(-time.Millisecond)}, []Group{}},
 		{"a longer window", Query{Since: since.Add(-time.Hour), Key: "k", Target: "p/m", Model: "fast"}, []Group{
-			ranked(pay(Group{Requests: 3, Errors: 1, Input: 20, CacheRead: 4, Output: 10, Reasoning: 3, CostUSD: ptr(0.5)}), 5, 5, 1, 1),
+			ranked(pay(Group{Requests: 3, Errors: 1, Input: 20, CacheRead: 4, Output: 10, Reasoning: ptr(int64(3)), CostUSD: ptr(0.5)}), 5, 5, 1, 1),
 		}},
 	} {
 		rep, err := Show(context.Background(), st.Read(), tc.q, now, 90)
@@ -165,10 +165,10 @@ func TestShowRecords(t *testing.T) {
 	pay := func(g Group) Group { g.Billing, g.Model = domain.BillingPayPerUse, "fast"; return counted(g) }
 	want := Report{Source: "records", Since: q.Since, Until: now, Groups: []Group{
 		ranked(pay(Group{Key: "a", EffortSent: "-", Requests: 1, Length: ptr(int64(1)), Empty: ptr(int64(1)), Input: 10, CacheRead: 2, Output: 7, CostUSD: ptr(0.25)}), 7, 7, -1, -1),
-		ranked(pay(Group{Key: "a", EffortSent: "low", Requests: 12, Errors: 1, Estimated: ptr(int64(1)), Input: 120, CacheRead: 24, Output: 1055, Reasoning: 451, CostUSD: ptr(3.0)}), 5, 9, 50, 90),
-		ranked(pay(Group{Key: "b", EffortSent: "high", Requests: 3, Length: ptr(int64(2)), Input: 30, CacheRead: 6, Output: 600, Reasoning: 3, CostUSD: ptr(0.75)}), 200, 300, 1, 2),
+		ranked(pay(Group{Key: "a", EffortSent: "low", Requests: 12, Errors: 1, Estimated: ptr(int64(1)), Input: 120, CacheRead: 24, Output: 1055, Reasoning: ptr(int64(451)), CostUSD: ptr(3.0)}), 5, 9, 50, 90),
+		ranked(pay(Group{Key: "b", EffortSent: "high", Requests: 3, Length: ptr(int64(2)), Input: 30, CacheRead: 6, Output: 600, Reasoning: ptr(int64(3)), CostUSD: ptr(0.75)}), 200, 300, 1, 2),
 	}, Previous: &Report{Source: "records", Since: q.Since.Add(-24 * time.Hour), Until: q.Since, Groups: []Group{
-		ranked(pay(Group{Key: "a", EffortSent: "low", Requests: 2, Input: 20, CacheRead: 4, Output: 6, Reasoning: 6, CostUSD: ptr(0.5)}), 2, 4, 2, 4),
+		ranked(pay(Group{Key: "a", EffortSent: "low", Requests: 2, Input: 20, CacheRead: 4, Output: 6, Reasoning: ptr(int64(6)), CostUSD: ptr(0.5)}), 2, 4, 2, 4),
 	}}}
 	rep.Groups = slices.DeleteFunc(rep.Groups, func(g Group) bool { return g.Key == "r" })
 	if err != nil || !reflect.DeepEqual(rep, want) {
@@ -192,8 +192,8 @@ func TestShowRecords(t *testing.T) {
 // TestShowDaily seeds records older than usage_days, which the writer also
 // summed in usage_daily: a window that starts before the retention reads
 // those sums over whole UTC days, through today, without the counts and
-// percentiles they do not hold and without a cost of 0 that may be an
-// unpriced call; a previous window that starts before it is read the same
+// percentiles they do not hold and without a cost for a group no record
+// priced; a previous window that starts before it is read the same
 // way, to 00:00 of the day the current window starts; and effort-sent is
 // refused whenever a window would be read from the sums.
 func TestShowDaily(t *testing.T) {
@@ -216,15 +216,15 @@ func TestShowDaily(t *testing.T) {
 	pay := func(g Group) Group { g.Billing = domain.BillingPayPerUse; return g }
 	rep, err := Show(context.Background(), st.Read(), Query{Since: since, By: []string{"key"}}, now, 90)
 	want := Report{Source: "daily", Since: time.Date(2026, 8, 6, 0, 0, 0, 0, time.UTC), Until: now, Groups: []Group{
-		pay(Group{Key: "k", Requests: 5, Errors: 1, Input: 50, CacheRead: 10, Output: 25, Reasoning: 5, CostUSD: ptr(1.25)}),
-		pay(Group{Key: "u", Requests: 1, Input: 10, CacheRead: 2, Output: 5, Reasoning: 1}),
+		pay(Group{Key: "k", Requests: 5, Errors: 1, Input: 50, CacheRead: 10, Output: 25, Reasoning: ptr(int64(5)), CostUSD: ptr(1.25)}),
+		pay(Group{Key: "u", Requests: 1, Input: 10, CacheRead: 2, Output: 5, Reasoning: ptr(int64(1))}),
 		{Billing: domain.BillingSubscription, Key: "k", Requests: 1, Input: 10, CacheRead: 2, Output: 5},
 	}}
 	if err != nil || !reflect.DeepEqual(rep, want) {
 		t.Errorf("a window before the retention: %+v, error %v\nwant %+v", rep, err, want)
 	}
 	if rep, err := Show(context.Background(), st.Read(), Query{Since: since, Key: "u"}, now, 90); err != nil || rep.Source != "daily" ||
-		!reflect.DeepEqual(rep.Groups, []Group{pay(Group{Requests: 1, Input: 10, CacheRead: 2, Output: 5, Reasoning: 1})}) {
+		!reflect.DeepEqual(rep.Groups, []Group{pay(Group{Requests: 1, Input: 10, CacheRead: 2, Output: 5, Reasoning: ptr(int64(1))})}) {
 		t.Errorf("filtered by key: %+v, error %v", rep, err)
 	}
 
@@ -233,9 +233,9 @@ func TestShowDaily(t *testing.T) {
 	since = now.AddDate(0, 0, -60)
 	rep, err = Show(context.Background(), st.Read(), Query{Since: since, ComparePrevious: true}, now, 90)
 	want = Report{Source: "records", Since: since, Until: now, Groups: []Group{
-		ranked(counted(pay(Group{Requests: 2, Input: 20, CacheRead: 4, Output: 10, Reasoning: 2, CostUSD: ptr(0.5)})), 5, 5, 1, 1),
+		ranked(counted(pay(Group{Requests: 2, Input: 20, CacheRead: 4, Output: 10, Reasoning: ptr(int64(2)), CostUSD: ptr(0.5)})), 5, 5, 1, 1),
 	}, Previous: &Report{Source: "daily", Since: time.Date(2026, 7, 17, 0, 0, 0, 0, time.UTC), Until: time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC), Groups: []Group{
-		pay(Group{Requests: 4, Errors: 1, Input: 40, CacheRead: 8, Output: 20, Reasoning: 4, CostUSD: ptr(0.75)}),
+		pay(Group{Requests: 4, Errors: 1, Input: 40, CacheRead: 8, Output: 20, Reasoning: ptr(int64(4)), CostUSD: ptr(0.75)}),
 		{Billing: domain.BillingSubscription, Requests: 1, Input: 10, CacheRead: 2, Output: 5},
 	}}}
 	if err != nil || !reflect.DeepEqual(rep, want) {
@@ -245,7 +245,7 @@ func TestShowDaily(t *testing.T) {
 	// usage_daily over whole days, the record of 06:00 included.
 	rep, err = Show(context.Background(), st.Read(), Query{Since: since}, now, 30)
 	want = Report{Source: "daily", Since: time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC), Until: now, Groups: []Group{
-		pay(Group{Requests: 3, Input: 30, CacheRead: 6, Output: 15, Reasoning: 3, CostUSD: ptr(0.75)}),
+		pay(Group{Requests: 3, Input: 30, CacheRead: 6, Output: 15, Reasoning: ptr(int64(3)), CostUSD: ptr(0.75)}),
 	}}
 	if err != nil || !reflect.DeepEqual(rep, want) {
 		t.Errorf("usage_days 30: %+v, error %v\nwant %+v", rep, err, want)
@@ -274,6 +274,33 @@ func TestShowDaily(t *testing.T) {
 		var de *domain.Error
 		if _, err := Show(context.Background(), st.Read(), q, now, 90); !errors.As(err, &de) || de.Status != http.StatusBadRequest {
 			t.Errorf("effort-sent with %+v: %v", q, err)
+		}
+	}
+}
+
+// TestShowReasoning: a group's reasoning tokens and cost are absent where no
+// record reported them, the sum of those reported in a mix, and 0 where a
+// record reported 0, read from the records and from the daily sums alike
+// (USE-9, phase-5 design C49).
+func TestShowReasoning(t *testing.T) {
+	st := openStore(t)
+	unreported := func(r *Record) { r.ReasoningTokens, r.CostUSD, r.CostSource = nil, nil, "none" }
+	seed(t, st, []Record{
+		rec("none", func(r *Record) { r.KeyName = "none" }, unreported),
+		rec("mixed, none", func(r *Record) { r.KeyName = "mixed" }, unreported),
+		rec("mixed, reported", func(r *Record) { r.KeyName, r.ReasoningTokens = "mixed", ptr(int64(3)) }),
+		rec("zero", func(r *Record) { r.KeyName, r.ReasoningTokens, r.CostUSD = "zero", ptr(int64(0)), ptr(0.0) }),
+	})
+	now := time.UnixMilli(1_794_614_401_000).Add(time.Hour)
+	want := map[string]string{"mixed": "3 0.25", "none": "<nil> <nil>", "zero": "0 0"}
+	for source, usageDays := range map[string]int64{"records": 90, "daily": 0} {
+		rep, err := Show(context.Background(), st.Read(), Query{Since: now.Add(-2 * time.Hour), By: []string{"key"}}, now, usageDays)
+		got := map[string]string{}
+		for _, g := range rep.Groups {
+			got[g.Key] = fmt.Sprint(deref(g.Reasoning), deref(g.CostUSD))
+		}
+		if err != nil || rep.Source != source || !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: %s %v, error %v; want %v", source, rep.Source, got, err, want)
 		}
 	}
 }

@@ -185,7 +185,7 @@ func schema(t *testing.T, db *sql.DB) string {
 const golden = "testdata/schema.golden"
 
 // TestSchema compares sqlite_master after the migrations with the golden
-// file; migrations 001 and 002 are annex A of the kick-off verbatim.
+// file; migrations 001 to 003 are annex A of the kick-off verbatim.
 func TestSchema(t *testing.T) {
 	s := open(t, t.TempDir())
 	got := schema(t, s.Read())
@@ -397,6 +397,18 @@ func TestMigrations(t *testing.T) {
 					t.Errorf("budget_totals since_revision: %d rows not 0, error %v", n, err)
 				}
 			}
+			if version == 2 {
+				// Migration 003 copies an old 0 of usage_daily's reasoning
+				// tokens or cost as NULL, since it cannot be told from an
+				// unknown; every other value is kept (phase-5 design C49).
+				kept = maps.Clone(seeded)
+				kept["usage_daily"] = nil
+				for _, r := range seeded["usage_daily"] {
+					r = strings.Replace(r, " reasoning_tokens=int64:0 ", " reasoning_tokens=<nil>:<nil> ", 1)
+					kept["usage_daily"] = append(kept["usage_daily"], strings.Replace(r, " cost_usd=float64:0 ", " cost_usd=<nil>:<nil> ", 1))
+				}
+				slices.Sort(kept["usage_daily"])
+			}
 			if got := tableRows(t, s.Read(), cols); !maps.EqualFunc(got, kept, slices.Equal) {
 				t.Errorf("rows after migrating:\n%v\nwant:\n%v", got, kept)
 			}
@@ -486,7 +498,7 @@ func TestMigrationFromVersion1(t *testing.T) {
 	}
 
 	s := open(t, dir)
-	if v := pragma(t, s.Read(), "user_version"); v != "2" {
+	if v := pragma(t, s.Read(), "user_version"); v != "3" {
 		t.Errorf("user_version %s", v)
 	}
 	checkIntegrity(t, s.Read())
@@ -908,7 +920,7 @@ func TestBackup(t *testing.T) {
 			t.Errorf("the copy holds %d records (%d, %d, %v) and usage_daily %v %v", records, input, output, cost, daily, dailyCost)
 		}
 		last = records
-		if v := pragma(t, db, "user_version"); v != "2" {
+		if v := pragma(t, db, "user_version"); v != "3" {
 			t.Errorf("the copy's user_version %s", v)
 		}
 	}
@@ -974,10 +986,10 @@ func TestBackup(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = db.Close() }()
-			if _, err := db.Exec("PRAGMA user_version = 3"); err != nil {
+			if _, err := db.Exec("PRAGMA user_version = 4"); err != nil {
 				t.Fatal(err)
 			}
-		}, "user_version 3; this binary's is 2"},
+		}, "user_version 4; this binary's is 3"},
 		"context ended": {func(_ *testing.T, _ string, cancel context.CancelFunc) { cancel() }, "context canceled"},
 	} {
 		cancelled, cancel := context.WithCancel(ctx)

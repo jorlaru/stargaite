@@ -207,10 +207,11 @@ func TestQuickStart(t *testing.T) {
 	// cost of the chat completion; the chat completion's usage, 1 input and 2
 	// output tokens, at 1 and 2 USD per million, an output median and p90 of
 	// 2; the embeddings request's, 1 input token and 0 output, at 1 USD per
-	// million; no length finish, no empty answer and no reasoning reported.
-	if !regexp.MustCompile(`(?m)\Awindow \S+ to \S+, from the records\n.*\npay_per_use +- +1 +0 +1 +0 +0 +2 +0 +0 +0\.000005 +0 +0 +0 +2 +2 +- +- *\n` +
-		`pay_per_use +embed +1 +0 +1 +0 +0 +0 +0 +0 +0\.000001 +0 +0 +0 +0 +0 +- +- *\n` +
-		`pay_per_use +fast +1 +0 +1 +0 +0 +2 +0 +0 +0\.000005 +0 +0 +0 +2 +2 +- +- *$`).MatchString(shown) {
+	// million; no length finish, no empty answer and no reasoning reported,
+	// shown "-" (USE-9).
+	if !regexp.MustCompile(`(?m)\Awindow \S+ to \S+, from the records\n.*\npay_per_use +- +1 +0 +1 +0 +0 +2 +- +0 +0\.000005 +0 +0 +0 +2 +2 +- +- *\n` +
+		`pay_per_use +embed +1 +0 +1 +0 +0 +0 +- +0 +0\.000001 +0 +0 +0 +0 +0 +- +- *\n` +
+		`pay_per_use +fast +1 +0 +1 +0 +0 +2 +- +0 +0\.000005 +0 +0 +0 +2 +2 +- +- *$`).MatchString(shown) {
 		t.Errorf("usage show printed:\n%s", shown)
 	}
 	usage := func() {

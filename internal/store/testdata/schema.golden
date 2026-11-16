@@ -1,4 +1,4 @@
--- user_version 2
+-- user_version 3
 
 -- index idx_usage_key_time on usage
 CREATE INDEX idx_usage_key_time   ON usage(key_name, completed_at)
@@ -194,7 +194,7 @@ CREATE TABLE usage_daily (
     cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
     cache_write_tokens  INTEGER NOT NULL DEFAULT 0,
     output_tokens       INTEGER NOT NULL DEFAULT 0,
-    reasoning_tokens    INTEGER NOT NULL DEFAULT 0,
-    cost_usd            REAL NOT NULL DEFAULT 0,
+    reasoning_tokens    INTEGER,          -- NULL when no record of the row reported it
+    cost_usd            REAL,             -- NULL when no record of the row reported it
     PRIMARY KEY (day, key_name, model, target, billing)   -- a provider whose billing changes keeps its rows apart
 )

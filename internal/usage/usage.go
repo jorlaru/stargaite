@@ -28,6 +28,7 @@ type Call struct {
 	Provider                                *domain.Provider
 	Out                                     *plan.Outgoing
 	Stream, Complete                        bool   // Complete: the answer was read to its end
+	Sent                                    bool   // the whole request was written to the provider
 	ErrorCode                               string // the kick-off section 15 code, "client_gone", or ""
 	Obs                                     domain.Observed
 	Started, FirstEvent, Ended              time.Time // the service clock
@@ -86,9 +87,10 @@ type Record struct {
 // answer was read to its end, else an estimate that keeps what was reported
 // (input from the bytes sent, output from the visible bytes, each divided by
 // four and rounded up, the larger output winning); without a 2xx, zero
-// tokens with source provider. Cost: none for subscription and none billing;
-// else the provider's figure, else the price table over the recorded
-// tokens, else none (USE-6, USE-7). content_empty is read on chat and
+// tokens with source provider. Cost: none for subscription and none billing,
+// and none for a call whose request was sent and got no answer, which may
+// have run up a cost nobody reported; else the provider's figure, else the
+// price table over the recorded tokens, else none (USE-6, USE-7). content_empty is read on chat and
 // messages only: an embeddings or rerank answer has no visible bytes, and its
 // estimate has output 0 (phase-4 design sections 4 and 5).
 func NewRecord(c Call) Record {
@@ -131,6 +133,7 @@ func NewRecord(c Call) Record {
 
 	switch p := c.Target.Pricing; {
 	case r.Billing != domain.BillingPayPerUse:
+	case c.Status == 0 && c.Sent:
 	case c.Obs.Cost != nil:
 		r.CostUSD, r.CostSource = c.Obs.Cost, "provider"
 	case p != nil && p.InputPerMillion != nil && p.OutputPerMillion != nil:

@@ -43,7 +43,8 @@ func rec(id string, edit ...func(*Record)) Record {
 }
 
 // daily reads usage_daily, and the same sums from usage grouped alike: the
-// two must agree (USE-2).
+// two must agree (USE-2), the reasoning tokens and the cost NULL where no
+// record reported them (USE-9).
 func daily(t *testing.T, db *sql.DB) (aggregates, fromRecords string) {
 	t.Helper()
 	read := func(q string) string {
@@ -55,20 +56,24 @@ func daily(t *testing.T, db *sql.DB) (aggregates, fromRecords string) {
 		var b strings.Builder
 		for rows.Next() {
 			var day, key, model, target, billing string
-			var n [7]int64
-			var cost float64
+			var n [7]any // the reasoning tokens last, nil for NULL
+			var cost sql.NullFloat64
 			if err := rows.Scan(&day, &key, &model, &target, &billing, &n[0], &n[1], &n[2], &n[3], &n[4], &n[5], &n[6], &cost); err != nil {
 				t.Fatal(err)
 			}
-			fmt.Fprintf(&b, "%s %s %s %s %s %v %.6f\n", day, key, model, target, billing, n, cost)
+			usd := "NULL"
+			if cost.Valid {
+				usd = fmt.Sprintf("%.6f", cost.Float64)
+			}
+			fmt.Fprintf(&b, "%s %s %s %s %s %v %s\n", day, key, model, target, billing, n, usd)
 		}
 		return b.String()
 	}
 	return read(`SELECT day, key_name, model, target, billing, requests, errors, input_tokens, cache_read_tokens, cache_write_tokens,
 			output_tokens, reasoning_tokens, cost_usd FROM usage_daily ORDER BY 1, 2, 3, 4, 5`),
 		read(`SELECT strftime('%Y-%m-%d', completed_at / 1000, 'unixepoch'), key_name, model, target, billing, COUNT(*), COUNT(error_type),
-			SUM(input_tokens), SUM(cache_read_tokens), SUM(cache_write_tokens), SUM(output_tokens), SUM(COALESCE(reasoning_tokens, 0)),
-			SUM(COALESCE(cost_usd, 0)) FROM usage GROUP BY 1, 2, 3, 4, 5 ORDER BY 1, 2, 3, 4, 5`)
+			SUM(input_tokens), SUM(cache_read_tokens), SUM(cache_write_tokens), SUM(output_tokens), SUM(reasoning_tokens),
+			SUM(cost_usd) FROM usage GROUP BY 1, 2, 3, 4, 5 ORDER BY 1, 2, 3, 4, 5`)
 }
 
 func count(t *testing.T, db *sql.DB, q string, args ...any) int {
@@ -670,5 +675,56 @@ func TestSeeder(t *testing.T) {
 	}
 	if _, err := seed("p", time.UnixMilli(0)); err == nil || !strings.Contains(log.String(), `"level":"ERROR","msg":"quota windows not seeded","provider":"p","error":`) {
 		t.Errorf("a row that cannot be read: %v; log %s", err, &log)
+	}
+}
+
+// TestDailyNull: usage_daily keeps a day's reasoning tokens and cost NULL
+// while no record of the row reported them, 0 when one reported 0, and the
+// sum of those reported in a mix, in whatever order they come; the spend
+// seed reads an unpriced day as no spend (USE-9, phase-5 design C49).
+func TestDailyNull(t *testing.T) {
+	st := openStore(t)
+	unreported := func(r *Record) { r.ReasoningTokens, r.CostUSD, r.CostSource = nil, nil, "none" }
+	reported := func(reasoning int64, cost float64) func(*Record) {
+		return func(r *Record) { r.ReasoningTokens, r.CostUSD = ptr(reasoning), ptr(cost) }
+	}
+	key := func(k string) func(*Record) { return func(r *Record) { r.KeyName = k } }
+	seed(t, st, []Record{
+		rec("none 1", key("none"), unreported),
+		rec("none 2", key("none"), unreported),
+		rec("zero", key("zero"), reported(0, 0)),
+		rec("mix 1", key("mix"), unreported),
+		rec("mix 2", key("mix"), reported(3, 0.5)),
+		rec("mix 3", key("mix"), unreported),
+		rec("mix 4", key("mix"), reported(4, 0.25)),
+	})
+	rows, err := st.Read().Query("SELECT key_name, requests, reasoning_tokens, cost_usd FROM usage_daily ORDER BY key_name")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	var got []string
+	for rows.Next() {
+		var k string
+		var requests int64
+		var reasoning, cost any
+		if err := rows.Scan(&k, &requests, &reasoning, &cost); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, fmt.Sprintf("%s %d %v %v", k, requests, reasoning, cost))
+	}
+	if want := []string{"mix 4 7 0.75", "none 2 <nil> <nil>", "zero 1 0 0"}; !slices.Equal(got, want) || rows.Err() != nil {
+		t.Errorf("usage_daily %q, error %v; want %q", got, rows.Err(), want)
+	}
+
+	a := admission.New(func() time.Time { return time.UnixMilli(1_794_614_401_000) }, nil)
+	if err := Restore(context.Background(), st.Read(), a, time.UnixMilli(1_794_614_401_000)); err != nil {
+		t.Fatal(err)
+	}
+	for scope, want := range map[string]float64{"global": 0.75, "key:none": 0, "key:zero": 0, "key:mix": 0.75} {
+		b := admission.Budget{Scope: scope, Spec: domain.Budget{LimitUSD: ptr(100.0), ResetInterval: "daily"}}
+		if got := a.Spent(b); got != want {
+			t.Errorf("seeded spend of %s: %v, want %v", scope, got, want)
+		}
 	}
 }

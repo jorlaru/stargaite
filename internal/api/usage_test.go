@@ -4,9 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -259,6 +263,70 @@ func TestRecords(t *testing.T) {
 	}
 	if counted["cost_usd/agent/reported/"] != 0.42 || counted["cost_usd/agent/plan/"] != 0 {
 		t.Errorf("cost counters %v", counted)
+	}
+}
+
+// TestCutCallCost: a pay_per_use call whose request was sent and that got no
+// answer, here cut by the total timer, has no cost and counts as unpriced,
+// although its target has prices; a dial refused before anything was sent
+// and a provider's 400 keep their known cost of 0 from the price table
+// (USE-6, USE-12, phase-5 design C49).
+func TestCutCallCost(t *testing.T) {
+	f := newFixture(t)
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		<-r.Context().Done()
+	}))
+	t.Cleanup(slow.Close)
+	refusing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"no"}}`))
+	}))
+	t.Cleanup(refusing.Close)
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused := closed.Addr().String()
+	_ = closed.Close()
+	tokens := f.apply(t, `version: 1
+settings: { timeouts: { total_ms: 300 } }
+providers:
+  slow: { protocol: openai, base_url: "`+slow.URL+`", api_key_env: MOCK_KEY, billing: pay_per_use, allow_private_network: true }
+  refused: { protocol: openai, base_url: "http://`+refused+`", api_key_env: MOCK_KEY, billing: pay_per_use, allow_private_network: true }
+  bad: { protocol: openai, base_url: "`+refusing.URL+`", api_key_env: MOCK_KEY, billing: pay_per_use, allow_private_network: true }
+targets:
+  slow/m: { kind: chat, pricing: { input_per_million: 1, output_per_million: 2, as_of: "2026-11-01" } }
+  refused/m: { kind: chat, pricing: { input_per_million: 1, output_per_million: 2, as_of: "2026-11-01" } }
+  bad/m: { kind: chat, pricing: { input_per_million: 1, output_per_million: 2, as_of: "2026-11-01" } }
+models:
+  slow: { targets: [slow/m] }
+  refused: { targets: [refused/m] }
+  bad: { targets: [bad/m] }
+keys:
+  agent: { models: ["*"] }
+`)
+	for alias, status := range map[string]int{"slow": http.StatusGatewayTimeout, "refused": http.StatusBadGateway, "bad": http.StatusBadRequest} {
+		if w := f.chat("Bearer "+tokens["agent"], chatBody(alias, "")); w.Code != status {
+			t.Fatalf("%s: %d %s", alias, w.Code, w.Body)
+		}
+	}
+	waitFlight(t, f)
+	got := map[string]string{}
+	for _, r := range f.stored(t, 3) {
+		got[r.Model] = fmt.Sprint(r.Status, " ", money(r.Cost), " ", r.CostSource) // -1: NULL
+	}
+	if want := map[string]string{"slow": "0 -1 none", "refused": "0 0 price_table", "bad": "400 0 price_table"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("records %v, want %v", got, want)
+	}
+	unpriced := map[string]float64{}
+	f.counters.Each(func(c usage.Counter, v float64) {
+		if c.Name == "unpriced" {
+			unpriced[c.Model] = v
+		}
+	})
+	if want := map[string]float64{"slow": 1}; !reflect.DeepEqual(unpriced, want) {
+		t.Errorf("unpriced counters %v, want %v", unpriced, want)
 	}
 }
 

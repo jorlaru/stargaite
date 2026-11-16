@@ -248,7 +248,8 @@ VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (day, key_name, model, target, billing) DO UPDATE SET requests = requests + 1, errors = errors + excluded.errors,
 	input_tokens = input_tokens + excluded.input_tokens, cache_read_tokens = cache_read_tokens + excluded.cache_read_tokens,
 	cache_write_tokens = cache_write_tokens + excluded.cache_write_tokens, output_tokens = output_tokens + excluded.output_tokens,
-	reasoning_tokens = reasoning_tokens + excluded.reasoning_tokens, cost_usd = cost_usd + excluded.cost_usd`
+	reasoning_tokens = coalesce(reasoning_tokens + excluded.reasoning_tokens, reasoning_tokens, excluded.reasoning_tokens),
+	cost_usd = coalesce(cost_usd + excluded.cost_usd, cost_usd, excluded.cost_usd)`
 
 const chargeNever = `UPDATE budget_totals SET cost_usd = cost_usd + ?
 WHERE scope_type = ? AND scope_name = ? AND since_revision <= ?`
@@ -259,7 +260,8 @@ VALUES (?, 'system', ?, ?, ?, 'warning', ?)`
 // insert inserts each record or ignores it when its id is stored already;
 // only an inserted row moves usage_daily, for the UTC day of completed_at
 // (USE-2): one request, one error when error_type is set, each token count
-// and the cost, a NULL counting as 0; and, for a pay_per_use record with a
+// and the cost, the reasoning count and the cost staying NULL until a record
+// reports one (USE-9); and, for a pay_per_use record with a
 // cost, the total of each never budget of the instance, its key and its
 // alias whose counter started at or before the record's revision (phase-3
 // design section 8). An audit row is inserted or ignored by its id.
@@ -296,24 +298,16 @@ func insert(tx *sql.Tx, batch []entry) error {
 		if r.ErrorType != "" {
 			failed = 1
 		}
-		var reasoning int64
-		if r.ReasoningTokens != nil {
-			reasoning = *r.ReasoningTokens
-		}
-		var cost float64
-		if r.CostUSD != nil {
-			cost = *r.CostUSD
-		}
 		day := time.UnixMilli(r.CompletedAt).UTC().Format(time.DateOnly)
 		if _, err := tx.Exec(upsertDaily, day, r.KeyName, r.Model, r.Target, r.Billing, failed, r.InputTokens, r.CacheReadTokens,
-			r.CacheWriteTokens, r.OutputTokens, reasoning, cost); err != nil {
+			r.CacheWriteTokens, r.OutputTokens, r.ReasoningTokens, r.CostUSD); err != nil {
 			return err
 		}
 		if r.Billing != domain.BillingPayPerUse || r.CostUSD == nil {
 			continue
 		}
 		for _, scope := range [][2]string{{"global", ""}, {"key", r.KeyName}, {"model", r.Model}} {
-			if _, err := tx.Exec(chargeNever, cost, scope[0], scope[1], r.ConfigRevision); err != nil {
+			if _, err := tx.Exec(chargeNever, *r.CostUSD, scope[0], scope[1], r.ConfigRevision); err != nil {
 				return err
 			}
 		}
@@ -329,7 +323,7 @@ func insert(tx *sql.Tx, batch []entry) error {
 // to the critical log are in neither (phase-3 design section 17, point 15).
 func Restore(ctx context.Context, db *sql.DB, a *admission.State, now time.Time) error {
 	today := now.UTC().Format(time.DateOnly)
-	rows, err := db.QueryContext(ctx, `SELECT key_name, model, day, SUM(cost_usd) FROM usage_daily
+	rows, err := db.QueryContext(ctx, `SELECT key_name, model, day, IFNULL(SUM(cost_usd), 0) FROM usage_daily
 		WHERE billing = 'pay_per_use' AND day >= ? GROUP BY 1, 2, 3`, today[:8]+"01")
 	if err != nil {
 		return err

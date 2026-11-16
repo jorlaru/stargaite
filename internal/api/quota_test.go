@@ -106,7 +106,7 @@ func TestQuotas(t *testing.T) {
 	if spent := f.limits.Spent(admission.Budget{Scope: "key:agent", Spec: domain.Budget{ResetInterval: domain.ResetDaily}}); spent != 0 {
 		t.Errorf("agent's budget reads %v after subscription traffic", spent)
 	}
-	if got := rows(t, f, "SELECT billing || ' ' || SUM(requests) || ' ' || SUM(cost_usd) FROM usage_daily GROUP BY billing ORDER BY billing"); fmt.Sprint(got) != "[none 1 0.0 subscription 5 0.0]" {
+	if got := rows(t, f, "SELECT billing || ' ' || SUM(requests) || ' ' || quote(SUM(cost_usd)) FROM usage_daily GROUP BY billing ORDER BY billing"); fmt.Sprint(got) != "[none 1 NULL subscription 5 NULL]" {
 		t.Errorf("usage_daily %v", got)
 	}
 

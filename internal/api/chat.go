@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jorlaru/stargaite/internal/adapters/anthropic"
@@ -110,6 +111,7 @@ type attempt struct {
 	cause                     error           // what ended it early: a timer, client gone, a transport, read or relay failure; nil otherwise
 	text                      string          // the provider's text of a failure, redacted and cut (settle); "" when it has none
 	obs                       domain.Observed // design section 11
+	sent                      atomic.Bool     // the whole request was written to the provider (WroteRequest)
 	written                   bool            // a byte reached the client: no other answer from here
 	complete                  bool            // the answer was read to its end: a synchronous body observed, or a stream's last event
 	started, firstByte, ended time.Time       // the service clock; firstByte: when the response headers arrived
@@ -521,8 +523,16 @@ func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *c
 	defer cancel(nil)
 	connect := time.AfterFunc(ms(tm.ConnectMS), func() { cancel(errConnectTimeout) })
 	defer connect.Stop()
-	// GotConn comes after the dial and the TLS handshake.
-	trace := &httptrace.ClientTrace{GotConn: func(httptrace.GotConnInfo) { connect.Stop() }}
+	// GotConn comes after the dial and the TLS handshake; WroteRequest after
+	// the transport wrote the whole request, which GotConn alone would claim
+	// for a failed write. A request small enough to sit in the transport's
+	// write buffer counts as written even if the connection then fails.
+	trace := &httptrace.ClientTrace{GotConn: func(httptrace.GotConnInfo) { connect.Stop() },
+		WroteRequest: func(i httptrace.WroteRequestInfo) {
+			if i.Err == nil {
+				a.sent.Store(true)
+			}
+		}}
 	var timer, idle *time.Timer
 	wait := ms(tm.TotalMS)
 	if rq.client.Stream {
@@ -957,7 +967,7 @@ func (h *handler) usageCall(rq *request, a *attempt) usage.Call {
 	}
 	return usage.Call{RequestID: rq.id, TraceID: rq.traceID, Key: rq.key.Name, Model: rq.alias, Version: h.Version,
 		Endpoint: rq.ep, Attempt: a.n, Status: a.status, TargetID: a.target.ID, Target: &a.target.Spec, Provider: &a.target.Provider.Spec,
-		Out: a.out, Stream: rq.client.Stream, Complete: a.complete, ErrorCode: code, Obs: a.obs,
+		Out: a.out, Stream: rq.client.Stream, Complete: a.complete, Sent: a.sent.Load(), ErrorCode: code, Obs: a.obs,
 		Started: a.started, FirstEvent: a.firstEvent, Ended: a.ended, Revision: rq.snap.Revision}
 }
 

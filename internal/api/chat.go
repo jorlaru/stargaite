@@ -726,9 +726,14 @@ func classify(stream bool, status int, cause error, header http.Header, text str
 // Comments before the commit are dropped, those the adapter emits (an
 // Anthropic ping) included; the first event the adapter emits commits the
 // response: status 200, the SSE headers and the PAR-9 headers already set.
-// Every event is written and flushed at once, with the credential replaced
-// in it, and nothing is buffered beyond the event being read and the at most
-// 7 bytes of a think-tag stripper (RSN-12). A failure before the commit is
+// Every event is written with the credential replaced in it, and what the
+// adapter emits for an upstream event is flushed once that event is relayed;
+// nothing is buffered beyond the event being read and the at most 7 bytes of
+// a think-tag stripper (RSN-12). What it emits for the upstream event that
+// ends the stream, and the terminal event, stay in the server's buffer and
+// leave when the handler returns, after finish and done (RES-4, LIM-4, LIM-5),
+// as a synchronous answer does: a client that starts its next request on the
+// terminator finds the slot released. A failure before the commit is
 // left to the caller (settle); after it, the terminal event is written here,
 // always the proxy's own in the envelope of the endpoint: data: {"error":
 // {...}} with no [DONE] after it on chat, event: error with the Anthropic
@@ -756,11 +761,7 @@ func (h *handler) stream(ctx context.Context, w http.ResponseWriter, rq *request
 			a.written = true
 		}
 		e.Data = []byte(credential.Redact(string(e.Data)))
-		err := transport.WriteEvent(w, e)
-		if err == nil {
-			err = rc.Flush()
-		}
-		if err != nil {
+		if err := transport.WriteEvent(w, e); err != nil {
 			return fmt.Errorf("%w: %v", errClientGone, err)
 		}
 		if rq.content && !e.Comment {
@@ -801,6 +802,11 @@ func (h *handler) stream(ctx context.Context, w http.ResponseWriter, rq *request
 		default:
 			if relayErr = rl.event(ev.Name, ev.Data, emit); errors.Is(relayErr, errClientGone) {
 				err, relayErr = relayErr, nil
+			}
+		}
+		if err == nil && relayErr == nil && a.written {
+			if e := rc.Flush(); e != nil {
+				err = fmt.Errorf("%w: %v", errClientGone, e)
 			}
 		}
 		idle.Reset(silence)

@@ -316,6 +316,13 @@ its resolution. Values with meaning, such as `seed`, a non-zero penalty, `n` abo
 `service_tier` or a non-empty `logit_bias`, still skip the target unless a `drop` rule reaches them, and a `name` on
 a user, assistant or system message still makes the request untranslatable for it.
 
+What a stream sends for the provider's last event (`[DONE]` or `message_stop`, or the error event that ends it, and
+toward a chat client of an `anthropic` target also the finish-reason and usage chunks) now leaves once the request has
+ended for the proxy, after its usage is charged and its slots are released, as the end of a non-streaming answer
+already did: a client that starts its next request on reading it no longer meets its own `max_parallel_requests` as a
+`429 parallel_limit_exceeded`. Every earlier event is still sent as it arrives, so a client that starts on a native
+finish-reason chunk, before the terminator, can still meet it.
+
 ## Reference
 
 The details of each part, for operators who need the exact behaviour:
@@ -439,9 +446,10 @@ given a large limit but not none. Nothing else is limited by default.
 A request beyond any limit gets `429` before any provider is called: `parallel_limit_exceeded` with `Retry-After: 1`,
 or `rate_limit_exceeded` with `Retry-After` set to the seconds until the minute admits it again. Such a request counts
 in no limit and leaves no usage record; one that passed the limits and failed later counts. A request holds its slots
-until it ends, a stream until its last event, and gives them back on an error, a client gone or a stop alike. Minutes
-are counted in steps of one second, so a window may hold up to a second more than 60 s of traffic, never less, and
-counts start empty after a restart.
+until it ends and gives them back on an error, a client gone or a stop alike; the end of its answer reaches the client
+only then, a stream's included (`[DONE]`, `message_stop` or its error event), so a client that sends its next request
+on reading it finds its slots free. Minutes are counted in steps of one second, so a window may hold up to a second
+more than 60 s of traffic, never less, and counts start empty after a restart.
 
 ### Budgets
 

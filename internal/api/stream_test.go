@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -864,5 +865,116 @@ func TestChatAnthropicStreamFaults(t *testing.T) {
 	}
 	if calls := len(s.mock.Calls()); attempts != calls || requests != calls {
 		t.Errorf("%d attempt lines and %d request lines for %d calls", attempts, requests, calls)
+	}
+}
+
+// TestStreamEndsAfterRequest is RES-4 as K14 amends it, on the three relays:
+// what the adapter emits for the upstream event that ends a stream (the
+// terminator on the native paths; the finish-reason chunk, the usage chunk
+// and [DONE] on the translated one) leaves only once the request has ended
+// for the proxy, after its request line and the release of its slots, as a
+// synchronous answer does. The log hook holds the request line: while it is
+// held the client has the output of every earlier upstream event, the native
+// finish-reason chunk included (the control), and nothing more; released,
+// the held output arrives and the client has the bytes of an unheld run.
+func TestStreamEndsAfterRequest(t *testing.T) {
+	s := newStreamFixture(t, messagesConfig)
+	finish := `{"id":"c","object":"chat.completion.chunk","created":1,"model":"up-2","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`
+	anthropicUp := ev("message_start", messageStart, "content_block_start", textStart, "content_block_delta", textDelta("hello"),
+		"content_block_stop", `{"type":"content_block_stop","index":0}`,
+		"message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`, "message_stop", messageStop)
+	for _, tc := range []struct{ name, path, body, up, held string }{
+		// held is a marker of the first held event.
+		{"chat native", "/v1/chat/completions", streamBody("openai"), string(bytes.Join(sse(chunk("hello"), finish, "[DONE]"), nil)), "data: [DONE]"},
+		{"messages native", "/v1/messages", messagesBody("plain", `,"stream":true`), anthropicUp, "event: message_stop"},
+		{"chat translated", "/v1/chat/completions", chatBody("plain", `,"stream":true,"stream_options":{"include_usage":true}`), anthropicUp, `"finish_reason":"stop"`},
+		// A cut after the commit: the RES-4 terminal error event is held too.
+		{"chat native, cut", "/v1/chat/completions", streamBody("openai"), string(bytes.Join(sse(chunk("hello")), nil)), `{"error":`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			send := func() *http.Response {
+				s.mock.Script(mockprovider.Step{Chunks: [][]byte{[]byte(tc.up)}})
+				req, err := http.NewRequest(http.MethodPost, s.url+tc.path, strings.NewReader(tc.body))
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Header.Set("Authorization", "Bearer "+s.token)
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = resp.Body.Close() })
+				return resp
+			}
+			resp := send()
+			all, err := io.ReadAll(resp.Body)
+			want := string(all)
+			i := strings.Index(want, tc.held)
+			cut := strings.LastIndex(want[:max(i, 0)], "\n\n") + 2
+			if err != nil || resp.StatusCode != http.StatusOK || i < 0 || cut < 2 || !strings.HasSuffix(want, "\n\n") {
+				t.Fatalf("unheld run %d %v %q", resp.StatusCode, err, want)
+			}
+			if tc.name == "chat translated" && (!strings.Contains(want[cut:], `"usage":{`) || !strings.HasSuffix(want, "data: [DONE]\n\n")) {
+				t.Fatalf("the held output %q is not the finish reason, the usage and [DONE]", want[cut:])
+			}
+
+			held, release := make(chan struct{}), make(chan struct{})
+			unblock := sync.OnceFunc(func() { close(release) })
+			t.Cleanup(unblock) // before the data plane closes
+			t.Cleanup(func() { s.log.setHook(nil) })
+			s.log.setHook(func(line []byte) {
+				if bytes.Contains(line, []byte(`"msg":"request"`)) {
+					close(held)
+					<-release
+				}
+			})
+			resp = send()
+			chunks := make(chan []byte, 64)
+			go func() {
+				defer close(chunks)
+				for {
+					b := make([]byte, 4096)
+					n, err := resp.Body.Read(b)
+					if n > 0 {
+						chunks <- b[:n]
+					}
+					if err != nil {
+						return
+					}
+				}
+			}()
+			select {
+			case <-held:
+			case <-time.After(5 * time.Second):
+				t.Fatal("no request line")
+			}
+			var got []byte
+			for len(got) < cut {
+				select {
+				case c, ok := <-chunks:
+					if !ok {
+						t.Fatalf("the stream ended while the request line was held, after %q", got)
+					}
+					got = append(got, c...)
+				case <-time.After(5 * time.Second):
+					t.Fatalf("while the request line is held the client has %q, want %q", got, want[:cut])
+				}
+			}
+			if string(got) != want[:cut] {
+				t.Fatalf("while the request line is held the client has %q, want %q", got, want[:cut])
+			}
+			select {
+			case c := <-chunks:
+				t.Fatalf("%q arrived while the request line was held", c)
+			case <-time.After(100 * time.Millisecond):
+			}
+			unblock()
+			for c := range chunks {
+				got = append(got, c...)
+			}
+			if string(got) != want {
+				t.Errorf("the client has %q, want %q", got, want)
+			}
+		})
 	}
 }

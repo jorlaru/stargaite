@@ -12,12 +12,13 @@ import (
 
 // verifyTarget is targets verify (RSN-9): POST /admin/v1/verify/{id...} with
 // {"max_output_tokens": n}, n optional. Each call of the run is bounded by
-// total_ms (RES-3), so once the body is read the read deadline is cleared
-// and the write deadline set once to now + k × (total_ms + 5 s) for the k
-// calls the run makes; a deadline that cannot be set is a 500 before any
-// call. The answer is the Verification plus stored. Every run is audited by
-// Config.Verified, whose write outlives the request's context (SEC-7); a
-// refusal before any call (404, 400) runs nothing and is not. No revision.
+// the total_ms of the target's provider (RES-3), so once the body is read
+// the read deadline is cleared and the write deadline set once to
+// now + k × (total_ms + 5 s) for the k calls the run makes; a deadline that
+// cannot be set is a 500 before any call. The answer is the Verification
+// plus stored. Every run is audited by Config.Verified, whose write outlives
+// the request's context (SEC-7); a refusal before any call (404, 400) runs
+// nothing and is not. No revision.
 func (s *server) verifyTarget(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if r.URL.RawQuery != "" {
@@ -37,16 +38,16 @@ func (s *server) verifyTarget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	snap := s.cfg.Snapshot()
-	calls := 1
-	if t, ok := snap.Doc.Targets[id]; ok {
-		calls = len(domain.VerifyLevels(t.Reasoning))
+	calls, total := 1, snap.Settings.Timeouts.TotalMS
+	if t := snap.Targets[id]; t != nil {
+		calls, total = len(domain.VerifyLevels(t.Spec.Reasoning)), t.Provider.Timeouts.TotalMS
 	}
 	rc := http.NewResponseController(w)
 	if err := rc.SetReadDeadline(time.Time{}); err != nil {
 		s.fail(w, fmt.Errorf("verify: the read deadline was not cleared: %w", err))
 		return
 	}
-	wait := time.Duration(calls) * (time.Duration(snap.Settings.Timeouts.TotalMS)*time.Millisecond + 5*time.Second)
+	wait := time.Duration(calls) * (time.Duration(total)*time.Millisecond + 5*time.Second)
 	if err := rc.SetWriteDeadline(time.Now().Add(wait)); err != nil {
 		s.fail(w, fmt.Errorf("verify: the write deadline was not set: %w", err))
 		return

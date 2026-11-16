@@ -327,6 +327,8 @@ func TestRequests(t *testing.T) {
 		{[]string{"providers", "set", "local", "--allow-private-network="}, "PATCH", "/admin/v1/providers/local", `{"allow_private_network":null}`},
 		{[]string{"providers", "set", "local", "--param", "provider=forward", "--param", "seed=drop", "--param", "x="}, "PATCH", "/admin/v1/providers/local",
 			`{"params":{"provider":"forward","seed":"drop","x":null}}`},
+		{[]string{"providers", "set", "local", "--connect-ms", "100", "--first-byte-ms", "200", "--stream-idle-ms", "300", "--total-ms", "600000", "--connect-ms="},
+			"PATCH", "/admin/v1/providers/local", `{"timeouts":{"connect_ms":null,"first_byte_ms":200,"stream_idle_ms":300,"total_ms":600000}}`},
 		{[]string{"providers", "remove", "local", "--yes"}, "DELETE", "/admin/v1/providers/local", ""},
 		{[]string{"targets", "list"}, "GET", "/admin/v1/targets", ""},
 		{

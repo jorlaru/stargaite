@@ -473,6 +473,24 @@ func TestVerifyHoldsFlight(t *testing.T) {
 	f.records(t, 3)
 }
 
+// TestVerifyWait: the write deadline of a run follows the total_ms of the
+// target's provider, not the setting's (RES-3, phase-5 design C44). With the
+// setting at 1 ms the setting's deadline would pass 5.001 s after the body is
+// read; the mock answers the run's one call after 5.3 s, within the
+// provider's 10 s.
+func TestVerifyWait(t *testing.T) {
+	f := newVerifyFixture(t)
+	f.must(t, http.StatusOK, http.MethodPatch, "/admin/v1/settings", `{"timeouts":{"total_ms":1}}`)
+	f.must(t, http.StatusCreated, http.MethodPost, "/admin/v1/providers",
+		`{"name":"local","protocol":"openai","base_url":"`+f.mockURL+`","allow_private_network":true,"billing":"none","timeouts":{"total_ms":10000}}`)
+	f.must(t, http.StatusCreated, http.MethodPost, "/admin/v1/targets", `{"id":"local/m","kind":"chat"}`)
+	f.mock.Script(mockprovider.Step{Body: chat(1, 0), Delay: 5300 * time.Millisecond})
+	if v := f.verify(t, "local/m", `{}`); !v.OK || len(v.Calls) != 1 || len(f.mock.Calls()) != 1 {
+		t.Errorf("a run on a slow provider: %+v, %d mock calls", v, len(f.mock.Calls()))
+	}
+	f.records(t, 1)
+}
+
 // TestVerifyRefusedBeforeTheProvider: an exhausted global budget gives 402
 // and an exhausted quota window 429, each on the first call, with no mock
 // call and no record; the run is audited failed.

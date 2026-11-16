@@ -340,6 +340,10 @@ func validateProvider(r *report, name string, p domain.Provider, usageDays int64
 	r.oneOf("USE-8", res, "stream_usage", p.StreamUsage, false, domain.StreamUsageRequest, domain.StreamUsageNative, domain.StreamUsageNone)
 	r.oneOf("RSN-2", res, "target_defaults.dialect", p.TargetDefaults.Dialect, false, slices.Sorted(maps.Keys(domain.DialectKeys))...)
 	r.rules(res, p.Params, true, nil)
+	r.nonNegative("RES-3", res, "timeouts.connect_ms", p.Timeouts.ConnectMS)
+	r.nonNegative("RES-3", res, "timeouts.first_byte_ms", p.Timeouts.FirstByteMS)
+	r.nonNegative("RES-3", res, "timeouts.stream_idle_ms", p.Timeouts.StreamIdleMS)
+	r.nonNegative("RES-3", res, "timeouts.total_ms", p.Timeouts.TotalMS)
 }
 
 func validateTarget(r *report, doc *domain.Document, id string, scopes map[string]string) {

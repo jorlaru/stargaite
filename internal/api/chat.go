@@ -481,15 +481,15 @@ func quotaPlan(rq *request, t *config.Target) *admission.Plan {
 	return &admission.Plan{Provider: p.Name, Windows: p.Spec.Quota, Key: rq.key.Name, Share: rq.key.Spec.QuotaShare[p.Name], Revision: rq.snap.Revision}
 }
 
-// call is step 7 for one target: the credential header, the RES-3 timers
-// (connect, then total for a synchronous call, or first byte and idle for a
-// stream), the write deadline, the call and the answer. A synchronous body is
-// read whole up to max_response_bytes (RES-4) and, for a 2xx the adapter can
-// read, relayed as the adapter maps it: unchanged but for the think-tag edits
-// (RSN-12) on the native paths, translated for chat toward anthropic; a 2xx
-// stream is relayed as it arrives (stream). The PAR-9 headers of this
-// attempt, replacing those of an earlier one, go out with the status line.
-// The attempt it returns holds how it ended (settle).
+// call is step 7 for one target: the credential header, the RES-3 timers of
+// t's provider (connect, then total for a synchronous call, or first byte and
+// idle for a stream), the write deadline, the call and the answer. A
+// synchronous body is read whole up to max_response_bytes (RES-4) and, for a
+// 2xx the adapter can read, relayed as the adapter maps it: unchanged but for
+// the think-tag edits (RSN-12) on the native paths, translated for chat
+// toward anthropic; a 2xx stream is relayed as it arrives (stream). The PAR-9
+// headers of this attempt, replacing those of an earlier one, go out with the
+// status line. The attempt it returns holds how it ended (settle).
 func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *config.Target, out *plan.Outgoing, n int, gen uint64) *attempt {
 	a := &attempt{n: n, gen: gen, target: t, out: out, started: h.Config.Now()}
 	defer h.finish(rq, a)
@@ -505,7 +505,7 @@ func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *c
 		w.Header().Set(changedHeader, c)
 	}
 
-	tm, limit := rq.snap.Settings.Timeouts, rq.snap.Settings.MaxResponseBytes
+	tm, limit := t.Provider.Timeouts, rq.snap.Settings.MaxResponseBytes
 	ctx, cancel := context.WithCancelCause(r.Context())
 	defer cancel(nil)
 	connect := time.AfterFunc(ms(tm.ConnectMS), func() { cancel(errConnectTimeout) })
@@ -739,7 +739,7 @@ func (h *handler) stream(ctx context.Context, w http.ResponseWriter, rq *request
 	// the stream holds: an event over max_response_bytes, malformed data, an
 	// upstream error event, or io.EOF once the last event is relayed.
 	events := transport.NewEventReader(resp.Body, rq.snap.Settings.MaxResponseBytes)
-	silence := ms(rq.snap.Settings.Timeouts.StreamIdleMS)
+	silence := ms(a.target.Provider.Timeouts.StreamIdleMS)
 	var ev transport.Event
 	var err, relayErr error
 	for err == nil && relayErr == nil {

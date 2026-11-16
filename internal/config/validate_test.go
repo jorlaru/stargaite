@@ -75,6 +75,9 @@ func TestValidate(t *testing.T) {
 			[]string{"error RES-4 invalid_value settings max_response_bytes"}},
 		{"RES-3 negative timeout", func(d *domain.Document) { d.Settings.Timeouts.TotalMS = -1 },
 			[]string{"error RES-3 invalid_value settings timeouts.total_ms"}},
+		{"RES-3 negative provider timeout", func(d *domain.Document) {
+			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.Timeouts = domain.Timeouts{ConnectMS: 100, StreamIdleMS: -1} })
+		}, []string{"error RES-3 invalid_value providers/openrouter timeouts.stream_idle_ms"}},
 		{"USE-11 negative retention", func(d *domain.Document) { d.Settings.Retention.AuditMonths = -1 },
 			[]string{"error USE-11 invalid_value settings retention.audit_months"}},
 		{"TEL-8 negative content bound", func(d *domain.Document) { d.Settings.Telemetry.ContentMaxBytes = -1 },

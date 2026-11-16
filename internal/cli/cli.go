@@ -116,6 +116,10 @@ var providerFlags = []flagSpec{
 	{"target-defaults", kindStringPairs, "target_defaults", "dialect=<dialect>,output_cap_param=<name>: what a new target starts with"},
 	{"allow-private-network", kindBool, "allow_private_network", "allow plain HTTP, loopback and private addresses"},
 	{"param", kindStringPairs, "params", "<parameter>=<forward|drop>: what every target of the provider accepts beyond the reference, or refuses"},
+	{"connect-ms", kindNumber, "timeouts.connect_ms", "provider connection timeout; undeclared is the setting's"},
+	{"first-byte-ms", kindNumber, "timeouts.first_byte_ms", "time to the first byte of a provider response; undeclared is the setting's"},
+	{"stream-idle-ms", kindNumber, "timeouts.stream_idle_ms", "longest pause inside a stream; undeclared is the setting's"},
+	{"total-ms", kindNumber, "timeouts.total_ms", "longest provider call; undeclared is the setting's"},
 }
 
 // targetFlags are the fields of a target (kick-off section 6), with the

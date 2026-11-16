@@ -488,6 +488,75 @@ keys:
 	}
 }
 
+// TestProviderTimers: a provider's own timers bound the calls to its targets,
+// each one it does not declare being the setting's (RES-3, phase-5 design
+// C44); clearing its last timer leaves no timeouts block to export.
+func TestProviderTimers(t *testing.T) {
+	f := newFixture(t)
+	mock := mockprovider.New()
+	srv := httptest.NewServer(mock)
+	t.Cleanup(srv.Close)
+	tokens := f.apply(t, strings.ReplaceAll(`version: 1
+settings: { timeouts: { total_ms: 300, stream_idle_ms: 300 } }
+providers:
+  slow: { protocol: openai, base_url: MOCK, billing: none, allow_private_network: true, timeouts: { connect_ms: 1500, first_byte_ms: 2500, total_ms: 2000, stream_idle_ms: 2000 } }
+  plain: { protocol: openai, base_url: MOCK, billing: none, allow_private_network: true }
+targets:
+  slow/m: { kind: chat }
+  plain/m: { kind: chat }
+models:
+  slow: { targets: [slow/m] }
+  plain: { targets: [plain/m] }
+keys:
+  agent: { models: ["*"] }
+`, "MOCK", srv.URL))
+	providers := f.cfg.Snapshot().Providers
+	if got, want := providers["slow"].Timeouts, (domain.Timeouts{ConnectMS: 1500, FirstByteMS: 2500, StreamIdleMS: 2000, TotalMS: 2000}); got != want {
+		t.Errorf("slow's timers: %+v, want %+v", got, want)
+	}
+	if got, want := providers["plain"].Timeouts, (domain.Timeouts{ConnectMS: domain.DefaultConnectMS, FirstByteMS: domain.DefaultFirstByteMS, StreamIdleMS: 300, TotalMS: 300}); got != want {
+		t.Errorf("control: plain's timers: %+v, want %+v", got, want)
+	}
+	late := mockprovider.Step{Body: []byte(mockReply), Delay: 600 * time.Millisecond}
+	paused := mockprovider.Step{Chunks: sse(chunk("a"), chunk("b"), "[DONE]"), Gap: 600 * time.Millisecond}
+	for _, tc := range []struct {
+		name, alias, extra string
+		step               mockprovider.Step
+		status             int
+		done               bool // the answer holds the whole reply
+		within             time.Duration
+	}{
+		{"an answer at 600 ms under the provider's 2000 ms", "slow", "", late, 200, true, 2 * time.Second},
+		{"a pause of 600 ms under the provider's 2000 ms", "slow", `,"stream":true`, paused, 200, true, 3 * time.Second},
+		{"control: the setting's 300 ms without a block", "plain", "", late, 504, false, 550 * time.Millisecond},
+		{"control: the setting's pause without a block", "plain", `,"stream":true`, paused, 200, false, 3 * time.Second},
+	} {
+		mock.Script(tc.step)
+		start := time.Now()
+		w := f.chat("Bearer "+tokens["agent"], chatBody(tc.alias, tc.extra))
+		done := strings.Contains(w.Body.String(), "mock reply") || strings.Contains(w.Body.String(), "[DONE]")
+		if w.Code != tc.status || done != tc.done {
+			t.Errorf("%s: %d %s", tc.name, w.Code, w.Body)
+		}
+		if d := time.Since(start); d > tc.within {
+			t.Errorf("%s: answered after %v", tc.name, d)
+		}
+	}
+
+	for _, patch := range []string{`{"timeouts":{"connect_ms":null,"first_byte_ms":null}}`, `{"timeouts":{"total_ms":null}}`, `{"timeouts":{"stream_idle_ms":null}}`} {
+		if w := call(f.admin, "Bearer "+adminKey, http.MethodPatch, "/admin/v1/providers/slow", []byte(patch)); w.Code != http.StatusOK {
+			t.Fatalf("providers set %s: %d %s", patch, w.Code, w.Body)
+		}
+	}
+	var doc struct {
+		Providers map[string]map[string]json.RawMessage
+	}
+	w := call(f.admin, "Bearer "+adminKey, http.MethodGet, "/admin/v1/export?format=json", nil)
+	if err := json.Unmarshal(w.Body.Bytes(), &doc); err != nil || doc.Providers["slow"] == nil || doc.Providers["slow"]["timeouts"] != nil {
+		t.Errorf("export after the last timer is cleared: %s", w.Body)
+	}
+}
+
 // TestSDKRequests is AC-01 for synchronous requests: request bytes recorded
 // from the OpenAI Python SDK 3.50.0 and Node SDK 7.56.0 (testdata/*.http, with
 // their headers) reach the provider with only the alias's edits, and the

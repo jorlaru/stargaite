@@ -106,12 +106,15 @@ func exporter(t *domain.Telemetry, env Env, revision int64) *Exporter {
 
 // Provider is a provider as published. Credential is set when api_key_env
 // resolves to a value; a reference that does not resolve leaves the provider
-// Disabled. A provider without api_key_env sends no credential.
+// Disabled. A provider without api_key_env sends no credential. Timeouts
+// are the timers of a call to one of its targets: each one the provider
+// declares, else the published setting (RES-3).
 type Provider struct {
 	Name       string
 	Spec       domain.Provider
 	Credential transport.Secret
 	Disabled   bool
+	Timeouts   domain.Timeouts
 }
 
 // Target is a target as published, with its provider.
@@ -196,8 +199,15 @@ func build(st *State, env Env, findings []domain.Finding) *Snapshot {
 		Exporter:   exporter(d.Settings.Telemetry, env, st.Revision),
 		secrets:    make(map[string]secret, len(st.Secrets)),
 	}
+	set := s.Settings.Timeouts
 	for name, spec := range d.Providers {
-		p := &Provider{Name: name, Spec: spec}
+		t := spec.Timeouts
+		p := &Provider{Name: name, Spec: spec, Timeouts: domain.Timeouts{
+			ConnectMS:    cmp.Or(t.ConnectMS, set.ConnectMS),
+			FirstByteMS:  cmp.Or(t.FirstByteMS, set.FirstByteMS),
+			StreamIdleMS: cmp.Or(t.StreamIdleMS, set.StreamIdleMS),
+			TotalMS:      cmp.Or(t.TotalMS, set.TotalMS),
+		}}
 		if ref := spec.APIKeyEnv; ref != "" {
 			// The same test as the credential_unresolved warning of CheckResolved.
 			v, ok := "", false

@@ -94,7 +94,8 @@ type Provider struct {
 	GenAIProvider       string            `json:"gen_ai_provider,omitempty"`
 	TargetDefaults      TargetDefaults    `json:"target_defaults,omitzero"`
 	AllowPrivateNetwork bool              `json:"allow_private_network,omitzero"`
-	Params              map[string]string `json:"params,omitempty"` // parameter name -> rule, a fact about every target of the provider (PAR-2)
+	Params              map[string]string `json:"params,omitempty"`  // parameter name -> rule, a fact about every target of the provider (PAR-2)
+	Timeouts            Timeouts          `json:"timeouts,omitzero"` // its own RES-3 timers; each one undeclared is the setting's
 }
 
 // QuotaWindow is one window of a subscription plan ("5h", "7d"), limited in

@@ -71,8 +71,9 @@ flowchart LR
 Four kinds of resource, all managed with the CLI:
 
 - **Provider**: where and how to call: base URL, protocol (`openai` or `anthropic`), the name of the environment
-  variable that holds its credential, how it bills (`pay_per_use`, `subscription` or `none`), and the parameters its
-  models accept beyond the reference or refuse ([Parameters](#parameters)).
+  variable that holds its credential, how it bills (`pay_per_use`, `subscription` or `none`), the parameters its
+  models accept beyond the reference or refuse ([Parameters](#parameters)), and, when it needs them, its own timeouts
+  ([Resilience](#resilience)).
 - **Target**: one model of a provider, written `<provider>/<model>`, such as `openai/gpt-5-mini`, with its prices, its
   reasoning levels, what it can do, and the parameters it accepts or refuses where it differs from its provider.
 - **Model alias**: the name clients send as `model`. It lists its targets, primary first, and may set an effort, an
@@ -264,6 +265,7 @@ alias allows. Every answer carries `x-stargaite-request-id`, `x-stargaite-target
 | Add a fallback model to an alias | `stargaite targets add anthropic/<model> --kind chat`, then `stargaite models set smart --target openai/<model> --target anthropic/<model> --max-output-tokens 8192` |
 | See what an alias would send | `stargaite models explain smart` · `stargaite models explain smart --effort none` |
 | Let a provider's own parameter through, or remove one | `stargaite providers set openrouter --param provider=forward` · `stargaite targets set anthropic/<model> --param temperature=drop` |
+| Give a slow provider its own timeout | `stargaite providers set local --total-ms 600000` · `stargaite providers set local --total-ms=` |
 | Declare a target's reasoning levels | `stargaite targets set openai/<model> --level low --level medium --level high --can-disable=false` |
 | Create, rotate and revoke a client key | `stargaite keys create my-app --model smart` · `stargaite keys rotate my-app` · `stargaite keys revoke my-app --yes` |
 | Limit and budget a key | `stargaite keys set my-app --rpm-limit 60 --max-parallel-requests 4 --budget limit_usd=10,reset_interval=daily` |
@@ -291,7 +293,9 @@ target that declares `output_cap_param` is now sent under that name: an OpenAI S
 the `openai` preset arrives as `max_completion_tokens`, listed `max_tokens:translated`, and a client's
 `max_completion_tokens` toward one of the `openrouter` preset as `max_tokens`. A `mistral` provider created earlier
 lacks the preset's new rule: `providers set <name> --param output_dimension=forward` adds it. The log line of a refused
-request names the parameter at fault in `param`.
+request names the parameter at fault in `param`. Providers take the four timeout flags of `settings set`
+([Resilience](#resilience)); a provider that declares none behaves as before, and like any provider change a change
+of its timeouts clears the stored verification of its targets.
 
 ## Reference
 
@@ -622,7 +626,8 @@ with its date and the proxy version, which `targets show` and `targets list` pri
 milliseconds) and `verified_version`, and `validate` warns about every chat target without one (`validate -f`, with no
 store, does not); any change of the target or of its provider clears it. Every run is audited, `verified`, `failed`,
 or `stale` when the target changed while it ran, and none writes a revision. The server bounds the run by its own
-write deadline, the number of calls times `total_ms` plus 5 s, so the CLI waits without its 90 s timeout.
+write deadline, the number of calls times the provider's `total_ms` plus 5 s, so the CLI waits without its 90 s
+timeout.
 
 ### Resilience
 
@@ -637,6 +642,13 @@ usage records, then closes the store, gives queued spans up to 5 s to leave and 
 more than 55 s to stop (the 30 s, up to 5 s for the requests stopped to end, up to 10 s for the records plus the store's
 5 s busy timeout for the write in progress, and the 5 s of the spans) before it kills it: `docker stop` waits 10 s
 unless given `-t`.
+
+Four timeouts bound each provider call: `connect_ms` to connect, then `total_ms` for the whole of a non-streaming call,
+or `first_byte_ms` to the first byte and `stream_idle_ms` for the longest pause inside a stream. They are settings
+(`settings set --total-ms 180000` and the others), and a provider may declare any of the four for the calls to its
+targets (`providers set local --total-ms 600000`); each one it does not declare is the setting's, and `--total-ms=`
+removes its own. A local server that may take minutes and a cloud fallback that should give up in seconds can serve
+one alias: a shorter `total_ms` moves a request to its fallback sooner, never adds a call.
 
 ### The admin key and the data directory
 

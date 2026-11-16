@@ -78,7 +78,7 @@ func TestMainExitCodes(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var stdout, stderr bytes.Buffer
-			code := Main(tc.args, func(string) string { return "" }, &stdout, &stderr)
+			code := Main(tc.args, func(string) string { return "" }, unread{}, &stdout, &stderr)
 			if code != tc.code {
 				t.Fatalf("exit %d, want %d; stderr %q", code, tc.code, &stderr)
 			}
@@ -97,7 +97,7 @@ func TestMainExitCodes(t *testing.T) {
 
 func TestUsageListsEveryCommand(t *testing.T) {
 	var stdout bytes.Buffer
-	Main([]string{"--help"}, nil, &stdout, io.Discard)
+	Main([]string{"--help"}, nil, unread{}, &stdout, io.Discard)
 	for _, want := range append([]string{"serve"}, commandNames()...) {
 		if !strings.Contains(stdout.String(), "\n  "+want) {
 			t.Errorf("usage does not list %q:\n%s", want, &stdout)
@@ -120,7 +120,7 @@ func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("closed")
 func TestFailureExitsOne(t *testing.T) {
 	for _, args := range [][]string{{"version"}, {"version", "--json"}} {
 		var stderr bytes.Buffer
-		if code := Main(args, nil, failingWriter{}, &stderr); code != 1 {
+		if code := Main(args, nil, unread{}, failingWriter{}, &stderr); code != 1 {
 			t.Errorf("%q: exit %d, want 1", args, code)
 		}
 		if !strings.Contains(stderr.String(), "closed") {

@@ -114,6 +114,7 @@ var ContractParams = map[string]string{
 	"tool_choice":     CapabilityTools,
 	"response_format": CapabilityStructuredOutput,
 	"output_config":   CapabilityStructuredOutput,
+	"mcp_servers":     CapabilityTools, // on /v1/messages: the tools of the MCP servers it names
 }
 
 var nameSyntax = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)

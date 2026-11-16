@@ -61,7 +61,7 @@ type run struct {
 func validate(t *testing.T, env map[string]string, args ...string) run {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code := Main(append([]string{"validate"}, args...), func(n string) string { return env[n] }, &stdout, &stderr)
+	code := Main(append([]string{"validate"}, args...), func(n string) string { return env[n] }, unread{}, &stdout, &stderr)
 	return run{code, stdout.String(), stderr.String()}
 }
 

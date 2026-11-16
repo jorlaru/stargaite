@@ -65,9 +65,15 @@ keys:
 var corpusTargets = []string{"mock/none", "mock/re", "mock/re-free", "mock/ro", "mock/tt", "mock/et", "mock/tb", "mock/ae", "mock/cap", "mock/plain",
 	"anth/ae", "anth/tb", "anth/none", "req/re", "fwd/t"}
 
-// corpusAliases are the three aliases of each target, in YAML, named after
-// the target with its slash as a dash. An anthropic target needs a cap on
-// every alias (PAR-7).
+// corpusAliases are the six aliases of each target, in YAML, named after
+// the target with its slash as a dash: an effort in default mode with a cap,
+// a forced effort, parameter rules, and the alias's off form in default and
+// in forced mode and provider_default, whose change lists name what the
+// target was sent (PAR-3). An anthropic target needs a cap on every alias
+// (PAR-7). The -n, -o and -v aliases, with listed's check of an added member
+// per target, are a regression guard (phase-5 design C51): they pass on
+// af8796c and fail on its parent, which listed an alias's off form under the
+// wrong member.
 func corpusAliases() (string, []string) {
 	var yaml strings.Builder
 	names := []string{"mixed", "mixed2", "mixed3", "skips", "provfwd"}
@@ -88,7 +94,10 @@ func corpusAliases() (string, []string) {
 		fmt.Fprintf(&yaml, "  %s-d: { targets: [%s], reasoning: { effort: medium, mode: default }, max_output_tokens: %d }\n", a, id, limit)
 		fmt.Fprintf(&yaml, "  %s-f: { targets: [%s], reasoning: { effort: high, mode: forced }%s }\n", a, id, cap)
 		fmt.Fprintf(&yaml, "  %s-p: { targets: [%s], params: { x_fwd: forward, x_drop: drop, temperature: drop, max_tokens: drop, seed: drop }%s%s }\n", a, id, effort, cap)
-		names = append(names, a+"-d", a+"-f", a+"-p")
+		fmt.Fprintf(&yaml, "  %s-n: { targets: [%s], reasoning: { effort: none, mode: default }, max_output_tokens: %d }\n", a, id, limit)
+		fmt.Fprintf(&yaml, "  %s-o: { targets: [%s], reasoning: { effort: none, mode: forced }%s }\n", a, id, cap)
+		fmt.Fprintf(&yaml, "  %s-v: { targets: [%s], reasoning: { effort: provider_default, mode: default }%s }\n", a, id, cap)
+		names = append(names, a+"-d", a+"-f", a+"-p", a+"-n", a+"-o", a+"-v")
 	}
 	return yaml.String(), names
 }
@@ -619,6 +628,12 @@ func deref(s *string) string {
 	return *s
 }
 
+// present reports whether b holds a member at path.
+func present(b *params.Body, path ...string) bool {
+	_, ok := b.Get(path...)
+	return ok
+}
+
 // upstream is the upstream model id of a corpus target.
 func upstream(target string) string {
 	_, id, _ := strings.Cut(target, "/")
@@ -637,7 +652,7 @@ var mapped = []string{"model", "max_tokens", "system", "messages", "tools", "too
 // byte and a dropped one is absent unless listed again as written.
 func translated(inbound string, received []byte, changes string, group []string, target string) error {
 	in, e1 := params.Scan([]byte(inbound), nil)
-	out, e2 := params.Scan(received, nil)
+	out, e2 := params.Scan(received, params.MessagesOut)
 	if e1 != nil || e2 != nil {
 		return fmt.Errorf("scan: %v %v", e1, e2)
 	}
@@ -671,6 +686,8 @@ func translated(inbound string, received []byte, changes string, group []string,
 			return fmt.Errorf("%s is listed forwarded but changed", c)
 		case action == "dropped" && okOut && !again:
 			return fmt.Errorf("%s is listed dropped but was sent", c)
+		case action == "added" && !present(out, strings.Split(name, ".")...):
+			return fmt.Errorf("%s is listed added but was not sent", c)
 		}
 	}
 	for _, n := range out.Keys() {
@@ -700,7 +717,6 @@ func listed(inbound string, received []byte, changes string, group []string, tar
 	if v, _ := out.Get("model"); string(v) != strconv.Quote(upstream(target)) {
 		return fmt.Errorf("model %s sent to %s", v, target)
 	}
-	present := func(b *params.Body, path ...string) bool { _, ok := b.Get(path...); return ok }
 	differs := func(n string) bool {
 		a, okA := in.Get(n)
 		b, okB := out.Get(n)
@@ -726,6 +742,8 @@ func listed(inbound string, received []byte, changes string, group []string, tar
 			if present(out, strings.Split(name, ".")...) && !again {
 				return fmt.Errorf("%s is listed dropped but was sent", c)
 			}
+		case action == "added" && !present(out, strings.Split(name, ".")...):
+			return fmt.Errorf("%s is listed added but was not sent", c) // checked per target, not per dialect group
 		case slices.Contains(group, top):
 			if !slices.ContainsFunc(group, differs) {
 				return fmt.Errorf("%s is listed but no member of the dialect changed", c)
@@ -742,4 +760,107 @@ func listed(inbound string, received []byte, changes string, group []string, tar
 		}
 	}
 	return nil
+}
+
+// endpointsConfig: an embeddings alias whose provider forwards input_type and
+// whose alias drops task, and a rerank alias that falls back from a target
+// whose provider has no rerank_url.
+const endpointsConfig = `version: 1
+providers:
+  emb: { protocol: openai, base_url: MOCKURL, api_key_env: MOCK_KEY, billing: none, allow_private_network: true, params: { input_type: forward } }
+  rr: { protocol: openai, base_url: MOCKURL, rerank_url: MOCKURL/rerank, api_key_env: MOCK_KEY, billing: none, allow_private_network: true }
+targets:
+  emb/e-1: { kind: embeddings }
+  emb/r-0: { kind: rerank }
+  rr/r-1: { kind: rerank }
+models:
+  embed: { targets: [emb/e-1], params: { task: drop } }
+  rerank: { targets: [emb/r-0, rr/r-1] }
+keys:
+  agent: { models: ["*"] }
+`
+
+// TestExplainEndpoints is AC-17 on embeddings and rerank (PAR-10): for the
+// same body, models explain shows the URL, the headers without the
+// credential, the change list and the exact bytes the provider receives,
+// through the rules a target's provider declares; and it refuses what the data
+// plane refuses, with the same status, code and param, before any call. Its
+// minimal request is one the data plane serves.
+func TestExplainEndpoints(t *testing.T) {
+	f := newFixture(t)
+	mock := mockprovider.New()
+	srv := httptest.NewServer(mock)
+	t.Cleanup(srv.Close)
+	token := f.apply(t, strings.ReplaceAll(endpointsConfig, "MOCKURL", srv.URL))["agent"]
+	for _, tc := range []struct {
+		ep, alias, path, body string
+		status                int
+		code, param, changes  string
+	}{
+		{"embeddings", "embed", "/v1/embeddings", `{"model":"embed", "input":["a","b"],"input_type":{"x":[1]},"task":"q","dimensions":8}`, 200, "", "", "input_type:forwarded,task:dropped"},
+		{"embeddings", "embed", "/v1/embeddings", "", 200, "", "", ""},
+		{"embeddings", "embed", "/v1/embeddings", `{"model":"embed","input":"a","seed":1}`, 400, "unknown_parameter", "seed", ""},
+		{"rerank", "rerank", "/v1/rerank", `{"query":"q","model":"rerank","documents":["a",{"text":"b"}],"top_n":1,"return_documents":true}`, 200, "", "", ""},
+		{"rerank", "rerank", "/v1/rerank", "", 200, "", "", ""},
+		{"rerank", "rerank", "/v1/rerank", `{"model":"rerank","query":"q","query":"r"}`, 400, "invalid_request", "query", ""},
+	} {
+		req := map[string]string{"endpoint": tc.ep}
+		if tc.body != "" {
+			req["body"] = tc.body
+		}
+		data, _ := json.Marshal(req)
+		before := len(mock.Calls())
+		ew := call(f.admin, "Bearer "+adminKey, http.MethodPost, "/admin/v1/models/"+tc.alias+"/explain", data)
+		var ex struct{ Targets []explainBlock }
+		if err := json.Unmarshal(ew.Body.Bytes(), &ex); ew.Code == http.StatusOK && err != nil {
+			t.Fatalf("%s %s: explain %s", tc.ep, tc.body, ew.Body)
+		}
+		body := tc.body
+		if body == "" { // the minimal request explain used
+			k := slices.IndexFunc(ex.Targets, func(b explainBlock) bool { return b.Skipped == nil })
+			if k < 0 {
+				t.Fatalf("%s: explain's minimal request: %s", tc.ep, ew.Body)
+			}
+			model, _ := json.Marshal(upstream(ex.Targets[k].Target))
+			body = strings.Replace(ex.Targets[k].Body, `"model":`+string(model), `"model":"`+tc.alias+`"`, 1)
+		}
+		w := f.traffic(tc.path, token, body)
+		calls := mock.Calls()[before:]
+		e := envelopeOf(t, w)
+		if ew.Code != tc.status || w.Code != tc.status {
+			t.Fatalf("%s %s: explain %d %s, data plane %d %s", tc.ep, body, ew.Code, ew.Body, w.Code, w.Body)
+		}
+		if tc.status != http.StatusOK {
+			var a struct{ Error domain.Error }
+			_ = json.Unmarshal(ew.Body.Bytes(), &a)
+			if a.Error.Code != tc.code || a.Error.Param != tc.param || e.Code != tc.code || e.Param != tc.param || len(calls) != 0 {
+				t.Errorf("%s %s: explain %s, data plane %s, %d calls", tc.ep, body, ew.Body, w.Body, len(calls))
+			}
+			continue
+		}
+		k := slices.IndexFunc(ex.Targets, func(b explainBlock) bool { return b.Skipped == nil })
+		if len(calls) != 1 || k < 0 {
+			t.Fatalf("%s %s: %d calls; explain %s", tc.ep, body, len(calls), ew.Body)
+		}
+		b, got := ex.Targets[k], calls[0]
+		sent := got.Header.Clone()
+		for _, name := range []string{"Authorization", "Content-Length", "User-Agent", "Accept-Encoding"} {
+			sent.Del(name)
+		}
+		switch {
+		case string(got.Body) != b.Body:
+			t.Errorf("%s: the provider received\n%s\nexplain shows\n%s", tc.ep, got.Body, b.Body)
+		case srv.URL+got.Path != b.URL:
+			t.Errorf("%s: explain URL %q, the provider got %q", tc.ep, b.URL, srv.URL+got.Path)
+		case !maps.EqualFunc(sent, b.Header, slices.Equal):
+			t.Errorf("%s: headers: explain %q, the provider got %q", tc.ep, b.Header, got.Header)
+		case b.Changes != tc.changes || w.Header().Get(changedHeader) != tc.changes || w.Header().Get(targetHeader) != b.Target:
+			t.Errorf("%s: changes %q, data plane %q to %s; want %q", tc.ep, b.Changes, w.Header().Get(changedHeader), w.Header().Get(targetHeader), tc.changes)
+		case b.Effort.Sent != nil || b.MaxOutput.Sent != nil:
+			t.Errorf("%s: explain shows an effort or a cap sent: %s", tc.ep, ew.Body)
+		}
+		if tc.ep == "rerank" && (b.Target != "rr/r-1" || ex.Targets[0].Skipped == nil || ex.Targets[0].Skipped.Code != domain.CodeEndpointNotSupported) {
+			t.Errorf("rerank: %s", ew.Body)
+		}
+	}
 }

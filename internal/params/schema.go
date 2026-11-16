@@ -37,12 +37,15 @@ var Chat = Schema{
 // Messages is Anthropic Messages: the key list is the API reference as read on
 // AsOf, independent of the version header, because a client may send its own
 // anthropic-version (PAR-14). Content blocks nested in a tool_result are
-// walked for PAR-4 detection.
+// walked for PAR-4 detection. Two documented keys stay unknown: fallbacks
+// names another model to serve the request, with its own caps and prices
+// (PRI-4), and an expired thread answers 404, which the proxy reads as the
+// operator's fault; a provider forward lets either through.
 var Messages = Schema{
-	AsOf: "2026-11-13",
-	Known: set("max_tokens", "messages", "model", "cache_control", "container", "diagnostics", "inference_geo",
-		"metadata", "output_config", "service_tier", "speed", "stop_sequences", "stream", "system", "temperature",
-		"thinking", "tool_choice", "tools", "top_k", "top_p"),
+	AsOf: "2026-11-16",
+	Known: set("max_tokens", "messages", "model", "cache_control", "container", "context_management", "diagnostics",
+		"inference_geo", "mcp_servers", "metadata", "output_config", "service_tier", "speed", "stop_sequences",
+		"stream", "system", "temperature", "thinking", "tool_choice", "tools", "top_k", "top_p"),
 	Walk: [][]string{
 		{"thinking"}, {"output_config"}, {"output_config", "format"}, {"tools", "*"}, {"messages", "*"},
 		{"messages", "*", "content", "*"}, {"messages", "*", "content", "*", "content", "*"}, {"reasoning"},
@@ -97,7 +100,8 @@ func set(keys ...string) map[string]bool {
 type Features struct{ Tools, Structured, Strict, Vision bool }
 
 // Detect reads the features of a body scanned with the walk of endpoint ep,
-// "chat" or "messages"; any other endpoint uses none.
+// "chat" or "messages"; any other endpoint uses none. On messages, the MCP
+// servers a body names give the model tools, so mcp_servers uses tools.
 func Detect(ep string, b *Body) Features {
 	present := func([]byte) bool { return true }
 	isTrue := func(v []byte) bool { return string(v) == "true" }
@@ -113,7 +117,7 @@ func Detect(ep string, b *Body) Features {
 	case "messages":
 		media := is("image", "document")
 		return Features{
-			Tools:      b.has(present, "tools") || b.has(present, "tool_choice"),
+			Tools:      b.has(present, "tools") || b.has(present, "tool_choice") || b.has(present, "mcp_servers"),
 			Structured: b.has(is("json_schema"), "output_config", "format", "type"),
 			Strict:     b.has(isTrue, "tools", "*", "strict"),
 			Vision: b.has(media, "messages", "*", "content", "*", "type") ||

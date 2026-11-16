@@ -1,6 +1,7 @@
 // Package cli is the command line: a command table, one flag set per command
 // and deterministic exit codes. Every command but version and validate -f is
-// one call to the admin API. No command ever reads standard input (PRI-8).
+// one call to the admin API. No command ever prompts (PRI-8): standard input
+// is read only where a file argument is "-" (OPS-3).
 package cli
 
 import (
@@ -35,6 +36,7 @@ type input struct {
 	set    map[string]bool    // the flags given, by name
 	body   map[string]any     // what the body flags given fill, by path
 	getenv func(string) string
+	stdin  io.Reader // read only for a file argument "-"
 }
 
 type flagKind int
@@ -219,7 +221,7 @@ func action(collection, verb string) func(input) (string, string, any) {
 var commands = []command{
 	{words: []string{"version"}, local: version},
 	{words: []string{"validate"}, local: validateFile, request: get("/validate"), flags: []flagSpec{
-		{"f", kindString, "", "the YAML file to check, with no server running; without it, the server checks its configuration"},
+		{"f", kindString, "", "the YAML file to check, with no server running, - for standard input; without it, the server checks its configuration"},
 		{"env-file", kindString, "", "with -f: a file of NAME=value lines that credential references also resolve from"},
 	}},
 	{words: []string{"settings", "show"}, request: get("/settings")},
@@ -249,10 +251,10 @@ var commands = []command{
 	{words: []string{"models", "show"}, args: []string{"name"}, request: named(http.MethodGet, "/models")},
 	{words: []string{"models", "set"}, args: []string{"name"}, flags: modelFlags, request: named(http.MethodPatch, "/models")},
 	{words: []string{"models", "explain"}, args: []string{"name"}, flags: []flagSpec{
-		{"endpoint", kindString, "endpoint", "chat (default) or messages"},
-		{"effort", kindString, "effort", "the client's reasoning effort, set on the body"},
-		{"max-output-tokens", kindNumber, "max_output_tokens", "the client's output cap, set on the body"},
-		{"body", kindFile, "body", "a file holding the exact request body (default: a minimal request to the alias)"},
+		{"endpoint", kindString, "endpoint", "chat (default), messages, embeddings or rerank"},
+		{"effort", kindString, "effort", "the client's reasoning effort, set on the body; chat and messages only"},
+		{"max-output-tokens", kindNumber, "max_output_tokens", "the client's output cap, set on the body; chat and messages only"},
+		{"body", kindFile, "body", "a file holding the exact request body, - for standard input (default: a minimal request to the alias)"},
 	}, request: action("/models", "explain"), render: explained},
 	{words: []string{"models", "remove"}, args: []string{"name"}, needsYes: func(input) bool { return true }, request: named(http.MethodDelete, "/models")},
 	{words: []string{"keys", "create"}, args: []string{"name"}, flags: keyFlags, request: add("/keys", "name")},
@@ -303,10 +305,18 @@ var commands = []command{
 		return http.MethodGet, "/export", nil
 	}},
 	{words: []string{"apply"}, flags: []flagSpec{
-		{"f", kindString, "", "the YAML file to apply"},
+		{"f", kindString, "", "the YAML file to apply, - for standard input"},
 		{"dry-run", kindBool, "", "validate and show the difference, and publish nothing"},
 		{"prune", kindBool, "", "remove absent providers, targets and aliases, revoke absent keys and clear absent settings"},
 	}, needsYes: func(in input) bool { return *in.bools["prune"] && !*in.bools["dry-run"] },
+		// A pipe cut short is still valid YAML: pruned, it would remove what
+		// its missing part declares.
+		local: func(_ context.Context, in input, _ io.Writer) error {
+			if *in.flags["f"] == "-" && *in.bools["prune"] && !*in.bools["dry-run"] {
+				return fmt.Errorf("%w: -f - with --prune needs --dry-run; apply a file to prune", errUsage)
+			}
+			return errRemote
+		},
 		request: func(in input) (string, string, any) {
 			q := url.Values{"dry_run": {strconv.FormatBool(*in.bools["dry-run"])}, "prune": {strconv.FormatBool(*in.bools["prune"])}}
 			return http.MethodPost, "/apply?" + q.Encode(), yamlFile(*in.flags["f"])
@@ -327,8 +337,9 @@ var (
 )
 
 // Main runs one command and returns the exit code of the process. getenv is
-// the only way a command reads the process environment.
-func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) int {
+// the only way a command reads the process environment, and stdin the only
+// way it reads standard input.
+func Main(args []string, getenv func(string) string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) > 0 && (args[0] == "-h" || args[0] == "-help" || args[0] == "--help") {
 		usage(stdout)
 		return exitOK
@@ -348,7 +359,7 @@ func Main(args []string, getenv func(string) string, stdout, stderr io.Writer) i
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.Usage = func() {}
-	in := input{flags: map[string]*string{}, bools: map[string]*bool{}, set: map[string]bool{}, body: map[string]any{}, getenv: getenv}
+	in := input{flags: map[string]*string{}, bools: map[string]*bool{}, set: map[string]bool{}, body: map[string]any{}, getenv: getenv, stdin: stdin}
 	fs.BoolVar(&in.json, "json", false, "print JSON")
 	specs := slices.Clone(cmd.flags)
 	if cmd.request != nil {

@@ -39,7 +39,7 @@ func getenv(vars map[string]string) func(string) string {
 
 func runMain(vars map[string]string, args ...string) run {
 	var stdout, stderr bytes.Buffer
-	code := Main(args, getenv(vars), &stdout, &stderr)
+	code := Main(args, getenv(vars), unread{}, &stdout, &stderr)
 	return run{code, stdout.String(), stderr.String()}
 }
 
@@ -169,7 +169,8 @@ func TestCommandWalk(t *testing.T) {
 		"models explain": {
 			{[]string{"m@"}, 0}, {[]string{"m@", "--effort", "low", "--max-output-tokens", "50", "--body", filepath.Join(bodies, "body@.json")}, 0},
 			{[]string{"m@", "--endpoint", "messages"}, 0}, {[]string{"m@", "--effort", "bogus"}, 1}, {[]string{"m@", "--max-output-tokens", "101"}, 1},
-			{[]string{"m@", "--body", filepath.Join(bodies, "none.json")}, 1}, {[]string{"m@", "--endpoint", "rerank"}, 1}, {[]string{"nope"}, 1},
+			{[]string{"m@", "--body", filepath.Join(bodies, "none.json")}, 1}, {[]string{"m@", "--endpoint", "rerank"}, 0},
+			{[]string{"m@", "--endpoint", "rerank", "--effort", "low"}, 1}, {[]string{"m@", "--endpoint", "responses"}, 1}, {[]string{"nope"}, 1},
 		},
 		"models remove": {{[]string{"m@", "--yes"}, 0}, {[]string{"nope", "--yes"}, 1}},
 		"keys create": {

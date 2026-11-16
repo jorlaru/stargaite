@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -38,9 +39,13 @@ func validateFile(ctx context.Context, in input, stdout io.Writer) error {
 	case path == "":
 		return fmt.Errorf("%w: -f needs a file", errUsage)
 	}
+	data, err := readInput(in, path)
+	if errors.Is(err, errUsage) {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(ctx, lookupTimeout)
 	defer cancel()
-	findings := checkFile(ctx, path, *in.flags["env-file"], in.getenv)
+	findings := checkFile(ctx, data, err, *in.flags["env-file"], in.getenv)
 
 	errs := 0
 	for _, f := range findings {
@@ -89,13 +94,13 @@ func printable(s string) string {
 	return s
 }
 
-// checkFile returns the findings on the file at path; a file that cannot be
-// read or decoded is one error finding, so --json output stays one object.
-func checkFile(ctx context.Context, path, envFile string, getenv func(string) string) []domain.Finding {
+// checkFile returns the findings on data, a file as read with err; a file
+// that cannot be read or decoded is one error finding, so --json output stays
+// one object.
+func checkFile(ctx context.Context, data []byte, err error, envFile string, getenv func(string) string) []domain.Finding {
 	fail := func(code string, err error) []domain.Finding {
 		return []domain.Finding{{Severity: domain.SeverityError, Rule: "OPS-5", Code: code, Resource: "file", Message: err.Error()}}
 	}
-	data, err := readFile(path)
 	if err != nil {
 		return fail("file_unreadable", err)
 	}
@@ -111,6 +116,26 @@ func checkFile(ctx context.Context, path, envFile string, getenv func(string) st
 	}
 	env := config.NewEnv(environ, envFile, resolve)
 	return append(config.Validate(&doc), config.CheckResolved(ctx, &doc, config.OutboundURLs(&doc), env)...)
+}
+
+// readInput is readFile for a file argument, except that "-" reads standard
+// input whole, with the same bound (OPS-3). A terminal or another device is
+// refused without being read, and an empty input is refused: both are a
+// wrong usage, of a command that cannot prompt (PRI-8).
+func readInput(in input, path string) ([]byte, error) {
+	if path != "-" {
+		return readFile(path)
+	}
+	if f, ok := in.stdin.(interface{ Stat() (os.FileInfo, error) }); ok {
+		if info, err := f.Stat(); err == nil && info.Mode()&os.ModeCharDevice != 0 {
+			return nil, fmt.Errorf("%w: - reads standard input, which is a terminal or a device; pipe the file in, through docker compose exec -T or docker exec -i", errUsage)
+		}
+	}
+	data, err := io.ReadAll(io.LimitReader(in.stdin, config.MaxYAMLBytes+1))
+	if err == nil && len(data) == 0 {
+		err = fmt.Errorf("%w: standard input is empty; through docker compose exec, give -T so that it reaches the command", errUsage)
+	}
+	return data, err
 }
 
 // readFile reads a regular file only, so that standard input, a pipe or a

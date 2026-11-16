@@ -85,17 +85,27 @@ func (s *server) explainModel(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	ep, walk, capName, effortPath := domain.EndpointChat, params.Chat.Walk, "max_completion_tokens", []string{"reasoning_effort"}
-	switch e := req.Endpoint; {
-	case e == nil || *e == string(domain.EndpointChat):
-	case *e == string(domain.EndpointMessages):
-		ep, walk, capName, effortPath = domain.EndpointMessages, params.Messages.Walk, "max_tokens", []string{"output_config", "effort"}
-	default:
-		s.fail(w, invalid("endpoint must be chat or messages"))
+	ep := domain.EndpointChat
+	if req.Endpoint != nil {
+		ep = domain.Endpoint(*req.Endpoint)
+	}
+	minimal, ok := map[domain.Endpoint]string{
+		domain.EndpointChat:       `"messages":[{"role":"user","content":"hi"}]`,
+		domain.EndpointMessages:   `"messages":[{"role":"user","content":"hi"}]`,
+		domain.EndpointEmbeddings: `"input":"hi"`,
+		domain.EndpointRerank:     `"query":"hi","documents":["hi"]`,
+	}[ep]
+	walk, caps, effortPath := plan.Inbound(ep)
+	switch {
+	case !ok:
+		s.fail(w, invalid("endpoint must be chat, messages, embeddings or rerank"))
+		return
+	case effortPath == nil && (req.Effort != nil || req.MaxOutputTokens != nil):
+		s.fail(w, invalid("effort and max_output_tokens apply to chat and messages only"))
 		return
 	}
 
-	raw := fmt.Appendf(nil, `{"model":%s,"messages":[{"role":"user","content":"hi"}]}`, quote(name))
+	raw := fmt.Appendf(nil, `{"model":%s,%s}`, quote(name), minimal)
 	if req.Body != nil {
 		raw = []byte(*req.Body)
 	}
@@ -104,7 +114,7 @@ func (s *server) explainModel(w http.ResponseWriter, r *http.Request) {
 		ops = append(ops, params.Op{Path: effortPath, Value: quote(*req.Effort)})
 	}
 	if req.MaxOutputTokens != nil {
-		ops = append(ops, params.Op{Path: []string{capName}, Value: strconv.AppendInt(nil, *req.MaxOutputTokens, 10)})
+		ops = append(ops, params.Op{Path: caps[:1], Value: strconv.AppendInt(nil, *req.MaxOutputTokens, 10)})
 	}
 	b, e := scan(raw, walk, snap.Settings.MaxBodyBytes)
 	if e == nil && len(ops) > 0 {

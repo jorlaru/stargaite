@@ -46,7 +46,7 @@ func TestExplain(t *testing.T) {
 	for _, tc := range []struct {
 		name, alias, body string
 		status            int
-		answer            string // the whole answer, when the status is 200
+		answer            string // the whole answer when the status is 200, else a part of the message
 		code, param       string
 	}{
 		{name: "the minimal request", alias: "fast", status: 200, answer: `{"targets":[` +
@@ -90,7 +90,17 @@ func TestExplain(t *testing.T) {
 			`{"target":"local/up-2","skipped":{"code":"endpoint_not_supported"}}]}`},
 
 		{name: "unknown alias", alias: "nope", status: 404, code: domain.CodeNotFound},
-		{name: "unknown endpoint", alias: "fast", body: `{"endpoint":"embeddings"}`, status: 400, code: domain.CodeInvalidRequest},
+		{name: "embeddings toward chat targets", alias: "fast", body: `{"endpoint":"embeddings"}`, status: 200, answer: `{"targets":[` +
+			`{"target":"local/up-1","skipped":{"code":"endpoint_not_supported"}},{"target":"local/up-2","skipped":{"code":"endpoint_not_supported"}}]}`},
+		{name: "rerank toward chat targets", alias: "fast", body: `{"endpoint":"rerank"}`, status: 200, answer: `{"targets":[` +
+			`{"target":"local/up-1","skipped":{"code":"endpoint_not_supported"}},{"target":"local/up-2","skipped":{"code":"endpoint_not_supported"}}]}`},
+		{name: "unknown endpoint", alias: "fast", body: `{"endpoint":"responses"}`, status: 400, code: domain.CodeInvalidRequest},
+		{name: "an effort on embeddings", alias: "fast", body: `{"endpoint":"embeddings","effort":"low"}`, status: 400, code: domain.CodeInvalidRequest,
+			answer: "apply to chat and messages only"},
+		{name: "a cap on rerank", alias: "fast", body: `{"endpoint":"rerank","max_output_tokens":5}`, status: 400, code: domain.CodeInvalidRequest,
+			answer: "apply to chat and messages only"},
+		{name: "an unknown parameter on embeddings", alias: "fast", body: `{"endpoint":"embeddings","body":"{\"model\":\"fast\",\"input\":\"hi\",\"seed\":1}"}`,
+			status: 400, code: domain.CodeUnknownParameter, param: "seed"},
 		{name: "unknown member", alias: "fast", body: `{"model":"fast"}`, status: 400, code: domain.CodeInvalidRequest},
 		{name: "repeated member", alias: "fast", body: `{"effort":"low","effort":"high"}`, status: 400, code: domain.CodeInvalidRequest},
 		{name: "not an object", alias: "fast", body: `[]`, status: 400, code: domain.CodeInvalidRequest},
@@ -119,8 +129,12 @@ func TestExplain(t *testing.T) {
 				t.Errorf("the credential is in the answer: %s", w.Body)
 			}
 			if tc.status != http.StatusOK {
-				if e := errorOf(t, w, tc.status, tc.code); e.Param != tc.param {
+				e := errorOf(t, w, tc.status, tc.code)
+				if e.Param != tc.param {
 					t.Errorf("param %q, want %q", e.Param, tc.param)
+				}
+				if !strings.Contains(e.Message, tc.answer) {
+					t.Errorf("message %q, want it to hold %q", e.Message, tc.answer)
 				}
 				return
 			}

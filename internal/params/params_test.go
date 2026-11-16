@@ -106,10 +106,10 @@ func TestScanAccepts(t *testing.T) {
 
 // TestSchemas pins the key lists of design section 5 and kick-off PAR-1.
 func TestSchemas(t *testing.T) {
-	if len(Chat.Known) != 37 || len(Messages.Known) != 20 {
+	if len(Chat.Known) != 37 || len(Messages.Known) != 22 {
 		t.Errorf("known keys: chat %d, messages %d", len(Chat.Known), len(Messages.Known))
 	}
-	if Chat.AsOf != "2026-11-13" || Messages.AsOf != "2026-11-13" || AnthropicVersion != "2023-06-01" {
+	if Chat.AsOf != "2026-11-13" || Messages.AsOf != "2026-11-16" || AnthropicVersion != "2023-06-01" {
 		t.Errorf("pins %s %s %s", Chat.AsOf, Messages.AsOf, AnthropicVersion)
 	}
 	for _, k := range []string{"max_tokens", "max_completion_tokens", "reasoning_effort", "stream_options"} {
@@ -117,9 +117,15 @@ func TestSchemas(t *testing.T) {
 			t.Errorf("chat lacks %s", k)
 		}
 	}
-	for _, k := range []string{"thinking", "output_config", "temperature", "top_p", "top_k"} {
+	for _, k := range []string{"thinking", "output_config", "temperature", "top_p", "top_k", "context_management", "mcp_servers"} {
 		if !Messages.Known[k] {
 			t.Errorf("messages lacks %s", k)
+		}
+	}
+	// Documented, but outside the alias's contract by default (PRI-4).
+	for _, k := range []string{"fallbacks", "thread"} {
+		if Messages.Known[k] {
+			t.Errorf("messages knows %s", k)
 		}
 	}
 	out := [][]string{{"reasoning"}, {"thinking"}, {"output_config"}}
@@ -430,6 +436,9 @@ func TestDetect(t *testing.T) {
 		{"messages", `{"messages":[{"content":[{"type":"tool_result","content":[{"type":"text"},{"type":"image"}]}]}]}`, vision},
 		{"messages", `{"messages":[{"content":[{"type":"image_url"}]}]}`, none},
 		{"messages", `{"response_format":{"type":"json_schema"}}`, none},
+		{"messages", `{"mcp_servers":[{"type":"url","url":"https://mcp.example.com/sse","name":"m"}]}`, tools},
+		{"messages", `{"context_management":{"edits":[]},"messages":[{"content":"hi"}]}`, none}, // no mcp_servers, no feature
+		{"chat", `{"mcp_servers":[]}`, none},
 		{"embeddings", `{"tools":[]}`, none},
 	} {
 		s := Chat
@@ -451,7 +460,7 @@ func TestDetect(t *testing.T) {
 	for ep, body := range map[string]string{
 		"chat": `{"tools":[{"function":{"strict":true}}],"tool_choice":"auto","response_format":{"type":"json_schema","json_schema":{"strict":true}},` +
 			`"messages":[{"content":[{"type":"image_url"}]}]}`,
-		"messages": `{"tools":[{"name":"t","strict":true}],"tool_choice":{"type":"auto"},"output_config":{"format":{"type":"json_schema"}},` +
+		"messages": `{"tools":[{"name":"t","strict":true}],"tool_choice":{"type":"auto"},"mcp_servers":[],"output_config":{"format":{"type":"json_schema"}},` +
 			`"messages":[{"content":[{"type":"image"}]}]}`,
 	} {
 		s := map[string]Schema{"chat": Chat, "messages": Messages}[ep]

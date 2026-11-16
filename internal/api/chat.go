@@ -299,15 +299,7 @@ func (h *handler) check(w http.ResponseWriter, r *http.Request, rq *request) *do
 	// a request that lasts longer than it (design section 10).
 	_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
 
-	walk := params.Chat.Walk
-	switch rq.ep {
-	case domain.EndpointMessages:
-		walk = params.Messages.Walk
-	case domain.EndpointEmbeddings:
-		walk = params.Embeddings.Walk // nil: the top level only (PAR-1)
-	case domain.EndpointRerank:
-		walk = nil // no schema: the top level only (kick-off section 7.1)
-	}
+	walk, _, _ := plan.Inbound(rq.ep)
 	var pe *params.Error
 	if rq.body, pe = params.Scan(raw, walk); pe != nil {
 		e := domain.NewError(pe.Code, pe.Message)

@@ -43,6 +43,19 @@ func schema(ep domain.Endpoint) (s params.Schema, out [][]string, ok bool) {
 	return params.Schema{}, nil, false
 }
 
+// Inbound is the client's side of ep, for every reader of an inbound body: the
+// walk it is scanned with (PAR-1), nil on embeddings and rerank, where only
+// the top level is indexed; and on chat and messages the client's output-cap
+// members (PAR-6) and the path of its effort member (kick-off section 9.1),
+// which embeddings and rerank do not have.
+func Inbound(ep domain.Endpoint) (walk [][]string, caps, effort []string) {
+	s, _, _ := schema(ep)
+	if ep != domain.EndpointChat && ep != domain.EndpointMessages {
+		return s.Walk, nil, nil
+	}
+	return s.Walk, capNames(ep), reasoning.Inbound(ep)
+}
+
 // capNames are the client's output-cap members on ep (PAR-6).
 func capNames(ep domain.Endpoint) []string {
 	if ep == domain.EndpointMessages {

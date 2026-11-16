@@ -573,6 +573,9 @@ func TestValidate(t *testing.T) {
 			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.Params = map[string]string{"tools": "drop"} })
 			edit(d.Targets, sn, func(t *domain.Target) { t.Params = map[string]string{"response_format": "drop"} })
 		}, []string{"error PAR-4 invalid_value providers/openrouter params.tools", "error PAR-4 invalid_value targets/" + sn + " params.response_format"}},
+		{"PAR-4 a provider drop on mcp_servers, which carries tools on messages", func(d *domain.Document) {
+			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.Params = map[string]string{"mcp_servers": "drop"} })
+		}, []string{"error PAR-4 invalid_value providers/openrouter params.mcp_servers"}},
 		{"PAR-4 a provider drop on another key, an alias drop on a contractual key", func(d *domain.Document) {
 			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.Params = map[string]string{"temperature": "drop"} })
 			edit(d.Models, "fast", func(m *domain.Model) { m.Params["tools"] = "drop" })

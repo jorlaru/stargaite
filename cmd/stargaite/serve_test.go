@@ -54,7 +54,7 @@ const (
 // set, so a test can start serve as a process of its own and kill it.
 func TestMain(m *testing.M) {
 	if os.Getenv("STARGAITE_TEST_RUN") != "" {
-		os.Exit(run(os.Args[1:], os.Getenv, os.Stdout, os.Stderr))
+		os.Exit(run(os.Args[1:], os.Getenv, os.Stdin, os.Stdout, os.Stderr))
 	}
 	os.Exit(m.Run())
 }
@@ -176,7 +176,7 @@ func TestServe(t *testing.T) {
 	}
 	// The CLI finds the generated key in the data directory (SEC-3).
 	var stdout bytes.Buffer
-	if code := cli.Main([]string{"settings", "show", "--json", "--admin-url", "http://" + ready.AdminAddr}, env(map[string]string{"STARGAITE_DATA_DIR": dir}), &stdout, io.Discard); code != 0 || !json.Valid(stdout.Bytes()) {
+	if code := cli.Main([]string{"settings", "show", "--json", "--admin-url", "http://" + ready.AdminAddr}, env(map[string]string{"STARGAITE_DATA_DIR": dir}), nil, &stdout, io.Discard); code != 0 || !json.Valid(stdout.Bytes()) {
 		t.Errorf("settings show: exit %d, stdout %q", code, &stdout)
 	}
 
@@ -834,7 +834,7 @@ func TestServeKilled(t *testing.T) {
 	backedUp := make(chan int, 1)
 	var cliOut, cliErr bytes.Buffer
 	go func() {
-		backedUp <- cli.Main([]string{"backup", file, "--admin-url", proxy.URL}, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), &cliOut, &cliErr)
+		backedUp <- cli.Main([]string{"backup", file, "--admin-url", proxy.URL}, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), nil, &cliOut, &cliErr)
 	}()
 	// The CLI creates its part once it has the response headers.
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
@@ -887,7 +887,7 @@ func TestServeKilled(t *testing.T) {
 		t.Errorf("the plan after the restart: %d %s, Retry-After %q", resp.StatusCode, body, resp.Header.Get("Retry-After"))
 	}
 	if code := cli.Main([]string{"keys", "set", "agent", "--budget=", "--admin-url", "http://" + ready.AdminAddr},
-		env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), io.Discard, io.Discard); code != 0 {
+		env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), nil, io.Discard, io.Discard); code != 0 {
 		t.Fatalf("keys set: exit %d", code)
 	}
 	refused(`the budget of model \"m\" is exhausted`)
@@ -896,7 +896,7 @@ func TestServeKilled(t *testing.T) {
 	}
 	var stdout bytes.Buffer
 	if code := cli.Main([]string{"usage", "show", "--json", "--since", "1h", "--admin-url", "http://" + ready.AdminAddr},
-		env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), &stdout, io.Discard); code != 0 {
+		env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), nil, &stdout, io.Discard); code != 0 {
 		t.Fatalf("usage show: exit %d", code)
 	}
 	var report struct {
@@ -910,7 +910,7 @@ func TestServeKilled(t *testing.T) {
 	}
 	stdout.Reset()
 	if code := cli.Main([]string{"usage", "quota", "--admin-url", "http://" + ready.AdminAddr},
-		env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), &stdout, io.Discard); code != 0 ||
+		env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), nil, &stdout, io.Discard); code != 0 ||
 		!strings.Contains(stdout.String(), "counts this proxy's traffic only") || !strings.Contains(stdout.String(), "q         -    -      1h      requests  2     2      100") {
 		t.Errorf("usage quota after the restart: exit %d\n%s", code, &stdout)
 	}
@@ -955,7 +955,7 @@ func TestBackupRestore(t *testing.T) {
 	committed(t, dir, 4)
 	backup := filepath.Join(t.TempDir(), "backup.db")
 	var stdout, stderr bytes.Buffer
-	if code := cli.Main([]string{"backup", backup, "--admin-url", "http://" + adminAddr}, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), &stdout, &stderr); code != 0 ||
+	if code := cli.Main([]string{"backup", backup, "--admin-url", "http://" + adminAddr}, env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), nil, &stdout, &stderr); code != 0 ||
 		!strings.HasPrefix(stdout.String(), backup+": ") {
 		t.Fatalf("backup: exit %d, stdout %q, stderr %q", code, &stdout, &stderr)
 	}
@@ -1624,11 +1624,11 @@ func TestDefaultsAreLoopback(t *testing.T) {
 
 func TestRunDispatch(t *testing.T) {
 	var stdout, stderr bytes.Buffer
-	if code := run([]string{"version"}, env(nil), &stdout, &stderr); code != 0 || stdout.String() != cli.Version+"\n" {
+	if code := run([]string{"version"}, env(nil), nil, &stdout, &stderr); code != 0 || stdout.String() != cli.Version+"\n" {
 		t.Errorf("version: exit %d stdout %q stderr %q", code, &stdout, &stderr)
 	}
 	// Only serve answers its own help with 0: the CLI has no such command.
-	if code := run([]string{"serve", "--help"}, env(nil), &stdout, &stderr); code != 0 {
+	if code := run([]string{"serve", "--help"}, env(nil), nil, &stdout, &stderr); code != 0 {
 		t.Errorf("serve --help: exit %d", code)
 	}
 }
@@ -1677,7 +1677,7 @@ func renameInto(t *testing.T, path, content string) {
 // exit code, stdout and stderr.
 func reloadSecrets(admin string, args ...string) (int, string, string) {
 	var stdout, stderr bytes.Buffer
-	code := cli.Main(append([]string{"secrets", "reload", "--admin-url", "http://" + admin}, args...), env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), &stdout, &stderr)
+	code := cli.Main(append([]string{"secrets", "reload", "--admin-url", "http://" + admin}, args...), env(map[string]string{"STARGAITE_ADMIN_KEY": adminKey}), nil, &stdout, &stderr)
 	return code, stdout.String(), stderr.String()
 }
 

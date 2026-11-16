@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -205,7 +206,10 @@ func call(ctx context.Context, name string, in input, method, path string, body 
 			return exitUsage
 		}
 		var err error
-		if data, err = readFile(string(b)); err != nil {
+		if data, err = readInput(in, string(b)); errors.Is(err, errUsage) {
+			say(stderr, "%s: %v\n", name, err)
+			return exitUsage
+		} else if err != nil {
 			return failed(name, in, domain.NewError(domain.CodeInvalidRequest, "the file was not read: "+err.Error()), stdout, stderr)
 		}
 		contentType = "application/yaml"
@@ -218,7 +222,11 @@ func call(ctx context.Context, name string, in input, method, path string, body 
 				if !ok {
 					continue
 				}
-				text, err := readFile(string(f))
+				text, err := readInput(in, string(f))
+				if errors.Is(err, errUsage) {
+					say(stderr, "%s: %v\n", name, err)
+					return exitUsage
+				}
 				if err == nil && !utf8.Valid(text) {
 					err = fmt.Errorf("%s is not UTF-8 text", f)
 				}

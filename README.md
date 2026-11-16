@@ -172,10 +172,11 @@ curl -sS --retry 10 --retry-all-errors --retry-delay 1 http://127.0.0.1:4000/hea
 
 The data plane is published on `127.0.0.1:4000` of the host. The admin API never leaves the container; the CLI inside
 it administers the proxy with the admin key generated in the volume. A shell alias saves typing (run it from the clone,
-where `compose.yaml` is):
+where `compose.yaml` is); `-T` lets a file of the host reach the CLI on standard input, as `-` (`stargaite apply -f - <
+config.yaml`):
 
 ```sh
-alias stargaite='docker compose exec stargaite /stargaite'
+alias stargaite='docker compose exec -T stargaite /stargaite'
 ```
 
 **3. Configure a provider, an alias and a key.** Replace the model ids with ones your provider offers, and the prices
@@ -263,7 +264,7 @@ alias allows. Every answer carries `x-stargaite-request-id`, `x-stargaite-target
 | List the provider presets | `stargaite providers presets` |
 | Add a provider from a preset, or any compatible endpoint | `stargaite providers add openrouter` · `stargaite providers add local --protocol openai --base-url http://127.0.0.1:8000/v1 --allow-private-network --billing none` |
 | Add a fallback model to an alias | `stargaite targets add anthropic/<model> --kind chat`, then `stargaite models set smart --target openai/<model> --target anthropic/<model> --max-output-tokens 8192` |
-| See what an alias would send | `stargaite models explain smart` · `stargaite models explain smart --effort none` |
+| See what an alias would send | `stargaite models explain smart` · `stargaite models explain smart --effort none` · `stargaite models explain smart --body - < request.json` · `stargaite models explain embed --endpoint embeddings` |
 | Let a provider's own parameter through, or remove one | `stargaite providers set openrouter --param provider=forward` · `stargaite targets set anthropic/<model> --param temperature=drop` |
 | Give a slow provider its own timeout | `stargaite providers set local --total-ms 600000` · `stargaite providers set local --total-ms=` |
 | Declare a target's reasoning levels | `stargaite targets set openai/<model> --level low --level medium --level high --can-disable=false` |
@@ -273,11 +274,14 @@ alias allows. Every answer carries `x-stargaite-request-id`, `x-stargaite-target
 | See usage and cost | `stargaite usage show --since 24h --by key,model` |
 | Send traces to Langfuse | `stargaite telemetry set --preset langfuse --otlp-endpoint https://<host>/api/public/otel` · `stargaite telemetry test` |
 | Check the whole configuration | `stargaite validate` |
-| Save and apply the configuration as YAML | `stargaite export > config.yaml` · `stargaite apply -f config.yaml --dry-run` · `stargaite apply -f config.yaml` |
+| Save and apply the configuration as YAML | `stargaite export > config.yaml` · `stargaite apply -f - --dry-run < config.yaml` · `stargaite apply -f - < config.yaml` |
 | Back up the store | `stargaite backup <file>` |
 
 Every command accepts `--json`, never prompts, and exits `0` on success, `1` on failure and `2` on wrong usage;
-`remove`, `keys revoke` and `apply --prune` (unless `--dry-run`) need `--yes`. Each change is published atomically, at
+`remove`, `keys revoke` and `apply --prune` (unless `--dry-run`) need `--yes`. Where a command takes a file (`apply -f`,
+`validate -f`, `models explain --body`), `-` reads standard input, never a terminal; `apply -f - --prune` exits `2`
+unless it is a `--dry-run`, since a pipe cut short is still valid YAML and would remove what its missing part
+declares: prune from a file. Each change is published atomically, at
 a new revision, and audited; requests in flight finish on the configuration they started with.
 
 ## Status
@@ -343,6 +347,16 @@ scanning a body whose megabyte is one long message allocates a few KB where it a
 members the proxy reads costs what it did, so a body of many short messages can still cost several times its size
 per scan.
 
+`models explain` now serves `--endpoint embeddings` and `--endpoint rerank`, through the rules the alias, its targets
+and their providers declare; `--effort` and `--max-output-tokens` apply to chat and messages only. Where a command
+takes a file (`apply -f`, `validate -f`, `models explain --body`), `-` reads standard input, so a file of the host
+reaches the CLI inside the container; the Docker alias above gains `-T` for that, and `apply -f - --prune` needs
+`--dry-run`. On `/v1/messages`, `context_management` and `mcp_servers` are no longer `400 unknown_parameter`;
+`fallbacks` and `thread` still are, since one lets a body choose another model and the other expires into a `404`,
+and `providers set <provider> --param fallbacks=forward` lets one through. A body with `mcp_servers` uses tools,
+so an alias whose targets declare `capabilities.tools` false skips them for it, and `validate` refuses a provider's
+or a target's `drop` on `mcp_servers`.
+
 ## Reference
 
 The details of each part, for operators who need the exact behaviour:
@@ -378,8 +392,8 @@ unsupported_parameter` naming it. Every forward and drop is listed in `x-stargai
 switch that drops whatever a provider does not support, and no wildcard. `validate` refuses a `forward` rule, at any
 level, on a member the proxy itself writes toward a target it applies to (the reasoning dialect's members, the output
 cap, `stream_options`, and toward `anthropic` the members of the translation), a target's `forward` on a member it
-lists in `unsupported_params`, and a provider's or a target's `drop` on `tools`, `tool_choice`, `response_format` or
-`output_config`: a target that cannot honour such a feature declares the capability false instead
+lists in `unsupported_params`, and a provider's or a target's `drop` on `tools`, `tool_choice`, `response_format`,
+`output_config` or `mcp_servers`: a target that cannot honour such a feature declares the capability false instead
 (`--capabilities tools=false`). The log line of a refused request names the member in `param`, which is how to learn
 which rule a client needs. The `mistral` preset forwards `output_dimension`; every other rule is yours to declare.
 
@@ -628,7 +642,8 @@ alias, `max_body_bytes`, the limits, budgets and quotas, fallback and the circui
 members are `input`, `model`, `dimensions`, `encoding_format` and `user`; any other, `stream` included, is refused with
 `400 unknown_parameter` unless a [rule](#parameters) names it (`providers set <provider> --param input_type=forward`,
 for a provider field such as `input_type` or `output_dimension`, which the `mistral` preset forwards). Only `model` is
-replaced by the upstream id and the rules applied; no output cap or effort is ever sent, whatever the alias declares.
+replaced by the upstream id and the rules applied; no output cap or effort is ever sent, whatever the alias declares
+(`./stargaite models explain <alias> --endpoint embeddings` shows the bytes it would send).
 The answer is relayed as the provider sent it, `float` or `base64` vectors alike. A record's input tokens are the
 provider's `usage.prompt_tokens`, else its `usage.total_tokens`, and its output tokens 0; an answer without `usage` is
 estimated from the bytes sent, so a priced embeddings target (`output_per_million=0`) always moves its budgets. A
@@ -647,7 +662,8 @@ which answers `502 upstream_error` (the attempt's log line names the limit); rai
 `POST /v1/rerank` forwards the body to the `rerank_url` of a rerank target's provider (`providers add <name>
 --protocol openai --rerank-url <url>`, then `targets add <provider>/<model> --kind rerank`), with only `model` replaced
 by the upstream id: the proxy defines no rerank schema, so Cohere, Jina, Voyage, vLLM or TEI shapes pass unchanged,
-no alias rule, output cap or effort is applied, and the answer is relayed as the provider sent it. Of the body checks
+no alias rule, output cap or effort is applied, and the answer is relayed as the provider sent it
+(`./stargaite models explain <alias> --endpoint rerank` shows the bytes it would send). Of the body checks
 only these apply: well-formed UTF-8 JSON, no repeated top-level key, and `model` naming an alias the key may use;
 every other protection of chat applies as well. A target whose provider has no `rerank_url`, or of the `anthropic`
 protocol, is skipped (`422 endpoint_not_supported` when no other is left); `validate` warns about an alias none of
@@ -724,7 +740,8 @@ file, or from `STARGAITE_ADMIN_KEY` when it is set; a key given to `serve` that 
 The CLI finds the admin API at `--admin-url`, else `STARGAITE_ADMIN_URL`, else `http://127.0.0.1:4001`.
 
 One `serve` per data directory: a second one exits `1`. Keep the directory on a local disk, not a network file system.
-`./stargaite export` prints the whole configuration as YAML, and `./stargaite apply -f <file>` applies one;
+`./stargaite export` prints the whole configuration as YAML, and `./stargaite apply -f <file>` applies one (`-f -`
+reads it from standard input);
 `config.example.yaml` is an example input (`./stargaite validate -f config.example.yaml` checks it without a server).
 
 ### Backup and restore
@@ -796,6 +813,7 @@ docker run -d --name stargaite --read-only -v stargaite-data:/data -p 127.0.0.1:
   stargaite serve --listen 0.0.0.0:4000 --behind-tls-proxy
 curl -sS --retry 10 --retry-all-errors --retry-delay 1 http://127.0.0.1:4000/health/ready
 docker exec stargaite /stargaite settings show
+docker exec -i stargaite /stargaite apply -f - --dry-run < config.yaml
 docker stop -t 60 stargaite
 ```
 

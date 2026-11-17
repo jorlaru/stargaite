@@ -109,7 +109,7 @@ func TestSchemas(t *testing.T) {
 	if len(Chat.Known) != 37 || len(Messages.Known) != 22 {
 		t.Errorf("known keys: chat %d, messages %d", len(Chat.Known), len(Messages.Known))
 	}
-	if Chat.AsOf != "2026-11-13" || Messages.AsOf != "2026-11-16" || AnthropicVersion != "2023-06-01" {
+	if Chat.AsOf != "2026-11-13" || Messages.AsOf != "2026-11-17" || AnthropicVersion != "2023-06-01" {
 		t.Errorf("pins %s %s %s", Chat.AsOf, Messages.AsOf, AnthropicVersion)
 	}
 	for _, k := range []string{"max_tokens", "max_completion_tokens", "reasoning_effort", "stream_options"} {

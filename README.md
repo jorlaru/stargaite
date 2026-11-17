@@ -356,7 +356,10 @@ takes a file (`apply -f`, `validate -f`, `models explain --body`), `-` reads sta
 reaches the CLI inside the container; the Docker alias above gains `-T` for that, and `apply -f - --prune` needs
 `--dry-run`. On `/v1/messages`, `context_management` and `mcp_servers` are no longer `400 unknown_parameter`;
 `fallbacks` and `thread` still are, since one lets a body choose another model and the other expires into a `404`,
-and `providers set <provider> --param fallbacks=forward` lets one through. A body with `mcp_servers` uses tools,
+and `providers set <provider> --param fallbacks=forward` lets one through; so are the beta `compaction`,
+`fallback_credit_token` and `output_format`. The reference was read on 2026-11-17: the API version `2026-10-21`
+removes `temperature`, `top_p` and `top_k`, which stay known because the proxy sends `anthropic-version: 2023-06-01`
+when the client sends none; a client that sends `2026-10-21` with one of them gets the provider's own `400`. A body with `mcp_servers` uses tools,
 so an alias whose targets declare `capabilities.tools` false skips them for it, and `validate` refuses a provider's
 or a target's `drop` on `mcp_servers`; on chat toward an `anthropic` target, `mcp_servers` that a rule lets through
 uses tools the same way. Since both keys are now known on `/v1/messages`, a stored alias `drop` on

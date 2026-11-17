@@ -40,9 +40,14 @@ var Chat = Schema{
 // walked for PAR-4 detection. Two documented keys stay unknown: fallbacks
 // names another model to serve the request, with its own caps and prices
 // (PRI-4), and an expired thread answers 404, which the proxy reads as the
-// operator's fault; a provider forward lets either through.
+// operator's fault; a provider forward lets either through. So do the beta
+// keys compaction, fallback_credit_token (of fallbacks) and output_format
+// (structured output, which PAR-4 reads under output_config.format). The
+// version 2026-10-21 removes temperature, top_p and top_k; they stay known,
+// since the proxy sends AnthropicVersion when the client sends none, and a
+// client that sends 2026-10-21 meets the provider's own 400.
 var Messages = Schema{
-	AsOf: "2026-11-16",
+	AsOf: "2026-11-17",
 	Known: set("max_tokens", "messages", "model", "cache_control", "container", "context_management", "diagnostics",
 		"inference_geo", "mcp_servers", "metadata", "output_config", "service_tier", "speed", "stop_sequences",
 		"stream", "system", "temperature", "thinking", "tool_choice", "tools", "top_k", "top_p"),

@@ -61,7 +61,9 @@ func newVerifyFixture(t *testing.T) *verifyFixture {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 	env := func() config.Env {
-		return config.Env{Lookup: func(string) (string, bool) { return "", false }, Resolve: resolve}
+		// Every reference resolves to planted; only TestVerifyProviderMessage
+		// declares a credential.
+		return config.Env{Lookup: func(string) (string, bool) { return planted, true }, Resolve: resolve}
 	}
 	now := time.UnixMilli(testNow)
 	cfg, err := config.Open(context.Background(), st, env, func() time.Time { return now })
@@ -489,6 +491,58 @@ func TestVerifyWait(t *testing.T) {
 		t.Errorf("a run on a slow provider: %+v, %d mock calls", v, len(f.mock.Calls()))
 	}
 	f.records(t, 1)
+}
+
+// TestVerifyProviderMessage: targets verify is the operator's own tool, so a
+// call the provider refused carries the provider's text beside the fixed
+// error, redacted and cut to 2,000 characters as on the attempt's log line
+// (RSN-9, phase-5 design C52): a provider that echoes its credential does
+// not show it. Control: a client of the data plane still gets the fixed text
+// alone (kick-off section 15).
+func TestVerifyProviderMessage(t *testing.T) {
+	f := newVerifyFixture(t)
+	token := f.setUp(t)
+	f.must(t, http.StatusOK, http.MethodPatch, "/admin/v1/providers/mock", `{"api_key_env":"MOCK_KEY"}`)
+	text := "The model m does not exist for key " + planted + ". " + strings.Repeat("x", 3000)
+	want := strings.ReplaceAll(text, planted, "[redacted]")[:2000]
+	refusal := mockprovider.Step{Status: 404, Body: []byte(`{"error":{"message":"` + text + `"}}`)}
+	f.mock.Script(refusal, refusal, refusal)
+	v := f.verify(t, "mock/m", `{}`)
+	if v.OK || len(v.Calls) != 3 {
+		t.Fatalf("a run on a refused model id: %+v", v)
+	}
+	for _, c := range v.Calls {
+		if c.Status != 404 || c.Error == nil || c.Error.Message != "the provider answered 404" || c.ProviderMessage != want {
+			t.Errorf("call %s: status %d, error %+v, provider message %.80q (%d)", c.Effort, c.Status, c.Error, c.ProviderMessage, len(c.ProviderMessage))
+		}
+	}
+	f.records(t, 3)
+
+	// The client's class: the provider's text is the error's own message, so
+	// provider_message stays empty, as the attempt's line carries none.
+	const reason = "temperature is not supported"
+	client := mockprovider.Step{Status: 400, Body: []byte(`{"error":{"message":"` + reason + `"}}`)}
+	f.mock.Script(client, client, client)
+	v = f.verify(t, "mock/m", `{}`)
+	if v.OK || len(v.Calls) == 0 {
+		t.Fatalf("a run the provider refused for the client's reason: %+v", v)
+	}
+	for _, c := range v.Calls {
+		if c.Status != 400 || c.Error == nil || !strings.Contains(c.Error.Message, reason) || c.ProviderMessage != "" {
+			t.Errorf("call %s: status %d, error %+v, provider message %q", c.Effort, c.Status, c.Error, c.ProviderMessage)
+		}
+	}
+	f.records(t, 3+len(v.Calls))
+
+	f.mock.Script(refusal)
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"fast","messages":[{"role":"user","content":"hi"}]}`))
+	r.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	f.data.ServeHTTP(w, r)
+	if w.Code != http.StatusBadGateway || !strings.Contains(w.Body.String(), "the provider answered 404") || strings.Contains(w.Body.String(), "does not exist") ||
+		strings.Contains(w.Body.String(), planted) {
+		t.Errorf("control: the data plane answered %d %s", w.Code, w.Body)
+	}
 }
 
 // TestVerifyRefusedBeforeTheProvider: an exhausted global budget gives 402

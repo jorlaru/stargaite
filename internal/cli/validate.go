@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -136,6 +137,15 @@ func readInput(in input, path string) ([]byte, error) {
 		err = fmt.Errorf("%w: standard input is empty; through docker compose exec, give -T so that it reaches the command", errUsage)
 	}
 	return data, err
+}
+
+// complete reports whether data, read from standard input for apply, can be
+// told from a cut one: its last non-blank line is the YAML document end
+// marker "...", or it is one flow mapping, as export --json writes, which a
+// cut leaves unclosed and the decoder refuses.
+func complete(data []byte) bool {
+	s := bytes.TrimSpace(data)
+	return bytes.HasPrefix(s, []byte("{")) || bytes.HasSuffix(s, []byte("\n..."))
 }
 
 // readFile reads a regular file only, so that standard input, a pipe or a

@@ -268,9 +268,10 @@ func TestRecords(t *testing.T) {
 
 // TestCutCallCost: a pay_per_use call whose request was sent and that got no
 // answer, here cut by the total timer, has no cost and counts as unpriced,
-// although its target has prices; a dial refused before anything was sent
-// and a provider's 400 keep their known cost of 0 from the price table
-// (USE-6, USE-12, phase-5 design C49).
+// although its target has prices; a dial refused before anything was sent, a
+// request whose write failed on a connection the provider reset, and a
+// provider's 400 keep their known cost of 0 from the price table (USE-6,
+// USE-12, phase-5 design C49).
 func TestCutCallCost(t *testing.T) {
 	f := newFixture(t)
 	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -289,34 +290,61 @@ func TestCutCallCost(t *testing.T) {
 	}
 	refused := closed.Addr().String()
 	_ = closed.Close()
+	// A peer that accepts each connection and resets it: a request of several
+	// MiB, more than the socket buffers hold, fails while it is written.
+	// A regression guard (phase-5 design C52): passes on bc85529, fails when the
+	// WroteRequest hook marks a failed write as sent.
+	reset, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = reset.Close() })
+	go func() {
+		for {
+			c, err := reset.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.(*net.TCPConn).SetLinger(0)
+			_ = c.Close()
+		}
+	}()
 	tokens := f.apply(t, `version: 1
 settings: { timeouts: { total_ms: 300 } }
 providers:
   slow: { protocol: openai, base_url: "`+slow.URL+`", api_key_env: MOCK_KEY, billing: pay_per_use, allow_private_network: true }
   refused: { protocol: openai, base_url: "http://`+refused+`", api_key_env: MOCK_KEY, billing: pay_per_use, allow_private_network: true }
   bad: { protocol: openai, base_url: "`+refusing.URL+`", api_key_env: MOCK_KEY, billing: pay_per_use, allow_private_network: true }
+  reset: { protocol: openai, base_url: "http://`+reset.Addr().String()+`", api_key_env: MOCK_KEY, billing: pay_per_use, allow_private_network: true }
 targets:
   slow/m: { kind: chat, pricing: { input_per_million: 1, output_per_million: 2, as_of: "2026-11-01" } }
   refused/m: { kind: chat, pricing: { input_per_million: 1, output_per_million: 2, as_of: "2026-11-01" } }
   bad/m: { kind: chat, pricing: { input_per_million: 1, output_per_million: 2, as_of: "2026-11-01" } }
+  reset/m: { kind: chat, pricing: { input_per_million: 1, output_per_million: 2, as_of: "2026-11-01" } }
 models:
   slow: { targets: [slow/m] }
   refused: { targets: [refused/m] }
   bad: { targets: [bad/m] }
+  reset: { targets: [reset/m] }
 keys:
   agent: { models: ["*"] }
 `)
-	for alias, status := range map[string]int{"slow": http.StatusGatewayTimeout, "refused": http.StatusBadGateway, "bad": http.StatusBadRequest} {
-		if w := f.chat("Bearer "+tokens["agent"], chatBody(alias, "")); w.Code != status {
+	big := `{"model":"reset","messages":[{"role":"user","content":"` + strings.Repeat("x", 5<<20) + `"}]}`
+	for alias, status := range map[string]int{"slow": http.StatusGatewayTimeout, "refused": http.StatusBadGateway, "bad": http.StatusBadRequest, "reset": http.StatusBadGateway} {
+		body := chatBody(alias, "")
+		if alias == "reset" {
+			body = big
+		}
+		if w := f.chat("Bearer "+tokens["agent"], body); w.Code != status {
 			t.Fatalf("%s: %d %s", alias, w.Code, w.Body)
 		}
 	}
 	waitFlight(t, f)
 	got := map[string]string{}
-	for _, r := range f.stored(t, 3) {
+	for _, r := range f.stored(t, 4) {
 		got[r.Model] = fmt.Sprint(r.Status, " ", money(r.Cost), " ", r.CostSource) // -1: NULL
 	}
-	if want := map[string]string{"slow": "0 -1 none", "refused": "0 0 price_table", "bad": "400 0 price_table"}; !reflect.DeepEqual(got, want) {
+	if want := map[string]string{"slow": "0 -1 none", "refused": "0 0 price_table", "bad": "400 0 price_table", "reset": "0 0 price_table"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("records %v, want %v", got, want)
 	}
 	unpriced := map[string]float64{}

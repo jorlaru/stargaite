@@ -17,6 +17,10 @@ type VerifyCall struct {
 	Body            string  `json:"body"` // the exact bytes sent (PAR-8)
 	RequestID       string  `json:"request_id"`
 	Error           *Error  `json:"error,omitempty"`
+	// ProviderMessage is the provider's text as the attempt's log line
+	// carries it, redacted and cut, wherever the error does not: the reason a
+	// provider gave for refusing the operator's own call.
+	ProviderMessage string `json:"provider_message,omitempty"`
 }
 
 // Verification is the result of one verify run (RSN-9). It lives here, not in

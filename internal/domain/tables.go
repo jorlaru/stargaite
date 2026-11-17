@@ -114,8 +114,16 @@ var ContractParams = map[string]string{
 	"tool_choice":     CapabilityTools,
 	"response_format": CapabilityStructuredOutput,
 	"output_config":   CapabilityStructuredOutput,
-	"mcp_servers":     CapabilityTools, // on /v1/messages: the tools of the MCP servers it names
+	"mcp_servers":     CapabilityTools, // the tools of the MCP servers it names, wherever it reaches a Messages body
 }
+
+// OwnedParams are the top-level members the proxy itself reads or writes to
+// serve a request at all: the alias it resolves and the upstream id it writes
+// (model), whether to relay a stream (stream), what the chat adapter maps and
+// writes (messages, system), and what explain's minimal requests send on
+// embeddings and rerank (input, query, documents). No rule of a provider or a
+// target names one, and no output_cap_param does (PAR-2, PAR-6).
+var OwnedParams = []string{"model", "messages", "system", "stream", "input", "query", "documents"}
 
 var nameSyntax = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 

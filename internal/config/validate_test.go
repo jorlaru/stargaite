@@ -78,6 +78,16 @@ func TestValidate(t *testing.T) {
 		{"RES-3 negative provider timeout", func(d *domain.Document) {
 			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.Timeouts = domain.Timeouts{ConnectMS: 100, StreamIdleMS: -1} })
 		}, []string{"error RES-3 invalid_value providers/openrouter timeouts.stream_idle_ms"}},
+		{"RES-3 a setting and a provider timer above one day", func(d *domain.Document) {
+			d.Settings.Timeouts.FirstByteMS = 86_400_001
+			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.Timeouts = domain.Timeouts{TotalMS: 10_000_000_000_000} })
+		}, []string{"error RES-3 invalid_value settings timeouts.first_byte_ms", "error RES-3 invalid_value providers/openrouter timeouts.total_ms"}},
+		{"RES-3 timers of one day", func(d *domain.Document) {
+			d.Settings.Timeouts = &domain.Timeouts{ConnectMS: 86_400_000, FirstByteMS: 86_400_000, StreamIdleMS: 86_400_000, TotalMS: 86_400_000}
+			edit(d.Providers, "openrouter", func(p *domain.Provider) {
+				p.Timeouts = domain.Timeouts{ConnectMS: 86_400_000, FirstByteMS: 86_400_000, StreamIdleMS: 86_400_000, TotalMS: 86_400_000}
+			})
+		}, nil},
 		{"USE-11 negative retention", func(d *domain.Document) { d.Settings.Retention.AuditMonths = -1 },
 			[]string{"error USE-11 invalid_value settings retention.audit_months"}},
 		{"TEL-8 negative content bound", func(d *domain.Document) { d.Settings.Telemetry.ContentMaxBytes = -1 },
@@ -584,6 +594,53 @@ func TestValidate(t *testing.T) {
 			edit(d.Targets, qw, func(t *domain.Target) {
 				t.Params = map[string]string{"max_tokens": "drop", "stream_options": "drop", "reasoning": "drop"}
 			})
+		}, nil},
+		{"PAR-2 provider and target rules on the members the proxy owns", func(d *domain.Document) {
+			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.Params = map[string]string{"model": "drop", "stream": "forward"} })
+			edit(d.Targets, qw, func(t *domain.Target) {
+				t.Params = map[string]string{"messages": "drop", "system": "drop", "input": "forward", "query": "drop", "documents": "forward"}
+			})
+		}, []string{"error PAR-2 invalid_value providers/openrouter params.model", "error PAR-2 invalid_value providers/openrouter params.stream",
+			"error PAR-2 invalid_value targets/" + qw + " params.documents", "error PAR-2 invalid_value targets/" + qw + " params.input",
+			"error PAR-2 invalid_value targets/" + qw + " params.messages", "error PAR-2 invalid_value targets/" + qw + " params.query",
+			"error PAR-2 invalid_value targets/" + qw + " params.system"}},
+		{"PAR-6 an output_cap_param naming a member the proxy owns", func(d *domain.Document) {
+			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.TargetDefaults.OutputCapParam = "model" })
+			edit(d.Targets, qw, func(t *domain.Target) { t.OutputCapParam = "messages" })
+		}, []string{"error PAR-6 invalid_value providers/openrouter target_defaults.output_cap_param", "error PAR-6 invalid_value targets/" + qw + " output_cap_param"}},
+		{"PAR-6 an output_cap_param naming a key the proxy writes toward the target", func(d *domain.Document) {
+			edit(d.Providers, "openrouter", func(p *domain.Provider) {
+				p.TargetDefaults = domain.TargetDefaults{Dialect: domain.DialectReasoningEffort, OutputCapParam: "reasoning_effort"}
+			})
+			edit(d.Targets, sn, func(t *domain.Target) { t.OutputCapParam = "thinking" })
+			edit(d.Targets, mm, func(t *domain.Target) { t.OutputCapParam = "stream_options" })
+			edit(d.Targets, qw, func(t *domain.Target) { t.OutputCapParam = "reasoning" })
+		}, []string{"error PAR-6 invalid_value providers/openrouter target_defaults.output_cap_param", "error PAR-6 invalid_value targets/" + sn + " output_cap_param",
+			"error PAR-6 invalid_value targets/" + mm + " output_cap_param", "error PAR-6 invalid_value targets/" + qw + " output_cap_param"}},
+		{"PAR-6 an output_cap_param naming a key of a target's fragment", func(d *domain.Document) {
+			edit(d.Targets, qw, func(t *domain.Target) {
+				t.Reasoning.On = map[string]json.RawMessage{"chat_template_kwargs": json.RawMessage(`{"thinking":true}`)}
+				t.OutputCapParam = "chat_template_kwargs"
+			})
+		}, []string{"error PAR-6 invalid_value targets/" + qw + " output_cap_param"}},
+		{"PAR-6 an output_cap_param naming a key that carries a contractual feature", func(d *domain.Document) {
+			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.TargetDefaults.OutputCapParam = "tools" })
+			edit(d.Targets, qw, func(t *domain.Target) { t.OutputCapParam = "response_format" })
+		}, []string{"error PAR-6 invalid_value providers/openrouter target_defaults.output_cap_param", "error PAR-6 invalid_value targets/" + qw + " output_cap_param"}},
+		{"PAR-6 an output_cap_param naming a key of another reasoning dialect", func(d *domain.Document) {
+			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.TargetDefaults = domain.TargetDefaults{OutputCapParam: "reasoning_effort"} })
+			edit(d.Targets, qw, func(t *domain.Target) { t.OutputCapParam = "reasoning_effort" })
+			edit(d.Targets, sn, func(t *domain.Target) { t.OutputCapParam = "enable_thinking" })
+		}, []string{"error PAR-6 invalid_value providers/openrouter target_defaults.output_cap_param", "error PAR-6 invalid_value targets/" + sn + " output_cap_param",
+			"error PAR-6 invalid_value targets/" + qw + " output_cap_param"}},
+		{"PAR-6 an output_cap_param naming a known chat parameter", func(d *domain.Document) {
+			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.TargetDefaults.OutputCapParam = "temperature" })
+			edit(d.Targets, qw, func(t *domain.Target) { t.OutputCapParam = "seed" })
+		}, []string{"error PAR-6 invalid_value providers/openrouter target_defaults.output_cap_param", "error PAR-6 invalid_value targets/" + qw + " output_cap_param"}},
+		{"PAR-6 an output_cap_param of the model's own", func(d *domain.Document) {
+			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.TargetDefaults.OutputCapParam = "max_new_tokens" })
+			edit(d.Targets, qw, func(t *domain.Target) { t.OutputCapParam = "max_completion_tokens" })
+			edit(d.Targets, sn, func(t *domain.Target) { t.OutputCapParam = "max_tokens" })
 		}, nil},
 		{"RSN-5 effort outside the scale", func(d *domain.Document) {
 			edit(d.Models, "fast", func(m *domain.Model) { m.Reasoning.Effort = "default" })

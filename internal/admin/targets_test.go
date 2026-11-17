@@ -204,7 +204,7 @@ func TestSetTarget(t *testing.T) {
 func TestReasoningFragments(t *testing.T) {
 	f := newFixture(t)
 	f.addProvider(t, `{"name":"anthropic"}`)
-	file := string(f.export(t)) + `targets:
+	file := strings.TrimSuffix(string(f.export(t)), "...\n") + `targets:
   anthropic/m:
     kind: chat
     reasoning:

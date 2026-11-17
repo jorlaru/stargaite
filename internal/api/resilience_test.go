@@ -507,8 +507,8 @@ func TestClassify(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name            string
-		stream          bool
-		status          int // the status line
+		stream, written bool // written: after the commit
+		status          int  // the status line
 		cause, relay    error
 		effective       int
 		eligible        bool
@@ -571,11 +571,22 @@ func TestClassify(t *testing.T) {
 		{name: "2xx not a stream", stream: true, status: 200, effective: 200, relay: errNotStream, breaker: routing.Pass, code: "upstream_error", errStatus: 502, message: "not an event stream"},
 		{name: "oversized event", stream: true, status: 200, effective: 200, relay: transport.ErrEventTooLarge, breaker: routing.Pass, code: "upstream_error", errStatus: 502, message: "stream failed"},
 
+		// After the commit: the breaker still hears the class, the answer is the
+		// terminal event's (phase-5 design C45). A regression guard (phase-5
+		// design C52): passes on bc85529, fails when settle turns a post-commit
+		// Fail into Pass.
+		{name: "openai chunk with code 502 after the commit", stream: true, written: true, status: 200, relay: coded(502), effective: 200, eligible: true,
+			breaker: routing.Fail, code: "upstream_error", errStatus: 502, message: "the provider's stream reported an error"},
+		{name: "stream cut after the commit", stream: true, written: true, status: 200, effective: 200, cause: errStreamEnded, eligible: true, breaker: routing.Fail,
+			code: "upstream_error", errStatus: 502, message: "the provider's stream failed"},
+		{name: "idle timer after the commit", stream: true, written: true, status: 200, effective: 200, cause: errIdleTimeout, eligible: true, breaker: routing.Fail,
+			code: "upstream_timeout", errStatus: 504, message: "idle timeout"},
+
 		{name: "client gone", stream: true, status: 200, effective: 200, cause: errClientGone, breaker: routing.None},
 		{name: "shutdown", stream: true, status: 200, effective: 200, cause: ErrStopping, breaker: routing.None, code: "internal_error", errStatus: 500, message: "server stopping"},
 		{name: "shutdown before an answer", cause: ErrStopping, breaker: routing.None, code: "internal_error", errStatus: 500, message: "server stopping"},
 	} {
-		a := &attempt{status: tc.status, target: &config.Target{Provider: &config.Provider{Credential: transport.NewSecret("sk-planted")}}}
+		a := &attempt{status: tc.status, written: tc.written, target: &config.Target{Provider: &config.Provider{Credential: transport.NewSecret("sk-planted")}}}
 		settle(context.Background(), a, tc.stream, retry, body, tc.cause, tc.relay)
 		v := a.end
 		if a.status != tc.effective || v.eligible != tc.eligible || v.breaker != tc.breaker || v.operator != tc.operator || v.final != tc.final ||
@@ -628,6 +639,37 @@ func TestBreakerClasses(t *testing.T) {
 	before := len(s.mock.Calls())
 	if status := ask(); status != 503 || len(s.mock.Calls()) != before {
 		t.Fatalf("after five coded 502s: %d, %d calls", status, len(s.mock.Calls())-before)
+	}
+}
+
+// TestBreakerAfterCommit is RES-2 after the first chunk (phase-5 design C45):
+// the answer is the terminal event, but the breaker still hears a transient
+// fault, so five streams that each send a chunk and then end without their
+// terminator, carry an OpenAI error chunk with code 502, or fall silent past
+// stream_idle_ms open bad/m's circuit, and the next request is 503
+// no_target_available without a call. A regression guard (phase-5 design
+// C52): passes on bc85529, fails when settle turns a post-commit Fail into
+// Pass.
+func TestBreakerAfterCommit(t *testing.T) {
+	for name, step := range map[string]mockprovider.Step{
+		"no terminator":         {Chunks: sse(chunk("a"))},
+		"an error chunk":        {Chunks: sse(chunk("a"), `{"error":{"code":502,"message":"no provider"}}`)},
+		"silent past idle time": {Chunks: sse(chunk("a")), Hang: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, _, _ := newResilience(t)
+			for n := range 5 {
+				s.mock.Script(step)
+				if resp, got := s.post(t, chatBody("bad-one", `,"stream":true`)); resp.StatusCode != 200 || !strings.Contains(got, `"error"`) {
+					t.Fatalf("stream %d: %d %s", n+1, resp.StatusCode, got)
+				}
+			}
+			before := len(s.mock.Calls())
+			if resp, got := s.post(t, chatBody("bad-one", `,"stream":true`)); resp.StatusCode != 503 || !strings.Contains(got, "no_target_available") ||
+				len(s.mock.Calls()) != before {
+				t.Fatalf("after five: %d %s, %d calls", resp.StatusCode, got, len(s.mock.Calls())-before)
+			}
+		})
 	}
 }
 

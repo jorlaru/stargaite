@@ -407,7 +407,9 @@ func (s *server) patchSettings(w http.ResponseWriter, r *http.Request) {
 }
 
 // export answers the published declarations as YAML, or as the canonical
-// JSON with ?format=json: no secret, no revoked key, no default (OPS-3).
+// JSON with ?format=json: no secret, no revoked key, no default (OPS-3). The
+// YAML ends with the document end marker, so that apply -f - can tell it
+// whole from a pipe cut short.
 func (s *server) export(w http.ResponseWriter, r *http.Request) {
 	q, err := query(r, "format")
 	if err != nil {
@@ -425,7 +427,7 @@ func (s *server) export(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/yaml")
-		_, _ = w.Write(data)
+		_, _ = w.Write(append(data, "...\n"...))
 	default:
 		s.fail(w, invalid("format must be yaml or json"))
 	}

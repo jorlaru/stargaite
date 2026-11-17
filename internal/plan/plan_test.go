@@ -304,10 +304,17 @@ func TestCaps(t *testing.T) {
 		// K3: toward a declared output_cap_param the client's cap is one member under that name.
 		{"client cap under the declared name", "chat", `{"model":"a",` + msgs + `,"max_tokens":500}`, 1000, domain.Target{OutputCapParam: "max_completion_tokens"},
 			`{"model":"up-1",` + msgs + `,"max_completion_tokens":500}`, "max_tokens:translated", 500, 500, "", 1000},
+		// PAR-3: the declared member the client sent leaves with another value, so it is listed too.
 		{"both names toward a declared name: the larger under it", "chat", `{"model":"a",` + msgs + `,"max_tokens":900,"max_completion_tokens":300}`, 1000,
 			domain.Target{OutputCapParam: "max_completion_tokens"},
-			`{"model":"up-1",` + msgs + `,"max_completion_tokens":900}`, "max_tokens:translated", 900, 900, "", 1000},
+			`{"model":"up-1",` + msgs + `,"max_completion_tokens":900}`, "max_tokens:translated,max_completion_tokens:translated", 900, 900, "", 1000},
 		{"both names toward a declared max_tokens", "chat", `{"model":"a",` + msgs + `,"max_tokens":300,"max_completion_tokens":900}`, 0,
+			domain.Target{OutputCapParam: "max_tokens"},
+			`{"model":"up-1",` + msgs + `,"max_tokens":900}`, "max_completion_tokens:translated,max_tokens:translated", 900, 900, "", 0},
+		{"both names, the larger already under the declared name: only the other listed", "chat", `{"model":"a",` + msgs + `,"max_tokens":300,"max_completion_tokens":900}`, 1000,
+			domain.Target{OutputCapParam: "max_completion_tokens"},
+			`{"model":"up-1",` + msgs + `,"max_completion_tokens":900}`, "max_tokens:translated", 900, 900, "", 1000},
+		{"both names, the larger already under a declared max_tokens: only the other listed", "chat", `{"model":"a",` + msgs + `,"max_tokens":900,"max_completion_tokens":300}`, 0,
 			domain.Target{OutputCapParam: "max_tokens"},
 			`{"model":"up-1",` + msgs + `,"max_tokens":900}`, "max_completion_tokens:translated", 900, 900, "", 0},
 		{"client max_completion_tokens toward a declared max_tokens", "chat", `{"model":"a",` + msgs + `,"max_completion_tokens":50}`, 0,

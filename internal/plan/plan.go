@@ -358,6 +358,11 @@ func Build(in Input) (*Outgoing, *Skip) {
 			translatedBody, _, untranslatable = anthropic.FromChat(b)
 		}
 	}
+	// mcp_servers that a rule lets through reaches the Messages body as sent,
+	// where it gives the model tools, as on /v1/messages (PAR-4).
+	if _, ok := b.Get("mcp_servers"); ok && translated && t.Capabilities.Tools != nil && !*t.Capabilities.Tools {
+		return nil, &Skip{Code: domain.CodeCapabilityMismatch, Param: domain.CapabilityTools}
+	}
 	// Content inside a dropped member does not skip the target (PAR-12).
 	if untranslatable != "" {
 		return nil, &Skip{Code: domain.CodeUnsupportedParameter, Param: untranslatable}
@@ -379,7 +384,8 @@ func Build(in Input) (*Outgoing, *Skip) {
 	// for a client that sent none. Toward a target that declares its cap's
 	// name, the client's cap is one member under that name, holding the larger
 	// value the client sent; each member under another name is listed
-	// translated, or the declared name when a rule dropped them all.
+	// translated, and so is the declared name when the client sent it with
+	// another value or a rule dropped every member (PAR-3).
 	switch kept, _ := largest(b, capNames(ep)); {
 	case c.Cap == nil && m.MaxOutputTokens > 0:
 		ops = append(ops, params.Op{Path: []string{capName}, Value: strconv.AppendInt(nil, m.MaxOutputTokens, 10)})
@@ -396,9 +402,9 @@ func Build(in Input) (*Outgoing, *Skip) {
 				renamed = true
 			}
 		}
-		if sent, _ := b.Get(capName); renamed || string(sent) != string(v) {
+		if sent, ok := b.Get(capName); renamed || string(sent) != string(v) {
 			ops = append(ops, params.Op{Path: []string{capName}, Value: v})
-			if !renamed {
+			if string(sent) != string(v) && (ok || !renamed) {
 				out.Changes = append(out.Changes, Change{Name: capName, Action: reasoning.ActionTranslated})
 			}
 		}

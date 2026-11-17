@@ -25,11 +25,13 @@ import (
 // can_disable false, a target cap and unsupported parameters, three targets
 // of the anthropic protocol on the same mock, and three aliases per target:
 // an effort in default mode with a cap, a forced effort, and parameter
-// rules; a provider that streams usage only on request (USE-8); a provider
-// with a forward rule whose target has a drop rule (PAR-2). Four aliases list
-// several targets, so a static skip sends the request to the next one, the
-// provider's forward included (PAR-12); another skips both targets with
-// different codes, so the first skip is told from the last (RES-10).
+// rules; a target that declares its output cap's name and takes a client's
+// cap under any (PAR-6, K3); a provider that streams usage only on request
+// (USE-8); a provider with a forward rule whose target has a drop rule
+// (PAR-2). Four aliases list several targets, so a static skip sends the
+// request to the next one, the provider's forward included (PAR-12); another
+// skips both targets with different codes, so the first skip is told from
+// the last (RES-10).
 const corpusConfig = `version: 1
 providers:
   mock: { protocol: openai, base_url: MOCK, api_key_env: MOCK_KEY, billing: none, allow_private_network: true }
@@ -47,6 +49,7 @@ targets:
   mock/ae: { kind: chat, reasoning: { dialect: adaptive_effort, levels: [low, medium, high], can_disable: false } }
   mock/cap: { kind: chat, max_output_tokens: 1000, output_cap_param: max_completion_tokens, unsupported_params: [temperature, top_p, max_tokens], capabilities: { tools: false }, reasoning: { dialect: reasoning_effort } }
   mock/plain: { kind: chat, capabilities: { tools: false, vision: false } }
+  mock/capd: { kind: chat, output_cap_param: max_completion_tokens, reasoning: { dialect: reasoning_effort, levels: [low, medium, high], can_disable: true } }
   anth/ae: { kind: chat, inline_think_tags: true, reasoning: { dialect: adaptive_effort, levels: [low, medium, high], can_disable: true } }
   anth/tb: { kind: chat, max_output_tokens: 8000, unsupported_params: [top_p], reasoning: { dialect: thinking_budget, levels: [low, medium, high], budgets: { low: 1024, medium: 2048, high: 4096 } } }
   anth/none: { kind: chat, capabilities: { vision: false } }
@@ -63,7 +66,7 @@ keys:
 `
 
 var corpusTargets = []string{"mock/none", "mock/re", "mock/re-free", "mock/ro", "mock/tt", "mock/et", "mock/tb", "mock/ae", "mock/cap", "mock/plain",
-	"anth/ae", "anth/tb", "anth/none", "req/re", "fwd/t"}
+	"mock/capd", "anth/ae", "anth/tb", "anth/none", "req/re", "fwd/t"}
 
 // corpusAliases are the six aliases of each target, in YAML, named after
 // the target with its slash as a dash: an effort in default mode with a cap,
@@ -331,6 +334,7 @@ func TestCorpus(t *testing.T) {
 	msgServed, msgRefused, msgSkipped, msgStreamed := 0, 0, 0, 0
 	logged, injected := 0, map[string]int{} // injected: requests by the stream_options action listed (USE-8)
 	ruled := map[string]int{}               // requests served under a provider or a target rule of fwd/t (PAR-2, PAR-12)
+	renamed, capBoth := 0, false            // client caps sent to mock/capd under its declared name (K3); the fixed body sent
 	type sentValues struct {
 		changes, effort string
 		maxOutput       *int64
@@ -352,6 +356,14 @@ func TestCorpus(t *testing.T) {
 			body = corpusMessagesBody(r, alias)
 		} else {
 			body = corpusBody(r, alias)
+		}
+		if !messages && !capBoth {
+			// One fixed body sends both cap names toward mock/capd, the
+			// declared one the smaller: no generated body does at this seed,
+			// and listed must find both listed (design C52 item 5). The
+			// generated body is drawn all the same, so the stream is unchanged.
+			capBoth, alias = true, "mock-capd-f"
+			body = `{"model":"mock-capd-f","messages":[{"role":"user","content":"hi"}],"max_tokens":700,"max_completion_tokens":300}`
 		}
 		fail := func(format string, args ...any) {
 			t.Helper()
@@ -541,6 +553,9 @@ func TestCorpus(t *testing.T) {
 		if k > 0 && ex.Targets[0].Skipped.Param == "x_prov" {
 			ruled["passed over"]++
 		}
+		if b.Target == "mock/capd" && strings.Contains(b.Changes, "max_tokens:translated") {
+			renamed++
+		}
 
 		// AC-09: what differs is what is listed.
 		check := listed
@@ -595,10 +610,10 @@ func TestCorpus(t *testing.T) {
 		}
 	}
 	if refused == 0 || allSkipped == 0 || streamed == 0 || translatedStreams == 0 || msgRefused == 0 || msgSkipped == 0 || msgServed == 0 || msgStreamed == 0 ||
-		injected["added"] == 0 || injected["translated"] == 0 || len(ruled) != 3 {
+		injected["added"] == 0 || injected["translated"] == 0 || len(ruled) != 3 || renamed == 0 {
 		t.Errorf("the corpus has %d refusals, %d bodies every target skipped, %d streams and %d streams toward anthropic, stream_options listed %v, "+
-			"rules of fwd/t %v; on /v1/messages %d refusals, %d bodies every target skipped, %d served and %d streams; each kind needs one",
-			refused, allSkipped, streamed, translatedStreams, injected, ruled, msgRefused, msgSkipped, msgServed, msgStreamed)
+			"rules of fwd/t %v, %d caps renamed; on /v1/messages %d refusals, %d bodies every target skipped, %d served and %d streams; each kind needs one",
+			refused, allSkipped, streamed, translatedStreams, injected, ruled, renamed, msgRefused, msgSkipped, msgServed, msgStreamed)
 	}
 }
 
@@ -703,7 +718,10 @@ func translated(inbound string, received []byte, changes string, group []string,
 // received is named by the change list, and every change names a member that
 // changed. The effort change is named after the client's member or the
 // dialect's (PAR-3), so it stands for every member of group, the client's
-// effort member and those the dialect writes; a forwarded member is listed
+// effort member and those the dialect writes; a cap the client sent under
+// another name than the target's is named after the client's member, so a
+// listed cap stands for a cap member the client did not send (K3), never for
+// one it sent with another value; a forwarded member is listed
 // unchanged; a dropped one is absent, unless listed again as written; an
 // alias effort dropped toward a none target is listed though the client sent
 // none (C12), and so is a client effort on /v1/messages that a thinking of
@@ -723,7 +741,8 @@ func listed(inbound string, received []byte, changes string, group []string, tar
 		return okA != okB || !bytes.Equal(a, b)
 	}
 	names := map[string]bool{}
-	effortListed := false
+	effortListed, capListed := false, false
+	caps := []string{"max_tokens", "max_completion_tokens"}
 	var list []string
 	if changes != "" {
 		list = strings.Split(changes, ",")
@@ -753,9 +772,10 @@ func listed(inbound string, received []byte, changes string, group []string, tar
 		}
 		names[top] = true
 		effortListed = effortListed || slices.Contains(group, top)
+		capListed = capListed || slices.Contains(caps, top)
 	}
 	for _, n := range slices.Concat(in.Keys(), out.Keys()) {
-		if n != "model" && differs(n) && !names[n] && (!effortListed || !slices.Contains(group, n)) {
+		if n != "model" && differs(n) && !names[n] && (!effortListed || !slices.Contains(group, n)) && (!capListed || !slices.Contains(caps, n) || present(in, n)) {
 			return fmt.Errorf("%s changed but is not listed", n)
 		}
 	}

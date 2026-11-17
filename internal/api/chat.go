@@ -597,6 +597,17 @@ func (h *handler) call(w http.ResponseWriter, r *http.Request, rq *request, t *c
 	return a
 }
 
+// logged is the provider's text wherever the client does not get it: every
+// class but the client's, and any fault after the commit (phase-5 design
+// section 5.1); "" otherwise. The attempt line carries it, and targets verify
+// shows it to the operator.
+func (a *attempt) logged() string {
+	if a.written || a.end.operator || !a.end.final {
+		return a.text
+	}
+	return ""
+}
+
 // ms is a duration in milliseconds, as the settings state them.
 func ms(v int64) time.Duration { return time.Duration(v) * time.Millisecond }
 
@@ -897,12 +908,9 @@ func (h *handler) finish(rq *request, a *attempt) {
 	if a.cause != nil {
 		attrs = append(attrs, "cause", cut(a.target.Provider.Credential.Redact(a.cause.Error())))
 	}
-	// The provider's text wherever the client does not get it: every class
-	// but the client's, and any fault after the commit (phase-5 design
-	// section 5.1). The WARN is the alert, rate-limited; this line is the
-	// record.
-	if a.text != "" && (a.written || a.end.operator || !a.end.final) {
-		attrs = append(attrs, "provider_message", a.text)
+	// The WARN is the alert, rate-limited; this line is the record.
+	if text := a.logged(); text != "" {
+		attrs = append(attrs, "provider_message", text)
 	}
 	if a.end.operator {
 		if n, ok := h.upstream.tick(a.ended); ok {

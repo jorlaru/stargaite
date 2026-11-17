@@ -173,7 +173,7 @@ curl -sS --retry 10 --retry-all-errors --retry-delay 1 http://127.0.0.1:4000/hea
 The data plane is published on `127.0.0.1:4000` of the host. The admin API never leaves the container; the CLI inside
 it administers the proxy with the admin key generated in the volume. A shell alias saves typing (run it from the clone,
 where `compose.yaml` is); `-T` lets a file of the host reach the CLI on standard input, as `-` (`stargaite apply -f - <
-config.yaml`):
+config.yaml`, for a file whose last line is the end marker `...`, as an export's is: see "Everyday operations"):
 
 ```sh
 alias stargaite='docker compose exec -T stargaite /stargaite'
@@ -279,10 +279,12 @@ alias allows. Every answer carries `x-stargaite-request-id`, `x-stargaite-target
 
 Every command accepts `--json`, never prompts, and exits `0` on success, `1` on failure and `2` on wrong usage;
 `remove`, `keys revoke` and `apply --prune` (unless `--dry-run`) need `--yes`. Where a command takes a file (`apply -f`,
-`validate -f`, `models explain --body`), `-` reads standard input, never a terminal; `apply -f - --prune` exits `2`
-unless it is a `--dry-run`, since a pipe cut short is still valid YAML and would remove what its missing part
-declares: prune from a file. Each change is published atomically, at
-a new revision, and audited; requests in flight finish on the configuration they started with.
+`validate -f`, `models explain --body`), `-` reads standard input, never a terminal. A pipe cut short is still valid
+YAML, and `apply` replaces each resource it names whole, so `apply -f -` publishes only a document whose last line is
+the YAML end marker `...`, which `export` writes, and exits `2` on any other (a JSON document, which a cut leaves
+unclosed, needs none); `--dry-run` and `validate -f -` need no marker. `apply -f - --prune` exits `2` unless it is a
+`--dry-run`: prune from a file. Each change is published atomically, at a new revision, and audited; requests in
+flight finish on the configuration they started with.
 
 ## Status
 
@@ -355,7 +357,23 @@ reaches the CLI inside the container; the Docker alias above gains `-T` for that
 `fallbacks` and `thread` still are, since one lets a body choose another model and the other expires into a `404`,
 and `providers set <provider> --param fallbacks=forward` lets one through. A body with `mcp_servers` uses tools,
 so an alias whose targets declare `capabilities.tools` false skips them for it, and `validate` refuses a provider's
-or a target's `drop` on `mcp_servers`.
+or a target's `drop` on `mcp_servers`; on chat toward an `anthropic` target, `mcp_servers` that a rule lets through
+uses tools the same way. Since both keys are now known on `/v1/messages`, a stored alias `drop` on
+`context_management` or `mcp_servers` acts only toward a target that refuses the key, as for every known key: to keep
+removing it, list it in the target's `unsupported_params`, or declare a provider's or a target's `drop` for
+`context_management`; to keep MCP servers out, declare `capabilities.tools` false.
+
+`export` now ends its YAML with the end marker `...`, and `apply -f -` publishes only a document that ends with it, so a
+pipe cut short no longer resets the resource at the cut; what you add to an exported file goes before the marker, since
+text after it is a second document, which `apply` refuses. Toward a target that declares `output_cap_param`, a client
+that sends both cap names with different values now finds the declared member listed `translated` too when its value changed. `targets verify`
+prints the provider's own text for a call it refused. `validate` now refuses a timer above one day (86,400,000 ms), a
+provider's or a target's rule on a member the proxy itself reads or writes (`model`, `messages`, `system`, `stream`,
+`input`, `query`, `documents`), and an `output_cap_param` naming one, a key that carries a contractual feature (such as
+`tools`), a key of any reasoning dialect (such as `reasoning_effort`), another key the proxy writes toward the target
+(`stream_options`, its `on` and `off` keys) or a known chat parameter other than `max_tokens` and
+`max_completion_tokens` (such as `temperature`); a model's own name such as `max_new_tokens` stays valid. A stored
+configuration with one keeps serving, and the next change must remove it.
 
 ## Reference
 
@@ -682,17 +700,18 @@ is sent as `medium`. Each call sends the fixed prompt "What is 17 × 23? Answer 
 build as live traffic, so the body printed is the exact one sent, translated toward an `anthropic` target. The only
 output cap sent is `--max-output-tokens`, written under the target's `output_cap_param` (`max_tokens` toward
 `anthropic`) and listed as added; it is required for an `anthropic` target and may not exceed the target's
-`max_output_tokens`. For each call it prints the level asked, the effort sent, the provider's status, the reasoning
-and output tokens and the body, then `verified` or `failed`; it exits `0` only when every call answered `2xx`, and
-`--json` gives every body's exact bytes. The calls cost tokens: they are recorded under the key `_verify` with an
-empty alias, count toward the global budget and the provider's quota (and are refused, `402` or `429`, when either is
-exhausted), and pass no key or alias limit; they neither open nor obey a target's circuit. A successful run is stored
-with its date and the proxy version, which `targets show` and `targets list` print as `verified_at` (Unix
+`max_output_tokens`. For each call it prints the level asked, the effort sent, the provider's status, the reasoning and
+output tokens and the body, and for a call the provider refused its error and, on a line of its own, the provider's own
+text as the attempt's log line carries it (credential redacted, at most 2,000 characters), such as why a model id was
+not found; then `verified` or `failed`. It exits `0` only when every call answered `2xx`, and `--json` gives every
+body's exact bytes and the text as `provider_message`. The calls cost tokens: they are recorded under the key `_verify`
+with an empty alias, count toward the global budget and the provider's quota (and are refused, `402` or `429`, when
+either is exhausted), and pass no key or alias limit; they neither open nor obey a target's circuit. A successful run is
+stored with its date and the proxy version, which `targets show` and `targets list` print as `verified_at` (Unix
 milliseconds) and `verified_version`, and `validate` warns about every chat target without one (`validate -f`, with no
-store, does not); any change of the target or of its provider clears it. Every run is audited, `verified`, `failed`,
-or `stale` when the target changed while it ran, and none writes a revision. The server bounds the run by its own
-write deadline, the number of calls times the provider's `total_ms` plus 5 s, so the CLI waits without its 90 s
-timeout.
+store, does not); any change of the target or of its provider clears it. Every run is audited, `verified`, `failed`, or
+`stale` when the target changed while it ran, and none writes a revision. The server bounds the run by its own write
+deadline, the number of calls times the provider's `total_ms` plus 5 s, so the CLI waits without its 90 s timeout.
 
 ### Resilience
 

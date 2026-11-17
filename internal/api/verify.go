@@ -153,6 +153,6 @@ func verifyCall(ctx context.Context, d Deps, snap *config.Snapshot, t *config.Ta
 	}
 	a := h.call(discard{}, r, rq, t, p.out, 1, gen)
 	rq.err = a.end.err
-	c.Status, c.ReasoningTokens, c.OutputTokens = a.status, a.rec.ReasoningTokens, a.rec.OutputTokens
+	c.Status, c.ReasoningTokens, c.OutputTokens, c.ProviderMessage = a.status, a.rec.ReasoningTokens, a.rec.OutputTokens, a.logged()
 	return c, ctx.Err() != nil
 }

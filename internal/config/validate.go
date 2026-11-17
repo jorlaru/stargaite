@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jorlaru/stargaite/internal/domain"
+	"github.com/jorlaru/stargaite/internal/params"
 	"github.com/jorlaru/stargaite/internal/transport"
 )
 
@@ -62,14 +63,49 @@ func (r *report) nonNegative(rule, resource, field string, v int64) {
 	}
 }
 
+// maxTimerMS is one day: a longer timer serves no request, and one far
+// longer overflows a duration into a timer that fires at once.
+const maxTimerMS = 86_400_000
+
+// timers checks the four RES-3 timers of the settings or of a provider: none
+// negative, none above one day.
+func (r *report) timers(resource string, t domain.Timeouts) {
+	for _, m := range []struct {
+		field string
+		v     int64
+	}{{"timeouts.connect_ms", t.ConnectMS}, {"timeouts.first_byte_ms", t.FirstByteMS}, {"timeouts.stream_idle_ms", t.StreamIdleMS}, {"timeouts.total_ms", t.TotalMS}} {
+		r.nonNegative("RES-3", resource, m.field, m.v)
+		if m.v > maxTimerMS {
+			r.fail("RES-3", "invalid_value", resource, m.field, "%s must not be above %d, one day", m.field, maxTimerMS)
+		}
+	}
+}
+
+// capParam refuses an output_cap_param that names a member the proxy owns
+// on the request, a key that carries a contractual feature, a key of any
+// reasoning dialect (the proxy reads the client's effort member and removes
+// or translates the others), one of the keys the proxy writes toward the
+// target besides the cap, or a known chat parameter other than a cap name
+// (PAR-6): the cap would be written over it, or the cap lost.
+func (r *report) capParam(resource, field, name string, writes []string) {
+	dialectKey := slices.ContainsFunc(slices.Collect(maps.Values(domain.DialectKeys)), func(keys []string) bool { return slices.Contains(keys, name) })
+	chatParam := params.Chat.Known[name] && name != "max_tokens" && name != "max_completion_tokens"
+	if name != "" && (slices.Contains(domain.OwnedParams, name) || domain.ContractParams[name] != "" || dialectKey || chatParam || slices.Contains(writes, name)) {
+		r.fail("PAR-6", "invalid_value", resource, field, "%s may not be %.64q, which the proxy itself reads or writes: name the model's output cap", field, name)
+	}
+}
+
 // rules checks the params of an alias, or with fact those of a provider or
-// a target (PAR-2): each rule is forward or drop; a fact never drops a key
-// that carries a contractual feature (PAR-4), nor forwards one the same
-// target lists in unsupported.
+// a target (PAR-2): each rule is forward or drop; a fact never names a
+// member the proxy itself reads or writes to serve the request, never drops
+// a key that carries a contractual feature (PAR-4), and never forwards one
+// the same target lists in unsupported.
 func (r *report) rules(resource string, rules map[string]string, fact bool, unsupported []string) {
 	for _, k := range slices.Sorted(maps.Keys(rules)) {
 		r.oneOf("PAR-2", resource, "params."+k, rules[k], true, domain.ParamForward, domain.ParamDrop)
 		switch c := domain.ContractParams[k]; {
+		case fact && slices.Contains(domain.OwnedParams, k):
+			r.fail("PAR-2", "invalid_value", resource, "params."+k, "a rule may not name %s, which the proxy itself reads or writes to serve the request", k)
 		case fact && c != "" && rules[k] == domain.ParamDrop:
 			r.fail("PAR-4", "invalid_value", resource, "params."+k,
 				"a drop rule may not name %s, which carries a contractual feature: declare capabilities.%s false instead", k, c)
@@ -167,17 +203,24 @@ func dialect(t domain.Target) string {
 	return cmp.Or(t.Reasoning.Dialect, domain.DefaultDialect)
 }
 
-// written lists the top-level body keys the proxy itself can write toward a
-// target, which no forward rule may name (PAR-2): the reasoning dialect and
-// its fragments, the output cap, stream_options and, toward anthropic, the
-// keys the chat adapter writes outside params.Chat.Known (design section 5).
-func written(t domain.Target, protocol string) []string {
+// beside lists the top-level body keys the proxy itself can write toward a
+// target besides its output cap, on either protocol: the reasoning dialect
+// and its fragments, and stream_options.
+func beside(t domain.Target) []string {
 	keys := slices.Clone(domain.DialectKeys[dialect(t)])
 	if t.Reasoning != nil {
 		keys = slices.AppendSeq(keys, maps.Keys(t.Reasoning.On))
 		keys = slices.AppendSeq(keys, maps.Keys(t.Reasoning.Off))
 	}
-	keys = append(keys, cmp.Or(t.OutputCapParam, domain.DefaultOutputCapParam), "stream_options")
+	return append(keys, "stream_options")
+}
+
+// written lists the top-level body keys the proxy itself can write toward a
+// target, which no forward rule may name (PAR-2): the keys of beside, the
+// output cap and, toward anthropic, the keys the chat adapter writes outside
+// params.Chat.Known (design section 5).
+func written(t domain.Target, protocol string) []string {
+	keys := append(beside(t), cmp.Or(t.OutputCapParam, domain.DefaultOutputCapParam))
 	if protocol == domain.ProtocolAnthropic {
 		keys = append(keys, "max_tokens", "system", "stop_sequences", "tool_choice", "output_config") // max_tokens: every cap toward anthropic (PAR-6)
 	}
@@ -251,10 +294,7 @@ func validateSettings(r *report, s domain.Settings) {
 	if s.Retention == nil {
 		s.Retention = &domain.Retention{}
 	}
-	r.nonNegative("RES-3", res, "timeouts.connect_ms", s.Timeouts.ConnectMS)
-	r.nonNegative("RES-3", res, "timeouts.first_byte_ms", s.Timeouts.FirstByteMS)
-	r.nonNegative("RES-3", res, "timeouts.stream_idle_ms", s.Timeouts.StreamIdleMS)
-	r.nonNegative("RES-3", res, "timeouts.total_ms", s.Timeouts.TotalMS)
+	r.timers(res, *s.Timeouts)
 	r.nonNegative("USE-11", res, "retention.usage_days", s.Retention.UsageDays)
 	r.nonNegative("USE-11", res, "retention.usage_daily_months", s.Retention.UsageDailyMonths)
 	r.nonNegative("USE-11", res, "retention.audit_months", s.Retention.AuditMonths)
@@ -339,11 +379,9 @@ func validateProvider(r *report, name string, p domain.Provider, usageDays int64
 	}
 	r.oneOf("USE-8", res, "stream_usage", p.StreamUsage, false, domain.StreamUsageRequest, domain.StreamUsageNative, domain.StreamUsageNone)
 	r.oneOf("RSN-2", res, "target_defaults.dialect", p.TargetDefaults.Dialect, false, slices.Sorted(maps.Keys(domain.DialectKeys))...)
+	r.capParam(res, "target_defaults.output_cap_param", p.TargetDefaults.OutputCapParam, nil)
 	r.rules(res, p.Params, true, nil)
-	r.nonNegative("RES-3", res, "timeouts.connect_ms", p.Timeouts.ConnectMS)
-	r.nonNegative("RES-3", res, "timeouts.first_byte_ms", p.Timeouts.FirstByteMS)
-	r.nonNegative("RES-3", res, "timeouts.stream_idle_ms", p.Timeouts.StreamIdleMS)
-	r.nonNegative("RES-3", res, "timeouts.total_ms", p.Timeouts.TotalMS)
+	r.timers(res, p.Timeouts)
 }
 
 func validateTarget(r *report, doc *domain.Document, id string, scopes map[string]string) {
@@ -356,6 +394,7 @@ func validateTarget(r *report, doc *domain.Document, id string, scopes map[strin
 	}
 	r.oneOf("OPS-5", res, "kind", t.Kind, true, domain.KindChat, domain.KindEmbeddings, domain.KindRerank)
 	r.nonNegative("PAR-6", res, "max_output_tokens", t.MaxOutputTokens)
+	r.capParam(res, "output_cap_param", t.OutputCapParam, beside(t))
 	r.rules(res, t.Params, true, t.UnsupportedParams)
 	// A forward rule of the target, or one of its provider that the target
 	// does not replace, may not name a key the proxy writes toward it (PAR-2).

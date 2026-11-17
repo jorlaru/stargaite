@@ -205,8 +205,17 @@ func call(ctx context.Context, name string, in input, method, path string, body 
 			say(stderr, "%s: -f <file> is required\n", name)
 			return exitUsage
 		}
+		// yamlFile is apply's body, and only apply declares --dry-run. apply
+		// replaces each resource it names whole (OPS-3), so a pipe cut short
+		// would reset the fields of the resource at the cut. An input above
+		// the size bound is left to the size check, which names the cause.
 		var err error
-		if data, err = readInput(in, string(b)); errors.Is(err, errUsage) {
+		data, err = readInput(in, string(b))
+		if err == nil && b == "-" && !*in.bools["dry-run"] && len(data) <= config.MaxYAMLBytes && !complete(data) {
+			err = fmt.Errorf("%w: apply -f - publishes only a whole document, whose last line is the YAML end marker ..., as export writes it: "+
+				"add the line, apply a file, or give --dry-run", errUsage)
+		}
+		if errors.Is(err, errUsage) {
 			say(stderr, "%s: %v\n", name, err)
 			return exitUsage
 		} else if err != nil {
@@ -511,10 +520,11 @@ func explained(w io.Writer, answer []byte) error {
 
 // verified renders the answer of targets verify (RSN-9): one block per call,
 // a blank line between blocks, with the level asked, the effort sent, the
-// provider's status, the reasoning and output tokens, the error when there is
-// one, and the exact body sent; then verified or failed, and whether the
-// result was stored. Text from the server is printable() like every rendered
-// value; --json has the exact bytes of each body.
+// provider's status, the reasoning and output tokens, the error and the
+// provider's own text when there are, and the exact body sent; then verified
+// or failed, and whether the result was stored. Text from the server is
+// printable() like every rendered value; --json has the exact bytes of each
+// body.
 func verified(w io.Writer, answer []byte) error {
 	var v struct {
 		Target string `json:"target"`
@@ -528,6 +538,7 @@ func verified(w io.Writer, answer []byte) error {
 			OutputTokens    int64         `json:"output_tokens"`
 			Body            string        `json:"body"`
 			Error           *domain.Error `json:"error"`
+			ProviderMessage string        `json:"provider_message"`
 		} `json:"calls"`
 	}
 	if err := json.Unmarshal(answer, &v); err != nil {
@@ -546,6 +557,9 @@ func verified(w io.Writer, answer []byte) error {
 		line("output", strconv.FormatInt(c.OutputTokens, 10))
 		if c.Error != nil {
 			line("error", printable(c.Error.Code+": "+c.Error.Message))
+		}
+		if c.ProviderMessage != "" {
+			line("provider", printable(c.ProviderMessage))
 		}
 		line("body", printable(c.Body))
 		say(w, "\n")

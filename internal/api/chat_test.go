@@ -509,52 +509,83 @@ keys:
 
 // TestProviderTimers: a provider's own timers bound the calls to its targets,
 // each one it does not declare being the setting's (RES-3, phase-5 design
-// C44); clearing its last timer leaves no timeouts block to export.
+// C44), each of the four on the wire: a first byte or an answer later than
+// the setting's timer but within the provider's is served, and a provider's
+// connect timer far below the setting's fires first. Clearing its last timer
+// leaves no timeouts block to export.
 func TestProviderTimers(t *testing.T) {
 	f := newFixture(t)
 	mock := mockprovider.New()
 	srv := httptest.NewServer(mock)
 	t.Cleanup(srv.Close)
-	tokens := f.apply(t, strings.ReplaceAll(`version: 1
-settings: { timeouts: { total_ms: 300, stream_idle_ms: 300 } }
+	// A peer that accepts and never answers the TLS handshake.
+	silent, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = silent.Close() })
+	go func() {
+		for {
+			c, err := silent.Accept()
+			if err != nil {
+				return
+			}
+			defer func() { _ = c.Close() }() // when the listener closes
+		}
+	}()
+	tokens := f.apply(t, strings.NewReplacer("MOCK", srv.URL, "SILENT", silent.Addr().String()).Replace(`version: 1
+settings: { timeouts: { first_byte_ms: 300, total_ms: 300, stream_idle_ms: 300 } }
 providers:
   slow: { protocol: openai, base_url: MOCK, billing: none, allow_private_network: true, timeouts: { connect_ms: 1500, first_byte_ms: 2500, total_ms: 2000, stream_idle_ms: 2000 } }
   plain: { protocol: openai, base_url: MOCK, billing: none, allow_private_network: true }
+  deaf: { protocol: openai, base_url: "https://SILENT", billing: none, allow_private_network: true, timeouts: { connect_ms: 100 } }
 targets:
   slow/m: { kind: chat }
   plain/m: { kind: chat }
+  deaf/m: { kind: chat }
 models:
   slow: { targets: [slow/m] }
   plain: { targets: [plain/m] }
+  deaf: { targets: [deaf/m] }
 keys:
   agent: { models: ["*"] }
-`, "MOCK", srv.URL))
+`))
 	providers := f.cfg.Snapshot().Providers
 	if got, want := providers["slow"].Timeouts, (domain.Timeouts{ConnectMS: 1500, FirstByteMS: 2500, StreamIdleMS: 2000, TotalMS: 2000}); got != want {
 		t.Errorf("slow's timers: %+v, want %+v", got, want)
 	}
-	if got, want := providers["plain"].Timeouts, (domain.Timeouts{ConnectMS: domain.DefaultConnectMS, FirstByteMS: domain.DefaultFirstByteMS, StreamIdleMS: 300, TotalMS: 300}); got != want {
+	if got, want := providers["plain"].Timeouts, (domain.Timeouts{ConnectMS: domain.DefaultConnectMS, FirstByteMS: 300, StreamIdleMS: 300, TotalMS: 300}); got != want {
 		t.Errorf("control: plain's timers: %+v, want %+v", got, want)
 	}
 	late := mockprovider.Step{Body: []byte(mockReply), Delay: 600 * time.Millisecond}
 	paused := mockprovider.Step{Chunks: sse(chunk("a"), chunk("b"), "[DONE]"), Gap: 600 * time.Millisecond}
+	lateStream := mockprovider.Step{Chunks: sse(chunk("a"), "[DONE]"), Delay: 600 * time.Millisecond}
 	for _, tc := range []struct {
 		name, alias, extra string
 		step               mockprovider.Step
 		status             int
-		done               bool // the answer holds the whole reply
+		done               bool   // the answer holds the whole reply
+		says               string // in the answer, when not ""
 		within             time.Duration
 	}{
-		{"an answer at 600 ms under the provider's 2000 ms", "slow", "", late, 200, true, 2 * time.Second},
-		{"a pause of 600 ms under the provider's 2000 ms", "slow", `,"stream":true`, paused, 200, true, 3 * time.Second},
-		{"control: the setting's 300 ms without a block", "plain", "", late, 504, false, 550 * time.Millisecond},
-		{"control: the setting's pause without a block", "plain", `,"stream":true`, paused, 200, false, 3 * time.Second},
+		{"an answer at 600 ms under the provider's 2000 ms", "slow", "", late, 200, true, "", 2 * time.Second},
+		{"a pause of 600 ms under the provider's 2000 ms", "slow", `,"stream":true`, paused, 200, true, "", 3 * time.Second},
+		// A regression guard (phase-5 design C52), these two rows: they pass on
+		// bc85529 and fail when call reads the setting's first_byte_ms or
+		// connect_ms instead of the provider's.
+		{"a first byte at 600 ms under the provider's 2500 ms", "slow", `,"stream":true`, lateStream, 200, true, "", 3 * time.Second},
+		{"a connect timer of 100 ms under the setting's default 5000 ms", "deaf", "", mockprovider.Step{}, 504, false, "connect timeout", 1 * time.Second},
+		{"control: the setting's 300 ms without a block", "plain", "", late, 504, false, "total timeout", 550 * time.Millisecond},
+		{"control: the setting's pause without a block", "plain", `,"stream":true`, paused, 200, false, "", 3 * time.Second},
+		{"control: the setting's first byte without a block", "plain", `,"stream":true`, lateStream, 504, false, "first byte timeout", 550 * time.Millisecond},
 	} {
-		mock.Script(tc.step)
+		if tc.alias != "deaf" { // deaf's call never reaches the mock
+			mock.Script(tc.step)
+		}
 		start := time.Now()
 		w := f.chat("Bearer "+tokens["agent"], chatBody(tc.alias, tc.extra))
 		done := strings.Contains(w.Body.String(), "mock reply") || strings.Contains(w.Body.String(), "[DONE]")
-		if w.Code != tc.status || done != tc.done {
+		if w.Code != tc.status || done != tc.done || !strings.Contains(w.Body.String(), tc.says) {
 			t.Errorf("%s: %d %s", tc.name, w.Code, w.Body)
 		}
 		if d := time.Since(start); d > tc.within {
@@ -632,10 +663,12 @@ providers:
   anth: { protocol: anthropic, base_url: MOCK, api_key_env: ANTH_KEY, billing: none, allow_private_network: true }
 targets:
   anth/claude-up: { kind: chat, inline_think_tags: true, reasoning: { dialect: adaptive_effort, levels: [low, medium, high], can_disable: true } }
+  anth/notools: { kind: chat, capabilities: { tools: false } }
   mock/up-2: { kind: chat }
 models:
   claude: { targets: [anth/claude-up], reasoning: { effort: high, mode: default }, max_output_tokens: 500 }
   both: { targets: [anth/claude-up, mock/up-2], max_output_tokens: 500 }
+  notools: { targets: [anth/notools], params: { mcp_servers: forward }, max_output_tokens: 500 }
 keys:
   agent: { models: ["*"] }
 `
@@ -649,7 +682,8 @@ keys:
 // calls with their arguments as a JSON string, the finish reason and the
 // usage mapped. The attempt line keeps the provider's own stop_reason and
 // records the removal. Provider errors keep the section 15 statuses; a
-// stream is served by the anthropic target (TestChatAnthropicStream).
+// stream is served by the anthropic target (TestChatAnthropicStream). An
+// mcp_servers that a rule forwards uses tools, as on /v1/messages (PAR-4).
 func TestChatAnthropic(t *testing.T) {
 	f := newFixture(t)
 	mock := mockprovider.New()
@@ -743,6 +777,7 @@ func TestChatAnthropic(t *testing.T) {
 		t.Errorf("log %s", log)
 	}
 
+	const mcp = `,"mcp_servers":[{"type":"url","url":"https://mcp.example.com/sse","name":"x"}]`
 	for _, tc := range []struct {
 		name, alias, extra string
 		step               *mockprovider.Step
@@ -768,6 +803,9 @@ func TestChatAnthropic(t *testing.T) {
 		{"untranslatable content", "claude", `,"messages":[{"role":"user","name":"ann","content":"hi"}]`, nil, 422, "unsupported_parameter", "messages[0].name", "", "", ""},
 		{"a stream toward the anthropic target", "claude", `,"stream":true`, nil, 200, "", "", "", "anth/claude-up", "/v1/messages"},
 		{"a stream toward the first of both protocols", "both", `,"stream":true`, nil, 200, "", "", "", "anth/claude-up", "/v1/messages"},
+		// mcp_servers that a rule lets into the Messages body uses tools (PAR-4).
+		{"mcp_servers toward a target without tools", "notools", mcp, nil, 422, "capability_mismatch", "tools", "", "", ""},
+		{"control: no mcp_servers toward a target without tools", "notools", "", nil, 200, "", "", "", "anth/notools", "/v1/messages"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.step != nil {
@@ -797,10 +835,18 @@ func TestChatAnthropic(t *testing.T) {
 		})
 	}
 
+	// Control: the same mcp_servers on /v1/messages, where the reference
+	// knows it, skips the same target.
+	before := len(mock.Calls())
+	w := f.messages(`{"model":"notools","max_tokens":10,"messages":[{"role":"user","content":"hi"}]`+mcp+`}`, "X-Api-Key", tokens["agent"])
+	if w.Code != http.StatusUnprocessableEntity || w.Header().Get(errorCodeHeader) != "capability_mismatch" || len(mock.Calls()) != before {
+		t.Errorf("mcp_servers on /v1/messages: %d %v %s", w.Code, w.Header(), w.Body)
+	}
+
 	// cache_control on a text part reaches the provider on its block, so
 	// prompt caching works through chat (phase-5 design C46).
-	before := len(mock.Calls())
-	w := f.chat(auth, `{"model":"claude","messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]}`)
+	before = len(mock.Calls())
+	w = f.chat(auth, `{"model":"claude","messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]}`)
 	calls := mock.Calls()[before:]
 	const sent = `"messages":[{"role":"user","content":[{"type":"text","text":"hi","cache_control":{"type":"ephemeral"}}]}]`
 	if w.Code != http.StatusOK || len(calls) != 1 || !strings.Contains(string(calls[0].Body), sent) {

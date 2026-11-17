@@ -638,13 +638,16 @@ body        {}
 	}
 }
 
-// TestVerifyRender: targets verify prints one block per call, then verified
+// TestVerifyRender: targets verify prints one block per call, the provider's
+// own text on a line of its own when the answer carries it, then verified
 // or failed; it exits 0 only when every call answered 2xx (ok), with --json
 // too, and text from the server never reaches the terminal raw.
 func TestVerifyRender(t *testing.T) {
 	calls := `"calls":[{"effort":"low","effort_sent":"low","status":200,"reasoning_tokens":10,"output_tokens":12,"body":"{\"model\":\"m\",\"reasoning_effort\":\"low\"}","request_id":"A"},` +
 		`{"effort":"","effort_sent":null,"status":0,"reasoning_tokens":null,"output_tokens":0,"body":"{}\n","request_id":"B",` +
-		`"error":{"message":"the global budget is exhausted","type":"billing_error","code":"budget_exceeded"}}]`
+		`"error":{"message":"the global budget is exhausted","type":"billing_error","code":"budget_exceeded"}},` +
+		`{"effort":"high","effort_sent":"high","status":404,"reasoning_tokens":null,"output_tokens":0,"body":"{}","request_id":"C",` +
+		`"error":{"message":"the provider answered 404","type":"api_error","code":"upstream_error"},"provider_message":"no such model: m\n"}]`
 	blocks := `effort      low
 sent        low
 status      200
@@ -659,6 +662,15 @@ reasoning   -
 output      0
 error       budget_exceeded: the global budget is exhausted
 body        "{}\n"
+
+effort      high
+sent        high
+status      404
+reasoning   -
+output      0
+error       upstream_error: the provider answered 404
+provider    "no such model: m\n"
+body        {}
 
 `
 	for _, tc := range []struct {

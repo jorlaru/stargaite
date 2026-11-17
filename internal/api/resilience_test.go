@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -30,8 +31,9 @@ import (
 // which the SEC-4 guard refuses), each alone and followed by good/m, an
 // anthropic target on the GOOD mock, so a fallback from an openai target is
 // translated again; off has no credential; bad/m2 is a second target on
-// provider bad; goodoai/m is an openai target on the GOOD mock. Timers are
-// milliseconds.
+// provider bad; goodoai/m is an openai target on the GOOD mock; paid/m, behind
+// an alias whose budget is spent, and sub/m, whose quota allows one request,
+// are passed over dynamically. Timers are milliseconds.
 const resilienceConfig = `version: 1
 settings: { timeouts: { connect_ms: 200, total_ms: 300, first_byte_ms: 300, stream_idle_ms: 300 }, max_response_bytes: 4096 }
 providers:
@@ -42,6 +44,8 @@ providers:
   good: { protocol: anthropic, base_url: GOOD, api_key_env: GOOD_KEY, billing: none, allow_private_network: true }
   off: { protocol: openai, base_url: GOOD, api_key_env: MISSING_KEY, billing: none, allow_private_network: true }
   goodoai: { protocol: openai, base_url: GOOD, api_key_env: GOOD_KEY, billing: none, allow_private_network: true }
+  paid: { protocol: openai, base_url: GOOD, api_key_env: GOOD_KEY, billing: pay_per_use, allow_private_network: true }
+  sub: { protocol: openai, base_url: GOOD, api_key_env: GOOD_KEY, billing: subscription, allow_private_network: true, quota: [{ window: 1h, requests: 1 }] }
 targets:
   bad/m: { kind: chat, reasoning: { dialect: reasoning_effort, levels: [low, medium, high], can_disable: true } }
   bad/m2: { kind: chat }
@@ -52,6 +56,8 @@ targets:
   good/notools: { kind: chat, capabilities: { tools: false } }
   off/m: { kind: chat }
   goodoai/m: { kind: chat }
+  paid/m: { kind: chat, pricing: { input_per_million: 1, output_per_million: 1, as_of: 2026-11-01 } }
+  sub/m: { kind: chat }
 models:
   bad-one: { targets: [bad/m], reasoning: { effort: high, mode: default }, max_output_tokens: 500 }
   bad-two: { targets: [bad/m, good/m], reasoning: { effort: high, mode: default }, max_output_tokens: 500 }
@@ -66,6 +72,8 @@ models:
   bad-m2: { targets: [bad/m2] }
   notools-bad: { targets: [good/notools, bad/m], max_output_tokens: 500 }
   badanth-oai: { targets: [badanth/m, goodoai/m], max_output_tokens: 500 }
+  bad-paid: { targets: [bad/m, paid/m], budget: { limit_usd: 0, reset_interval: never } }
+  bad-sub: { targets: [bad/m, sub/m] }
 keys:
   agent: { models: ["*"] }
 `
@@ -364,13 +372,13 @@ func TestNoTargetLeft(t *testing.T) {
 }
 
 // TestBreakerBehaviour is AC-22 for the circuit (RES-2), on the service
-// clock: five eligible failures within 30 s open bad/m, so the next request
+// clock: five failures that count within 30 s open bad/m, so the next request
 // to an alias with only bad/m answers 503 no_target_available without a call
 // (RES-10), also after a static skip of the target before it, and an alias
 // with a fallback goes straight to good/m; the circuit is keyed by target id,
 // not provider, and outlives an apply (RES-7). After 20 s two trials
 // pass and close it; five more failures open it again, and one failing trial
-// reopens it for another 20 s. Non-eligible failures never open it.
+// reopens it for another 20 s. Failures that do not count never open it.
 func TestBreakerBehaviour(t *testing.T) {
 	s, good, yaml := newResilience(t)
 	ask := func(alias string) (int, string) {
@@ -403,7 +411,7 @@ func TestBreakerBehaviour(t *testing.T) {
 		}
 	}
 
-	fail(10, 400) // never eligible
+	fail(10, 400) // never counts
 	fail(4, 500)
 	s.now.Add(29_000)
 	fail(1, 429) // the fifth within 30 s
@@ -701,6 +709,10 @@ func TestShouldRetry(t *testing.T) {
 		{"a served fallback", "bad-two", "", &mockprovider.Step{Status: 500}, nil, 200, false},
 		{"a committed stream", "bad-one", `,"stream":true`, &mockprovider.Step{Chunks: sse(chunk("a"), `{"error":{"code":400,"message":"no"}}`)}, nil, 200, false},
 		{"503 then 401", "bad-two", "", &mockprovider.Step{Status: 503}, &mockprovider.Step{Status: 401}, 502, false},
+		// A regression guard (phase-5 design C53), with the quota pair below:
+		// passes on a4ccd1f, fails when only an open circuit counts as a
+		// target passed over.
+		{"401 then a target over its budget", "bad-paid", "", &mockprovider.Step{Status: 401}, nil, 502, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s.pastWindow()
@@ -715,6 +727,15 @@ func TestShouldRetry(t *testing.T) {
 				t.Errorf("%d %v: %s", resp.StatusCode, resp.Header, got)
 			}
 		})
+	}
+	// A 401 then a full quota window: the first request takes sub/m's one
+	// request of the hour, the second passes it over.
+	for i, want := range []int{200, 502} {
+		s.pastWindow()
+		s.mock.Script(mockprovider.Step{Status: 401})
+		if resp, got := s.post(t, chatBody("bad-sub", "")); resp.StatusCode != want || resp.Header.Get("X-Should-Retry") != "" {
+			t.Errorf("a 401 then sub/m, request %d: %d %v: %s", i+1, resp.StatusCode, resp.Header, got)
+		}
 	}
 	// A 401 then an open circuit: good/notools refuses, bad/m's circuit is
 	// open, which reopens in 20 s.
@@ -1180,12 +1201,17 @@ func (w *stalledWriter) Write(p []byte) (int, error) {
 	default:
 		return w.ResponseRecorder.Write(p)
 	}
+	return 0, w.blocked()
+}
+
+// blocked returns once the write deadline has passed.
+func (w *stalledWriter) blocked() error {
 	for ; ; time.Sleep(5 * time.Millisecond) {
 		w.mu.Lock()
 		d := w.deadline
 		w.mu.Unlock()
 		if !d.IsZero() && time.Now().After(d) {
-			return 0, os.ErrDeadlineExceeded
+			return os.ErrDeadlineExceeded
 		}
 	}
 }
@@ -1222,4 +1248,139 @@ func TestShutdownStalledClient(t *testing.T) {
 		t.Fatal("the request still runs 3 s after the stop")
 	}
 	waitFlight(t, s.fixture)
+}
+
+// stalledFlush is a client whose socket fills with the end of a stream: the
+// second flush, infer's of the held terminator, closes stall and blocks
+// until its write deadline passes.
+type stalledFlush struct {
+	stalledWriter
+	flushes atomic.Int32
+}
+
+func (w *stalledFlush) FlushError() error {
+	if w.flushes.Add(1) < 2 {
+		return nil
+	}
+	close(w.stall)
+	return w.blocked()
+}
+
+// TestShutdownStalledLastFlush: a committed stream the shutdown stops, whose
+// last flush blocks on a client that stopped reading, lets Flight go about
+// 1 s after the stop, so within the drain wait: the flush runs while infer's
+// hook still caps a write to 1 s, not under the stream's per-event deadline
+// (stream_idle_ms + 5 s).
+func TestShutdownStalledLastFlush(t *testing.T) {
+	s, _, yaml := newResilience(t)
+	s.apply(t, longTimers.Replace(yaml))
+	s.mock.Script(mockprovider.Step{Chunks: sse(chunk("a")), Hang: true})
+	base, halt := context.WithCancelCause(context.Background())
+	defer halt(nil)
+	r := httptest.NewRequestWithContext(base, http.MethodPost, "/v1/chat/completions", strings.NewReader(chatBody("bad-one", `,"stream":true`)))
+	r.Header.Set("Authorization", "Bearer "+s.token)
+	w := &stalledFlush{stalledWriter: stalledWriter{ResponseRecorder: httptest.NewRecorder(), stall: make(chan struct{}), wrote: make(chan struct{})}}
+	go s.data.ServeHTTP(w, r)
+	select {
+	case <-w.wrote:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stream did not commit")
+	}
+	stopped := time.Now()
+	halt(ErrStopping)
+	select {
+	case <-w.stall:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the last flush did not start")
+	}
+	idle := make(chan struct{})
+	go func() { s.flight.Wait(); close(idle) }()
+	select {
+	case <-idle:
+		if d := time.Since(stopped); d > 1500*time.Millisecond {
+			t.Errorf("Flight was done %v after the stop", d)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Flight is still held 3 s after the stop")
+	}
+}
+
+// TestStreamEndOneWrite is the control of infer's flush for a stream: one
+// that ends in time is not flushed by infer, so its end leaves with the
+// body's last chunk when the handler returns, in one write.
+func TestStreamEndOneWrite(t *testing.T) {
+	s, _, _ := newResilience(t)
+	s.mock.Script(mockprovider.Step{Chunks: sse(chunk("a"), "[DONE]")})
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(chatBody("bad-one", `,"stream":true`)))
+	r.Header.Set("Authorization", "Bearer "+s.token)
+	w := &heldWriter{ResponseRecorder: httptest.NewRecorder(), wrote: make(chan struct{})}
+	s.data.ServeHTTP(w, r)
+	if held := string(w.held); held != "data: [DONE]\n\n" {
+		t.Errorf("held when the handler returned: %q; sent %q", held, w.sent)
+	}
+}
+
+// TestSyncAnswerLength is the control of infer's flush: a synchronous answer
+// is not flushed before the handler returns, so it goes out with its
+// Content-Length, not chunked.
+func TestSyncAnswerLength(t *testing.T) {
+	s := newStreamFixture(t, streamConfig)
+	if resp, got := s.post(t, chatBody("plain", "")); resp.StatusCode != http.StatusOK || resp.ContentLength != int64(len(got)) {
+		t.Errorf("a synchronous 200 of %d bytes: %d, Content-Length %d, Transfer-Encoding %v", len(got), resp.StatusCode, resp.ContentLength, resp.TransferEncoding)
+	}
+}
+
+// heldWriter keeps what the handler writes until it flushes, as the
+// server's buffer does: sent is what a flush let out. wrote is closed by the
+// first write.
+type heldWriter struct {
+	*httptest.ResponseRecorder
+	mu         sync.Mutex
+	held, sent []byte
+	wrote      chan struct{}
+	once       sync.Once
+}
+
+func (w *heldWriter) Write(p []byte) (int, error) {
+	defer w.once.Do(func() { close(w.wrote) })
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.held = append(w.held, p...)
+	return len(p), nil
+}
+
+func (w *heldWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.sent, w.held = append(w.sent, w.held...), nil
+}
+
+// TestStoppedStreamLeavesBeforeFlight is RES-6 for the terminal event of a
+// committed stream the shutdown stops (phase-5 design C53): done holds it in
+// the server's buffer, and it has left by the time Flight lets serve go on
+// to close the store and exit. The writer stands for the server's buffer,
+// so the order is exact: nothing is flushed after the handler returns.
+func TestStoppedStreamLeavesBeforeFlight(t *testing.T) {
+	s, _, yaml := newResilience(t)
+	s.apply(t, longTimers.Replace(yaml))
+	s.mock.Script(mockprovider.Step{Chunks: sse(chunk("a")), Hang: true})
+	base, halt := context.WithCancelCause(context.Background())
+	defer halt(nil)
+	r := httptest.NewRequestWithContext(base, http.MethodPost, "/v1/chat/completions", strings.NewReader(chatBody("bad-one", `,"stream":true`)))
+	r.Header.Set("Authorization", "Bearer "+s.token)
+	w := &heldWriter{ResponseRecorder: httptest.NewRecorder(), wrote: make(chan struct{})}
+	go s.data.ServeHTTP(w, r)
+	select {
+	case <-w.wrote:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stream did not commit")
+	}
+	halt(ErrStopping)
+	waitFlight(t, s.fixture)
+	w.mu.Lock()
+	sent, held := string(w.sent), string(w.held)
+	w.mu.Unlock()
+	if want := "data: " + chunk("a") + "\n\n" + terminal("server stopping", "internal_error"); sent != want || held != "" {
+		t.Errorf("when Flight is done the client has %q, %q still held; want %q", sent, held, want)
+	}
 }

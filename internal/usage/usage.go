@@ -22,7 +22,7 @@ import (
 type Call struct {
 	RequestID, TraceID, Key, Model, Version string
 	Endpoint                                domain.Endpoint
-	Attempt, Status                         int // Status: the provider's; 0 without a response
+	Attempt, Status                         int // Status: the effective one (RES-2); 0 without a response
 	TargetID                                string
 	Target                                  *domain.Target
 	Provider                                *domain.Provider
@@ -90,9 +90,10 @@ type Record struct {
 // tokens with source provider. Cost: none for subscription and none billing,
 // and none for a call whose request was sent and got no answer, which may
 // have run up a cost nobody reported; else the provider's figure, else the
-// price table over the recorded tokens, else none (USE-6, USE-7). content_empty is read on chat and
-// messages only: an embeddings or rerank answer has no visible bytes, and its
-// estimate has output 0 (phase-4 design sections 4 and 5).
+// price table over the recorded tokens, else none (USE-6, USE-7).
+// content_empty is read on chat and messages only: an embeddings or rerank
+// answer has no visible bytes, and its estimate has output 0 (phase-4 design
+// sections 4 and 5).
 func NewRecord(c Call) Record {
 	r := Record{
 		ID: fmt.Sprintf("%s-%d", c.RequestID, c.Attempt), RequestID: c.RequestID, TraceID: c.TraceID, Attempt: c.Attempt,

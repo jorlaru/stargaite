@@ -24,6 +24,7 @@ providers:
     stream_usage: native
     gen_ai_provider: openrouter
     target_defaults: { dialect: reasoning_object, output_cap_param: max_tokens }
+    params: { provider: forward }       # a fact about every target of the provider (PAR-2)
   anthropic:
     protocol: anthropic
     base_url: https://api.anthropic.com
@@ -53,6 +54,7 @@ providers:
     rerank_url: http://localhost:8081/rerank
     billing: none
     allow_private_network: true
+    timeouts: { total_ms: 600000 }      # its own timer; the other three are the settings' (RES-3)
 
 targets:
   minimax-plan/MiniMax-M3.1-Flash:
@@ -81,6 +83,7 @@ targets:
       levels: [low, medium, high, xhigh, max]
       can_disable: false                # set to true, with an `off` fragment if needed, where the model allows it
     pricing: { input_per_million: 3.00, output_per_million: 15.00, cache_read_per_million: 0.30, cache_write_per_million: 3.75, as_of: 2026-11-01 }
+    params: { top_p: drop }             # removed toward this model alone, and listed (PAR-2)
   tei-embed/bge-m3:
     kind: embeddings
   tei-rerank/bge-reranker-v2-m3:

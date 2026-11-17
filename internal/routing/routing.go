@@ -10,7 +10,7 @@ import (
 
 // The RES-2 constants.
 const (
-	failures = 5                // eligible failures that open a circuit
+	failures = 5                // failures that count (RES-2), which open a circuit
 	window   = 30 * time.Second // within which they count
 	openFor  = 20 * time.Second // how long it stays open
 	trials   = 2                // requests a half-open circuit lets through, which must all pass
@@ -24,7 +24,7 @@ type Verdict int
 const (
 	None Verdict = iota // the call says nothing of the target: the client went away
 	Pass                // the target answered, whatever the answer
-	Fail                // a failure eligible for fallback (RES-1)
+	Fail                // a failure that counts: a transient one (RES-1, RES-2)
 )
 
 // Breakers are the circuit breakers by target id; a target never seen has a

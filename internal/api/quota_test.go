@@ -291,7 +291,7 @@ func TestQuotaOrder(t *testing.T) {
 func TestQuotaTakeRefusedReturnsPermit(t *testing.T) {
 	f, mock, _, keys := newQuotas(t, "quota: [{ window: 1h, requests: 6 }]", "rpm_limit: 0")
 	token := keys["agent"]
-	for range 5 { // five eligible failures open sub/m's circuit, and use 5 of the 6 requests
+	for range 5 { // five failures that count open sub/m's circuit, and use 5 of the 6 requests
 		mock.Script(mockprovider.Step{Status: 500})
 		if w := f.chat("Bearer "+token, chatBody("plan", "")); w.Code != http.StatusBadGateway {
 			t.Fatalf("failing call: %d %s", w.Code, w.Body)

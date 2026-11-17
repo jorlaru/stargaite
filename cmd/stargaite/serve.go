@@ -213,7 +213,8 @@ func serve(args []string, getenv func(string) string, stdout, stderr io.Writer) 
 	if code == 0 {
 		// Every request context derives from base: cancelling it stops the
 		// requests still running when the grace ends, and flight counts the
-		// inference requests whose done has not run yet and the verify runs
+		// inference requests whose handler has not returned yet (a committed
+		// stream until its end is flushed) and the verify runs
 		// (phase-4 design section 8, stop order). Retention and the
 		// store check run on bg once the proxy is ready, counted by
 		// background (kick-off section 14.3).

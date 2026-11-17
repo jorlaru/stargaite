@@ -261,10 +261,10 @@ VALUES (?, 'system', ?, ?, ?, 'warning', ?)`
 // only an inserted row moves usage_daily, for the UTC day of completed_at
 // (USE-2): one request, one error when error_type is set, each token count
 // and the cost, the reasoning count and the cost staying NULL until a record
-// reports one (USE-9); and, for a pay_per_use record with a
-// cost, the total of each never budget of the instance, its key and its
-// alias whose counter started at or before the record's revision (phase-3
-// design section 8). An audit row is inserted or ignored by its id.
+// reports one (USE-9); and, for a pay_per_use record with a cost, the total
+// of each never budget of the instance, its key and its alias whose counter
+// started at or before the record's revision (phase-3 design section 8). An
+// audit row is inserted or ignored by its id.
 func insert(tx *sql.Tx, batch []entry) error {
 	for _, e := range batch {
 		if a := e.warn; a != nil {

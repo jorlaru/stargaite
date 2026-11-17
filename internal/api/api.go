@@ -52,8 +52,9 @@ type Deps struct {
 	Config  *config.Service
 	Log     *slog.Logger
 	Clients [2]*http.Client // [0] public addresses only, [1] allow_private_network (SEC-4)
-	// Flight counts the authenticated inference requests not yet done: serve
-	// waits for it before it closes the usage writer and the store (RES-6).
+	// Flight counts the authenticated inference requests whose handler has
+	// not returned, a committed stream until its end is flushed: serve waits
+	// for it before it closes the usage writer and the store (RES-6).
 	Flight    *sync.WaitGroup
 	Usage     *usage.Writer    // one record per provider call (USE-1)
 	Admission *admission.State // slots and rate windows (LIM-5, LIM-6)

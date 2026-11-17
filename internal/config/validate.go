@@ -96,15 +96,15 @@ func (r *report) capParam(resource, field, name string, writes []string) {
 }
 
 // rules checks the params of an alias, or with fact those of a provider or
-// a target (PAR-2): each rule is forward or drop; a fact never names a
-// member the proxy itself reads or writes to serve the request, never drops
-// a key that carries a contractual feature (PAR-4), and never forwards one
-// the same target lists in unsupported.
+// a target (PAR-2): each rule is forward or drop; no rule names a member the
+// proxy itself reads or writes to serve the request; a fact never drops a
+// key that carries a contractual feature (PAR-4), and never forwards one the
+// same target lists in unsupported.
 func (r *report) rules(resource string, rules map[string]string, fact bool, unsupported []string) {
 	for _, k := range slices.Sorted(maps.Keys(rules)) {
 		r.oneOf("PAR-2", resource, "params."+k, rules[k], true, domain.ParamForward, domain.ParamDrop)
 		switch c := domain.ContractParams[k]; {
-		case fact && slices.Contains(domain.OwnedParams, k):
+		case slices.Contains(domain.OwnedParams, k):
 			r.fail("PAR-2", "invalid_value", resource, "params."+k, "a rule may not name %s, which the proxy itself reads or writes to serve the request", k)
 		case fact && c != "" && rules[k] == domain.ParamDrop:
 			r.fail("PAR-4", "invalid_value", resource, "params."+k,
@@ -396,6 +396,11 @@ func validateTarget(r *report, doc *domain.Document, id string, scopes map[strin
 	r.nonNegative("PAR-6", res, "max_output_tokens", t.MaxOutputTokens)
 	r.capParam(res, "output_cap_param", t.OutputCapParam, beside(t))
 	r.rules(res, t.Params, true, t.UnsupportedParams)
+	for _, k := range t.UnsupportedParams {
+		if slices.Contains(domain.OwnedParams, k) {
+			r.fail("PAR-12", "invalid_value", res, "unsupported_params", "unsupported_params may not name %s, which the proxy itself reads or writes to serve the request", k)
+		}
+	}
 	// A forward rule of the target, or one of its provider that the target
 	// does not replace, may not name a key the proxy writes toward it (PAR-2).
 	p, ok := doc.Providers[provider]

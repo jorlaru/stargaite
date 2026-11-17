@@ -121,8 +121,9 @@ var ContractParams = map[string]string{
 // serve a request at all: the alias it resolves and the upstream id it writes
 // (model), whether to relay a stream (stream), what the chat adapter maps and
 // writes (messages, system), and what explain's minimal requests send on
-// embeddings and rerank (input, query, documents). No rule of a provider or a
-// target names one, and no output_cap_param does (PAR-2, PAR-6).
+// embeddings and rerank (input, query, documents). No rule names one, of an
+// alias, a target or a provider, no unsupported_params entry and no
+// output_cap_param (PAR-2, PAR-6, PAR-12).
 var OwnedParams = []string{"model", "messages", "system", "stream", "input", "query", "documents"}
 
 var nameSyntax = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)

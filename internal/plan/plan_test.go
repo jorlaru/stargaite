@@ -586,6 +586,12 @@ func TestTargetRules(t *testing.T) {
 		{name: "reference key, unsupported", extra: `,"temperature":0.5`, unsupported: []string{"temperature"}, skip: "temperature"},
 		{name: "reference key, unsupported and an alias drop", extra: `,"temperature":0.5`, unsupported: []string{"temperature"}, alias: rules{"temperature": drop},
 			want: ``, changes: "temperature:dropped"},
+		// The target's declaration wins over its provider's, unsupported_params
+		// as its params do: the alias decides (PAR-12).
+		{name: "reference key, unsupported over a provider drop", extra: `,"temperature":0.5`, provider: rules{"temperature": drop},
+			unsupported: []string{"temperature"}, skip: "temperature"},
+		{name: "reference key, unsupported over a provider drop, an alias drop (control)", extra: `,"temperature":0.5`, provider: rules{"temperature": drop},
+			unsupported: []string{"temperature"}, alias: rules{"temperature": drop}, want: ``, changes: "temperature:dropped"},
 		{name: "unknown key, a provider forward", extra: `,"x_p":{"a":[1, 2]}`, provider: rules{"x_p": fwd}, want: `,"x_p":{"a":[1, 2]}`, changes: "x_p:forwarded"},
 		{name: "unknown key, a target forward and an alias forward", extra: `,"x_p":1`, target: rules{"x_p": fwd}, alias: rules{"x_p": fwd}, want: `,"x_p":1`, changes: "x_p:forwarded"},
 		{name: "unknown key, a target forward over a provider drop", extra: `,"x_p":1`, provider: rules{"x_p": drop}, target: rules{"x_p": fwd}, want: `,"x_p":1`, changes: "x_p:forwarded"},

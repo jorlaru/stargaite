@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -890,6 +891,12 @@ func TestStreamEndsAfterRequest(t *testing.T) {
 		{"chat translated", "/v1/chat/completions", chatBody("plain", `,"stream":true,"stream_options":{"include_usage":true}`), anthropicUp, `"finish_reason":"stop"`},
 		// A cut after the commit: the RES-4 terminal error event is held too.
 		{"chat native, cut", "/v1/chat/completions", streamBody("openai"), string(bytes.Join(sse(chunk("hello")), nil)), `{"error":`},
+		// A keep-alive comment after the commit is an earlier event: it is
+		// flushed as it arrives, not held with the terminator (phase-5
+		// design C53). A regression guard: passes on a4ccd1f, fails when the
+		// read loop skips the flush for a comment.
+		{"chat native, a comment", "/v1/chat/completions", streamBody("openai"), string(bytes.Join(sse(chunk("hello")), nil)) + ": keep-alive\n\ndata: [DONE]\n\n",
+			"data: [DONE]"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			send := func() *http.Response {
@@ -976,5 +983,42 @@ func TestStreamEndsAfterRequest(t *testing.T) {
 				t.Errorf("the client has %q, want %q", got, want)
 			}
 		})
+	}
+}
+
+// TestStreamConnectionReused: ten sequential streamed calls whose provider
+// ends the body with the terminator go over one provider connection (phase-5
+// design C48, C53). The body has a Content-Length, so its end is read with
+// [DONE]: the relay stops reading there, and the transport, which has seen
+// the end of the body, returns the connection to the pool. What the test
+// pins is that the data plane keeps and reuses it; a chunked body whose last
+// chunk arrives after [DONE] is not covered. A regression guard: passes on
+// a4ccd1f, fails when the provider client disables keep-alives.
+func TestStreamConnectionReused(t *testing.T) {
+	f := newFixture(t)
+	mock := mockprovider.New()
+	var conns atomic.Int64
+	srv := httptest.NewUnstartedServer(mock)
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+	tokens := f.apply(t, strings.ReplaceAll(streamConfig, "base_url: MOCK", "base_url: "+srv.URL))
+	data := httptest.NewServer(f.data)
+	t.Cleanup(data.Close)
+	s := &streamFixture{fixture: f, mock: mock, mockURL: srv.URL, url: data.URL, token: tokens["agent"]}
+	up := sse(chunk("a"), "[DONE]")
+	length := http.Header{"Content-Length": {strconv.Itoa(len(bytes.Join(up, nil)))}}
+	for i := range 10 {
+		mock.Script(mockprovider.Step{Header: length, Chunks: up})
+		if resp, got := s.post(t, streamBody("plain")); resp.StatusCode != http.StatusOK || !strings.HasSuffix(got, "data: [DONE]\n\n") {
+			t.Fatalf("stream %d: %d %q", i+1, resp.StatusCode, got)
+		}
+	}
+	if n := conns.Load(); n != 1 {
+		t.Errorf("ten streams opened %d provider connections, want 1", n)
 	}
 }

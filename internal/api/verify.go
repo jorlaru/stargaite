@@ -135,6 +135,7 @@ func verifyCall(ctx context.Context, d Deps, snap *config.Snapshot, t *config.Ta
 	rq := &request{id: rand.Text(), traceID: hex.EncodeToString(trace.Trace[:]), trace: trace, ep: domain.EndpointChat, snap: snap,
 		key: &config.Key{Name: domain.VerifyKey}, body: p.body, client: p.client, started: d.Config.Now()}
 	h.Flight.Add(1)
+	defer h.Flight.Done() // nothing is written to a client: done is the last step
 	defer h.done(rq)
 	c = domain.VerifyCall{Effort: p.level, EffortSent: p.out.Effort.Sent, Body: string(p.out.Body), RequestID: rq.id}
 	defer func() { c.Error = rq.err }()

@@ -466,25 +466,36 @@ func Build(in Input) (*Outgoing, *Skip) {
 	return out, nil
 }
 
-// refuses is the one answer to "does t, of provider p, take k": no when t,
-// else p, declares k drop, or t lists k in unsupported_params (PAR-12). rules
-// and the proxy's own stream_options write read it.
+// targetFact is the rule that states whether t, of provider p, takes k: the
+// target's own, else none when t lists k in unsupported_params, which leaves
+// the remedy to the alias (PAR-12), else its provider's. The more specific
+// declaration wins.
+func targetFact(t *domain.Target, p *domain.Provider, k string) string {
+	if r := t.Params[k]; r != "" || slices.Contains(t.UnsupportedParams, k) {
+		return r
+	}
+	return p.Params[k]
+}
+
+// refuses is the one answer to "does t, of provider p, take k": no when its
+// fact is drop, or t lists k in unsupported_params (PAR-12). rules and the
+// proxy's own stream_options write read it.
 func refuses(t *domain.Target, p *domain.Provider, k string) bool {
-	return cmp.Or(t.Params[k], p.Params[k]) == domain.ParamDrop || slices.Contains(t.UnsupportedParams, k)
+	return targetFact(t, p, k) == domain.ParamDrop || slices.Contains(t.UnsupportedParams, k)
 }
 
 // rules applies the rules of the target, its provider and the alias, and
 // PAR-12, to the top-level keys of b toward t, in body order (PAR-2). The
-// target's rule, else its provider's, is a fact about t; the alias's is a
-// policy; between the two a drop wins. A key is removed when the fact is
-// drop, or when the policy is drop and t refuses the key or it is unknown;
-// else a key t refuses, or one with no equivalent on the translated path,
-// skips t; a reference key is unchanged; an unknown key is sent when a rule
-// forwards it, and skips t when none does. Each removal is an op of drops,
-// and each is listed with every forward in changes (PAR-3).
+// fact about t is targetFact's; the alias's rule is a policy; between the
+// two a drop wins. A key is removed when the fact is drop, or when the
+// policy is drop and t refuses the key or it is unknown; else a key t
+// refuses, or one with no equivalent on the translated path, skips t; a
+// reference key is unchanged; an unknown key is sent when a rule forwards
+// it, and skips t when none does. Each removal is an op of drops, and each
+// is listed with every forward in changes (PAR-3).
 func rules(b *params.Body, m *domain.Model, t *domain.Target, p *domain.Provider, s params.Schema, noEquivalent []string) (drops []params.Op, changes []Change, skip *Skip) {
 	for _, k := range b.Keys() {
-		fact, policy, known := cmp.Or(t.Params[k], p.Params[k]), m.Params[k], s.Known[k]
+		fact, policy, known := targetFact(t, p, k), m.Params[k], s.Known[k]
 		refused := refuses(t, p, k) || slices.Contains(noEquivalent, k)
 		switch {
 		case fact == domain.ParamDrop || policy == domain.ParamDrop && (refused || !known):

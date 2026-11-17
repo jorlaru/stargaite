@@ -209,7 +209,8 @@ names what to fix (for example, a key with a budget needs prices on every target
 - **Change a credential.** Edit `.env`, then `docker compose up -d`: the container is recreated with the new value
   and requests in flight are given time to finish (`stop_grace_period`). Configuration and usage live in the volume
   and survive it.
-- **Upgrade.** `git pull && docker compose up -d --build`. The store migrates itself on start.
+- **Upgrade.** `git pull && docker compose up -d --build`. The store migrates itself on start. A migration is
+  one-way, and an older binary then refuses the store, so take a `stargaite backup` first.
 - **Back up.** `stargaite backup /data/backup.db` writes a checked copy while traffic flows;
   `docker compose cp stargaite:/data/backup.db ./backup.db` copies it out (see [Backup and restore](#backup-and-restore)).
 - **Watch it.** `docker compose logs -f stargaite` shows its JSON log; `stargaite usage show` and
@@ -279,11 +280,11 @@ alias allows. Every answer carries `x-stargaite-request-id`, `x-stargaite-target
 
 Every command accepts `--json`, never prompts, and exits `0` on success, `1` on failure and `2` on wrong usage;
 `remove`, `keys revoke` and `apply --prune` (unless `--dry-run`) need `--yes`. Where a command takes a file (`apply -f`,
-`validate -f`, `models explain --body`), `-` reads standard input, never a terminal. A pipe cut short is still valid
-YAML, and `apply` replaces each resource it names whole, so `apply -f -` publishes only a document whose last line is
-the YAML end marker `...`, which `export` writes, and exits `2` on any other (a JSON document, which a cut leaves
-unclosed, needs none); `--dry-run` and `validate -f -` need no marker. `apply -f - --prune` exits `2` unless it is a
-`--dry-run`: prune from a file. Each change is published atomically, at a new revision, and audited; requests in
+`validate -f`, `models explain --body`), and only there, `-` reads standard input, never a terminal. A pipe cut short is
+still valid YAML, and `apply` replaces each resource it names whole, so `apply -f -` publishes only a document whose
+last line is the YAML end marker `...`, which `export` writes, and exits `2` on any other (a JSON document, which a cut
+leaves unclosed, needs none); `--dry-run` and `validate -f -` need no marker. `apply -f - --prune` exits `2` unless it
+is a `--dry-run`: prune from a file. Each change is published atomically, at a new revision, and audited; requests in
 flight finish on the configuration they started with.
 
 ## Status
@@ -336,13 +337,13 @@ calls opened rather than paying a lookup, a connection and a TLS handshake each
 fails as any connection failure does ([Resilience](#resilience)).
 
 A figure no record reported is now absent at every level of `usage show` instead of 0 ([Usage](#usage)): reasoning
-tokens where the provider reported none, in the records and in the daily sums alike, so a reported 0 (the evidence
-that effort `none` works) is told apart from no figure; and a daily cost where no call was priced, while a priced 0 is
-now shown. The store's migration 003 makes the daily sums' reasoning tokens and cost nullable and copies each old 0
-as absent, since it cannot be told from an unknown. A `pay_per_use` call whose request reached the provider and got no
-answer, such as one cut by a timer, now has no cost and counts as unpriced instead of costing 0 from the price table;
-as before, it charges no budget. One that never reached the provider, such as a refused connection, keeps its cost of
-0.
+tokens where the provider reported none, in the records and in the daily sums alike, so a reported 0 (the evidence that
+effort `none` works) is told apart from no figure; and a daily cost where no call was priced, while a priced 0 is now
+shown. The store's migration 003 makes the daily sums' reasoning tokens and cost nullable and copies each old 0 as
+absent, since it cannot be told from an unknown. A `pay_per_use` call whose request reached the provider and got no
+answer, such as one cut by a timer or by the client leaving before it, now has no cost and counts as unpriced instead of
+costing 0 from the price table (its record has `status_code` 0); as before, it charges no budget. One that never reached
+the provider, such as a refused connection, keeps its cost of 0.
 
 A request body is now read in place each time the proxy scans it: a scan no longer copies the values it reads past, so
 scanning a body whose megabyte is one long message allocates a few KB where it allocated about 4 MB. The index of the
@@ -366,14 +367,17 @@ removing it, list it in the target's `unsupported_params`, or declare a provider
 `export` now ends its YAML with the end marker `...`, and `apply -f -` publishes only a document that ends with it, so a
 pipe cut short no longer resets the resource at the cut; what you add to an exported file goes before the marker, since
 text after it is a second document, which `apply` refuses. Toward a target that declares `output_cap_param`, a client
-that sends both cap names with different values now finds the declared member listed `translated` too when its value changed. `targets verify`
-prints the provider's own text for a call it refused. `validate` now refuses a timer above one day (86,400,000 ms), a
-provider's or a target's rule on a member the proxy itself reads or writes (`model`, `messages`, `system`, `stream`,
-`input`, `query`, `documents`), and an `output_cap_param` naming one, a key that carries a contractual feature (such as
-`tools`), a key of any reasoning dialect (such as `reasoning_effort`), another key the proxy writes toward the target
-(`stream_options`, its `on` and `off` keys) or a known chat parameter other than `max_tokens` and
-`max_completion_tokens` (such as `temperature`); a model's own name such as `max_new_tokens` stays valid. A stored
-configuration with one keeps serving, and the next change must remove it.
+that sends both cap names with different values now finds the declared member listed `translated` too when its value
+changed. `targets verify` prints the provider's own text for a call it refused. `validate` now refuses a timer above one
+day (86,400,000 ms), a provider's or a target's rule on a member the proxy itself reads or writes (`model`, `messages`,
+`system`, `stream`, `input`, `query`, `documents`), and an `output_cap_param` naming one, a key that carries a
+contractual feature (such as `tools`), a key of any reasoning dialect (such as `reasoning_effort`), another key the
+proxy writes toward the target (`stream_options`, its `on` and `off` keys) or a known chat parameter other than
+`max_tokens` and `max_completion_tokens` (such as `temperature`); a model's own name such as `max_new_tokens` stays
+valid. It also refuses an alias's rule, or a target's `unsupported_params` entry, on one of those members. A stored
+configuration with one keeps serving, and the next change must remove it. A target that lists a member in
+`unsupported_params` now lets the alias decide even when its provider declares that member `drop`: it is skipped unless
+the alias drops it.
 
 ## Reference
 
@@ -398,7 +402,8 @@ called, unless a rule names it. A rule is `forward` or `drop`, given as `--param
   unchanged; `drop`, the target does not accept it, and it is removed. One rule serves every alias that reaches the
   provider.
 - On a target (`targets set anthropic/<model> --param temperature=drop`), the same fact for that model alone; it wins
-  over its provider's rule for the same member.
+  over its provider's rule for the same member, and so does a target's `unsupported_params`: the alias then decides,
+  as for any member the target refuses.
 - On an alias (`models set <alias> --param <name>=forward`), a policy: `forward` sends an unknown member to every
   target that states nothing about it; `drop` removes an unknown member, and one a target does not accept, instead of
   skipping that target.
@@ -412,8 +417,12 @@ level, on a member the proxy itself writes toward a target it applies to (the re
 cap, `stream_options`, and toward `anthropic` the members of the translation), a target's `forward` on a member it
 lists in `unsupported_params`, and a provider's or a target's `drop` on `tools`, `tool_choice`, `response_format`,
 `output_config` or `mcp_servers`: a target that cannot honour such a feature declares the capability false instead
-(`--capabilities tools=false`). The log line of a refused request names the member in `param`, which is how to learn
-which rule a client needs. The `mistral` preset forwards `output_dimension`; every other rule is yours to declare.
+(`--capabilities tools=false`). No rule at any level, and no `unsupported_params` entry, may name a member the proxy
+itself reads or writes to serve the request (`model`, `messages`, `system`, `stream`, `input`, `query`, `documents`).
+The log line of a refused request names the member in `param`, which is how to learn which rule a client needs. The
+`mistral` preset forwards `output_dimension`; every other rule is yours to declare. A provider's rule holds on every
+endpoint, so a chat request with `output_dimension` toward a Mistral chat target is forwarded too, and the provider
+refuses it with its own `400`.
 
 Toward an `openai` target that declares `output_cap_param`, every output cap is sent under that name: a client's
 `max_tokens` or `max_completion_tokens` becomes one member holding the larger value the client sent, each other name
@@ -436,13 +445,15 @@ the bytes (a quarter of them, rounded up) and marked `estimated`. Toward a provi
 `x-stargaite-params-changed`, and relays that chunk only to a client that asked for it. A provider is billed
 `pay_per_use`, `subscription` or `none`; only `pay_per_use` calls have a cost, read from the response at the provider's
 `cost_report` path when it declares one (OpenRouter and xAI do), else computed from the target's `--pricing`, else left
-empty and counted as unpriced: it is never guessed. A call whose request reached the provider and got no answer, such
-as one cut by a timer, has no cost either. Records reach the store in batches within 50 ms; on `SIGTERM` the pending ones are
-written before the store closes, and a record that cannot be stored is written to the log as one `CRITICAL` line
-instead of being lost. A crash loses at most the records not yet committed. When the store fails three commits in a
-row it is unavailable: `pay_per_use` targets are passed over (`503 usage_store_unavailable` when the alias has no
-other target), `subscription` and `none` targets keep serving, and records wait in a queue of 10,000 while the
-writer retries every 5 s; a record that finds the queue full goes to the log as one `CRITICAL` line.
+empty and counted as unpriced: it is never guessed. A call whose request reached the provider and got no answer, such as
+one cut by a timer or by the client leaving before it, has no cost either and is counted as unpriced too, although its
+target has prices; its record has `status_code` 0, which tells it from a call to a target without prices. Records reach
+the store in batches within 50 ms; on `SIGTERM` the pending ones are written before the store closes, and a record that
+cannot be stored is written to the log as one `CRITICAL` line instead of being lost. A crash loses at most the records
+not yet committed. When the store fails three commits in a row it is unavailable: `pay_per_use` targets are passed over
+(`503 usage_store_unavailable` when the alias has no other target), `subscription` and `none` targets keep serving, and
+records wait in a queue of 10,000 while the writer retries every 5 s; a record that finds the queue full goes to the log
+as one `CRITICAL` line.
 
 `./stargaite usage show` sums the records of a window (`--since 24h` by default, or an RFC 3339 time) per billing mode,
 filtered with `--key`, `--model` and `--target` and grouped with `--by key,model,target,effort-sent`: requests,
@@ -749,7 +760,9 @@ or `first_byte_ms` to the first byte and `stream_idle_ms` for the longest pause 
 (`settings set --total-ms 180000` and the others), and a provider may declare any of the four for the calls to its
 targets (`providers set local --total-ms 600000`); each one it does not declare is the setting's, and `--total-ms=`
 removes its own. A local server that may take minutes and a cloud fallback that should give up in seconds can serve
-one alias: a shorter `total_ms` moves a request to its fallback sooner, never adds a call.
+one alias: a shorter `total_ms` moves a request to its fallback sooner, never adds a call. A timeout counts toward the
+target's circuit like any transient failure, so a non-streaming call that legitimately needs longer than the
+provider's `total_ms` fails and counts: set it above the slowest answer the alias's clients ask for.
 
 ### The admin key and the data directory
 

@@ -837,14 +837,14 @@ func TestAnnexBByCommand(t *testing.T) {
 	built := adminServer(t)
 	levels := []string{"--level", "low", "--level", "medium", "--level", "high", "--level", "xhigh", "--level", "max"}
 	for _, args := range [][]string{
-		{"providers", "add", "openrouter"},
+		{"providers", "add", "openrouter", "--param", "provider=forward"},
 		{"providers", "add", "anthropic"},
 		{"providers", "add", "minimax-plan", "--preset", "minimax", "--protocol", "anthropic", "--base-url", "https://api.minimax.io/anthropic",
 			"--api-key-env", "MINIMAX_PLAN_API_KEY", "--target-defaults", "dialect=adaptive_effort,output_cap_param=", "--stream-usage", "native",
 			"--billing", "subscription", "--quota", "5h:requests=1000", "--quota", "7d:requests=10000"},
 		{"providers", "add", "tei-embed", "--protocol", "openai", "--base-url", "http://localhost:8080/v1", "--billing", "none", "--allow-private-network"},
 		{"providers", "add", "tei-rerank", "--protocol", "openai", "--base-url", "http://localhost:8081/v1", "--rerank-url", "http://localhost:8081/rerank",
-			"--billing", "none", "--allow-private-network"},
+			"--billing", "none", "--allow-private-network", "--total-ms", "600000"},
 		append([]string{"targets", "add", "minimax-plan/MiniMax-M3.1-Flash", "--kind", "chat", "--capabilities", "tools=true,structured_output=true",
 			"--max-output-tokens", "64000", "--can-disable=false"}, levels...),
 		{"targets", "add", "openrouter/qwen/qwen-3.6-flash", "--kind", "chat", "--capabilities", "tools=true,structured_output=true,strict_schema=true",
@@ -852,7 +852,8 @@ func TestAnnexBByCommand(t *testing.T) {
 			"--pricing", "input_per_million=0.15,output_per_million=0.60,cache_read_per_million=0.05,as_of=2026-11-01"},
 		append([]string{"targets", "add", "anthropic/claude-sonnet-5-5", "--kind", "chat", "--capabilities", "tools=true,structured_output=true,strict_schema=true,vision=true",
 			"--max-output-tokens", "64000", "--can-disable=false",
-			"--pricing", "input_per_million=3.00,output_per_million=15.00,cache_read_per_million=0.30,cache_write_per_million=3.75,as_of=2026-11-01"}, levels...),
+			"--pricing", "input_per_million=3.00,output_per_million=15.00,cache_read_per_million=0.30,cache_write_per_million=3.75,as_of=2026-11-01",
+			"--param", "top_p=drop"}, levels...),
 		{"models", "add", "fast", "--target", "minimax-plan/MiniMax-M3.1-Flash", "--target", "openrouter/qwen/qwen-3.6-flash", "--require", "tools",
 			"--require", "structured_output", "--effort", "medium", "--effort-mode", "default", "--max-output-tokens", "32000", "--param", "enable_search=drop"},
 		{"models", "add", "deep", "--target", "anthropic/claude-sonnet-5-5", "--require", "tools", "--require", "structured_output", "--require", "strict_schema",

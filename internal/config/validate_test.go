@@ -540,17 +540,19 @@ func TestValidate(t *testing.T) {
 			edit(d.Models, "deep", func(m *domain.Model) {
 				m.Params = map[string]string{"system": "forward", "stop_sequences": "forward", "tool_choice": "forward", "top_k": "forward"}
 			})
-		}, []string{"error PAR-2 param_collision models/deep params.stop_sequences", "error PAR-2 param_collision models/deep params.system",
-			"error PAR-2 param_collision models/deep params.tool_choice"}},
+		}, []string{"error PAR-2 invalid_value models/deep params.system", "error PAR-2 param_collision models/deep params.stop_sequences",
+			"error PAR-2 param_collision models/deep params.system", "error PAR-2 param_collision models/deep params.tool_choice"}},
+		// system is a member the proxy owns, refused at every level since C53;
+		// the adapter's other keys are free.
 		{"PAR-2 the chat adapter's keys are free toward openai", func(d *domain.Document) {
 			edit(d.Models, "fast", func(m *domain.Model) {
 				m.Targets, m.Params = []string{qw}, map[string]string{"system": "forward", "stop_sequences": "forward", "output_config": "forward"}
 			})
-		}, nil},
+		}, []string{"error PAR-2 invalid_value models/fast params.system"}},
 		{"PAR-2 forward rule naming stream_options", func(d *domain.Document) {
 			edit(d.Models, "embed", func(m *domain.Model) { m.Params = map[string]string{"stream_options": "forward"} })
 		}, []string{"error PAR-2 param_collision models/embed params.stream_options"}},
-		{"PAR-2 a drop rule may name any key", func(d *domain.Document) {
+		{"PAR-2 a drop rule may name a key the proxy writes", func(d *domain.Document) {
 			edit(d.Models, "fast", func(m *domain.Model) { m.Params["reasoning"], m.Params["stream_options"] = "drop", "drop" })
 		}, nil},
 		{"PAR-2 a forward rule for a key nobody writes", func(d *domain.Document) {
@@ -604,6 +606,12 @@ func TestValidate(t *testing.T) {
 			"error PAR-2 invalid_value targets/" + qw + " params.documents", "error PAR-2 invalid_value targets/" + qw + " params.input",
 			"error PAR-2 invalid_value targets/" + qw + " params.messages", "error PAR-2 invalid_value targets/" + qw + " params.query",
 			"error PAR-2 invalid_value targets/" + qw + " params.system"}},
+		// Nor at the alias, nor in unsupported_params, which Build would also
+		// remove the member for (phase-5 design C53); top_k is the control.
+		{"PAR-2 an alias rule and an unsupported_params entry on members the proxy owns", func(d *domain.Document) {
+			edit(d.Models, "fast", func(m *domain.Model) { m.Params["stream"] = "drop" })
+			edit(d.Targets, qw, func(t *domain.Target) { t.UnsupportedParams = []string{"top_k", "stream"} })
+		}, []string{"error PAR-12 invalid_value targets/" + qw + " unsupported_params", "error PAR-2 invalid_value models/fast params.stream"}},
 		{"PAR-6 an output_cap_param naming a member the proxy owns", func(d *domain.Document) {
 			edit(d.Providers, "openrouter", func(p *domain.Provider) { p.TargetDefaults.OutputCapParam = "model" })
 			edit(d.Targets, qw, func(t *domain.Target) { t.OutputCapParam = "messages" })

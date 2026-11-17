@@ -60,6 +60,8 @@ providers:
     target_defaults:
       dialect: reasoning_object
       output_cap_param: max_tokens
+    params:
+      provider: forward
   tei-embed:
     protocol: openai
     base_url: http://localhost:8080/v1
@@ -71,6 +73,8 @@ providers:
     billing: none
     rerank_url: http://localhost:8081/rerank
     allow_private_network: true
+    timeouts:
+      total_ms: 600000
 targets:
   anthropic/claude-sonnet-5-5:
     kind: chat
@@ -95,6 +99,8 @@ targets:
       cache_read_per_million: 0.3
       cache_write_per_million: 3.75
       as_of: "2026-11-01"
+    params:
+      top_p: drop
   minimax-plan/MiniMax-M3.1-Flash:
     kind: chat
     capabilities:

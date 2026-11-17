@@ -11,7 +11,7 @@ const VerifyKey = "_verify"
 type VerifyCall struct {
 	Effort          string  `json:"effort"`
 	EffortSent      *string `json:"effort_sent"`
-	Status          int     `json:"status"` // the provider's; 0 without a response
+	Status          int     `json:"status"` // the effective one (RES-2); 0 without a response
 	ReasoningTokens *int64  `json:"reasoning_tokens"`
 	OutputTokens    int64   `json:"output_tokens"`
 	Body            string  `json:"body"` // the exact bytes sent (PAR-8)

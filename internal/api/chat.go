@@ -227,7 +227,7 @@ func (h *handler) infer(ep domain.Endpoint) http.HandlerFunc {
 		_, _ = rand.Read(draw[:]) // never fails
 		rq.sample = binary.LittleEndian.Uint64(draw[:])
 		h.Flight.Add(1)
-		defer h.done(rq)
+		defer h.Flight.Done()
 		// A body read, or a write to a client that stopped reading, does not
 		// end with the request's context: once that ends (the shutdown, or the
 		// client gone), the read stops at once and a write gets 1 s, so the
@@ -250,6 +250,21 @@ func (h *handler) infer(ep domain.Endpoint) http.HandlerFunc {
 				<-fired
 			}
 		}()
+		// Flight counts a committed stream until its last byte has left: when
+		// the request's context has ended, its end, which the stream holds in
+		// the server's buffer until done has run, is flushed before Flight is
+		// done, so serve never goes on to stop while a terminal event is still
+		// in that buffer (RES-6). serve calls halt, which ends every request
+		// context, before it waits on Flight, and the hook above has then
+		// already capped the write to 1 s. A stream that ends in time keeps
+		// its end in one write with the body's last chunk; a synchronous
+		// answer is not flushed and keeps its Content-Length.
+		defer func() {
+			if n := len(rq.attempts); n > 0 && rq.client.Stream && rq.attempts[n-1].written && r.Context().Err() != nil {
+				_ = http.NewResponseController(w).Flush()
+			}
+		}()
+		defer h.done(rq)
 		if ep == domain.EndpointMessages {
 			rq.header = http.Header{}
 			for _, name := range []string{"Anthropic-Version", "Anthropic-Beta"} {
@@ -744,8 +759,8 @@ func classify(stream bool, status int, cause error, header http.Header, text str
 // nothing is buffered beyond the event being read and the at most 7 bytes of
 // a think-tag stripper (RSN-12). What it emits for the upstream event that
 // ends the stream, and the terminal event, stay in the server's buffer and
-// leave when the handler returns, after finish and done (RES-4, LIM-4, LIM-5),
-// as a synchronous answer does: a client that starts its next request on the
+// leave with infer's flush, after finish and done and before Flight is done
+// (RES-4, LIM-4, LIM-5, RES-6): a client that starts its next request on the
 // terminator finds the slot released. A failure before the commit is
 // left to the caller (settle); after it, the terminal event is written here,
 // always the proxy's own in the envelope of the endpoint: data: {"error":
@@ -1015,16 +1030,16 @@ func (h *handler) count(r *usage.Record) {
 // when an exporter is published (phase-3 design section 10), counted in
 // Spanned by key and alias as the request counter is, then the
 // request line (OPS-9), then the slots of an admitted request (LIM-6), also
-// on a panic, then Flight. Nothing but the spans reads the sampling draw.
+// on a panic; infer then lets Flight go. Nothing but the spans reads the
+// sampling draw.
 // Its status and code are those of the error the client got, also as the
 // terminal event of a committed stream (so 500 internal_error for a request
 // the shutdown stopped); 499 client_gone when the client went away, whatever
 // was written before; else 200. The request line names the parameter of a
 // refused request, when its error has one.
 func (h *handler) done(rq *request) {
-	defer h.Flight.Done()
 	if rq.release != nil {
-		defer rq.release() // after every finish, before Flight
+		defer rq.release() // after every finish
 	}
 	n := len(rq.attempts)
 	status, code := http.StatusOK, ""

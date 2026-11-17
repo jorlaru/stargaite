@@ -47,6 +47,9 @@
       "target_defaults": {
         "dialect": "reasoning_object",
         "output_cap_param": "max_tokens"
+      },
+      "params": {
+        "provider": "forward"
       }
     },
     "anthropic": {
@@ -91,7 +94,10 @@
       "base_url": "http://localhost:8081/v1",
       "rerank_url": "http://localhost:8081/rerank",
       "billing": "none",
-      "allow_private_network": true
+      "allow_private_network": true,
+      "timeouts": {
+        "total_ms": 600000
+      }
     }
   },
   "targets": {
@@ -165,6 +171,9 @@
         "cache_read_per_million": 0.3,
         "cache_write_per_million": 3.75,
         "as_of": "2026-11-01"
+      },
+      "params": {
+        "top_p": "drop"
       }
     },
     "tei-embed/bge-m3": {

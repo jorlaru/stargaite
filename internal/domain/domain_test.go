@@ -45,6 +45,7 @@ var annexB = Document{
 			StreamUsage:    StreamUsageNative,
 			GenAIProvider:  "openrouter",
 			TargetDefaults: TargetDefaults{Dialect: DialectReasoningObject, OutputCapParam: "max_tokens"},
+			Params:         map[string]string{"provider": ParamForward},
 		},
 		"anthropic": {
 			Protocol:       ProtocolAnthropic,
@@ -79,6 +80,7 @@ var annexB = Document{
 			RerankURL:           "http://localhost:8081/rerank",
 			Billing:             BillingNone,
 			AllowPrivateNetwork: true,
+			Timeouts:            Timeouts{TotalMS: 600000},
 		},
 	},
 	Targets: map[string]Target{
@@ -126,6 +128,7 @@ var annexB = Document{
 				CacheWritePerMillion: new(3.75),
 				AsOf:                 "2026-11-01",
 			},
+			Params: map[string]string{"top_p": ParamDrop},
 		},
 		"tei-embed/bge-m3":              {Kind: KindEmbeddings},
 		"tei-rerank/bge-reranker-v2-m3": {Kind: KindRerank},

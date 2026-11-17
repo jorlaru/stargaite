@@ -46,7 +46,7 @@ func permit(t *testing.T, b *Breakers, target string) uint64 {
 	return gen
 }
 
-// TestBreaker is RES-2 on an injected clock: five eligible failures within
+// TestBreaker is RES-2 on an injected clock: five failures that count within
 // 30 s open a circuit for 20 s; half-open it lets two trials through and
 // refuses the rest; two passes close it, one failure opens it again, and a
 // trial without a verdict returns its permit. Breakers are per target.

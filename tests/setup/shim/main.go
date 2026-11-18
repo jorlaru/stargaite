@@ -11,10 +11,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -32,7 +34,9 @@ type record struct {
 
 // state is what the fake docker knows between calls: whether the container
 // exists, the variable names of .env it was last created with, and the
-// configuration the fake CLI holds.
+// configuration the fake CLI holds: budgets by scope (instance, alias:<name>
+// or key:<name>) and the telemetry flags given since the last unset, merged
+// as telemetry set merges its patch.
 type state struct {
 	Up        bool                         `json:"up"`
 	Env       []string                     `json:"env"`
@@ -40,6 +44,8 @@ type state struct {
 	Targets   map[string]map[string]any    `json:"targets"`
 	Models    map[string][]string          `json:"models"`
 	Keys      []string                     `json:"keys"`
+	Budgets   map[string]string            `json:"budgets"`
+	Telemetry map[string]string            `json:"telemetry"`
 }
 
 func main() {
@@ -104,7 +110,8 @@ func env(name, def string) string {
 }
 
 func loadState() *state {
-	st := &state{Providers: map[string]map[string]string{}, Targets: map[string]map[string]any{}, Models: map[string][]string{}}
+	st := &state{Providers: map[string]map[string]string{}, Targets: map[string]map[string]any{}, Models: map[string][]string{},
+		Budgets: map[string]string{}, Telemetry: map[string]string{}}
 	if data, err := os.ReadFile(os.Getenv("SETUP_STATE")); err == nil {
 		_ = json.Unmarshal(data, st)
 	}
@@ -136,7 +143,9 @@ func envNames() []string {
 // created by up, which takes the variable names of .env at that moment, as
 // Compose gives the container the file's values when it creates it.
 // FAKE_UP=hang makes up last 30 s, a build that takes long; FAKE_UP=noenv
-// gives the container none of the variables of .env.
+// gives the container none of the variables of .env. FAKE_DOCKER=denied
+// fails info and ps as a user outside the docker group sees;
+// FAKE_DOCKER=unreadable fails ps alone, as a .env Compose cannot parse does.
 func fakeDocker(args []string) int {
 	st := loadState()
 	defer st.save()
@@ -156,6 +165,12 @@ func fakeDocker(args []string) int {
 		return 1
 	case args[1] == "version":
 		fmt.Println(env("FAKE_COMPOSE", "2.29.1"))
+	case args[1] == "ps" && os.Getenv("FAKE_DOCKER") == "denied":
+		fmt.Fprintln(os.Stderr, "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock")
+		return 1
+	case args[1] == "ps" && os.Getenv("FAKE_DOCKER") == "unreadable":
+		fmt.Fprintln(os.Stderr, "failed to read .env: line 1: unterminated quoted value 'sk-hand-edited-secret")
+		return 1
 	case args[1] == "ps":
 		if st.Up {
 			fmt.Println("c0ffee")
@@ -172,6 +187,8 @@ func fakeDocker(args []string) int {
 		fmt.Println(" Container fake-stargaite-1 Started")
 	case args[1] == "logs":
 		fmt.Println("a log line")
+	case args[1] == "exec" && slices.Equal(args[4:], []string{"/stargaite", "version", "--json"}):
+		fmt.Println(`{"version":"v0.6.0-fake"}`)
 	case args[1] == "exec" && len(args) > 4 && args[4] == "/stargaite":
 		out, code := fakeCLI(st, args[5:])
 		fmt.Println(out)
@@ -221,6 +238,18 @@ func written(resource any) string {
 // fakeCLI answers the CLI commands setup.sh runs, in the shapes of the admin
 // API's --json answers.
 func fakeCLI(st *state, args []string) (string, int) {
+	// telemetry test without --json prints the line the CLI renders (TEL-2).
+	if slices.Equal(args, []string{"telemetry", "test"}) {
+		switch {
+		case st.Telemetry["otlp-endpoint"] == "":
+			return "stargaite: no exporter is configured: telemetry set --otlp-endpoint <url> sets one", 1
+		case len(st.unresolved()) > 0:
+			return "credentials: unresolved · credential_unresolved: " + strings.Join(st.unresolved(), ", ") + " does not resolve", 1
+		case os.Getenv("FAKE_TELEMETRY") == "unauthorized":
+			return "credentials: resolved · reachable: yes · authorized: no (401) · bad credentials", 1
+		}
+		return "credentials: resolved · reachable: yes · authorized: yes · span: accepted (200) · trace_id=4bf92f3577b34da6a3ce929d0e0e4736", 0
+	}
 	if len(args) < 3 || args[2] != "--json" {
 		return failure(fmt.Sprintf("fake CLI: --json is not the third argument: %q", args))
 	}
@@ -273,7 +302,14 @@ func fakeCLI(st *state, args []string) (string, int) {
 		st.Providers[name] = p
 		return written(view(name)), 0
 	case "settings show":
-		return `{"timeouts":{"connect_ms":5000,"first_byte_ms":30000,"stream_idle_ms":120000,"total_ms":180000}}`, 0
+		return encode(map[string]any{"timeouts": map[string]int{"connect_ms": 5000, "first_byte_ms": 30000, "stream_idle_ms": 120000, "total_ms": 180000},
+			"budget": st.budget("instance")}), 0
+	case "models show", "keys show":
+		scope := map[string]string{"models": "alias:", "keys": "key:"}[args[0]] + pos[0]
+		if _, ok := st.Models[pos[0]]; !ok && !slices.Contains(st.Keys, pos[0]) {
+			return failure(args[0] + " " + pos[0] + " does not exist")
+		}
+		return encode(map[string]any{"name": pos[0], "budget": st.budget(scope)}), 0
 	case "targets list":
 		list := []any{}
 		for _, t := range st.Targets {
@@ -313,6 +349,44 @@ func fakeCLI(st *state, args []string) (string, int) {
 		st.Keys = append(st.Keys, pos[0])
 		return encode(map[string]any{"revision": 2, "changed": true, "diff": []any{}, "findings": []any{},
 			"secrets": map[string]string{pos[0]: "sk-stargaite-fake-" + pos[0]}, "resource": map[string]any{"name": pos[0]}}), 0
+	case "settings set", "models set", "keys set":
+		return fakeBudget(st, args[0], flags, pos)
+	case "targets set":
+		t, ok := st.Targets[pos[0]]
+		if !ok {
+			return failure("target does not exist")
+		}
+		t["pricing"] = flags["pricing"][0]
+		return written(t), 0
+	case "telemetry set":
+		if e := flags["otlp-endpoint"][0]; !strings.HasPrefix(e, "http://") && !strings.HasPrefix(e, "https://") {
+			return failure("url scheme must be http or https")
+		}
+		for flag, v := range flags {
+			if flag != "json" {
+				st.Telemetry[flag] = v[len(v)-1]
+			}
+		}
+		return written(st.Telemetry), 0
+	case "telemetry unset":
+		if !slices.Contains(args, "--yes") {
+			return failure("telemetry unset needs --yes")
+		}
+		st.Telemetry = map[string]string{}
+		return encode(map[string]any{"revision": 1, "changed": true, "diff": []any{}, "findings": []any{}}), 0
+	case "telemetry status":
+		v := map[string]any{"telemetry": nil, "unresolved": st.unresolved()}
+		if e := st.Telemetry["otlp-endpoint"]; e != "" {
+			t := map[string]any{"otlp_endpoint": e}
+			if st.Telemetry["preset"] == "langfuse" {
+				t["basic_auth_env"] = []string{"LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"}
+			}
+			if name, ref, ok := strings.Cut(st.Telemetry["header-env"], "="); ok {
+				t["header_env"] = map[string]string{name: ref}
+			}
+			v["telemetry"] = t
+		}
+		return encode(v), 0
 	}
 	return failure(fmt.Sprintf("fake CLI: not handled: %q", args))
 }
@@ -385,4 +459,79 @@ func fakeCurl(args []string) int {
 	}
 	fmt.Print(strings.NewReplacer(`\n`, "\n", "%{http_code}", code, "%{time_total}", "0.012").Replace(format))
 	return 0
+}
+
+// budget is the budget set on scope, as the API shows it, or nil.
+func (st *state) budget(scope string) any {
+	pairs, ok := st.Budgets[scope]
+	if !ok {
+		return nil
+	}
+	b := map[string]any{}
+	for _, pair := range strings.Split(pairs, ",") {
+		name, v, _ := strings.Cut(pair, "=")
+		b[name] = v
+		if n, err := strconv.ParseFloat(v, 64); err == nil {
+			b[name] = n
+		}
+	}
+	return b
+}
+
+// unresolved are the variables the telemetry flags reference that the
+// container does not have.
+func (st *state) unresolved() []string {
+	var refs, missing []string
+	if st.Telemetry["preset"] == "langfuse" {
+		refs = append(refs, "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY")
+	}
+	if _, v, ok := strings.Cut(st.Telemetry["header-env"], "="); ok {
+		refs = append(refs, v)
+	}
+	for _, r := range refs {
+		if !slices.Contains(st.Env, r) {
+			missing = append(missing, r)
+		}
+	}
+	return missing
+}
+
+// fakeBudget sets the budget of settings, models or keys set. As USE-12 does,
+// it refuses one that reaches a pay-per-use target without prices, naming
+// each in an unpriced_under_budget finding: an alias's budget reaches the
+// targets of that alias, the instance's or a key's those of every alias.
+func fakeBudget(st *state, kind string, flags map[string][]string, pos []string) (string, int) {
+	scope, aliases := "instance", slices.Collect(maps.Keys(st.Models))
+	switch kind {
+	case "models":
+		if _, ok := st.Models[pos[0]]; !ok {
+			return failure("alias does not exist")
+		}
+		scope, aliases = "alias:"+pos[0], pos[:1]
+	case "keys":
+		if !slices.Contains(st.Keys, pos[0]) {
+			return failure("key does not exist")
+		}
+		scope = "key:" + pos[0]
+	}
+	ids := map[string]bool{}
+	for _, a := range aliases {
+		for _, id := range st.Models[a] {
+			provider, _, _ := strings.Cut(id, "/")
+			if st.Providers[provider]["billing"] == "pay_per_use" && st.Targets[id]["pricing"] == nil {
+				ids[id] = true
+			}
+		}
+	}
+	findings := []any{}
+	for _, id := range slices.Sorted(maps.Keys(ids)) {
+		findings = append(findings, map[string]any{"severity": "error", "rule": "USE-12", "code": "unpriced_under_budget", "resource": "targets/" + id,
+			"field": "pricing", "message": "pay-per-use target with neither prices nor a provider cost report, reachable under the budget of " + scope})
+	}
+	if len(findings) > 0 {
+		return encode(map[string]any{"error": map[string]any{"message": "the change is refused: the configuration it leads to has errors",
+			"type": "invalid_request_error", "findings": findings}}), 1
+	}
+	st.Budgets[scope] = flags["budget"][0]
+	return written(map[string]any{"budget": flags["budget"][0]}), 0
 }

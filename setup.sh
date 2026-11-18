@@ -13,7 +13,7 @@
 set -u
 
 override_marker='# Written by setup.sh from its "# setup:" lines below; it rewrites this file whole.'
-tmp_file=""
+tmp_file="" agreed=0
 provider="" model="" alias="" key_name="" protocol="" provider_json="" key_value="" client_key=""
 declare -A opt=()
 
@@ -105,28 +105,64 @@ confirm() {
 	die "stopped; nothing more was changed"
 }
 
-# secret VAR NAME: the value for the credential variable NAME, from the
-# variable of this script's environment that --key-env names, or typed hidden
-# at a terminal. Only builtins touch it. .env holds it single-quoted, so a
-# value with ' or a newline, or ending in \, is refused.
+# agree TEXT: says TEXT, a change to .env or the override that the container
+# reads only once recreated, and asks for that recreate the first time in a
+# run, before the change is made, so a refusal leaves nothing written.
+agree() {
+	if ((agreed)); then
+		say "$1"
+		return
+	fi
+	confirm "$1, and the container is then recreated to read it: requests in flight are given time to finish, and the rate-limit windows restart"
+	agreed=1
+}
+
+# secret VAR NAME FLAG: the value for the credential variable NAME, from the
+# variable of this script's environment that --FLAG names, or typed hidden at
+# a terminal. Only builtins touch it. .env holds it single-quoted, so a value
+# with ' or a newline, or ending in \, is refused.
 secret() {
 	local -n _secret=$1
-	local from=${opt[key-env]-}
+	local from=${opt[$3]-}
 	if [[ -n $from ]]; then
 		# Not printed: a pasted value instead of a name would reach the screen.
 		# Only an exported variable counts, never one of this script's own.
 		[[ $from =~ ^[A-Za-z_][A-Za-z0-9_]*$ && $(declare -p -- "$from" 2>/dev/null) =~ ^declare\ -[a-zA-Z]*x ]] ||
-			usage_error "--key-env takes the name of a variable exported to this script"
+			usage_error "--$3 takes the name of a variable exported to this script"
 		_secret=${!from}
 	elif interactive; then
 		read -rs -p "$2 (typed hidden): " _secret || die "no answer to: $2"
 		printf '\n'
 	else
-		usage_error "missing --key-env: the variable of this script's environment that holds $2"
+		usage_error "missing --$3: the variable of this script's environment that holds $2"
 	fi
 	[[ -n $_secret ]] || die "$2 is empty"
 	[[ $_secret != *"'"* && $_secret != *$'\n'* && $_secret != *\\ ]] ||
 		die "$2 holds ' or a newline, or ends in \\: .env cannot hold it, so nothing was written"
+}
+
+# credentials NAME FLAG...: each credential NAME kept from .env unless
+# --replace (or y at a terminal) replaces it, otherwise read by secret from
+# FLAG; all are read before any is written, each through agree. key_value is
+# the last one's value.
+credentials() {
+	local -a names=() values=()
+	local i
+	while (($#)); do
+		key_value=""
+		if env_get key_value "$1" && ! yesno replace "$1 is in .env: replace it?"; then
+			say "$1 is in .env; kept"
+		else
+			secret key_value "$1" "$2"
+			names+=("$1")
+			values+=("$key_value")
+		fi
+		shift 2
+	done
+	for i in "${!names[@]}"; do
+		agree "writing ${names[i]} to .env"
+		env_set "${names[i]}" "${values[i]}"
+	done
 }
 
 # env_get VAR NAME: VAR is the value NAME has in .env, without its quotes;
@@ -168,10 +204,10 @@ env_set() {
 }
 
 # override_set KEY VALUE NEED FIELD: compose.override.yaml regenerated whole
-# from its "# setup: KEY=VALUE" lines, with KEY set to VALUE; false when
-# nothing changes. An override without the marker on its first line is the
-# reader's own and is never touched: when it holds NEED, nothing changes;
-# otherwise the step stops, asking for NEED in FIELD of the service.
+# from its "# setup: KEY=VALUE" lines, with KEY set to VALUE, through agree;
+# false when nothing changes. An override without the marker on its first
+# line is the reader's own and is never touched: when it holds NEED, nothing
+# changes; otherwise the step stops, asking for NEED in FIELD of the service.
 override_set() {
 	local -A set=()
 	local -a keys=()
@@ -187,9 +223,10 @@ override_set() {
 			set[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
 		done <compose.override.yaml
 		[[ ${set[$1]-} == "$2" ]] && return 1
-		confirm "compose.override.yaml is rewritten with $1=$2, keeping its other \"# setup:\" lines"
+		agreed=0 # a replacement is confirmed although the recreate was
+		agree "compose.override.yaml is rewritten with $1=$2, keeping its other \"# setup:\" lines"
 	else
-		say "writing compose.override.yaml with $1=$2"
+		agree "writing compose.override.yaml with $1=$2"
 	fi
 	[[ -v "set[$1]" ]] || keys+=("$1")
 	set[$1]=$2
@@ -214,13 +251,16 @@ field() {
 	printf '%s' "$json" | jq -r "$@"
 }
 
+# ctl ARGS...: the CLI in the container, standard input closed.
+ctl() { docker compose exec -T stargaite /stargaite "$@" </dev/null; }
+
 # cli WORD WORD ARGS...: one CLI command in the container, with --json; the
 # answer is in $reply. Its findings, warnings included, are printed; a failure
 # also prints the CLI's message and returns 1. The CLI bounds its own wait:
 # 90 s, or the server's deadline for a verify.
 cli() {
 	local code message
-	reply=$(docker compose exec -T stargaite /stargaite "$1" "$2" --json "${@:3}" </dev/null)
+	reply=$(ctl "$1" "$2" --json "${@:3}")
 	code=$?
 	field "$reply" '(.findings // .error.findings // [])[] | "  \(.severity): \(.resource): \(.message)"' 2>/dev/null
 	((code == 0)) && return 0
@@ -274,10 +314,16 @@ check_machine() {
 		fi
 	elif ! v=$(docker compose version --short 2>/dev/null) || ! at_least "$v" 2.24.4; then
 		missing+=("Docker Compose 2.24.4 or later${v:+, found $v}: see https://docs.docker.com/compose/install/linux/")
+	elif ! v=$(docker compose ps -q 2>&1 >/dev/null); then
+		# Compose quotes the rest of a .env line it cannot parse, which may be
+		# a credential: its words after the line number are left out.
+		v=${v%%$'\n'*}
+		[[ $v =~ ^(.*line\ [0-9]+) ]] && v=${BASH_REMATCH[1]}
+		missing+=("a .env and compose.override.yaml that Compose reads (docker compose ps: ${v%%$'\n'*})")
 	fi
 	command -v curl >/dev/null || missing+=("curl: see https://curl.se/download.html")
 	command -v jq >/dev/null || missing+=("jq: see https://jqlang.org/download/")
-	if [[ $port != "$env_port" || -z $(docker compose ps -q 2>/dev/null) ]] && (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+	if v=$(docker compose ps -q 2>/dev/null) && [[ $port != "$env_port" || -z $v ]] && (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
 		missing+=("a free host port: 127.0.0.1:$port is taken; give another with --port <n>")
 	fi
 	((${#missing[@]} == 0)) && return 0
@@ -312,10 +358,17 @@ compose_up() {
 }
 
 # recreate WHY: the container recreated to read a changed .env or override,
-# once confirmed, then readiness.
+# confirmed unless agree was, then readiness.
 recreate() {
-	confirm "the container is recreated to $1: requests in flight are given time to finish, and the rate-limit windows restart"
+	((agreed)) || confirm "the container is recreated to $1: requests in flight are given time to finish, and the rate-limit windows restart"
 	compose_up --no-build
+}
+
+# clone_version: STARGAITE_VERSION, the clone's git describe as make image
+# takes it, dev without git; exported for the build.
+clone_version() {
+	command -v git >/dev/null && STARGAITE_VERSION=$(git describe --tags --always --dirty 2>/dev/null) || STARGAITE_VERSION=dev
+	export STARGAITE_VERSION
 }
 
 # start: .env (mode 0600) with the host port, then the container, built with
@@ -331,8 +384,7 @@ start() {
 		confirm "STARGAITE_PORT is replaced in .env, from $kept to $port"
 		env_set STARGAITE_PORT "$port"
 	fi
-	command -v git >/dev/null && STARGAITE_VERSION=$(git describe --tags --always --dirty 2>/dev/null) || STARGAITE_VERSION=dev
-	export STARGAITE_VERSION
+	clone_version
 	if [[ -z $(docker compose ps -a -q) ]]; then
 		say "building and starting version $STARGAITE_VERSION (the first build takes a few minutes)"
 		compose_up --build
@@ -347,13 +399,34 @@ start() {
 	fi
 }
 
+# reach VAR WHAT [HINT]: a URL on the host's loopback becomes one on
+# host.docker.internal, as the container reaches the host, and
+# --allow-private-network joins the caller's args; a plain-HTTP URL is
+# offered it.
+reach() {
+	local -n _url=$1
+	if [[ $_url =~ ^(https?://)(localhost|127\.[0-9.]+|\[::1\])(:[0-9]+)?(/.*)?$ ]]; then
+		_url=${BASH_REMATCH[1]}host.docker.internal${BASH_REMATCH[3]}${BASH_REMATCH[4]}
+		say "localhost inside the container is the container: $2 is reached at $_url, the host's bridge address, so it must listen beyond the host's loopback${3:+ ($3)}"
+		args+=(--allow-private-network)
+	elif [[ $_url == http://* || -v opt[allow-private-network] ]] && yesno allow-private-network "$_url is plain HTTP or a private address: allow it?"; then
+		args+=(--allow-private-network)
+	fi
+}
+
+# gateway URL: the host-gateway line in the override when URL is on
+# host.docker.internal.
+gateway() {
+	[[ $1 == *//host.docker.internal* ]] && override_set host_gateway 1 host.docker.internal:host-gateway extra_hosts
+}
+
 # step_provider: the provider, from a preset or another compatible service,
 # added through the CLI before any secret is typed, which checks the variable
 # name and the URL; then its credential into .env and, for a local service,
-# the override; the container is recreated once to read them. A provider that
-# exists is kept.
+# the override, once the recreate that reads them is agreed; the container is
+# recreated once. A provider that exists is kept.
 step_provider() {
-	local presets n choice existing preset url var billing change="" args=()
+	local presets n choice existing preset url var billing args=()
 	cli providers presets || exit 1
 	presets=$reply
 	cli providers list || exit 1
@@ -392,13 +465,7 @@ step_provider() {
 			[[ $var != none ]] && billing=pay_per_use && args+=(--api-key-env "$var")
 			args+=(--protocol "$protocol" --billing "$billing")
 		fi
-		if [[ $url =~ ^(https?://)(localhost|127\.[0-9.]+|\[::1\])(:[0-9]+)?(/.*)?$ ]]; then
-			url=${BASH_REMATCH[1]}host.docker.internal${BASH_REMATCH[3]}${BASH_REMATCH[4]}
-			say "localhost inside the container is the container: $provider is reached at $url, the host's bridge address, so it must listen beyond the host's loopback (Ollama binds 127.0.0.1 unless OLLAMA_HOST=0.0.0.0)"
-			args+=(--allow-private-network)
-		elif [[ $url == http://* || -v opt[allow-private-network] ]] && yesno allow-private-network "$url is plain HTTP or a private address: allow it?"; then
-			args+=(--allow-private-network)
-		fi
+		reach url "$provider" "Ollama binds 127.0.0.1 unless OLLAMA_HOST=0.0.0.0"
 		say "adding provider $provider"
 		cli providers add --base-url "$url" "${args[@]}" -- "$provider" || exit 1
 		provider_json=$(field "$reply" .resource)
@@ -406,24 +473,13 @@ step_provider() {
 	protocol=$(field "$provider_json" .protocol)
 	var=$(field "$provider_json" '.api_key_env // ""')
 	key_value=""
-	if [[ -n $var ]]; then
-		if ! env_get key_value "$var" || { yesno replace "$var is in .env: replace it?" && key_value=""; }; then
-			secret key_value "$var"
-			say "writing $var to .env"
-			env_set "$var" "$key_value"
-			change="read $var"
-		else
-			say "$var is in .env; kept"
-		fi
+	[[ -n $var ]] && credentials "$var" key-env
+	gateway "$(field "$provider_json" .base_url)"
+	# A credential the container lacks, as after a run that stopped before
+	# its recreate, recreates it too.
+	if ((agreed)) || { cli providers show -- "$provider" && [[ $(field "$reply" .credential) == unresolved ]]; }; then
+		recreate "read $var"
 	fi
-	if [[ $(field "$provider_json" .base_url) == *//host.docker.internal* ]] &&
-		override_set host_gateway 1 host.docker.internal:host-gateway extra_hosts; then
-		change+="${change:+ and }reach host.docker.internal"
-	fi
-	if [[ -z $change ]] && cli providers show -- "$provider" && [[ $(field "$reply" .credential) == unresolved ]]; then
-		change="read $var"
-	fi
-	[[ -n $change ]] && recreate "$change"
 	cli providers show -- "$provider" || exit 1
 	[[ $(field "$reply" .credential) =~ ^(resolved|none)$ ]] || die "the credential of $provider does not resolve: $var is not in the container's environment"
 }
@@ -520,16 +576,18 @@ step_target() {
 	say "target $target is verified"
 }
 
-# step_alias: the alias toward the target, or the one that exists, kept.
-step_alias() {
-	local exists max effort args=()
+# alias_kept: the alias's name; true, and said, when it exists: it is kept.
+alias_kept() {
+	local exists
 	ask alias alias main "a name for the alias your clients call"
 	cli models list || exit 1
 	exists=$(field "$reply" --arg n "$alias" '.models[] | select(.name == $n) | .targets | join(", ")')
-	if [[ -n $exists ]]; then
-		say "alias $alias exists, toward $exists; kept"
-		return
-	fi
+	[[ -n $exists ]] && say "alias $alias exists, toward $exists; kept"
+}
+
+# step_alias: the alias, which alias_kept found new, toward the target.
+step_alias() {
+	local max effort args=()
 	if [[ $protocol == anthropic ]]; then
 		ask max max-output-tokens 8192 "the alias's output cap in tokens, which an anthropic target needs"
 		args+=(--max-output-tokens "$max")
@@ -542,7 +600,8 @@ step_alias() {
 
 # step_key: a client key allowed the alias, printed once inside a frame and
 # written nowhere. A key that exists keeps its secret, which cannot be shown
-# again: the reader names another, or the first answer is skipped (false).
+# again: the reader names another, or the first answer is skipped (false),
+# which, as for anything kept, is no failure.
 step_key() {
 	local rpm
 	ask key_name key-name my-app "a name for the client key"
@@ -553,7 +612,10 @@ step_key() {
 			say "the first answer is skipped: give --key-name with a new name to make a key for it"
 			return 1
 		fi
-		read -r -p "another name, or Enter to skip the first answer: " key_name && [[ -n $key_name ]] || return 1
+		read -r -p "another name, or Enter to skip the first answer: " key_name && [[ -n $key_name ]] || {
+			say "no key made; the first answer is skipped"
+			return 1
+		}
 	done
 	ask rpm rpm-limit 60 "the requests a minute the key may send"
 	say "creating key $key_name for alias $alias"
@@ -591,7 +653,9 @@ step_answer() {
 	say "finish_reason: $(field "$out" '.choices[0].finish_reason // "-"'), $time s, from ${served:--}"
 }
 
-install() {
+# machine: the host port, from --port or .env (4000 without either), and the
+# checks of check_machine.
+machine() {
 	port=4000
 	env_get port STARGAITE_PORT
 	env_port=$port
@@ -601,12 +665,133 @@ install() {
 		usage_error "--port takes a port number, 1 to 65535"
 	fi
 	check_machine
+	base_url=http://127.0.0.1:$port/v1
+}
+
+# running: a container that runs, then machine and readiness, which every
+# subcommand but install and status needs. Only Compose answering with none
+# means none runs; a Docker or Compose that fails is named by machine.
+running() {
+	local id
+	id=$(docker compose ps -q 2>/dev/null) && [[ -z $id ]] && die "no container runs here: ./setup.sh install starts it"
+	machine
+	wait_ready
+}
+
+# budget: a budget on the instance, an alias or a key; one that replaces
+# another is confirmed. When the CLI refuses it because a target it reaches
+# has no price (USE-12), the prices of exactly the targets it names are asked
+# and set, and the budget applied once more.
+budget() {
+	local on limit reset in out today old id ids=() args=() show=(settings show) num='^[0-9]+(\.[0-9]+)?$'
+	ask on on "" "what the budget is on: instance, alias:<name> or key:<name>"
+	ask limit limit-usd "" "the limit in USD"
+	ask reset reset monthly "when it resets: daily, monthly or never"
+	[[ $limit =~ $num ]] || usage_error "--limit-usd takes a number of USD"
+	[[ $reset =~ ^(daily|monthly|never)$ ]] || usage_error "--reset takes daily, monthly or never"
+	case $on in
+	instance) args=(settings set) ;;
+	alias:?*) args=(models set) show=(models show -- "${on#*:}") ;;
+	key:?*) args=(keys set) show=(keys show -- "${on#*:}") ;;
+	*) usage_error "--on takes instance, alias:<name> or key:<name>" ;;
+	esac
+	args+=(--budget "limit_usd=$limit,reset_interval=$reset")
+	[[ $on == instance ]] || args+=(-- "${on#*:}")
+	cli "${show[@]}" || exit 1
+	old=$(field "$reply" '.budget // empty | "\(.limit_usd) USD, reset \(.reset_interval)"')
+	[[ -n $old ]] && confirm "the budget on $on, $old, is replaced"
+	say "setting a budget of $limit USD on $on, reset $reset"
+	cli "${args[@]}" && return
+	mapfile -t ids < <(field "$reply" '(.findings // .error.findings // [])[] | select(.code == "unpriced_under_budget") | .resource | ltrimstr("targets/")' 2>/dev/null)
+	((${#ids[@]})) || exit 1
+	printf -v today '%(%Y-%m-%d)T' -1
+	for id in "${ids[@]}"; do
+		ask in input-price "" "the price of $id in USD per million input tokens"
+		ask out output-price "" "the price of $id in USD per million output tokens"
+		[[ $in =~ $num && $out =~ $num ]] || usage_error "--input-price and --output-price take a number of USD"
+		say "setting the prices of $id to $in and $out USD per million input and output tokens, as of $today, which clears its verification: a later install or alias toward it verifies it again"
+		cli targets set --pricing "input_per_million=$in,output_per_million=$out,as_of=$today" -- "$id" || exit 1
+	done
+	cli "${args[@]}" || exit 1
+	say "the budget of $limit USD on $on is set"
+}
+
+# telemetry: Langfuse or any OTLP endpoint, its credentials into .env, a
+# local endpoint reached as a local provider is. A block that exists is
+# replaced whole, once confirmed: telemetry set is a merge patch, so an
+# earlier backend's credentials would otherwise go to the new endpoint. Then
+# telemetry set; the container recreated when this run changed .env or the
+# override, or when a reference does not resolve, as after a run that stopped
+# before its recreate; and telemetry test, its line printed as it comes.
+telemetry() {
+	local backend endpoint header var old creds=() args=()
+	ask backend backend "" "the backend: langfuse or otlp"
+	if [[ $backend == langfuse ]]; then
+		[[ -v opt[header-name] || -v opt[key-env] ]] && usage_error "--header-name and --key-env are for --backend otlp"
+		ask endpoint endpoint "" "the Langfuse endpoint, https://<host>/api/public/otel"
+		args+=(--preset langfuse)
+		creds=(LANGFUSE_PUBLIC_KEY langfuse-public-env LANGFUSE_SECRET_KEY langfuse-secret-env)
+	elif [[ $backend == otlp ]]; then
+		ask endpoint endpoint "" "the OTLP endpoint in full; spans go to <endpoint>/v1/traces"
+		ask header header-name "" "a header that carries a credential, such as Authorization; empty for none" optional
+		[[ -z $header && -v opt[key-env] ]] && usage_error "--key-env holds the credential of --header-name: give both"
+		if [[ -n $header ]]; then
+			var=OTLP_${header^^}
+			var=${var//[^A-Z0-9_]/_}
+			args+=(--header-env "$header=$var")
+			creds=("$var" key-env)
+		fi
+	else
+		usage_error "--backend takes langfuse or otlp"
+	fi
+	cli telemetry status || exit 1
+	old=$(field "$reply" '.telemetry.otlp_endpoint // empty')
+	[[ -n $old ]] && confirm "telemetry toward $old is replaced whole, none of its credentials or headers kept: it is unset first, so a change the CLI refuses leaves it unset"
+	((${#creds[@]})) && credentials "${creds[@]}"
+	reach endpoint telemetry
+	gateway "$endpoint"
+	if [[ -n $old ]]; then
+		cli telemetry unset --yes || exit 1
+	fi
+	say "setting telemetry to $endpoint"
+	cli telemetry set --otlp-endpoint "$endpoint" "${args[@]}" || die "telemetry is ${old:+now unset; it was toward }${old:-not set}"
+	cli telemetry status || exit 1
+	var=$(field "$reply" '.unresolved // [] | join(", ")')
+	if ((agreed)) || [[ -n $var ]]; then
+		recreate "read $var"
+	fi
+	say "telemetry test: one span to $endpoint"
+	ctl telemetry test
+}
+
+# status: the running version and the clone's, and the state of each
+# credential, of the providers and of telemetry; no more (cut 1 of the
+# design's section 6).
+status() {
+	local v id
+	clone_version
+	if id=$(docker compose ps -q 2>/dev/null) && [[ -z $id ]]; then
+		say "version: $STARGAITE_VERSION in this clone; no container runs (./setup.sh install starts it)"
+		return
+	fi
+	machine
+	v=$(ctl version --json) || die "the running version was not read"
+	say "version: $(field "$v" .version) running, $STARGAITE_VERSION in this clone"
+	cli providers list || exit 1
+	field "$reply" '.providers[] | "provider \(.name): credential \(.credential)"'
+	cli telemetry status || exit 1
+	field "$reply" 'if .telemetry.otlp_endpoint == null then "telemetry: not set" else "telemetry \(.telemetry.otlp_endpoint): " +
+		(if .unresolved then "credentials unresolved: \(.unresolved | join(", "))" elif .telemetry.basic_auth_env // .telemetry.header_env
+		then "credentials resolved" else "no credential" end) end'
+}
+
+install() {
+	machine
 	start
 	step_provider
 	step_model
 	step_target
-	step_alias
-	base_url=http://127.0.0.1:$port/v1
+	alias_kept || step_alias
 	step_key && step_answer
 	say ""
 	say "Ready. Point an OpenAI-compatible client at base URL $base_url, with model $alias and its key, such as:"
@@ -623,10 +808,20 @@ gave; without a terminal, a missing answer exits 2 naming its flag.
 subcommands:
   install   check this machine, start the container, and go from a provider
             to a key and a first answer; run again, it resumes and keeps
-            what exists (the default at a terminal)
+            what exists (the default at a terminal before it exists; a menu
+            of the others after)
+  provider  add a provider and its credential to a running installation
+  alias     an alias toward a provider's model, the target verified first;
+            one that exists (--alias, main) is kept, with no paid call
+  key       a client key for an alias (--alias, main), then a first answer
+  budget    a spending limit on the instance, an alias or a key; the prices
+            of the targets it reaches unpriced are asked first
+  telemetry traces to Langfuse or any OTLP endpoint, replacing what was set
+            whole, then telemetry test
+  status    the running and the clone's versions, each credential's state
   help      this text
 
-install flags:
+install flags, which provider, alias and key take for their steps:
   --port <n>                the host port of the data plane on 127.0.0.1 (4000)
   --provider <name>         a preset, a provider already added, or a new name
   --base-url <url>          the provider's base URL, when its preset has none
@@ -646,6 +841,23 @@ install flags:
   --yes                     confirm a change that replaces something or
                             briefly interrupts traffic, without a terminal
 
+budget flags, with --yes to replace a budget:
+  --on <scope>              instance, alias:<name> or key:<name>
+  --limit-usd <usd>         the limit
+  --reset <interval>        daily, monthly or never (monthly)
+  --input-price <usd>, --output-price <usd>
+                            per million tokens, for each target it reaches
+                            unpriced; as of today
+
+telemetry flags, with --key-env, --replace, --allow-private-network and --yes:
+  --backend <b>             langfuse or otlp
+  --endpoint <url>          the OTLP endpoint in full; for Langfuse,
+                            https://<host>/api/public/otel
+  --langfuse-public-env <VAR>, --langfuse-secret-env <VAR>
+                            the variables of this script's environment that
+                            hold Langfuse's keys; typed hidden otherwise
+  --header-name <name>      an OTLP header that carries a credential (none)
+
 Paid calls: one targets verify (a call per reasoning level the target
 declares) unless the target is verified, and one test chat completion, each
 capped at 256 output tokens, announced first and never retried."
@@ -663,19 +875,30 @@ main() {
 		cd -- "${BASH_SOURCE[0]%/*}" || exit 1
 	fi
 	[[ -f compose.yaml ]] || die "compose.yaml is not beside setup.sh: run it from the clone of stargaite"
-	case ${1-} in
-	install)
-		shift
-		parse_flags "port provider base-url protocol api-key-env key-env model alias max-output-tokens effort key-name rpm-limit" \
-			"replace allow-private-network reverify yes" "$@"
-		install
-		;;
-	help | --help | -h) usage ;;
-	"")
+	local sub=${1-} menu=(provider alias key budget telemetry status)
+	local pf="provider base-url protocol api-key-env key-env" bf="replace allow-private-network yes"
+	shift
+	# With no subcommand at a terminal: install, or a menu once it exists.
+	if [[ -z $sub ]]; then
 		interactive || usage_error "no subcommand; ./setup.sh help lists them"
-		install
-		;;
-	*) usage_error "unknown subcommand ${1-}; ./setup.sh help lists them" ;;
+		sub=install
+		if [[ -n $(docker compose ps -a -q 2>/dev/null) ]]; then
+			say "this installation exists; ./setup.sh help says what each choice does:"
+			say "  1) provider  2) alias  3) key  4) budget  5) telemetry  6) status"
+			read -r -p "what to do: a number or a name: " sub || die "no answer to: what to do"
+			[[ $sub =~ ^[1-6]$ ]] && sub=${menu[sub - 1]}
+		fi
+	fi
+	case $sub in
+	install) parse_flags "port $pf model alias max-output-tokens effort key-name rpm-limit" "$bf reverify" "$@"; install ;;
+	provider) parse_flags "$pf" "$bf" "$@"; running; step_provider ;;
+	alias) parse_flags "$pf model alias max-output-tokens effort" "$bf reverify" "$@"; running; alias_kept || { step_provider; step_model; step_target; step_alias; } ;;
+	key) parse_flags "alias key-name rpm-limit" "" "$@"; running; alias_kept || die "alias $alias does not exist: ./setup.sh alias makes it"; if step_key; then step_answer; fi ;;
+	budget) parse_flags "on limit-usd reset input-price output-price" "yes" "$@"; running; budget ;;
+	telemetry) parse_flags "backend endpoint langfuse-public-env langfuse-secret-env header-name key-env" "$bf" "$@"; running; telemetry ;;
+	status) parse_flags "" "" "$@"; status ;;
+	help | --help | -h) usage ;;
+	*) usage_error "unknown subcommand \"$sub\"; ./setup.sh help lists them" ;;
 	esac
 }
 

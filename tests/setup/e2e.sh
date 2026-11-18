@@ -2,8 +2,9 @@
 # make setup-test: setup.sh end to end (docs/design/phase-6.md section 7), on
 # a Linux host with Docker. A temporary copy of the working tree, made a git
 # repository, runs ./setup.sh install with every answer as a flag and no
-# terminal, under its own Compose project, image name and free host port, so
-# it runs beside a service on port 4000. The mock provider runs from the
+# terminal, then key, budget, telemetry and status on that installation,
+# under its own Compose project, image name and free host port, so it runs
+# beside a service on port 4000. The mock provider runs from the
 # source in the Go image, listening only on the Docker bridge's gateway
 # address, and is reached as a local provider. It removes only the project,
 # volume, images and container it created.
@@ -25,6 +26,15 @@ free_port() {
 		fi
 	done
 	return 1
+}
+
+# again ARGS...: ./setup.sh ARGS in the copy, without a terminal; out holds
+# what it printed, which is shown.
+again() {
+	out=$(cd "$tree" && ./setup.sh "$@" </dev/null 2>&1)
+	code=$?
+	printf '%s\n' "$out"
+	((code == 0)) || fail "setup.sh $1 exited $code"
 }
 
 cleanup() {
@@ -85,6 +95,32 @@ main() {
 	# credential exactly as given.
 	[[ $(curl -fsS --max-time 10 "http://$gw:$mport/mock/calls" | jq --arg a "Bearer $key" '[.[] | select(.Header.Authorization == [$a])] | length') -ge 2 ]] ||
 		fail "the mock did not receive the credential byte for byte"
+
+	# Run again: a key, a budget that prices the mock's target first, and
+	# telemetry to the mock, first Langfuse, then OTLP with a header
+	# credential, each needing a recreate.
+	again key --alias main --key-name e2e-2
+	[[ $out == *"answer: mock reply"* ]] || fail "no first answer through the second key"
+	again budget --on alias:main --limit-usd 5 --input-price 1 --output-price 2
+	[[ $out == *"setting the prices of mock/mock"* ]] || fail "the budget did not price mock/mock first"
+	[[ $(cd "$tree" && docker compose exec -T stargaite /stargaite models show main --json | jq -c .budget) == '{"limit_usd":5,"reset_interval":"monthly"}' ]] ||
+		fail "alias main has no budget of 5 USD"
+	E2E_PK=pk-lf-e2e E2E_SK=sk-lf-e2e again telemetry --backend langfuse --endpoint "http://localhost:$mport" \
+		--langfuse-public-env E2E_PK --langfuse-secret-env E2E_SK --yes
+	[[ $out == *"span: accepted (200)"* && $out != *"-lf-e2e"* ]] || fail "the Langfuse test was not accepted, or a key was printed"
+	# shellcheck disable=SC2016 # the $ is the point
+	otlp='tok $HOME #x y\z'
+	E2E_OTLP=$otlp again telemetry --backend otlp --endpoint "http://localhost:$mport" --header-name x-e2e-token --key-env E2E_OTLP --yes
+	[[ $out == *"span: accepted (200)"* ]] || fail "the telemetry test was not accepted"
+	[[ $out != *"$otlp"* ]] || fail "the telemetry credential was printed"
+	# The last span carries the OTLP credential byte for byte, and nothing of
+	# Langfuse's block, which the OTLP run replaced whole.
+	[[ $(curl -fsS --max-time 10 "http://$gw:$mport/mock/calls" | jq --arg a "$otlp" '[.[] | select(.Path == "/v1/traces")] | last |
+		.Header["X-E2e-Token"] == [$a] and .Header.Authorization == null and .Header["X-Langfuse-Ingestion-Version"] == null') == true ]] ||
+		fail "the last span did not carry the OTLP credential alone"
+	again status
+	[[ $out == *"version: $want running, $want in this clone"* && $out == *"provider mock: credential resolved"* &&
+		$out == *"credentials resolved"* ]] || fail "status does not show the versions and the credentials"
 	echo "setup-test: passed"
 }
 

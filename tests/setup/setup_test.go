@@ -325,6 +325,17 @@ func (r *run) leaks(secret, out string) []string {
 	return found
 }
 
+// written is what .env and compose.override.yaml hold, a missing one as
+// empty: what a refused run must leave as it was.
+func (r *run) written() string {
+	var s string
+	for _, name := range []string{".env", "compose.override.yaml"} {
+		data, _ := os.ReadFile(filepath.Join(r.dir, name))
+		s += name + ":\n" + string(data)
+	}
+	return s
+}
+
 // freePort is a loopback port nothing listens on.
 func freePort(t *testing.T) string {
 	t.Helper()
@@ -491,6 +502,267 @@ func TestSetupFlags(t *testing.T) {
 		}
 	})
 
+	// Run again (C55): each subcommand alone on the running installation,
+	// every answer a flag, through the CLI only.
+	t.Run("run again", func(t *testing.T) {
+		r := newRun(t, []string{"SRC=v", "PK=pk-lf-public", "SK=sk-lf-secret", "OT=Bearer otlp-secret"})
+		if code, out := r.exec(acme(freePort(t))...); code != 0 {
+			t.Fatalf("install: exit %d:\n%s", code, out)
+		}
+		// sub runs a subcommand and returns its CLI calls; all holds every
+		// output, for the leak check.
+		var all string
+		sub := func(args ...string) ([]string, string) {
+			t.Helper()
+			before := len(r.cli())
+			code, out := r.exec(args...)
+			all += out
+			if code != 0 {
+				t.Fatalf("%q: exit %d:\n%s", args, code, out)
+			}
+			return r.cli()[before:], out
+		}
+
+		got, out := sub("provider", "--provider", "ollama", "--yes")
+		want := []string{"providers presets", "providers list", "providers add --base-url http://host.docker.internal:11434/v1 --allow-private-network -- ollama",
+			"providers show -- ollama"}
+		if !slices.Equal(got, want) || r.count("docker", "compose up -d --no-build") != 2 || !strings.Contains(r.file("compose.override.yaml"), "host-gateway") {
+			t.Errorf("provider: %q, want %q:\n%s", got, want, out)
+		}
+
+		got, out = sub("alias", "--provider", "ollama", "--model", "llama3", "--alias", "local")
+		want = []string{"models list", "providers presets", "providers list", "providers show -- ollama", "providers show -- ollama", "targets list",
+			"targets add --kind chat -- ollama/llama3", "settings show", "targets verify --max-output-tokens 256 -- ollama/llama3", "models add --target ollama/llama3 -- local"}
+		if !slices.Equal(got, want) || !strings.Contains(out, "provider ollama exists; kept") {
+			t.Errorf("alias: %q, want %q:\n%s", got, want, out)
+		}
+		// An alias that exists (main, the default) is kept before any paid
+		// call.
+		got, out = sub("alias", "--provider", "acme", "--model", "m2")
+		if !slices.Equal(got, []string{"models list"}) || !strings.Contains(out, "alias main exists, toward acme/m1; kept") {
+			t.Errorf("alias that exists: %q:\n%s", got, out)
+		}
+
+		got, out = sub("key", "--alias", "local", "--key-name", "second", "--rpm-limit", "10")
+		if !slices.Equal(got, []string{"models list", "keys list", "keys create --model local --rpm-limit 10 -- second"}) ||
+			!strings.Contains(out, "answer: fake reply") || r.count("curl", "chat/completions") != 2 || r.count("curl", `"model":"local"`) != 1 {
+			t.Errorf("key: %q:\n%s", got, out)
+		}
+		// A key that exists is kept, as anything that exists is: exit 0.
+		got, out = sub("key", "--alias", "local", "--key-name", "second")
+		if !slices.Equal(got, []string{"models list", "keys list"}) || !strings.Contains(out, "key second exists") {
+			t.Errorf("key that exists: %q:\n%s", got, out)
+		}
+		// A key for an alias that does not exist is never made.
+		before := len(r.cli())
+		code, out := r.exec("key", "--alias", "nope", "--key-name", "third")
+		if got := r.cli()[before:]; code != 1 || !strings.Contains(out, "alias nope does not exist: ./setup.sh alias makes it") || !slices.Equal(got, []string{"models list"}) {
+			t.Errorf("key for no alias: exit %d, %q:\n%s", code, got, out)
+		}
+
+		// The alias's budget is refused for acme/m1, which has no price: its
+		// prices are set, as of today, and the budget applied once more.
+		// ollama/llama3, of a provider with billing none, is never asked about.
+		got, out = sub("budget", "--on", "alias:main", "--limit-usd", "5", "--input-price", "1.5", "--output-price", "6")
+		today := time.Now().Format(time.DateOnly)
+		want = []string{"models show -- main", "models set --budget limit_usd=5,reset_interval=monthly -- main",
+			"targets set --pricing input_per_million=1.5,output_per_million=6,as_of=" + today + " -- acme/m1",
+			"models set --budget limit_usd=5,reset_interval=monthly -- main"}
+		if !slices.Equal(got, want) || !strings.Contains(out, "error: targets/acme/m1: pay-per-use target") ||
+			!strings.Contains(out, "setting the prices of acme/m1 to 1.5 and 6 USD per million input and output tokens, as of "+today) ||
+			!strings.Contains(out, "which clears its verification: a later install or alias toward it verifies it again") {
+			t.Errorf("budget: %q, want %q:\n%s", got, want, out)
+		}
+		// A budget that replaces one is confirmed: without --yes, exit 2 and
+		// nothing set.
+		before = len(r.cli())
+		code, out = r.exec("budget", "--on", "alias:main", "--limit-usd", "7")
+		if got := r.cli()[before:]; code != 2 || !strings.Contains(out, "missing --yes: the budget on alias:main, 5 USD, reset monthly, is replaced") ||
+			!slices.Equal(got, []string{"models show -- main"}) {
+			t.Errorf("budget replaced without --yes: exit %d, %q:\n%s", code, got, out)
+		}
+		if got, out = sub("budget", "--on", "alias:main", "--limit-usd", "7", "--yes"); !slices.Equal(got, []string{"models show -- main",
+			"models set --budget limit_usd=7,reset_interval=monthly -- main"}) {
+			t.Errorf("budget replaced: %q:\n%s", got, out)
+		}
+		got, out = sub("budget", "--on", "instance", "--limit-usd", "20", "--reset", "daily")
+		if !slices.Equal(got, []string{"settings show", "settings set --budget limit_usd=20,reset_interval=daily"}) {
+			t.Errorf("budget on the instance: %q:\n%s", got, out)
+		}
+		if got, out = sub("budget", "--on", "key:app", "--limit-usd", "0.5", "--reset", "never"); !slices.Equal(got,
+			[]string{"keys show -- app", "keys set --budget limit_usd=0.5,reset_interval=never -- app"}) {
+			t.Errorf("budget on a key: %q:\n%s", got, out)
+		}
+
+		// Langfuse: both keys into .env, then set, the container recreated
+		// to read them, and the test's line as the CLI prints it.
+		got, out = sub("telemetry", "--backend", "langfuse", "--endpoint", "https://lf.example/api/public/otel",
+			"--langfuse-public-env", "PK", "--langfuse-secret-env", "SK", "--yes")
+		want = []string{"telemetry status", "telemetry set --otlp-endpoint https://lf.example/api/public/otel --preset langfuse", "telemetry status", "telemetry test"}
+		if !slices.Equal(got, want) || r.count("docker", "compose up -d --no-build") != 3 ||
+			!strings.Contains(out, "span: accepted (200) · trace_id=4bf92f3577b34da6a3ce929d0e0e4736") {
+			t.Errorf("telemetry langfuse: %q, want %q:\n%s", got, want, out)
+		}
+		// Any OTLP endpoint on the host, after Langfuse: the block is unset
+		// first, so Langfuse's keys never go to it; a header credential into
+		// .env, the endpoint reached as a local provider is.
+		got, out = sub("telemetry", "--backend", "otlp", "--endpoint", "http://localhost:4318", "--header-name", "Authorization", "--key-env", "OT", "--yes")
+		want = []string{"telemetry status", "telemetry unset --yes",
+			"telemetry set --otlp-endpoint http://host.docker.internal:4318 --header-env Authorization=OTLP_AUTHORIZATION --allow-private-network",
+			"telemetry status", "telemetry test"}
+		if !slices.Equal(got, want) || r.count("docker", "compose up -d --no-build") != 4 ||
+			!strings.Contains(out, "telemetry toward https://lf.example/api/public/otel is replaced whole") {
+			t.Errorf("telemetry otlp: %q, want %q:\n%s", got, want, out)
+		}
+		env := r.file(".env")
+		for _, s := range []string{"LANGFUSE_PUBLIC_KEY='pk-lf-public'\n", "LANGFUSE_SECRET_KEY='sk-lf-secret'\n", "OTLP_AUTHORIZATION='Bearer otlp-secret'\n"} {
+			if !strings.Contains(env, s) {
+				t.Errorf(".env has no %q: %q", s, env)
+			}
+		}
+
+		got, out = sub("status")
+		if !slices.Equal(got, []string{"version", "providers list", "telemetry status"}) {
+			t.Errorf("status: %q", got)
+		}
+		for _, s := range []string{"version: v0.6.0-fake running, dev in this clone", "provider acme: credential resolved", "provider ollama: credential none",
+			"telemetry http://host.docker.internal:4318: credentials resolved"} {
+			if !strings.Contains(out, s) {
+				t.Errorf("status: no %q in:\n%s", s, out)
+			}
+		}
+		if n := r.count("docker", "targets verify"); n != 2 {
+			t.Errorf("%d verify, want 2: the install's and the alias's", n)
+		}
+		// A block the CLI refuses after the unset: said, since nothing is
+		// set any more.
+		code, out = r.exec("telemetry", "--backend", "otlp", "--endpoint", "otlp.example:4318", "--yes")
+		all += out
+		if code != 1 || !strings.Contains(out, "telemetry is now unset; it was toward http://host.docker.internal:4318\n") {
+			t.Errorf("telemetry refused: exit %d:\n%s", code, out)
+		}
+		for _, secret := range []string{"pk-lf-public", "sk-lf-secret", "otlp-secret"} {
+			if found := r.leaks(secret, all); len(found) > 0 {
+				t.Errorf("%s is in %q", secret, found)
+			}
+		}
+	})
+
+	// A run refused at the confirmation writes nothing, so the same run with
+	// --yes recreates the container and reaches its end; a credential in .env
+	// that the container lacks, as after a run interrupted before its
+	// recreate, is read by a recreate too.
+	t.Run("resume", func(t *testing.T) {
+		r := newRun(t, []string{"SRC=v", "OT=Bearer otlp-secret"})
+		if code, out := r.exec(acme(freePort(t))...); code != 0 {
+			t.Fatalf("install: exit %d:\n%s", code, out)
+		}
+		otlp := []string{"telemetry", "--backend", "otlp", "--endpoint", "https://otlp.example", "--header-name", "Authorization", "--key-env", "OT"}
+		for _, args := range [][]string{{"provider", "--provider", "ollama"}, otlp} {
+			up := r.count("docker", "compose up")
+			files := r.written()
+			if code, out := r.exec(args...); code != 2 || !strings.Contains(out, "missing --yes: writing ") || r.written() != files {
+				t.Errorf("%q without --yes: exit %d, files:\n%s\nwere:\n%s\n%s", args, code, r.written(), files, out)
+			}
+			code, out := r.exec(append(args, "--yes")...)
+			if code != 0 || r.count("docker", "compose up") != up+1 {
+				t.Errorf("%q again with --yes: exit %d, %d compose up, want %d:\n%s", args, code, r.count("docker", "compose up"), up+1, out)
+			}
+		}
+		if !strings.Contains(r.file(".env"), "OTLP_AUTHORIZATION='Bearer otlp-secret'") || !strings.Contains(r.file("compose.override.yaml"), "host-gateway") {
+			t.Errorf(".env %q, override %q", r.file(".env"), r.file("compose.override.yaml"))
+		}
+		// Written to .env by a run that stopped before its recreate.
+		env := r.file(".env") + "OTLP_X_TOK='v'\n"
+		if err := os.WriteFile(filepath.Join(r.dir, ".env"), []byte(env), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		up := r.count("docker", "compose up")
+		code, out := r.exec("telemetry", "--backend", "otlp", "--endpoint", "https://otlp.example", "--header-name", "X-Tok", "--yes")
+		if code != 0 || r.count("docker", "compose up") != up+1 || !strings.Contains(out, "OTLP_X_TOK is in .env; kept") ||
+			!strings.Contains(out, "the container is recreated to read OTLP_X_TOK") || !strings.Contains(out, "span: accepted (200)") {
+			t.Errorf("credential kept but unresolved: exit %d, %d compose up, want %d:\n%s", code, r.count("docker", "compose up"), up+1, out)
+		}
+	})
+
+	// A local telemetry endpoint on an installation without the override:
+	// the override is written only once the recreate is confirmed.
+	t.Run("local telemetry", func(t *testing.T) {
+		r := newRun(t, []string{"SRC=v"})
+		if code, out := r.exec(acme(freePort(t))...); code != 0 {
+			t.Fatalf("install: exit %d:\n%s", code, out)
+		}
+		args := []string{"telemetry", "--backend", "otlp", "--endpoint", "http://127.0.0.1:4318"}
+		if code, out := r.exec(args...); code != 2 || !strings.Contains(out, "missing --yes: writing compose.override.yaml with host_gateway=1") ||
+			strings.Contains(r.written(), "host_gateway") {
+			t.Errorf("without --yes: exit %d:\n%s", code, out)
+		}
+		before := len(r.cli())
+		code, out := r.exec(append(args, "--yes")...)
+		want := []string{"telemetry status", "telemetry set --otlp-endpoint http://host.docker.internal:4318 --allow-private-network", "telemetry status", "telemetry test"}
+		if got := r.cli()[before:]; code != 0 || !slices.Equal(got, want) || r.count("docker", "compose up -d --no-build") != 2 ||
+			!strings.Contains(r.file("compose.override.yaml"), `      - "host.docker.internal:host-gateway"`) || strings.Contains(out, "Ollama") {
+			t.Errorf("exit %d, %q, want %q:\n%s", code, got, want, out)
+		}
+		if code, out := r.exec("status"); code != 0 || !strings.Contains(out, "telemetry http://host.docker.internal:4318: no credential") {
+			t.Errorf("status: exit %d:\n%s", code, out)
+		}
+	})
+
+	// A subcommand of a running installation needs one; status says what
+	// the clone holds. Only Compose answering with no container means none:
+	// a Docker or Compose that fails is named, and status exits 1 too.
+	t.Run("nothing runs", func(t *testing.T) {
+		r := newRun(t, nil)
+		code, out := r.exec("key", "--alias", "main")
+		if code != 1 || !strings.Contains(out, "no container runs here: ./setup.sh install starts it") || len(r.cli()) != 0 {
+			t.Errorf("key: exit %d:\n%s", code, out)
+		}
+		code, out = r.exec("status")
+		if code != 0 || !strings.Contains(out, "version: dev in this clone; no container runs") || len(r.cli()) != 0 {
+			t.Errorf("status: exit %d:\n%s", code, out)
+		}
+		// The port .env names, taken by another service, is not the matter.
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = ln.Close() }()
+		env := "STARGAITE_PORT='" + strconv.Itoa(ln.Addr().(*net.TCPAddr).Port) + "'\n"
+		if err := os.WriteFile(filepath.Join(r.dir, ".env"), []byte(env), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for _, args := range [][]string{{"status"}, {"key", "--alias", "main"}} {
+			if code, out := r.exec(args...); strings.Contains(out, "is taken") || code == 0 != (args[0] == "status") {
+				t.Errorf("%q with the port taken: exit %d:\n%s", args, code, out)
+			}
+		}
+		for _, c := range []struct{ env, want string }{
+			{"FAKE_DOCKER=denied", "permission to use Docker: run as root, or join the docker group"},
+			{"FAKE_DOCKER=unreadable", "a .env and compose.override.yaml that Compose reads (docker compose ps: failed to read .env: line 1"},
+		} {
+			r := newRun(t, []string{c.env})
+			for _, args := range [][]string{{"status"}, {"key", "--alias", "main"}} {
+				if code, out := r.exec(args...); code != 1 || !strings.Contains(out, c.want) || strings.Contains(out, "no container runs") || len(r.cli()) != 0 ||
+					strings.Contains(out, "sk-hand-edited-secret") || strings.Contains(out, "is taken") {
+					t.Errorf("%s, %q: exit %d, want 1 and %q:\n%s", c.env, args, code, c.want, out)
+				}
+			}
+		}
+	})
+
+	// A telemetry test that fails prints its line and exits 1.
+	t.Run("telemetry test fails", func(t *testing.T) {
+		r := newRun(t, []string{"SRC=v", "FAKE_TELEMETRY=unauthorized"})
+		if code, out := r.exec(acme(freePort(t))...); code != 0 {
+			t.Fatalf("install: exit %d:\n%s", code, out)
+		}
+		code, out := r.exec("telemetry", "--backend", "otlp", "--endpoint", "https://otlp.example")
+		if code != 1 || !strings.Contains(out, "authorized: no (401) · bad credentials") || strings.Contains(out, "failed with exit") {
+			t.Errorf("exit %d:\n%s", code, out)
+		}
+	})
+
 	// --key-env names an exported variable only, never one of the script's.
 	t.Run("key-env not exported", func(t *testing.T) {
 		r := newRun(t, nil)
@@ -549,6 +821,59 @@ func TestSetupNoTTY(t *testing.T) {
 			t.Errorf("%q: exit %d, want 2:\n%s", args, code, out)
 		}
 	}
+	// The subcommands of a running installation (C55), each on a new one:
+	// a missing answer exits 2 naming its flag, before the change it is for,
+	// with .env and the override as they were; a wrong value exits 2 too.
+	// Their controls are TestSetupFlags/run again.
+	budget := []string{"budget", "--on", "alias:main", "--limit-usd", "5", "--input-price", "1", "--output-price", "2"}
+	langfuse := []string{"telemetry", "--backend", "langfuse", "--endpoint", "https://lf.example/api/public/otel",
+		"--langfuse-public-env", "SRC", "--langfuse-secret-env", "SRC", "--yes"}
+	otlp := []string{"telemetry", "--backend", "otlp", "--endpoint", "https://otlp.example", "--header-name", "Authorization", "--key-env", "SRC", "--yes"}
+	for _, c := range []struct {
+		args    []string
+		missing string
+		cli     []string // the CLI calls after the install's, which change nothing
+	}{
+		{without(budget, "--on"), "missing --on: what the budget is on", nil},
+		{without(budget, "--limit-usd"), "missing --limit-usd", nil},
+		{without(budget, "--input-price"), "missing --input-price: the price of acme/m1 in USD per million input tokens",
+			[]string{"models show -- main", "models set --budget limit_usd=5,reset_interval=monthly -- main"}},
+		{append(slices.Clone(budget), "--on", "alias"), "--on takes instance, alias:<name> or key:<name>", nil},
+		{append(slices.Clone(budget), "--reset", "weekly"), "--reset takes daily, monthly or never", nil},
+		{append(slices.Clone(budget), "--limit-usd", "5,reset_interval=never"), "--limit-usd takes a number of USD", nil},
+		{append(slices.Clone(budget), "--input-price", "1,as_of=2020-01-01"), "--input-price and --output-price take a number of USD",
+			[]string{"models show -- main", "models set --budget limit_usd=5,reset_interval=monthly -- main"}},
+		{without(langfuse, "--backend"), "missing --backend", nil},
+		{append(slices.Clone(langfuse), "--backend", "zipkin"), "--backend takes langfuse or otlp", nil},
+		{without(langfuse, "--endpoint"), "missing --endpoint", nil},
+		{without(langfuse, "--langfuse-public-env"), "missing --langfuse-public-env", []string{"telemetry status"}},
+		{without(langfuse, "--langfuse-secret-env"), "missing --langfuse-secret-env", []string{"telemetry status"}},
+		{append(slices.Clone(langfuse), "--header-name", "Authorization"), "--header-name and --key-env are for --backend otlp", nil},
+		{without(otlp, "--header-name"), "--key-env holds the credential of --header-name: give both", nil},
+		{without(otlp, "--key-env"), "missing --key-env: the variable of this script's environment that holds OTLP_AUTHORIZATION", []string{"telemetry status"}},
+		{without(otlp, "--yes"), "missing --yes: writing OTLP_AUTHORIZATION to .env, and the container is then recreated", []string{"telemetry status"}},
+		{[]string{"provider", "--provider", "ollama"}, "missing --yes: writing compose.override.yaml with host_gateway=1", []string{"providers presets", "providers list",
+			"providers add --base-url http://host.docker.internal:11434/v1 --allow-private-network -- ollama"}},
+		{[]string{"alias", "--provider", "acme", "--alias", "other"}, "missing --model", []string{"models list", "providers presets", "providers list",
+			"providers show -- acme", "providers show -- acme"}},
+		{[]string{"status", "--json"}, "unknown flag --json", nil},
+		{[]string{"key", "extra"}, "unexpected argument: extra", nil},
+	} {
+		t.Run(strings.Join(c.args, " "), func(t *testing.T) {
+			r := newRun(t, []string{"SRC=v"})
+			if code, out := r.exec(acme(freePort(t))...); code != 0 {
+				t.Fatalf("install: exit %d:\n%s", code, out)
+			}
+			before, up, files := len(r.cli()), r.count("docker", "compose up"), r.written()
+			code, out := r.exec(c.args...)
+			if got := r.cli()[before:]; code != 2 || !strings.Contains(out, c.missing) || !slices.Equal(got, c.cli) || r.count("docker", "compose up") != up {
+				t.Errorf("exit %d, want 2 and %q; CLI calls %q, want %q:\n%s", code, c.missing, got, c.cli, out)
+			}
+			if r.written() != files {
+				t.Errorf("files changed:\n%s\nwere:\n%s", r.written(), files)
+			}
+		})
+	}
 	r = newRun(t, nil)
 	if code, out := r.exec("help"); code != 0 || !strings.Contains(out, "--key-env <VAR>") {
 		t.Errorf("help: exit %d:\n%s", code, out)
@@ -587,6 +912,79 @@ func TestSetupPrompts(t *testing.T) {
 		if !slices.Contains(r.cli(), c) {
 			t.Errorf("no CLI call %q in %q", c, r.cli())
 		}
+	}
+
+	// Run again with no subcommand (C55): the menu of the others; budget
+	// asks for the prices of the target its budget reaches unpriced.
+	before := len(r.cli())
+	code, out = r.pty(nil,
+		step{"what to do: a number or a name: ", "4"},
+		step{"what the budget is on: instance, alias:<name> or key:<name>: ", "alias:main"},
+		step{"the limit in USD: ", "5"},
+		step{"when it resets: daily, monthly or never [monthly]: ", ""},
+		step{"the price of openai/gpt-b in USD per million input tokens: ", "2"},
+		step{"the price of openai/gpt-b in USD per million output tokens: ", "8"},
+	)
+	want := []string{"models show -- main", "models set --budget limit_usd=5,reset_interval=monthly -- main",
+		"targets set --pricing input_per_million=2,output_per_million=8,as_of=" + time.Now().Format(time.DateOnly) + " -- openai/gpt-b",
+		"models set --budget limit_usd=5,reset_interval=monthly -- main"}
+	if got := r.cli()[before:]; code != 0 || !strings.Contains(out, "1) provider  2) alias  3) key  4) budget  5) telemetry  6) status") || !slices.Equal(got, want) {
+		t.Errorf("menu, budget: exit %d, %q, want %q:\n%s", code, got, want, out)
+	}
+
+	// telemetry reads a header credential hidden.
+	const secret = "typed-otlp-secret"
+	code, out = r.pty([]string{"telemetry"},
+		step{"the backend: langfuse or otlp: ", "otlp"},
+		step{"spans go to <endpoint>/v1/traces: ", "https://otlp.example"},
+		step{"empty for none: ", "Authorization"},
+		step{"OTLP_AUTHORIZATION (typed hidden): ", secret},
+		step{"continue? [y/N]: ", "y"},
+	)
+	if code != 0 || !strings.Contains(out, "span: accepted") || !strings.Contains(r.file(".env"), "OTLP_AUTHORIZATION='"+secret+"'") {
+		t.Errorf("telemetry: exit %d, .env %q:\n%s", code, r.file(".env"), out)
+	}
+	if found := r.leaks(secret, out); len(found) > 0 {
+		t.Errorf("the credential is in %q", found)
+	}
+
+	// Langfuse replaces it, once confirmed, and reads its two keys hidden.
+	const public, private = "typed-lf-public", "typed-lf-secret"
+	code, out = r.pty([]string{"telemetry"},
+		step{"the backend: langfuse or otlp: ", "langfuse"},
+		step{"https://<host>/api/public/otel: ", "https://lf.example/api/public/otel"},
+		step{"continue? [y/N]: ", "y"},
+		step{"LANGFUSE_PUBLIC_KEY (typed hidden): ", public},
+		step{"LANGFUSE_SECRET_KEY (typed hidden): ", private},
+		step{"continue? [y/N]: ", "y"},
+	)
+	env := r.file(".env")
+	if code != 0 || !strings.Contains(out, "is replaced whole") || !strings.Contains(out, "span: accepted") ||
+		!strings.Contains(env, "LANGFUSE_PUBLIC_KEY='"+public+"'") || !strings.Contains(env, "LANGFUSE_SECRET_KEY='"+private+"'") {
+		t.Errorf("langfuse: exit %d, .env %q:\n%s", code, env, out)
+	}
+	for _, secret := range []string{public, private} {
+		if found := r.leaks(secret, out); len(found) > 0 {
+			t.Errorf("%s is in %q", secret, found)
+		}
+	}
+
+	// A key that exists: Enter skips it, said, and is no failure.
+	code, out = r.pty([]string{"key"},
+		step{"a name for the alias your clients call [main]: ", ""},
+		step{"a name for the client key [my-app]: ", ""},
+		step{"another name, or Enter to skip the first answer: ", ""},
+	)
+	if code != 0 || !strings.Contains(out, "no key made; the first answer is skipped") {
+		t.Errorf("key skipped: exit %d:\n%s", code, out)
+	}
+
+	// alias asks the alias's name first: one that exists is kept, with no
+	// other question and no other call.
+	before = len(r.cli())
+	code, out = r.pty([]string{"alias"}, step{"a name for the alias your clients call [main]: ", ""})
+	if got := r.cli()[before:]; code != 0 || !strings.Contains(out, "alias main exists, toward openai/gpt-b; kept") || !slices.Equal(got, []string{"models list"}) {
+		t.Errorf("alias kept: exit %d, %q:\n%s", code, got, out)
 	}
 }
 

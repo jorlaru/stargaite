@@ -341,6 +341,14 @@ at_least() {
 	return 0
 }
 
+# root_rule: root in a clone that belongs to another user is refused before
+# anything is written, git objects included.
+root_rule() {
+	if [[ $(id -u) == 0 && $(stat -c %u .) != 0 ]]; then
+		die "run as root in a clone that belongs to another user, setup.sh would leave root-owned files (.env, tls/, backups/, git objects) that break its next run and that user's git: run it as the clone's owner"
+	fi
+}
+
 # check_machine: the root rule, then everything install needs, all reported
 # at once with where to get it (nothing is ever installed here), then exit 1.
 # The host port must be free on loopback unless it is the one .env names and
@@ -348,9 +356,7 @@ at_least() {
 check_machine() {
 	local -a missing=()
 	local v
-	if [[ $(id -u) == 0 && $(stat -c %u .) != 0 ]]; then
-		die "run as root in a clone that belongs to another user, setup.sh would leave root-owned files (.env, tls/, backups/, git objects) that break its next run and that user's git: run it as the clone's owner"
-	fi
+	root_rule
 	if ! command -v docker >/dev/null; then
 		missing+=("Docker: see https://docs.docker.com/engine/install/")
 	elif ! v=$(docker info --format '{{.ServerVersion}}' 2>&1); then
@@ -815,10 +821,19 @@ telemetry() {
 
 # status: the running version and the clone's, and the state of each
 # credential, of the providers and of telemetry; no more (cut 1 of the
-# design's section 6).
+# design's section 6). With --check, first whether the upstream has an
+# upgrade, from one bounded git fetch.
 status() {
 	local v id
 	clone_version
+	if [[ -v opt[check] ]]; then
+		fetch
+		if ((ahead)); then
+			say "upgrade: $ahead new commit(s) on $upstream; ./setup.sh upgrade applies them"
+		else
+			say "upgrade: none, up to date with $upstream"
+		fi
+	fi
 	if id=$(docker compose ps -q 2>/dev/null) && [[ -z $id ]]; then
 		say "version: $STARGAITE_VERSION in this clone; no container runs (./setup.sh install starts it)"
 		return
@@ -949,6 +964,100 @@ remote() {
 	say "the CLI from this directory: alias stargaite='docker compose exec -T ${admin[*]} stargaite /stargaite'"
 }
 
+# fetch: after the root rule, as git writes to the clone, the clone's branch
+# and its upstream, fetched within 20 s without ever asking for a password
+# (K19); ahead is how many commits the upstream has that HEAD lacks. A clone
+# that is not one, a detached HEAD, a branch without upstream or a fetch that
+# fails stops here, nothing changed.
+fetch() {
+	root_rule
+	{ command -v git >/dev/null && git rev-parse --git-dir >/dev/null 2>&1; } ||
+		die "upgrades come from a git clone of stargaite, with git: see https://git-scm.com/downloads"
+	git symbolic-ref -q HEAD >/dev/null || die "HEAD is detached, so no branch says what to upgrade to: git switch <branch>, then run this again"
+	upstream=$(git rev-parse --abbrev-ref '@{upstream}' 2>/dev/null) ||
+		die "branch $(git branch --show-current) has no upstream to upgrade from: git branch --set-upstream-to <remote>/<branch>"
+	GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND='ssh -o BatchMode=yes' timeout -k 5 20 git fetch --quiet ||
+		die "git fetch failed or did not finish within 20 s; nothing was changed"
+	ahead=$(git rev-list --count 'HEAD..@{upstream}') || die "git rev-list failed; nothing was changed"
+}
+
+# upgrade: the clone fast-forwarded to its upstream and the image rebuilt;
+# the running image kept as <image>-previous first, and a backup taken just
+# before the new version starts, which is then checked. Nothing rolls back
+# by itself, since a migration may be one-way: the way back is printed.
+upgrade() {
+	local old v valid image id backup n out line ready="" legacy="" failed=1
+	running
+	[[ -z $(git status --porcelain --untracked-files=no 2>/dev/null) ]] ||
+		die "the clone has local changes to tracked files (git status lists them): commit or stash them, then run this again"
+	fetch
+	if ((ahead == 0)); then
+		# An upgrade that did not finish leaves the clone at a commit that
+		# does not run.
+		{ out=$(ctl version --json) && v=$(field "$out" .version); } || die "the running version was not read"
+		id=$(git rev-parse -q --verify "$v^{commit}" 2>/dev/null) && [[ $id != "$(git rev-parse HEAD)" ]] &&
+			die "up to date with $upstream, but $v runs, not this clone's commit: an upgrade did not finish; git reset --hard $v, then run this again"
+		say "up to date with $upstream; nothing was changed"
+		return
+	fi
+	git merge-base --is-ancestor HEAD '@{upstream}' ||
+		die "the clone has commits that $upstream lacks, so it cannot fast-forward: merge or rebase it yourself, then run this again"
+	say "$ahead new commit(s) on $upstream:"
+	git --no-pager log --oneline -20 'HEAD..@{upstream}'
+	git diff --quiet HEAD '@{upstream}' -- internal/store/migrations ||
+		say "a migration of the store changed: migrations are one-way, so the previous version cannot open the store they migrate"
+	{ old=$(git rev-parse HEAD) && clone_version && out=$(ctl version --json) && v=$(field "$out" .version); } || die "the running version was not read"
+	[[ $v == dev ]] && say "the running version is unknown (a dev build); this clone is at $STARGAITE_VERSION"
+	[[ $v == dev || $v == "$STARGAITE_VERSION" ]] || say "the running version, $v, is not this clone's, $STARGAITE_VERSION"
+	if [[ $(ctl --help) != *$'\n  restore '* ]]; then
+		say "the running stargaite predates backup -, so setup.sh cannot take the backup: make it by hand, a copy that also stays in the volume,"
+		say "  docker compose exec -T ${admin[*]:+${admin[*]} }stargaite /stargaite backup /data/pre-upgrade.db && mkdir -p backups && docker compose cp stargaite:/data/pre-upgrade.db backups/"
+		ask legacy legacy-backup "" "the copy made by hand, on this host, such as backups/pre-upgrade.db"
+		[[ -f $legacy && -s $legacy ]] || die "$legacy is not a file with a copy in it; nothing was changed"
+	fi
+	ctl validate --json >/dev/null
+	valid=$?
+	confirm "upgrading: the clone fast-forwards to $upstream and the image is rebuilt; then a backup of the store is taken and the container recreated on the new version, which interrupts traffic briefly"
+	{ id=$(docker compose ps -q stargaite) && id=$(docker inspect --format '{{.Image}} {{.Config.Image}}' "$id") && image=${id#* } && id=${id%% *} &&
+		docker tag "$id" "$image-previous"; } || die "the running image was not kept; nothing was changed"
+	say "the running image is kept as $image-previous"
+	git merge --ff-only --quiet '@{upstream}' || die "git merge --ff-only failed: $v still runs, the store unchanged"
+	clone_version
+	say "building version $STARGAITE_VERSION"
+	timeout --foreground -k 10 1200 docker compose build ||
+		die "the build failed or took over 20 minutes: $v still runs, the store unchanged; git reset --hard $old returns the clone to it"
+	backup=$legacy
+	if [[ -z $backup ]]; then
+		TZ=UTC0 printf -v backup 'backups/%s-%(%Y%m%dT%H%M%SZ)T.db' "${v//[^A-Za-z0-9._-]/_}" -1
+		say "backing up the store to $backup"
+		out=$( (umask 077 && mkdir -p backups && ctl backup - --json >"$backup") 2>&1)
+		# The summary is the last line, after anything docker itself printed;
+		# a backup never started reports no count, and its file may not exist.
+		n=$(field "${out##*$'\n'}" .bytes 2>/dev/null)
+		if [[ ! $n =~ ^[1-9][0-9]*$ || $n != "$(stat -c %s "$backup" 2>/dev/null)" ]]; then
+			rm -f -- "$backup"
+			die "the backup failed ($out), so the new version was not started: $v still runs, the store unchanged; docker tag $image-previous $image and git reset --hard $old return to it"
+		fi
+	fi
+	say "starting version $STARGAITE_VERSION"
+	if (compose_up --no-build) && out=$(ctl version --json) && out=$(field "$out" .version); then
+		ctl validate --json >/dev/null
+		id=$?
+		[[ $out == "$STARGAITE_VERSION" ]] || say "the running version is $out, not $STARGAITE_VERSION"
+		((id == valid)) || say "validate exits $id, and $valid before: the new version refuses part of the stored configuration"
+		while IFS= read -r line; do [[ $line == *'"msg":"ready"'* ]] && ready=$line; done < <(docker compose logs --no-log-prefix --tail 100 stargaite 2>/dev/null)
+		[[ $out == "$STARGAITE_VERSION" ]] && ((id == valid)) && failed=0 && say "upgraded: ${ready:-running $out}"
+	fi
+	((failed)) && say "the upgrade failed. Nothing rolls back by itself, since a migration may be one-way."
+	say "the way back to $v, from this directory, losing what changed since the backup; with the new image, as the previous one may predate restore:"
+	say "  docker compose stop"
+	say "  docker compose run --rm --no-deps -T stargaite restore --yes - < $(printf %q "$backup")"
+	say "  docker tag $image-previous $image"
+	say "  docker compose up -d --no-build"
+	say "and, before any later build, git reset --hard $old, which setup.sh does not run"
+	exit "$failed"
+}
+
 install() {
 	machine
 	start
@@ -984,7 +1093,11 @@ subcommands:
             whole, then telemetry test
   remote    publish the data plane beyond loopback, always with TLS: your
             certificate or a self-signed one; run again, it renews it
-  status    the running and the clone's versions, each credential's state
+  status    the running and the clone's versions, each credential's state;
+            with --check, whether the clone's upstream has an upgrade
+  upgrade   fast-forward this clone to its upstream and rebuild, keeping the
+            previous image and taking a backup just before the new version
+            starts, then checking it; it prints the way back
   help      this text
 
 install flags, which provider, alias and key take for their steps:
@@ -1035,6 +1148,10 @@ remote flags, with --yes:
   --tls-ca <file>           the private CA that signed it, as an absolute
                             path (none: a public CA)
 
+upgrade flags, with --yes:
+  --legacy-backup <file>    a copy made by hand, when the running version
+                            predates backup -; setup.sh says how to make it
+
 Paid calls: one targets verify (a call per reasoning level the target
 declares) unless the target is verified, and one test chat completion, each
 capped at 256 output tokens, announced first and never retried."
@@ -1052,7 +1169,7 @@ main() {
 		cd -- "${BASH_SOURCE[0]%/*}" || exit 1
 	fi
 	[[ -f compose.yaml ]] || die "compose.yaml is not beside setup.sh: run it from the clone of stargaite"
-	local sub=${1-} menu=(provider alias key budget telemetry status remote)
+	local sub=${1-} menu=(provider alias key budget telemetry status remote upgrade)
 	local pf="provider base-url protocol api-key-env key-env" bf="replace allow-private-network yes"
 	shift
 	# With no subcommand at a terminal: install, or a menu once it exists.
@@ -1061,9 +1178,9 @@ main() {
 		sub=install
 		if [[ -n $(docker compose ps -a -q 2>/dev/null) ]]; then
 			say "this installation exists; ./setup.sh help says what each choice does:"
-			say "  1) provider  2) alias  3) key  4) budget  5) telemetry  6) status  7) remote"
+			say "  1) provider  2) alias  3) key  4) budget  5) telemetry  6) status  7) remote  8) upgrade"
 			read -r -p "what to do: a number or a name: " sub || die "no answer to: what to do"
-			[[ $sub =~ ^[1-7]$ ]] && sub=${menu[sub - 1]}
+			[[ $sub =~ ^[1-8]$ ]] && sub=${menu[sub - 1]}
 		fi
 	fi
 	case $sub in
@@ -1074,7 +1191,8 @@ main() {
 	budget) parse_flags "on limit-usd reset input-price output-price" "yes" "$@"; running; budget ;;
 	telemetry) parse_flags "backend endpoint langfuse-public-env langfuse-secret-env header-name key-env" "$bf" "$@"; running; telemetry ;;
 	remote) parse_flags "address tls tls-cert tls-key tls-name tls-ca" "yes" "$@"; remote ;;
-	status) parse_flags "" "" "$@"; status ;;
+	status) parse_flags "" "check" "$@"; status ;;
+	upgrade) parse_flags "legacy-backup" "yes" "$@"; upgrade ;;
 	help | --help | -h) usage ;;
 	*) usage_error "unknown subcommand \"$sub\"; ./setup.sh help lists them" ;;
 	esac

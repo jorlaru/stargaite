@@ -1,14 +1,16 @@
 // Command shim stands in for every external command setup.sh runs in the
 // tests of tests/setup (see setup_test.go), which link it under each name:
 // it appends a record of the call to $SETUP_LOG, then answers as a fake
-// (docker, curl, id, stat, sleep, chown, hostname, getent) or runs the real
-// command; FAKE_TIMEOUT replaces the 1200 s bound given to the real timeout.
+// (docker, curl, id, stat -c %u ., sleep, chown, hostname, getent) or runs
+// the real command; FAKE_TIMEOUT replaces the 1200 s bound given to the real
+// timeout.
 // A separate binary, built once without the race detector, so each call
 // starts fast.
 package main
 
 import (
 	"bufio"
+	"cmp"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -39,11 +41,14 @@ type record struct {
 // runs, or exists stopped, the variable names of .env it was last created
 // with, whether its override gave serve a certificate, so both listeners
 // speak TLS, the override it was last started with and the certificate it
-// serves, read from tls/ only when it starts anew, as serve does, and the
-// configuration the fake CLI holds: budgets by scope (instance, alias:<name>
-// or key:<name>) and the telemetry flags given since the last unset, merged
-// as telemetry set merges its patch.
+// serves, read from tls/ only when it starts anew, as serve does, the
+// version the image was last built with and the one the container runs, and
+// the configuration the fake CLI holds: budgets by scope (instance,
+// alias:<name> or key:<name>) and the telemetry flags given since the last
+// unset, merged as telemetry set merges its patch.
 type state struct {
+	Built     string                       `json:"built"`
+	Version   string                       `json:"version"`
 	Up        bool                         `json:"up"`
 	Stopped   bool                         `json:"stopped"`
 	TLS       bool                         `json:"tls"`
@@ -176,10 +181,19 @@ func envNames() []string {
 // options (rootless Docker names rootless). FAKE_DOCKER=denied
 // fails info and ps as a user outside the docker group sees;
 // FAKE_DOCKER=unreadable fails ps alone, as a .env Compose cannot parse does.
+// An upgrade: build takes the version from STARGAITE_VERSION, which the
+// container runs from its next up; FAKE_UPGRADE=build-fails fails the build,
+// start-fails the up after it, invalid makes validate fail on the new
+// version, backup-short cuts backup - short, and legacy is a CLI from before
+// restore. FAKE_VERSION is the version before any build.
 func fakeDocker(args []string) int {
 	st := loadState()
 	defer st.save()
+	upgrade := os.Getenv("FAKE_UPGRADE")
 	switch {
+	case len(args) > 0 && args[0] == "inspect":
+		fmt.Println("sha256:0123abcd", env("STARGAITE_IMAGE", "stargaite:local"))
+	case len(args) > 0 && args[0] == "tag": // recorded, nothing to answer
 	case len(args) > 0 && args[0] == "info":
 		switch os.Getenv("FAKE_DOCKER") {
 		case "denied":
@@ -199,6 +213,12 @@ func fakeDocker(args []string) int {
 		return 1
 	case args[1] == "version":
 		fmt.Println(env("FAKE_COMPOSE", "2.29.1"))
+	case args[1] == "build":
+		if upgrade == "build-fails" {
+			fmt.Fprintln(os.Stderr, "failed to solve: process did not complete successfully: exit code: 1")
+			return 1
+		}
+		st.Built = os.Getenv("STARGAITE_VERSION")
 	case args[1] == "ps" && os.Getenv("FAKE_DOCKER") == "denied":
 		fmt.Fprintln(os.Stderr, "permission denied while trying to connect to the docker API at unix:///var/run/docker.sock")
 		return 1
@@ -214,7 +234,7 @@ func fakeDocker(args []string) int {
 			fmt.Println("fake build: 30 s")
 			time.Sleep(30 * time.Second)
 		}
-		if os.Getenv("FAKE_UP") == "fail" {
+		if os.Getenv("FAKE_UP") == "fail" || upgrade == "start-fails" && st.Built != "" {
 			st.Up, st.Stopped = false, true
 			fmt.Fprintln(os.Stderr, "Error response from daemon: failed to bind host port: address already in use")
 			return 1
@@ -225,6 +245,9 @@ func fakeDocker(args []string) int {
 			st.Cert = string(cert)
 		}
 		st.Up, st.Stopped, st.Env, st.Override = true, false, envNames(), string(override)
+		if st.Built != "" {
+			st.Version = st.Built
+		}
 		st.TLS = strings.Contains(string(override), `"--tls-cert"`)
 		if os.Getenv("FAKE_UP") == "noenv" {
 			st.Env = nil
@@ -232,14 +255,40 @@ func fakeDocker(args []string) int {
 		fmt.Println(" Container fake-stargaite-1 Started")
 	case args[1] == "logs":
 		fmt.Println("a log line")
+		if slices.Contains(args, "--no-log-prefix") {
+			fmt.Printf(`{"level":"INFO","msg":"ready","version":%q}`+"\n", st.Version)
+		}
 	case args[1] == "exec" && slices.Contains(args, "/stargaite"):
 		i := slices.Index(args, "/stargaite")
 		if st.TLS && !slices.ContainsFunc(args[:i], func(a string) bool { return strings.HasPrefix(a, "STARGAITE_ADMIN_URL=https://") }) {
 			fmt.Println(`{"error":{"message":"the admin API at http://127.0.0.1:4001 did not answer: it speaks TLS","type":"api_error"}}`)
 			return 1
 		}
-		if slices.Equal(args[i+1:], []string{"version", "--json"}) {
-			fmt.Println(`{"version":"v0.6.0-fake"}`)
+		switch strings.Join(args[i+1:], " ") {
+		case "version --json":
+			fmt.Printf(`{"version":%q}`+"\n", cmp.Or(st.Version, env("FAKE_VERSION", "v0.6.0-fake")))
+			return 0
+		case "--help":
+			fmt.Print("usage: stargaite <command> [arguments] [flags]\n\ncommands:\n  serve\n  backup file\n")
+			if upgrade != "legacy" {
+				fmt.Print("  restore file\n")
+			}
+			return 0
+		case "validate --json":
+			if upgrade == "invalid" && st.Built != "" && st.Version == st.Built {
+				fmt.Println(`{"findings":[{"severity":"error","rule":"R","resource":"targets/x","message":"refused"}]}`)
+				return 1
+			}
+			fmt.Println(`{"findings":[]}`)
+			return 0
+		case "backup - --json":
+			if upgrade == "backup-short" {
+				fmt.Print("SQLite")
+				fmt.Fprintln(os.Stderr, `{"error":{"message":"the copy on standard output is not whole: unexpected EOF","type":"api_error","code":"internal_error"}}`)
+				return 1
+			}
+			fmt.Print("SQLite format 3\x00 the store")
+			fmt.Fprintln(os.Stderr, `{"bytes":26,"path":"-"}`)
 			return 0
 		}
 		out, code := fakeCLI(st, args[i+1:])

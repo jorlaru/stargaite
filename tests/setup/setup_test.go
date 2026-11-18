@@ -1849,7 +1849,8 @@ func TestSetupInterrupt(t *testing.T) {
 }
 
 // TestSetupRoot: root in a clone of another user is refused before anything
-// runs; control: root in its own clone goes on.
+// runs, and status --check before its git fetch, with no container running;
+// control: root in its own clone goes on.
 func TestSetupRoot(t *testing.T) {
 	port := freePort(t)
 	r := newRun(t, []string{"SRC=v", "FAKE_UID=0", "FAKE_OWNER=1000"})
@@ -1860,5 +1861,329 @@ func TestSetupRoot(t *testing.T) {
 	r = newRun(t, []string{"SRC=v", "FAKE_UID=0", "FAKE_OWNER=0"})
 	if code, out := r.exec(acme(port)...); code != 0 {
 		t.Errorf("control: exit %d:\n%s", code, out)
+	}
+
+	r = newRun(t, []string{"SRC=v", "FAKE_UID=0", "FAKE_OWNER=1000"})
+	remote := t.TempDir()
+	gitIn(t, remote, "init", "-q", "--bare")
+	gitIn(t, r.dir, "init", "-q")
+	gitIn(t, r.dir, "add", "setup.sh", "compose.yaml")
+	gitIn(t, r.dir, "commit", "-q", "-m", "first")
+	gitIn(t, r.dir, "remote", "add", "origin", remote)
+	gitIn(t, r.dir, "push", "-q", "-u", "origin", "main")
+	code, out = r.exec("status", "--check")
+	if code != 1 || !strings.Contains(out, "run it as the clone's owner") || r.count("timeout", "git fetch")+r.count("git", "fetch") != 0 {
+		t.Errorf("status --check: exit %d:\n%s", code, out)
+	}
+	r.env = append(r.env, "FAKE_OWNER=0")
+	if code, out := r.exec("status", "--check"); code != 0 || !strings.Contains(out, "upgrade: none, up to date with origin/main") ||
+		r.count("timeout", "git fetch") != 1 {
+		t.Errorf("status --check, control: exit %d:\n%s", code, out)
+	}
+}
+
+// gitIn runs git in dir for the test, with an identity and no user or
+// system configuration.
+func gitIn(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+		"-c", "init.defaultBranch=main", "-c", "commit.gpgsign=false"}, args...)...)
+	cmd.Env = append(os.Environ(), "HOME="+t.TempDir(), "GIT_CONFIG_NOSYSTEM=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %q: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// installed is an installation in a clone of a bare repository, its
+// upstream; with newer, the upstream has one commit more, pushed from
+// another clone, which is returned.
+func installed(t *testing.T, newer bool) (*run, string) {
+	t.Helper()
+	r := newRun(t, []string{"SRC=v"})
+	remote, other := t.TempDir(), t.TempDir()
+	gitIn(t, remote, "init", "-q", "--bare")
+	gitIn(t, r.dir, "init", "-q")
+	gitIn(t, r.dir, "add", "setup.sh", "compose.yaml")
+	gitIn(t, r.dir, "commit", "-q", "-m", "first")
+	// The commit the fake container runs, as its version names it.
+	gitIn(t, r.dir, "tag", "v0.6.0-fake")
+	gitIn(t, r.dir, "remote", "add", "origin", remote)
+	gitIn(t, r.dir, "push", "-q", "-u", "origin", "main", "v0.6.0-fake")
+	if code, out := r.exec(acme(freePort(t))...); code != 0 {
+		t.Fatalf("install: exit %d:\n%s", code, out)
+	}
+	gitIn(t, other, "clone", "-q", remote, ".")
+	if newer {
+		if err := os.WriteFile(filepath.Join(other, "NEWS"), []byte("news\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		gitIn(t, other, "add", "NEWS")
+		gitIn(t, other, "commit", "-q", "-m", "second")
+		gitIn(t, other, "push", "-q")
+	}
+	return r, other
+}
+
+// TestSetupUpgrade: upgrade refuses a detached HEAD, a branch without
+// upstream, a dirty and a diverged clone, before anything changes, each with
+// the clone repaired as its control; up to date, it exits 0 with no backup.
+// It tags the previous image, merges, builds, takes the backup, starts and
+// checks the new version, in that order, and prints the way back. Without a
+// terminal it needs --yes; at one, from the menu too, it shows at most 20
+// commits, never through a pager, before it asks. A build or a backup that
+// fails or is never written leaves the old container running; a start or a
+// check that fails prints the way back and exits 1. A CLI from before
+// backup - needs --legacy-backup, asked at a terminal and quoted in the way
+// back. status --check says whether an upgrade is there.
+func TestSetupUpgrade(t *testing.T) {
+	// changed are the calls of an upgrade that change something.
+	changed := func(r *run) int {
+		return r.count("docker", "docker tag") + r.count("git", "merge --ff-only") + r.count("docker", "compose build") + r.count("docker", "backup -")
+	}
+	t.Run("up to date", func(t *testing.T) {
+		r, _ := installed(t, false)
+		code, out := r.exec("upgrade", "--yes")
+		if code != 0 || !strings.Contains(out, "up to date with origin/main; nothing was changed") || changed(r) != 0 {
+			t.Errorf("exit %d:\n%s", code, out)
+		}
+		if code, out := r.exec("status", "--check"); code != 0 || !strings.Contains(out, "upgrade: none, up to date with origin/main") {
+			t.Errorf("status --check: exit %d:\n%s", code, out)
+		}
+	})
+
+	t.Run("upgrade", func(t *testing.T) {
+		r, other := installed(t, true)
+		if code, out := r.exec("status", "--check"); code != 0 || !strings.Contains(out, "upgrade: 1 new commit(s) on origin/main; ./setup.sh upgrade applies them") {
+			t.Errorf("status --check: exit %d:\n%s", code, out)
+		}
+		want := gitIn(t, other, "describe", "--tags", "--always", "--dirty")
+		ups, fetches := r.count("docker", "compose up"), r.count("timeout", "timeout -k 5 20 git fetch --quiet")
+		start := len(r.calls())
+		code, out := r.exec("upgrade", "--yes")
+		if code != 0 || gitIn(t, r.dir, "rev-parse", "HEAD") != gitIn(t, other, "rev-parse", "HEAD") {
+			t.Fatalf("exit %d:\n%s", code, out)
+		}
+		// The order: tag, merge, build, backup, up, then the checks.
+		var order []string
+		for _, c := range r.calls()[start:] {
+			line := strings.Join(c.Argv, " ")
+			for _, step := range []string{"docker tag sha256:0123abcd stargaite:local-previous", "git merge --ff-only",
+				"docker compose build", "/stargaite backup - --json", "docker compose up -d --no-build", "/stargaite version --json", "/stargaite validate --json"} {
+				if strings.Contains(line, step) && (len(order) == 0 || order[len(order)-1] != step) {
+					order = append(order, step)
+				}
+			}
+		}
+		if want := []string{"/stargaite version --json", "/stargaite validate --json", "docker tag sha256:0123abcd stargaite:local-previous",
+			"git merge --ff-only", "docker compose build", "/stargaite backup - --json", "docker compose up -d --no-build",
+			"/stargaite version --json", "/stargaite validate --json"}; !slices.Equal(order, want) {
+			t.Errorf("order:\n%q\nwant:\n%q", order, want)
+		}
+		if r.count("docker", "compose up") != ups+1 || r.count("timeout", "timeout -k 5 20 git fetch --quiet") != fetches+1 {
+			t.Errorf("%d up, %d bounded fetches:\n%s", r.count("docker", "compose up")-ups, r.count("timeout", "git fetch")-fetches, out)
+		}
+		backups, err := filepath.Glob(filepath.Join(r.dir, "backups", "v0.6.0-fake-*Z.db"))
+		if err != nil || len(backups) != 1 {
+			t.Fatalf("backups %q, error %v:\n%s", backups, err, out)
+		}
+		backup := "backups/" + filepath.Base(backups[0])
+		if info, err := os.Stat(backups[0]); err != nil || info.Mode().Perm() != 0o600 || r.file(backup) != "SQLite format 3\x00 the store" {
+			t.Errorf("the backup: %v, error %v", info, err)
+		}
+		for _, s := range []string{"1 new commit(s) on origin/main:", "the running image is kept as stargaite:local-previous", "building version " + want,
+			"backing up the store to " + backup, `upgraded: {"level":"INFO","msg":"ready","version":"` + want + `"}`,
+			"  docker compose run --rm --no-deps -T stargaite restore --yes - < " + backup, "  docker tag stargaite:local-previous stargaite:local"} {
+			if !strings.Contains(out, s) {
+				t.Errorf("no %q in:\n%s", s, out)
+			}
+		}
+		if strings.Contains(out, "the upgrade failed") {
+			t.Errorf("a failure printed:\n%s", out)
+		}
+		if code, out := r.exec("status", "--check"); code != 0 || !strings.Contains(out, "version: "+want+" running, "+want+" in this clone") ||
+			!strings.Contains(out, "upgrade: none, up to date") {
+			t.Errorf("status --check after: exit %d:\n%s", code, out)
+		}
+		if strings.Contains(out, "a migration of the store changed") || strings.Contains(out, "the running version is unknown") {
+			t.Errorf("a migration or a dev build named:\n%s", out)
+		}
+		if code, out := r.exec("upgrade", "--yes"); code != 0 || !strings.Contains(out, "up to date with origin/main; nothing was changed") {
+			t.Errorf("upgrade again: exit %d:\n%s", code, out)
+		}
+	})
+
+	// A commit that touches a migration is named before the question; a dev
+	// build running is named, and its backup is named dev.
+	t.Run("migration and dev build", func(t *testing.T) {
+		r, other := installed(t, false)
+		dir := filepath.Join(other, "internal", "store", "migrations")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "0099_x.sql"), []byte("-- x\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		gitIn(t, other, "add", "internal")
+		gitIn(t, other, "commit", "-q", "-m", "migration")
+		gitIn(t, other, "push", "-q")
+		want := gitIn(t, other, "describe", "--tags", "--always", "--dirty")
+		r.env = append(r.env, "FAKE_VERSION=dev")
+		code, out := r.exec("upgrade", "--yes")
+		backups, _ := filepath.Glob(filepath.Join(r.dir, "backups", "dev-*Z.db"))
+		if code != 0 || len(backups) != 1 || !strings.Contains(out, "a migration of the store changed: migrations are one-way") ||
+			!strings.Contains(out, "the running version is unknown (a dev build); this clone is at v0.6.0-fake") || !strings.Contains(out, "building version "+want) ||
+			strings.Contains(out, "is not this clone's") {
+			t.Errorf("exit %d, backups %q:\n%s", code, backups, out)
+		}
+	})
+
+	for _, c := range []struct {
+		name         string
+		break_, mend func(t *testing.T, r *run)
+		want         string
+	}{
+		{"detached HEAD", func(t *testing.T, r *run) { gitIn(t, r.dir, "switch", "-q", "--detach") },
+			func(t *testing.T, r *run) { gitIn(t, r.dir, "switch", "-q", "main") }, "HEAD is detached"},
+		{"no upstream", func(t *testing.T, r *run) { gitIn(t, r.dir, "branch", "--unset-upstream") },
+			func(t *testing.T, r *run) { gitIn(t, r.dir, "branch", "-q", "--set-upstream-to", "origin/main") }, "branch main has no upstream"},
+		{"dirty", func(t *testing.T, r *run) {
+			if err := os.WriteFile(filepath.Join(r.dir, "compose.yaml"), []byte("# changed\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, func(t *testing.T, r *run) { gitIn(t, r.dir, "checkout", "-q", "--", "compose.yaml") }, "the clone has local changes to tracked files"},
+		{"diverged", func(t *testing.T, r *run) { gitIn(t, r.dir, "commit", "-q", "--allow-empty", "-m", "local") },
+			func(t *testing.T, r *run) { gitIn(t, r.dir, "reset", "-q", "--hard", "HEAD~1") }, "cannot fast-forward"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r, _ := installed(t, true)
+			c.break_(t, r)
+			head := gitIn(t, r.dir, "rev-parse", "HEAD")
+			code, out := r.exec("upgrade", "--yes")
+			if code != 1 || !strings.Contains(out, c.want) || changed(r) != 0 || gitIn(t, r.dir, "rev-parse", "HEAD") != head {
+				t.Errorf("exit %d, %d changes:\n%s", code, changed(r), out)
+			}
+			c.mend(t, r)
+			if code, out := r.exec("upgrade", "--yes"); code != 0 || !strings.Contains(out, "upgraded: ") {
+				t.Errorf("control: exit %d:\n%s", code, out)
+			}
+		})
+	}
+
+	t.Run("no --yes without a terminal", func(t *testing.T) {
+		r, _ := installed(t, true)
+		head := gitIn(t, r.dir, "rev-parse", "HEAD")
+		code, out := r.exec("upgrade")
+		if code != 2 || !strings.Contains(out, "missing --yes: upgrading") || changed(r) != 0 || gitIn(t, r.dir, "rev-parse", "HEAD") != head {
+			t.Errorf("exit %d, %d changes:\n%s", code, changed(r), out)
+		}
+	})
+
+	t.Run("at a terminal", func(t *testing.T) {
+		// Chosen from the menu, with more commits than are shown: at most
+		// 20, written out rather than through a pager, then the question;
+		// declined, nothing changes.
+		r, other := installed(t, true)
+		for i := range 25 {
+			gitIn(t, other, "commit", "-q", "--allow-empty", "-m", fmt.Sprintf("change %02d", i+1))
+		}
+		gitIn(t, other, "push", "-q")
+		head := gitIn(t, r.dir, "rev-parse", "HEAD")
+		code, out := r.pty(nil, step{"what to do: a number or a name: ", "8"}, step{"continue? [y/N]: ", "n"})
+		if code != 1 || !strings.Contains(out, "26 new commit(s) on origin/main:") || !strings.Contains(out, "stopped; nothing more was changed") ||
+			strings.Contains(out, "pager") || strings.Contains(out, "change 05") || changed(r) != 0 || gitIn(t, r.dir, "rev-parse", "HEAD") != head {
+			t.Errorf("exit %d, %d changes:\n%s", code, changed(r), out)
+		}
+		var missing []int
+		for i := 6; i <= 25; i++ {
+			if !strings.Contains(out, fmt.Sprintf("change %02d\r\n", i)) {
+				missing = append(missing, i)
+			}
+		}
+		if len(missing) > 0 {
+			t.Errorf("commits %v not shown:\n%s", missing, out)
+		}
+	})
+
+	t.Run("pre-phase CLI at a terminal", func(t *testing.T) {
+		r, _ := installed(t, true)
+		r.env = append(r.env, "FAKE_UPGRADE=legacy")
+		if err := os.MkdirAll(filepath.Join(r.dir, "my backups"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(r.dir, "my backups", "pre.db"), []byte("by hand"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		code, out := r.pty([]string{"upgrade"}, step{"such as backups/pre-upgrade.db: ", "my backups/pre.db"}, step{"continue? [y/N]: ", "y"})
+		// The way back holds the path quoted, as it is run.
+		if code != 0 || r.count("docker", "backup -") != 0 || !strings.Contains(out, `restore --yes - < my\ backups/pre.db`+"\r\n") {
+			t.Errorf("exit %d:\n%s", code, out)
+		}
+	})
+
+	t.Run("pre-phase CLI", func(t *testing.T) {
+		r, _ := installed(t, true)
+		r.env = append(r.env, "FAKE_UPGRADE=legacy")
+		code, out := r.exec("upgrade", "--yes")
+		if code != 2 || !strings.Contains(out, "missing --legacy-backup") || !strings.Contains(out, "  docker compose exec -T stargaite /stargaite backup /data/pre-upgrade.db") || changed(r) != 0 {
+			t.Fatalf("exit %d:\n%s", code, out)
+		}
+		if err := os.MkdirAll(filepath.Join(r.dir, "backups"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(r.dir, "backups", "pre.db"), []byte("by hand"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		code, out = r.exec("upgrade", "--yes", "--legacy-backup", "backups/pre.db")
+		if code != 0 || r.count("docker", "backup -") != 0 || !strings.Contains(out, "restore --yes - < backups/pre.db") {
+			t.Errorf("--legacy-backup: exit %d:\n%s", code, out)
+		}
+	})
+
+	for _, c := range []struct {
+		name, fake, want string
+		backup, up       int // backups taken, docker compose up run by the upgrade
+	}{
+		{"build fails", "build-fails", "the build failed or took over 20 minutes: v0.6.0-fake still runs, the store unchanged; git reset --hard ", 0, 0},
+		{"backup fails", "backup-short", "the backup failed", 0, 0},
+		{"backup never written", "", "the backup failed (mkdir: cannot create directory", 0, 0},
+		{"start fails", "start-fails", "the upgrade failed", 1, 1},
+		{"check fails", "invalid", "validate exits 1, and 0 before: the new version refuses part of the stored configuration", 1, 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r, _ := installed(t, true)
+			r.env = append(r.env, "FAKE_UPGRADE="+c.fake)
+			if c.fake == "" {
+				// backups is a file, so the directory is never made, the
+				// CLI never run, and no count is reported.
+				if err := os.WriteFile(filepath.Join(r.dir, "backups"), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ups := r.count("docker", "compose up")
+			code, out := r.exec("upgrade", "--yes")
+			files, _ := filepath.Glob(filepath.Join(r.dir, "backups", "*.db"))
+			if code != 1 || !strings.Contains(out, c.want) || len(files) != c.backup || r.count("docker", "compose up")-ups != c.up {
+				t.Errorf("exit %d, backups %q, %d up:\n%s", code, files, r.count("docker", "compose up")-ups, out)
+			}
+			if wayBack := strings.Contains(out, "restore --yes - < backups/"); wayBack != (c.backup == 1) {
+				t.Errorf("the way back printed: %v:\n%s", wayBack, out)
+			}
+			if c.fake != "build-fails" && c.fake != "backup-short" {
+				return
+			}
+			// The clone moved and the old version still runs: run again, it
+			// is named, not up to date; reset as told, the upgrade goes on.
+			code, out = r.exec("upgrade", "--yes")
+			if code != 1 || !strings.Contains(out, "up to date with origin/main, but v0.6.0-fake runs, not this clone's commit: an upgrade did not finish; git reset --hard v0.6.0-fake") {
+				t.Errorf("again: exit %d:\n%s", code, out)
+			}
+			gitIn(t, r.dir, "reset", "-q", "--hard", "v0.6.0-fake")
+			r.env = r.env[:len(r.env)-1]
+			if code, out := r.exec("upgrade", "--yes"); code != 0 || !strings.Contains(out, "upgraded: ") {
+				t.Errorf("after the reset: exit %d:\n%s", code, out)
+			}
+		})
 	}
 }

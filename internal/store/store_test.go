@@ -1051,3 +1051,170 @@ func TestBackup(t *testing.T) {
 		t.Errorf("files left: %v", left)
 	}
 }
+
+// TestRestore: Restore puts a copy that Backup wrote in place of a store,
+// mode 0600, the store's three files moved together into replaced/, emptied
+// first; an older copy goes into a data directory with no store, moving
+// nothing, and Open migrates it. A corrupt copy, one in WAL mode, one newer
+// than this binary and one that is no store are each refused before
+// anything moves, as is any copy while the lock is held; none leaves a part.
+func TestRestore(t *testing.T) {
+	ctx := context.Background()
+	setting := func(t *testing.T, s *Store, name string) {
+		t.Helper()
+		if err := s.Write(ctx, func(tx *sql.Tx) error {
+			_, err := tx.Exec("INSERT INTO settings (name, value, updated_at) VALUES (?, '1', 0)", name)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// file is a scratch file holding data, changed by the statements given.
+	file := func(t *testing.T, data []byte, statements ...string) []byte {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "x.db")
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, q := range statements {
+			if _, err := db.Exec(q); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		data, err = os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+
+	src := open(t, t.TempDir())
+	setting(t, src, "from the backup")
+	f, err := src.Backup(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backup, err := io.ReadAll(f)
+	_ = f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The store replaced: its -wal and -shm, which Close removes, planted
+	// with its database; replaced/ holds a file of an earlier restore.
+	dir := t.TempDir()
+	s, err := Open(ctx, dir, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	setting(t, s, "replaced")
+	if _, _, err := Restore(ctx, dir, bytes.NewReader(backup)); err == nil || !strings.Contains(err.Error(), "locked by another process: restore runs only while serve is stopped") {
+		t.Errorf("lock held: error %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, restorePart)); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("lock held: a part was written: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "replaced"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, data := range map[string]string{"stargaite.db-wal": "wal", "stargaite.db-shm": "shm", "replaced/earlier": "x"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(data), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db, err := os.ReadFile(filepath.Join(dir, "stargaite.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// listing is every file under dir with its content, the lock aside.
+	listing := func() map[string]string {
+		t.Helper()
+		files := map[string]string{}
+		_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+			if err == nil && !d.IsDir() && d.Name() != "lock" {
+				data, _ := os.ReadFile(path)
+				rel, _ := filepath.Rel(dir, path)
+				files[rel] = string(data)
+			}
+			return err
+		})
+		return files
+	}
+	before := listing()
+
+	wal, err := os.ReadFile(filepath.Join(dir, "stargaite.db"))
+	if err != nil || wal[18] != 2 || wal[19] != 2 {
+		t.Fatalf("the store is not in WAL mode: header %v, error %v", wal[:20], err)
+	}
+	for name, tc := range map[string]struct {
+		copy []byte
+		want string
+	}{
+		"corrupt":     {bytes.Repeat([]byte("not a store "), 1000), "the copy failed its check, so nothing was moved: "},
+		"in WAL mode": {wal, "the copy is in WAL mode"},
+		"newer":       {file(t, backup, "PRAGMA user_version = 4"), "user_version 4; this binary's is 3"},
+		"no store":    {nil, "user_version 0; this binary's is 3"},
+	} {
+		if _, _, err := Restore(ctx, dir, bytes.NewReader(tc.copy)); err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: error %v, want %q", name, err, tc.want)
+		}
+		if after := listing(); !maps.Equal(after, before) {
+			t.Errorf("%s: the data directory changed:\n%v\nwant:\n%v", name, slices.Sorted(maps.Keys(after)), slices.Sorted(maps.Keys(before)))
+		}
+	}
+	n, moved, err := Restore(ctx, dir, bytes.NewReader(backup))
+	if err != nil || n != int64(len(backup)) || !slices.Equal(moved, []string{"stargaite.db", "stargaite.db-wal", "stargaite.db-shm"}) {
+		t.Fatalf("restore: %d bytes, moved %q, error %v", n, moved, err)
+	}
+	want := map[string]string{"stargaite.db": string(backup), "replaced/stargaite.db": string(db), "replaced/stargaite.db-wal": "wal", "replaced/stargaite.db-shm": "shm"}
+	if after := listing(); !maps.Equal(after, want) {
+		t.Errorf("after the restore: %v, want %v", slices.Sorted(maps.Keys(after)), slices.Sorted(maps.Keys(want)))
+	}
+	if info, err := os.Stat(filepath.Join(dir, "stargaite.db")); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("stargaite.db: mode %v, error %v", info.Mode(), err)
+	}
+	s = open(t, dir)
+	var names []string
+	if err := each(ctx, s.Read(), "SELECT name FROM settings ORDER BY name", func(rows *sql.Rows) error {
+		var name string
+		err := rows.Scan(&name)
+		names = append(names, name)
+		return err
+	}); err != nil || !slices.Equal(names, []string{"from the backup"}) {
+		t.Errorf("settings %q, error %v", names, err)
+	}
+
+	// An older copy into a data directory not made yet: nothing moved, and
+	// Open migrates it as serve does at start.
+	first, err := migrations.ReadFile("migrations/001_base.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	older := file(t, nil, string(first), "PRAGMA user_version = 1", "INSERT INTO settings (name, value, updated_at) VALUES ('older', '1', 0)")
+	empty := filepath.Join(t.TempDir(), "data")
+	if n, moved, err := Restore(ctx, empty, bytes.NewReader(older)); err != nil || n != int64(len(older)) || moved != nil {
+		t.Fatalf("an older copy: %d bytes, moved %q, error %v", n, moved, err)
+	}
+	if _, err := os.Stat(filepath.Join(empty, "replaced")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("replaced/ made with nothing to move: %v", err)
+	}
+	s = open(t, empty)
+	if v := pragma(t, s.Read(), "user_version"); v != "3" {
+		t.Errorf("user_version %s after Open", v)
+	}
+	checkIntegrity(t, s.Read())
+	var value string
+	if err := s.Read().QueryRow("SELECT value FROM settings WHERE name = 'older'").Scan(&value); err != nil || value != "1" {
+		t.Errorf("the older copy's row: %q, error %v", value, err)
+	}
+}

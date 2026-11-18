@@ -208,6 +208,10 @@ func TestCommandWalk(t *testing.T) {
 		},
 		"secrets reload": {{nil, 0}},
 		"backup":         {{[]string{filepath.Join(backups, "walk@.db")}, 0}, {[]string{filepath.Join(backups, "missing", "walk@.db")}, 1}},
+		"restore": {
+			{[]string{filepath.Join(backups, "walk@.db"), "--data-dir", filepath.Join(backups, "restored"), "--yes"}, 0},
+			{[]string{filepath.Join(backups, "missing.db"), "--data-dir", filepath.Join(backups, "restored"), "--yes"}, 1},
+		},
 	}
 	vars := adminServer(t)
 	for _, c := range commands {

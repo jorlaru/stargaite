@@ -1,7 +1,7 @@
 // Package cli is the command line: a command table, one flag set per command
-// and deterministic exit codes. Every command but version and validate -f is
-// one call to the admin API. No command ever prompts (PRI-8): standard input
-// is read only where a file argument is "-" (OPS-3).
+// and deterministic exit codes. Every command but version, validate -f and
+// restore is one call to the admin API. No command ever prompts (PRI-8):
+// standard input is read only where a file argument is "-" (OPS-3).
 package cli
 
 import (
@@ -37,6 +37,7 @@ type input struct {
 	body   map[string]any     // what the body flags given fill, by path
 	getenv func(string) string
 	stdin  io.Reader // read only for a file argument "-"
+	stdout io.Writer // where backup - writes the copy
 }
 
 type flagKind int
@@ -327,6 +328,10 @@ var commands = []command{
 	{words: []string{"backup"}, args: []string{"file"}, local: backupFile, save: saveBackup, request: func(input) (string, string, any) {
 		return http.MethodPost, "/backup", nil
 	}},
+	// restore checks --yes itself, as it runs whole before Main's check.
+	{words: []string{"restore"}, args: []string{"file"}, local: restore, needsYes: func(input) bool { return true }, flags: []flagSpec{
+		{"data-dir", kindString, "", "the data directory, which no serve may hold (default $STARGAITE_DATA_DIR, else ./data)"},
+	}},
 }
 
 var (
@@ -359,7 +364,7 @@ func Main(args []string, getenv func(string) string, stdin io.Reader, stdout, st
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.Usage = func() {}
-	in := input{flags: map[string]*string{}, bools: map[string]*bool{}, set: map[string]bool{}, body: map[string]any{}, getenv: getenv, stdin: stdin}
+	in := input{flags: map[string]*string{}, bools: map[string]*bool{}, set: map[string]bool{}, body: map[string]any{}, getenv: getenv, stdin: stdin, stdout: stdout}
 	fs.BoolVar(&in.json, "json", false, "print JSON")
 	specs := slices.Clone(cmd.flags)
 	if cmd.request != nil {
@@ -399,6 +404,11 @@ func Main(args []string, getenv func(string) string, stdin io.Reader, stdout, st
 	}
 	in.args = pos
 	fs.Visit(func(f *flag.Flag) { in.set[f.Name] = true })
+	// backup - writes the copy to standard output: every message, an error
+	// under --json and the summary included, goes to standard error.
+	if cmd.save != nil && in.args[0] == "-" {
+		stdout = stderr
+	}
 
 	ctx := context.Background()
 	if cmd.local != nil {

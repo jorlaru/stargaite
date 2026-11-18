@@ -11,6 +11,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/url"
@@ -90,15 +91,8 @@ func Open(ctx context.Context, dataDir string, log *slog.Logger) (_ *Store, err 
 	}()
 
 	// The lock file stays open for the life of the process and is never deleted.
-	s.lock, err = os.OpenFile(filepath.Join(dir, "lock"), os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
+	if s.lock, err = lockDir(dir); err != nil {
 		return nil, err
-	}
-	if err := syscall.Flock(int(s.lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		if errors.Is(err, syscall.EWOULDBLOCK) {
-			return nil, fmt.Errorf("data directory %s is locked by another process", dir)
-		}
-		return nil, fmt.Errorf("lock %s: %w", s.lock.Name(), err)
 	}
 	// Under the lock, so no Backup of this directory is running. Only a
 	// regular file whose whole name is a copy's is ever removed.
@@ -138,6 +132,24 @@ func Open(ctx context.Context, dataDir string, log *slog.Logger) (_ *Store, err 
 
 	go s.run()
 	return s, nil
+}
+
+// lockDir takes the lock of the data directory dir, which holds while the
+// file it returns is open: one process at a time (OPS-10).
+func lockDir(dir string) (*os.File, error) {
+	f, err := os.OpenFile(filepath.Join(dir, "lock"), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			err = fmt.Errorf("data directory %s is locked by another process", dir)
+		} else {
+			err = fmt.Errorf("lock %s: %w", f.Name(), err)
+		}
+		return nil, errors.Join(err, f.Close())
+	}
+	return f, nil
 }
 
 // migrate runs every migration of fsys above PRAGMA user_version, each in
@@ -266,7 +278,7 @@ func (s *Store) Backup(ctx context.Context) (_ *os.File, err error) {
 	if vacuumed != nil {
 		vacuumed(path)
 	}
-	if err := withDB(ctx, "file:"+(&url.URL{Path: path}).EscapedPath()+"?mode=ro", func(db *sql.DB) error { return check(ctx, db) }); err != nil {
+	if err := withDB(ctx, "file:"+(&url.URL{Path: path}).EscapedPath()+"?mode=ro", func(db *sql.DB) error { return check(ctx, db, false) }); err != nil {
 		return nil, fmt.Errorf("the copy failed its check: %w", err)
 	}
 	f, err := os.Open(path)
@@ -292,8 +304,9 @@ func withDB(ctx context.Context, dsn string, fn func(*sql.DB) error) error {
 }
 
 // check requires integrity_check "ok", an empty foreign_key_check, which
-// integrity_check does not cover (ADR-018), and this binary's user_version.
-func check(ctx context.Context, db *sql.DB) error {
+// integrity_check does not cover (ADR-018), and this binary's user_version,
+// or, when older, a user_version from 1 up to it, which Open migrates.
+func check(ctx context.Context, db *sql.DB, older bool) error {
 	var lines []string
 	if err := each(ctx, db, "PRAGMA integrity_check", func(rows *sql.Rows) error {
 		var line string
@@ -328,10 +341,107 @@ func check(ctx context.Context, db *sql.DB) error {
 	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return err
 	}
-	if version != len(names) {
+	if version < 1 || version > len(names) || !older && version != len(names) {
 		return fmt.Errorf("user_version %d; this binary's is %d", version, len(names))
 	}
 	return nil
+}
+
+// restorePart is where Restore writes the copy before it checks it.
+const restorePart = ".stargaite-restore.db"
+
+// Restore puts the copy src holds in place of the store of dataDir while no
+// process holds the directory's lock (OPS-10), which it takes. It writes the
+// copy beside the store as restorePart, mode 0600, and checks it before
+// anything moves: not in WAL mode, as a file alone would lose the frames of
+// its -wal, integrity_check, foreign_key_check and a user_version from 1 up
+// to this binary's, since Open migrates an older store and refuses a newer
+// one. Then the store's files that exist move together into
+// <dataDir>/replaced, emptied first, so copies never accumulate, and the copy
+// is renamed to stargaite.db. It returns the bytes restored and the names of
+// the files moved, none for a data directory with no store. The part is
+// removed on any failure; a part a crash left is replaced by the next
+// Restore.
+func Restore(ctx context.Context, dataDir string, src io.Reader) (n int64, moved []string, err error) {
+	dir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return 0, nil, err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return 0, nil, err
+	}
+	lock, err := lockDir(dir)
+	if err != nil {
+		return 0, nil, fmt.Errorf("%w: restore runs only while serve is stopped", err)
+	}
+	defer func() { err = errors.Join(err, lock.Close()) }()
+
+	part := filepath.Join(dir, restorePart)
+	if err := os.Remove(part); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return 0, nil, err
+	}
+	f, err := os.OpenFile(part, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer func() {
+		if err != nil {
+			if rmErr := os.Remove(part); !errors.Is(rmErr, fs.ErrNotExist) {
+				err = errors.Join(err, rmErr)
+			}
+		}
+	}()
+	n, err = io.Copy(f, src)
+	if err == nil {
+		err = f.Sync()
+	}
+	// Bytes 18 and 19 of the header are 2 in WAL mode; a shorter file is
+	// left to the check.
+	header := make([]byte, 20)
+	_, rErr := f.ReadAt(header, 0)
+	if err = errors.Join(err, f.Close()); err != nil {
+		return 0, nil, fmt.Errorf("the copy was not written beside the store: %w", err)
+	}
+	if rErr == nil && (header[18] == 2 || header[19] == 2) {
+		return 0, nil, errors.New("the copy is in WAL mode, so it may lack the frames of its -wal file, and nothing was moved: restore a copy that backup wrote")
+	}
+	if err := withDB(ctx, "file:"+(&url.URL{Path: part}).EscapedPath()+"?mode=ro", func(db *sql.DB) error { return check(ctx, db, true) }); err != nil {
+		return 0, nil, fmt.Errorf("the copy failed its check, so nothing was moved: %w", err)
+	}
+
+	for _, name := range []string{"stargaite.db", "stargaite.db-wal", "stargaite.db-shm"} {
+		switch _, err := os.Lstat(filepath.Join(dir, name)); {
+		case err == nil:
+			moved = append(moved, name)
+		case !errors.Is(err, fs.ErrNotExist):
+			return 0, nil, err
+		}
+	}
+	if len(moved) > 0 {
+		replaced := filepath.Join(dir, "replaced")
+		if err := os.RemoveAll(replaced); err != nil {
+			return 0, nil, err
+		}
+		if err := os.Mkdir(replaced, 0o700); err != nil {
+			return 0, nil, err
+		}
+		for _, name := range moved {
+			if err := os.Rename(filepath.Join(dir, name), filepath.Join(replaced, name)); err != nil {
+				return 0, nil, fmt.Errorf("the store was moved to %s only in part, and the copy not put in place: %w", replaced, err)
+			}
+		}
+	}
+	if err := os.Rename(part, filepath.Join(dir, "stargaite.db")); err != nil {
+		return 0, nil, err
+	}
+	d, err := os.Open(dir)
+	if err == nil {
+		err = errors.Join(d.Sync(), d.Close())
+	}
+	if err != nil {
+		return 0, nil, fmt.Errorf("the copy is in place, but %s was not synced: %w", dir, err)
+	}
+	return n, moved, nil
 }
 
 // Check is PRAGMA quick_check on the read pool: nil for "ok", else its rows

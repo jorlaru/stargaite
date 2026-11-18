@@ -127,10 +127,8 @@ func readInput(in input, path string) ([]byte, error) {
 	if path != "-" {
 		return readFile(path)
 	}
-	if f, ok := in.stdin.(interface{ Stat() (os.FileInfo, error) }); ok {
-		if info, err := f.Stat(); err == nil && info.Mode()&os.ModeCharDevice != 0 {
-			return nil, fmt.Errorf("%w: - reads standard input, which is a terminal or a device; pipe the file in, through docker compose exec -T or docker exec -i", errUsage)
-		}
+	if device(in.stdin) {
+		return nil, fmt.Errorf("%w: - reads standard input, which is a terminal or a device; pipe the file in, through docker compose exec -T or docker exec -i", errUsage)
 	}
 	data, err := io.ReadAll(io.LimitReader(in.stdin, config.MaxYAMLBytes+1))
 	if err == nil && len(data) == 0 {

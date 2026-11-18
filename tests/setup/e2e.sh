@@ -3,12 +3,13 @@
 # a Linux host with Docker. A temporary copy of the working tree, made a git
 # repository, runs ./setup.sh install with every answer as a flag and no
 # terminal, then key, budget, telemetry, remote with a self-signed
-# certificate (then renewed) and status on that installation, under its own
-# Compose project, image name and free host port, so it runs beside a
-# service on port 4000. The mock provider runs from the source in the Go
-# image, listening only on the Docker bridge's gateway address, and is
-# reached as a local provider. It removes only the project, volume, images
-# and container it created.
+# certificate (then renewed), status and, from one commit more on a bare
+# upstream, upgrade, whose printed way back is then run, on that
+# installation, under its own Compose project, image name and free host
+# port, so it runs beside a service on port 4000. The mock provider runs
+# from the source in the Go image, listening only on the Docker bridge's
+# gateway address, and is reached as a local provider. It removes only the
+# project, volume, images and container it created.
 set -u
 
 fail() {
@@ -42,12 +43,13 @@ again() {
 cleanup() {
 	docker rm -f "$project-mock" >/dev/null 2>&1
 	(cd "$tree" && docker compose down --volumes --remove-orphans >/dev/null 2>&1)
-	docker image rm "$STARGAITE_IMAGE" >/dev/null 2>&1
-	[[ $tree == */stargaite-setup-test.* ]] && rm -rf -- "$tree"
+	docker image rm "$STARGAITE_IMAGE" "$STARGAITE_IMAGE-previous" ${built:+"$built"} >/dev/null 2>&1
+	[[ $tree == */stargaite-setup-test.* ]] && rm -rf -- "$tree" "$tree.remote"
 }
 
 main() {
-	local root gw mport port key want out code i cert a
+	local root gw mport port key want out code i cert a newer backup line keys adm
+	built=""
 	: "${GO_IMAGE:?GO_IMAGE names the Go image, as the Makefile sets it}"
 	root=$(cd "$(dirname "$0")/../.." && pwd) || fail "no repository root"
 	tree=$(mktemp -d "${TMPDIR:-/tmp}/stargaite-setup-test.XXXXXX") || fail "no temporary directory"
@@ -144,6 +146,41 @@ main() {
 	again status
 	[[ $out == *"version: $want running, $want in this clone"* && $out == *"provider mock: credential resolved"* &&
 		$out == *"credentials resolved"* ]] || fail "status does not show the versions and the credentials"
+	# Upgrade: the copy's upstream, a bare repository, holds one commit more.
+	# upgrade keeps the previous image, builds, backs up, starts and checks
+	# the new version; then the way back it printed is run as printed, and
+	# the previous image serves the restored store, without the key made
+	# after the backup. The commit moves every line of setup.sh, which the
+	# merge replaces while it runs (main "$@"; exit).
+	{ git init -q --bare "$tree.remote" && git -C "$tree" remote add origin "$tree.remote" && git -C "$tree" push -q -u origin HEAD &&
+		sed -i '1a # setup-test upgrade: every line below moves' "$tree/setup.sh" &&
+		git -C "$tree" -c user.name=setup-test -c user.email=setup-test@example.invalid commit -q -a -m "setup-test upgrade" &&
+		newer=$(git -C "$tree" describe --tags --always --dirty) && git -C "$tree" push -q && git -C "$tree" reset -q --hard HEAD~1; } ||
+		fail "the upstream with one commit more was not made"
+	again upgrade --yes
+	built=$(docker image inspect -f '{{.Id}}' "$STARGAITE_IMAGE") || fail "no image $STARGAITE_IMAGE after the upgrade"
+	[[ $out == *'upgraded: {'*'"msg":"ready"'*"\"version\":\"$newer\""* ]] || fail "upgrade did not report version $newer ready"
+	[[ $(cd "$tree" && docker compose exec -T stargaite /stargaite version) == "$newer" ]] || fail "the running version is not $newer"
+	docker image inspect "$STARGAITE_IMAGE-previous" >/dev/null || fail "no previous image $STARGAITE_IMAGE-previous"
+	[[ $out =~ "backing up the store to "(backups/[^ ]+\.db) ]] || fail "no backup named"
+	backup=${BASH_REMATCH[1]}
+	[[ $(stat -c %a "$tree/$backup") == 600 && -s $tree/$backup ]] || fail "$backup is empty or not mode 0600"
+	adm=(-e STARGAITE_ADMIN_URL=https://localhost:4001 -e SSL_CERT_FILE=/tls/cert.pem)
+	(cd "$tree" && docker compose exec -T "${adm[@]}" stargaite /stargaite keys create after --model main --json >/dev/null) ||
+		fail "no key made after the backup"
+	while IFS= read -r line; do
+		[[ $line == "  docker "* ]] || continue
+		printf 'the way back: %s\n' "${line#  }"
+		(cd "$tree" && eval "$line") || fail "the way back failed at: $line"
+	done <<<"$out"
+	for ((i = 0; i < 120; i++)); do
+		curl -fsS --max-time 2 -o /dev/null --cacert "$tree/tls/cert.pem" "https://127.0.0.1:$port/health/ready" 2>/dev/null && break
+		sleep 1
+	done
+	((i < 120)) || fail "the previous image is not ready after the restore"
+	[[ $(cd "$tree" && docker compose exec -T stargaite /stargaite version) == "$want" ]] || fail "the previous image, $want, does not run"
+	keys=$(cd "$tree" && docker compose exec -T "${adm[@]}" stargaite /stargaite keys list --json | jq -r '[.keys[].name] | sort | join(",")')
+	[[ $keys == e2e,e2e-2,e2e-3 ]] || fail "the restored store holds the keys $keys, not e2e, e2e-2 and e2e-3"
 	echo "setup-test: passed"
 }
 

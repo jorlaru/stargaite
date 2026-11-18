@@ -3,3 +3,7 @@
 /stargaite
 /backup.db*
 /.env
+/.env.*
+/compose.override.*
+/tls/
+/backups/

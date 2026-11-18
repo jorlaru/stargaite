@@ -3,6 +3,8 @@
 GO_IMAGE     := golang:1.27.4-trixie@sha256:b54b2639de8c1bfe538ec5ffc45f29b1932235ac5f6d63c059853646677112d9
 LINT_VERSION := 2.15.0
 VULN_VERSION := v1.9.0
+SHELLCHECK_VERSION := v0.11.0
+JQ_VERSION   := 1.8.2
 IMAGE        := stargaite:dev
 PLATFORMS    := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
@@ -18,7 +20,23 @@ b4d8f17068b35ee6060cc2f69a16fb48740d706fbba81661c318649c114a6998  golangci-lint-
 endef
 export LINT_SHA256
 
-.PHONY: ci check tools ci-container image image-test fuzz bench bench-container
+define SHELLCHECK_SHA256
+c2c15e08df0e8fbc374c335b230a7ee958c313fa5714817a59aa59f1aa594f51  shellcheck-v0.11.0.darwin.x86_64.tar.gz
+339b930feb1ea764467013cc1f72d09cd6b869ebf1013296ba9055ab2ffbd26f  shellcheck-v0.11.0.darwin.aarch64.tar.gz
+b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6  shellcheck-v0.11.0.linux.x86_64.tar.gz
+68a8133197a50beb8803f8d42f9908d1af1c5540d4bb05fdfca8c1fa47decefc  shellcheck-v0.11.0.linux.aarch64.tar.gz
+endef
+export SHELLCHECK_SHA256
+
+define JQ_SHA256
+e94b266e3c26690550006abe63152b782280f4e14374accdf04cbde844f00bc0  jq-macos-amd64
+2d75340ba57a4b4b4c8708a21c2dc8e958a48aaa8bba13b27f77f6e4c0eca07e  jq-macos-arm64
+b1c22172dd303f3be49e935aa56aa48a8b7a46e0bc838b4997d3bb451495870f  jq-linux-amd64
+8b85c817833814ddca00a144c33705546355afccf0cf39b188f3cdb48b852309  jq-linux-arm64
+endef
+export JQ_SHA256
+
+.PHONY: ci check tools ci-container image image-test setup-test fuzz bench bench-container
 
 # Tools and checks run with an empty environment, so none can lean on an ambient credential.
 ci:
@@ -31,13 +49,16 @@ check:
 	go mod tidy -diff
 	$(BIN)/golangci-lint run
 	$(BIN)/govulncheck ./...
+	$(BIN)/shellcheck --shell=bash setup.sh tests/setup/e2e.sh
 	@for p in $(PLATFORMS); do \
 		echo "build $$p"; \
 		GOOS=$${p%/*} GOARCH=$${p#*/} CGO_ENABLED=0 go build -trimpath -buildvcs=false ./... || exit 1; \
 	done
 	go test -race ./...
 
-tools: $(BIN)/golangci-lint $(BIN)/govulncheck
+# shellcheck lints setup.sh; jq is the one setup.sh needs, which the tests of
+# tests/setup find here.
+tools: $(BIN)/golangci-lint $(BIN)/govulncheck $(BIN)/shellcheck $(BIN)/jq
 
 # Outside make ci, which replays the committed seeds: every Fuzz target of the
 # repository runs for FUZZTIME, once per package and target. -fuzz is a regular
@@ -83,6 +104,24 @@ $(BIN)/golangci-lint:
 $(BIN)/govulncheck:
 	CGO_ENABLED=0 GOBIN="$(CURDIR)/$(BIN)" go install golang.org/x/vuln/cmd/govulncheck@$(VULN_VERSION)
 
+# These two name the system with uname, not go env: make setup-test runs on a
+# host without Go.
+$(BIN)/shellcheck:
+	@mkdir -p $(BIN)
+	f=shellcheck-$(SHELLCHECK_VERSION).$$(uname -s | tr A-Z a-z).$$(uname -m | sed s/arm64/aarch64/).tar.gz && cd $(BIN) && \
+	sum=$$(printf '%s\n' "$$SHELLCHECK_SHA256" | grep " $$f$$") && \
+	curl -fsSL -o $$f https://github.com/koalaman/shellcheck/releases/download/$(SHELLCHECK_VERSION)/$$f && \
+	echo "$$sum" | $(SHA256) -c - && \
+	tar -xzf $$f --strip-components=1 shellcheck-$(SHELLCHECK_VERSION)/shellcheck && rm $$f
+
+$(BIN)/jq:
+	@mkdir -p $(BIN)
+	f=jq-$$(uname -s | tr A-Z a-z | sed s/darwin/macos/)-$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') && cd $(BIN) && \
+	sum=$$(printf '%s\n' "$$JQ_SHA256" | grep " $$f$$") && \
+	curl -fsSL -o $$f https://github.com/jqlang/jq/releases/download/jq-$(JQ_VERSION)/$$f && \
+	echo "$$sum" | $(SHA256) -c - && \
+	chmod +x $$f && mv $$f jq
+
 # The same checks for a machine without Go 1.27.4 or a C compiler (the race detector needs one).
 ci-container:
 	docker run --rm --user "$$(id -u):$$(id -g)" -e HOME=/tmp -v "$(CURDIR)":/src -w /src $(GO_IMAGE) make ci
@@ -105,3 +144,10 @@ image-test: image
 	code=$$(docker inspect -f '{{.State.ExitCode}}' $$id); logs=$$(docker logs $$id 2>&1); \
 	docker container rm --volumes $$id >/dev/null; echo "$$logs"; echo "settings show: exit $$shown_code: $$shown"; \
 	echo "$$logs" | grep -q '"msg":"ready","data_dir":"/data"' && echo "$$logs" | grep -q '"msg":"stopped"' && test "$$code" = 0 && test "$$shown_code" = 0
+
+# Outside make ci, as image-test (PUB-5): setup.sh end to end on a Linux host
+# with Docker, from a temporary copy of the working tree, against the mock
+# provider; it runs beside a service on port 4000 and removes only the
+# project, volume, images and container it created.
+setup-test: $(BIN)/jq
+	PATH="$(CURDIR)/$(BIN):$$PATH" GO_IMAGE=$(GO_IMAGE) bash tests/setup/e2e.sh

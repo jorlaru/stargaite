@@ -47,7 +47,7 @@ runs of the same harness (three with the shipped transport, one with the variant
   configuration of 100 providers, 1,000 targets, 1,000 aliases and 10,000 keys.
 - RTO: the proxy's store after the run, which holds the 71,410 usage records of the run, plus the kick-off section 18
   configuration (100 providers, 1,000 priced targets, 1,000 aliases, 10,000 keys) applied with `apply -f`; then
-  `backup`, the restore procedure of the README (stop with `SIGTERM`, move the three store files out,
+  `backup`, the procedure `restore` follows, by hand (stop with `SIGTERM`, move the three store files out,
   `install -m 600` the copy) and the start to ready; a request with the restored key then succeeds. An operator's
   reaction time is outside it.
 - Image size: `docker image inspect` of `stargaite:dev` as `make image-test` builds it, on the host, since the Go

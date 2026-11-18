@@ -598,19 +598,19 @@ func TestRerank(t *testing.T) {
 }
 
 // quickStart returns the command lines of the first sh block after the
-// "## Quick start" heading of README.md, exactly as written. A line with "#"
-// fails: stock interactive zsh does not treat it as a comment.
+// "## Try it locally with Go" heading of README.md, exactly as written. A
+// line with "#" fails: stock interactive zsh does not treat it as a comment.
 func quickStart(t *testing.T) []string {
 	t.Helper()
 	readme, err := os.ReadFile("../../README.md")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, section, ok := strings.Cut(string(readme), "\n## Quick start\n")
+	_, section, ok := strings.Cut(string(readme), "\n## Try it locally with Go\n")
 	_, block, ok2 := strings.Cut(section, "\n```sh\n")
 	block, _, ok3 := strings.Cut(block, "\n```")
 	if !ok || !ok2 || !ok3 {
-		t.Fatal("README.md has no sh block under ## Quick start")
+		t.Fatal("README.md has no sh block under ## Try it locally with Go")
 	}
 	var lines []string
 	for _, line := range strings.Split(block, "\n") {

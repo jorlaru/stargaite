@@ -249,7 +249,8 @@ func TestBenchmark(t *testing.T) {
 
 	// RTO on a store of kick-off section 18 scale: its configuration applied
 	// to the proxy's store, which holds every usage record of the run; then
-	// the backup, the restore procedure of README.md and the start to ready.
+	// the backup, the procedure restore follows, by hand, and the start to
+	// ready.
 	scale := filepath.Join(t.TempDir(), "scale18.yaml")
 	writeFile(t, scale, scaleConfig(mockURL))
 	began = time.Now()

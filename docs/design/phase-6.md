@@ -179,7 +179,7 @@ Already cut against the first draft: `--key-stdin`, colour, the reverse-proxy ch
 
 Every new test fails on `03ffd6a`, where neither `setup.sh` nor `restore` exists.
 
-**Live check (not run; the owner's order).** On a clean Debian 13 machine, the owner runs `./setup.sh` by hand with one real provider: at most the calls of one `targets verify` plus one test call, each capped at 256 output tokens, no retry. Then `./setup.sh key` and `./setup.sh status`. Not covered live: macOS (not supported), the upgrade against a real remote (covered by `make setup-test`).
+**Live check (not run; the owner's order).** On a clean Debian 13 machine, the owner runs `./setup.sh` by hand with one real provider: at most the calls of one `targets verify` plus one test call, each capped at 256 output tokens, no retry. Then `./setup.sh key`, which makes one test call more, and `./setup.sh status`. Not covered live: macOS (not supported), the upgrade against a real remote (covered by `make setup-test`).
 
 ## 8. Ordered changes
 
@@ -189,7 +189,7 @@ Every new test fails on `03ffd6a`, where neither `setup.sh` nor `restore` exists
 | C55 | `provider`, `alias`, `key`, `budget`, `telemetry`, `status` | `TestSetupFlags` rows, `make setup-test` re-runs | — | C54 |
 | C56 | `remote` | `TestSetupRemote`, `make setup-test` HTTPS | — | C54 |
 | C57 | `backup -`, `restore`; `upgrade` and `status --check` | `TestBackupStdout`, `TestRestore`, `TestSetupUpgrade`, `make setup-test` upgrade and restore | K23, K24, K25, K27 | C54 |
-| C58 | README | `TestQuickStart` | — | C54 to C57 |
+| C58 | README; among what `make ci` needs on a host, `openssl` beside `script(1)` (`TestSetupRemote`) | `TestQuickStart` | — | C54 to C57 |
 
 ## 9. Risks
 

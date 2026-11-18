@@ -39,7 +39,7 @@ its CLI: no UI, no external database, no restart to change anything.
 | **Honest cost and hard limits** | Per key and per alias: requests and tokens per minute, requests in flight, USD budgets (daily, monthly or running) and shares of a subscription plan's windows. A request past any of them is refused before a provider is called. |
 | **Telemetry that is easy to trust** | OTLP/HTTP spans to Langfuse, an OpenTelemetry Collector or any OTLP backend, with no vendor SDK. `stargaite telemetry test` sends a real span and names what failed. Prometheus metrics on the admin API. |
 | **Small and fast** | A 26.5 MB image, 23 to 36 MB of memory at rest, under 0.5 ms of added median latency and 1,000 requests per second on one CPU ([docs/benchmark.md](docs/benchmark.md)). |
-| **Built to be run by an agent too** | No command ever prompts; every one accepts `--json` and exits `0`, `1` or `2`. A whole configuration is exported and applied as YAML. |
+| **Built to be run by an agent too** | No `stargaite` command ever prompts; every one accepts `--json` and exits `0`, `1` or `2`. A whole configuration is exported and applied as YAML. `./setup.sh`, the guided installer, asks only at a terminal and takes every answer as a flag. |
 | **Safe defaults** | Listeners on loopback, TLS required beyond it, credentials referenced by environment variable and never stored, client keys stored as hashes, outbound addresses checked against private networks at every connection, online backups. |
 
 **Endpoints.** `POST /v1/chat/completions` (OpenAI Chat Completions, synchronous and streamed, toward OpenAI-style
@@ -84,12 +84,103 @@ Four kinds of resource, all managed with the CLI:
 The `stargaite` binary is both the server (`stargaite serve`) and its CLI, which talks to the admin API on
 `127.0.0.1:4001` with the admin key that `serve` generates on its first start.
 
-## Quick start
+## Install
+
+`./setup.sh` installs StargAIte on Linux with Docker by asking questions: it checks the machine, builds and starts the
+container, and goes from a provider to a client key and a first answer. You need:
+
+- Docker Engine with Docker Compose 2.24.4 or later, which your user may run;
+- `curl` and `jq`;
+- `git`, to clone this repository and, later, to upgrade;
+- bash 4.4 or later, which every current Linux distribution has. macOS and native Windows are not supported yet; WSL
+  is Linux.
+
+On Debian and Ubuntu:
+
+```sh
+sudo apt-get update && sudo apt-get install -y ca-certificates curl git jq
+curl -fsSL https://get.docker.com -o get-docker.sh && sudo sh get-docker.sh
+sudo usermod -aG docker "$USER"
+```
+
+As root, where `sudo` may not be installed, leave out `sudo` and the third line. The second line runs Docker's own
+script, which adds Docker's package repository and installs Docker Engine and Compose; read it first if you like, and
+for a production machine follow Docker's step-by-step instructions for
+[Debian](https://docs.docker.com/engine/install/debian/) or [Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
+instead. The distributions' own packages may lack Compose or ship one older than 2.24.4. The third line lets your user
+run Docker once you log in again; membership of the `docker` group is equivalent to root. On another distribution,
+install [Docker](https://docs.docker.com/engine/install/), [curl](https://curl.se/download.html),
+[jq](https://jqlang.org/download/) and [git](https://git-scm.com/downloads) from their pages. Then, as the user
+who owns the clone (not with `sudo`):
+
+```sh
+git clone https://github.com/jorlaru/stargaite.git
+cd stargaite
+./setup.sh
+```
+
+It reports everything missing at once, with where to get it, and installs nothing. Then it asks, each question with its
+default in brackets, which Enter takes:
+
+1. **The machine.** The data plane goes on `127.0.0.1:4000`; when that port is taken, `--port <n>` picks another.
+   The container is built and started (a few minutes the first time).
+2. **A provider.** A preset from a numbered list, or another OpenAI- or Anthropic-compatible service by its URL. Its
+   credential is typed hidden and written only to `.env` (mode `0600`), never shown; the container is recreated to
+   read it. A server on this host, such as Ollama, is reached from the container at `host.docker.internal`, so it must
+   listen beyond the host's loopback (Ollama: `OLLAMA_HOST=0.0.0.0`).
+3. **A model.** Offered from the provider's own list (one free request), filtered by what you type, or typed.
+4. **The check.** `targets verify` calls the model for real (see [Targets verify](#targets-verify)); a failure prints
+   the provider's reason and stops before anything else is made.
+5. **An alias and a key.** The alias your clients call (`main`) and a client key (`my-app`, 60 requests a minute),
+   printed once, inside a frame, and written nowhere: store it then.
+6. **A first answer.** One chat completion with that key, then the base URL and an example call.
+
+It makes two kinds of paid call, each announced first with its count, capped at 256 output tokens and never retried:
+`targets verify` (one call per reasoning level the target declares), skipped for a target already verified, and the
+test chat completion. Interrupted, it resumes when run again: what exists is kept, never made twice.
+
+Run again on an installation, it offers a menu, or takes a subcommand; `./setup.sh help` lists each one's flags:
+
+| Subcommand | What it does |
+|---|---|
+| `install` | The steps above; the default at a terminal before the container exists |
+| `provider` | Add a provider and its credential, or replace a credential in `.env` |
+| `alias` | An alias toward a provider's model, the target verified first |
+| `key` | A client key for an alias, then a first answer with it |
+| `budget` | A spending limit on the instance, an alias or a key; the prices of the targets it reaches unpriced are asked first |
+| `telemetry` | Traces to Langfuse or any OTLP endpoint, then `telemetry test` |
+| `remote` | Publish the data plane beyond loopback, always with TLS: your certificate or a self-signed one ([Install with Docker by hand](#install-with-docker-by-hand), day two) |
+| `status` | The running and the clone's versions and each credential's state; `--check` also says whether an upgrade is available |
+| `upgrade` | Fast-forward the clone and rebuild, keeping the previous image and taking a backup first, then print the way back |
+
+It asks only when its standard input and output are both a terminal. Every answer is also a flag, so a script, CI or an
+agent runs it without one: an answer with a default takes it, a missing one exits `2` naming its flag, and a change
+that replaces something or briefly interrupts traffic needs `--yes`. A credential then comes from a variable you have
+exported, named by `--key-env` (here `OPENROUTER_API_KEY`), never from the command line. Run the first line alone and
+type the key, which it reads hidden, so it never reaches your shell history:
+
+```sh
+printf 'Key: '; read -rs OPENROUTER_API_KEY; echo; export OPENROUTER_API_KEY
+```
+
+Then the install, with your model id in place of `<model>`, and the key taken out of the shell's environment after:
+
+```sh
+./setup.sh install --provider openrouter --key-env OPENROUTER_API_KEY --model <model> --yes
+unset OPENROUTER_API_KEY
+```
+
+It exits `0` when done, `1` on a failure it explains and `2` on a wrong usage. Besides `.env` it writes only
+`compose.override.yaml` (for a local server or `remote`, and never one it did not write), `tls/` and `backups/`, all
+ignored by git and by the image build; it never edits `compose.yaml`, never uses `sudo` and never removes a volume.
+To run the CLI yourself, see the shell alias of [Install with Docker by hand](#install-with-docker-by-hand).
+
+## Try it locally with Go
 
 Try every feature in a few minutes, with no account and no credential: the mock provider in `tests/mockprovider`
-stands in for a real one. You need a clone of this repository and Go 1.27.4 or later (to run it with Docker instead,
-see [Deploy with Docker](#deploy-with-docker)). Run the block line by line from the clone; `tests/e2e` runs exactly
-these lines in `make ci`, so they work as written.
+stands in for a real one. You need a clone of this repository and Go 1.27.4 or later (to deploy it with Docker, see
+[Install](#install), or [Install with Docker by hand](#install-with-docker-by-hand)). Run the block line by line from
+the clone; `tests/e2e` runs exactly these lines in `make ci`, so they work as written.
 
 ```sh
 go build -o stargaite ./cmd/stargaite
@@ -141,39 +232,42 @@ What each step does:
 Both processes log JSON lines to the terminal; `kill %1 %2` stops them. `./stargaite --help` lists every command, and
 `./stargaite <command> --help` its flags.
 
-## Deploy with Docker
+## Install with Docker by hand
 
-The image is built from this repository: a static binary on a distroless base, run as a non-root user on a read-only
-root file system, with its data on a volume. You need Docker with Compose.
+What `./setup.sh` does, step by step without it. The image is built from this repository: a static binary on a
+distroless base, run as a non-root user on a read-only root file system, with its data on a volume. You need Docker
+with Compose 2.24.4 or later, curl and git ([Install](#install) has the commands).
 
 **1. Get the code and add your provider credentials.** Credentials go in a file named `.env` next to `compose.yaml`,
-one `NAME=value` line per credential, using the variable names of the presets (`OPENAI_API_KEY`,
+one `NAME='value'` line per credential, using the variable names of the presets (`OPENAI_API_KEY`,
 `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, …; `providers presets` lists them all). Git and the image build both
-ignore `.env`. Write it with an editor rather than `echo`, so the key stays out of your shell history:
+ignore `.env`. The last line below, in bash or zsh alike, reads the key without showing it and appends its line, so
+the key never reaches your shell history or a command's arguments; run it once per credential, with that
+credential's variable name in place of `OPENAI_API_KEY`. The single quotes let the value hold `$`, `#` and spaces;
+it may not hold a `'`, nor end in `\`, which Compose cannot read:
 
 ```sh
 git clone https://github.com/jorlaru/stargaite.git
 cd stargaite
 touch .env && chmod 600 .env
-"${EDITOR:-vi}" .env
-```
-
-```ini
-OPENAI_API_KEY=sk-...
-ANTHROPIC_API_KEY=sk-ant-...
+printf 'Key: '; read -rs k; echo; [ -n "$k" ] && printf "OPENAI_API_KEY='%s'\n" "$k" >> .env; unset k
 ```
 
 **2. Start it.**
 
 ```sh
+export STARGAITE_VERSION=$(git describe --tags --always --dirty)
 docker compose up -d --build
 curl -sS --retry 10 --retry-all-errors --retry-delay 1 http://127.0.0.1:4000/health/ready
 ```
 
-The data plane is published on `127.0.0.1:4000` of the host. The admin API never leaves the container; the CLI inside
-it administers the proxy with the admin key generated in the volume. A shell alias saves typing (run it from the clone,
-where `compose.yaml` is); `-T` lets a file of the host reach the CLI on standard input, as `-` (`stargaite apply -f - <
-config.yaml`, for a file whose last line is the end marker `...`, as an export's is: see "Everyday operations"):
+`STARGAITE_VERSION` gives the build the clone's version, which `stargaite version` then reports; without it, the
+version is `dev`. The data plane is published on `127.0.0.1:4000` of the host; a line `STARGAITE_PORT='<n>'` in
+`.env` publishes it on another port, and `STARGAITE_IMAGE` names the image (`stargaite:local` by default). The admin
+API never leaves the container; the CLI inside it administers the proxy with the admin key generated in the volume. A
+shell alias saves typing (run it from the clone, where `compose.yaml` is); `-T` lets a file of the host reach the CLI
+on standard input, as `-` (`stargaite apply -f - < config.yaml`, for a file whose last line is the end marker `...`, as
+an export's is: see "Everyday operations"):
 
 ```sh
 alias stargaite='docker compose exec -T stargaite /stargaite'
@@ -203,16 +297,35 @@ names what to fix (for example, a key with a budget needs prices on every target
 
 **Day two.**
 
-- **Reach it from other machines.** Put a TLS reverse proxy (Caddy, nginx, Traefik) in front of port 4000, or mount a
-  certificate and replace `--behind-tls-proxy` with `--tls-cert` and `--tls-key` in `compose.yaml` (see
-  [Listeners, TLS and the container](#listeners-tls-and-the-container)). Plain HTTP outside loopback is refused.
-- **Change a credential.** Edit `.env`, then `docker compose up -d`: the container is recreated with the new value
-  and requests in flight are given time to finish (`stop_grace_period`). Configuration and usage live in the volume
-  and survive it.
-- **Upgrade.** `git pull && docker compose up -d --build`. The store migrates itself on start. A migration is
-  one-way, and an older binary then refuses the store, so take a `stargaite backup` first.
-- **Back up.** `stargaite backup /data/backup.db` writes a checked copy while traffic flows;
-  `docker compose cp stargaite:/data/backup.db ./backup.db` copies it out (see [Backup and restore](#backup-and-restore)).
+- **Reach it from other machines.** `./setup.sh remote` publishes the data plane on the addresses of this host you
+  give, beside loopback, always with TLS: your certificate and its key, or a self-signed certificate it makes with
+  `openssl` for `localhost`, the host's name and each address, and says how each kind of client trusts it. It mounts
+  the files from `tls/` and replaces `--behind-tls-proxy` with `--tls-cert` and `--tls-key` in
+  `compose.override.yaml`, never in `compose.yaml`; the admin API then speaks TLS too, and it prints the CLI alias
+  that reaches it (see [Listeners, TLS and the container](#listeners-tls-and-the-container)). `serve` reads the
+  certificate at start: to renew it, run `./setup.sh remote` again. Docker publishes past `ufw` and `firewalld`, so
+  limit the port in your network's firewall. Plain HTTP outside loopback is refused.
+
+  A TLS reverse proxy (Caddy, nginx, Traefik) on the same host needs no change here: point it at the upstream
+  `http://127.0.0.1:4000`, which `compose.yaml` publishes with `--behind-tls-proxy` as shipped.
+- **Change a credential.** `./setup.sh provider`, naming the provider, asks whether to replace the credential in
+  `.env` (`--replace` without a terminal), reads the new one hidden and recreates the container. By hand: remove its
+  line (`sed -i '/^OPENAI_API_KEY=/d' .env`, which keeps the mode `0600`), run the last line of step 1 again, then
+  `docker compose up -d`. Either way requests in flight are given time to finish (`stop_grace_period`); configuration
+  and usage live in the volume and survive it.
+- **Upgrade.** `./setup.sh upgrade` refuses a clone with local changes to tracked files, a detached `HEAD`, a branch
+  without upstream and one that cannot fast-forward, naming which. It fetches (within 20 s, never asking for a
+  password), lists the new commits and says whether a migration of the store changed, then, once confirmed (`--yes`
+  without a terminal): it tags the running image `<image>-previous`, fast-forwards the clone and builds the new image
+  (a failed build leaves the old version running and the store untouched), backs the store up into `backups/` just
+  before it starts the new version, checks that version and that `validate` exits as before, and prints the way back:
+  the exact `restore` of that backup and `docker tag` of the previous image. Nothing rolls back by itself, since a
+  migration is one-way and an older binary refuses a newer store. `./setup.sh status --check` says whether an upgrade
+  is available. By hand: take a backup, `git pull --ff-only`, then step 2.
+- **Back up.** `(umask 077 && stargaite backup - > backup.db)` writes a checked copy, taken while traffic flows, to a
+  private file on the host, and nothing stays in the volume; `docker compose stop`, then
+  `docker compose run --rm --no-deps -T stargaite restore --yes - < backup.db` and `docker compose up -d` put it back
+  (see [Backup and restore](#backup-and-restore)).
 - **Watch it.** `docker compose logs -f stargaite` shows its JSON log; `stargaite usage show` and
   `stargaite telemetry set` cover spend and traces (see [Everyday operations](#everyday-operations)).
 - **Size it.** Request 50m of CPU and 64 Mi of memory and allow 1000m and 256 Mi
@@ -276,11 +389,12 @@ alias allows. Every answer carries `x-stargaite-request-id`, `x-stargaite-target
 | Send traces to Langfuse | `stargaite telemetry set --preset langfuse --otlp-endpoint https://<host>/api/public/otel` · `stargaite telemetry test` |
 | Check the whole configuration | `stargaite validate` |
 | Save and apply the configuration as YAML | `stargaite export > config.yaml` · `stargaite apply -f - --dry-run < config.yaml` · `stargaite apply -f - < config.yaml` |
-| Back up the store | `stargaite backup <file>` |
+| Back up the store, and put a backup back with `serve` stopped | `stargaite backup <file>` · `(umask 077 && stargaite backup - > backup.db)` · `stargaite restore backup.db --yes` ([Backup and restore](#backup-and-restore)) |
 
 Every command accepts `--json`, never prompts, and exits `0` on success, `1` on failure and `2` on wrong usage;
-`remove`, `keys revoke` and `apply --prune` (unless `--dry-run`) need `--yes`. Where a command takes a file (`apply -f`,
-`validate -f`, `models explain --body`), and only there, `-` reads standard input, never a terminal. A pipe cut short is
+`remove`, `keys revoke`, `telemetry unset`, `restore` and `apply --prune` (unless `--dry-run`) need `--yes`. Where a
+command reads a file (`apply -f`, `validate -f`, `models explain --body`, `restore`), and only there, `-` reads standard
+input, never a terminal; `backup -` writes the copy to standard output, never a terminal. A pipe cut short is
 still valid YAML, and `apply` replaces each resource it names whole, so `apply -f -` publishes only a document whose
 last line is the YAML end marker `...`, which `export` writes, and exits `2` on any other (a JSON document, which a cut
 leaves unclosed, needs none); `--dry-run` and `validate -f -` need no marker. `apply -f - --prune` exits `2` unless it
@@ -289,10 +403,23 @@ flight finish on the configuration they started with.
 
 ## Status
 
-Phases 1 to 4 of the specification are built: every feature above works and is tested (`make ci`), and the figures of
-[docs/benchmark.md](docs/benchmark.md) are measured. No release is tagged and no image is published yet, so build it
-from this repository. Presets marked `untested` have not been run against their live service. The specification is
-[kick-off.md](kick-off.md); the designs of each phase are in [docs/design](docs/design).
+Phases 1 to 6 of the specification are built: every feature above works and is tested (`make ci`, and
+`make setup-test` for `setup.sh`), and the figures of [docs/benchmark.md](docs/benchmark.md) are measured. No release
+is tagged and no image is published yet, so build it from this repository. Presets marked `untested` have not been run
+against their live service. The specification is [kick-off.md](kick-off.md); the designs of each phase are in
+[docs/design](docs/design).
+
+**Changes since phase 5.** `./setup.sh` installs, configures and upgrades a Docker deployment by asking questions
+([Install](#install)); the README starts with it, the Go quick start is now
+[Try it locally with Go](#try-it-locally-with-go), and the manual path,
+[Install with Docker by hand](#install-with-docker-by-hand), writes `.env` without an editor. `compose.yaml` passes
+`STARGAITE_VERSION` to the build as its version, so a Compose deployment no longer always reports `dev`; it names its
+image from `STARGAITE_IMAGE` (`stargaite:local` by default, as before) and publishes the host port `STARGAITE_PORT`
+(`4000` by default). `stargaite backup -` writes the copy to standard output and its summary to standard error, so a
+copy leaves the container without staying in the volume, and `stargaite restore <file|-> --yes` puts a copy back while
+`serve` is stopped, after checking it, for the binary and the container alike; it replaces the manual procedure, which
+a container, with no shell, could not run ([Backup and restore](#backup-and-restore)). Git and the image build also
+ignore `.env.*`, `compose.override.yaml`, `tls/` and `backups/`.
 
 **Changes since phase 4.** Providers and targets take `--param` rules ([Parameters](#parameters)); like any provider
 change, a change of a provider's rules clears the stored verification of its targets. A client's output cap toward a
@@ -792,16 +919,43 @@ on any failure, `Ctrl-C` and `SIGTERM` included. `serve` gives a backup up to 15
 log line with its size, no audit record. The admin key (`admin.key`) is not in the store, so a restored store keeps
 the key of its data directory.
 
-To restore a backup:
+`./stargaite backup -` writes the copy to standard output instead, never to a terminal, and its summary
+(`-: <n> bytes`, or `{"bytes":<n>,"path":"-"}` with `--json`) and any error to standard error. It exits `1` when fewer
+bytes arrive than were announced; the file a redirect made then holds a partial copy, so remove it. The shell creates
+that file, so make it private: `(umask 077 && ./stargaite backup - > backup.db)`. With Compose, it is how a copy reaches
+the host without staying in the volume:
+`(umask 077 && docker compose exec -T stargaite /stargaite backup - > backup.db)`.
 
-1. Stop `serve` (`SIGTERM`, or `Ctrl-C`) and wait for it to exit: it releases the data directory.
-2. Move `stargaite.db`, `stargaite.db-wal` and `stargaite.db-shm` out of the data directory, all three together. A
-   `-wal` left beside the restored copy is replayed onto it, which brings back rows the backup does not hold or
-   corrupts the store.
-3. Copy the backup in as `stargaite.db` with mode `0600`, owned by the user that runs `serve`:
-   `install -m 600 backup.db data/stargaite.db`.
-4. Start `serve`. It turns the copy back to WAL mode and runs any newer migration, and budgets and quota windows are
-   rebuilt from it, as at every start. Key tokens, aliases and usage are those of the backup.
+`./stargaite restore <file> --yes` puts a backup back while `serve` is stopped; `-` in place of `<file>` reads it from
+standard input, never a terminal. It runs without a server, in the data directory (`--data-dir`, else
+`STARGAITE_DATA_DIR`, else `./data`), whose lock it takes, so it exits `1` while a `serve` holds it. It writes the
+copy beside the store with mode `0600` and, before anything moves, checks it: `PRAGMA integrity_check` and
+`foreign_key_check`, not in WAL mode, and a schema version from 1 up to the binary's, so a store from a newer version,
+or an empty or foreign SQLite file, is refused. It then moves `stargaite.db`, `stargaite.db-wal` and
+`stargaite.db-shm` together into `<data-dir>/replaced/`, emptied first, and renames the copy to `stargaite.db`. The
+three move together because a `-wal` left beside the restored copy would be replayed onto it, bringing back rows the
+backup does not hold or corrupting the store. It prints what it moved and writes no audit record. Without `--yes` it
+exits `2`: it replaces every key, the whole configuration and the usage.
+
+With the binary, stop `serve` (`SIGTERM`, or `Ctrl-C`) and wait for it to exit, then:
+
+```sh
+./stargaite restore backup.db --yes
+```
+
+With Compose, stop the service and run the CLI in a container of its own on the same volume:
+
+```sh
+docker compose stop
+docker compose run --rm --no-deps -T stargaite restore --yes - < backup.db
+docker compose up -d
+```
+
+Then start `serve` again (with Compose, the last line). It turns the copy back to WAL mode and runs any newer
+migration, and budgets and quota windows are rebuilt from it, as at every start. Key tokens, aliases and usage are
+those of the backup. A copy from an older version is accepted, and migrated by the next start; a migration is one-way,
+so going back to an older version needs a backup taken before the upgrade, restored with the newer binary, which
+`./setup.sh upgrade` prints.
 
 ### Provider credentials
 
@@ -872,9 +1026,20 @@ in flight may hold a body and an answer of up to those sizes.
 
 ## Development
 
-`make ci` runs every check (format, vet, tidy, lint, vulnerability scan, four cross-builds, `go test -race ./...`,
-including `tests/e2e`) with Go 1.27.4 or later; `make ci-container` runs the same inside the Go image, and
-`make image-test` builds the image and runs it. No check needs a secret, and the tests use no network beyond loopback.
+`make ci` runs every check (format, vet, tidy, lint, `shellcheck` on the shell scripts, vulnerability scan, four
+cross-builds, `go test -race ./...`, including `tests/e2e`) with Go 1.27.4 or later and a C compiler, which the race
+detector needs; `make tools` fetches the pinned linters, `shellcheck` and `jq`, each checked against its checksum.
+On Linux, `tests/setup` runs `setup.sh` against stubs of every command it calls, and needs bash 4.4 or later,
+`script(1)` (util-linux), for its runs at a terminal, `openssl`, for the self-signed certificate of `remote`, and
+`git`, for the clones of `upgrade`.
+`make ci-container` runs the same inside the Go image, which has all of them, and `make image-test` builds the image
+and runs it. `make setup-test`, on a Linux host with Docker and outside `make ci` like `make image-test`, runs
+`setup.sh` end to end in a temporary copy of the working tree, under its own Compose project, image name and free
+host port, so it runs beside a service on port 4000: an install against the mock provider, which runs from the source
+in the Go image, then `key`, `budget`, `telemetry`, `remote` with a self-signed certificate, `status`, and an
+`upgrade` to a new commit whose printed way back it then runs; it removes only what it created. The hosted workflow
+runs `make ci-container`, `make image-test` and `make setup-test`. No check needs a secret, and the tests of
+`make ci` use no network beyond loopback.
 `tests/contract` runs the per-target cases against a live provider only when `STARGAITE_CONTRACT_BASE_URL` and
 `STARGAITE_CONTRACT_API_KEY` are set (its package comment lists the variables); it costs tokens, and without them it
 is skipped. Its usage cases (`-run TestUsage`) check the declared `stream_usage` and `cost_report` of the preset under
@@ -926,24 +1091,29 @@ fixes or documents what fails:
 
 1. `make ci-container`, and the hosted workflow on a fork with no secret configured (PUB-5).
 2. `make image-test`: the image builds, starts on a read-only root, bootstraps its admin key and stops with exit `0`.
-3. `make fuzz` (`FUZZTIME=60s` by default); a finding is committed as a seed with its fix.
-4. `make bench`, then a review of [docs/benchmark.md](docs/benchmark.md): the figures, the host and the commit
+3. `make setup-test`: `setup.sh` end to end against the mock provider: an install, the later subcommands, HTTPS with a
+   generated certificate, and an upgrade with its way back (AC-54).
+4. `make fuzz` (`FUZZTIME=60s` by default); a finding is committed as a seed with its fix.
+5. `make bench`, then a review of [docs/benchmark.md](docs/benchmark.md): the figures, the host and the commit
    updated, and every miss listed as an accepted deviation with its figure, reason and date (AC-52).
-5. `tests/contract` with its `STARGAITE_CONTRACT_*` variables (see [Development](#development)) against each preset
+6. `tests/contract` with its `STARGAITE_CONTRACT_*` variables (see [Development](#development)) against each preset
    whose `untested` mark is to go, and the live-safe parts against each of the first ten presets of
    `./stargaite providers presets`, with the preset notes checked against each provider's current documentation
    (AC-53).
-6. `tests/langfuse` with its variables, before a release that changes the span schema or the exporter (AC-30).
-7. The official OpenAI and Anthropic client SDKs, unmodified, against the mock provider through the proxy, changing
+7. `tests/langfuse` with its variables, before a release that changes the span schema or the exporter (AC-30).
+8. The official OpenAI and Anthropic client SDKs, unmodified, against the mock provider through the proxy, changing
    only the base URL, the key and the model name: a chat completion with each, and against `/v1/messages` a tool loop
    with thinking enabled (AC-01, AC-02).
-8. A search of every file and every commit message, in every revision, for the name of an organisation or a person
+9. A search of every file and every commit message, in every revision, for the name of an organisation or a person
    that develops, deploys or uses the product and for data of a particular infrastructure
    (`git grep -I -e <pattern> $(git rev-list --all)` for file contents, and `git log --all --format=%B` for commit
    messages) (PUB-2).
-9. The quick start on a clean machine: clone, build, start, an answer from `/health/ready`, then every line of
-   [Quick start](#quick-start) with the mock provider (PUB-3; `tests/e2e` runs it in `make ci`).
-10. A review of the repository and all its documentation for English (PUB-8).
+10. The quick start on a clean machine: clone, build, start, an answer from `/health/ready`, then every line of
+    [Try it locally with Go](#try-it-locally-with-go) with the mock provider (PUB-3; `tests/e2e` runs it in
+    `make ci`). On a clean Linux machine with only the prerequisites of [Install](#install), `./setup.sh` with one real
+    provider, then `./setup.sh key` and `./setup.sh status`: one `targets verify`, and one test call for the install
+    and one for the key, each capped at 256 output tokens and never retried (PRI-9).
+11. A review of the repository and all its documentation for English (PUB-8).
 
 ## License
 

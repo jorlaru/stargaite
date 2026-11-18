@@ -935,7 +935,7 @@ func TestServeKilled(t *testing.T) {
 
 // TestBackupRestore is AC-50 and OPS-7: serve commits traffic, the CLI takes
 // a backup, more traffic follows, and serve is killed with SIGKILL, leaving a
-// -wal. The README's procedure (stargaite.db, -wal and -shm moved aside
+// -wal. The procedure restore follows (stargaite.db, -wal and -shm moved aside
 // together, the backup copied in as stargaite.db with mode 0600) and a start
 // give a store whose records, daily sums and budget totals are the backup's,
 // with no row written after it, whose usage_daily equals the GROUP BY over
@@ -1005,7 +1005,7 @@ func TestBackupRestore(t *testing.T) {
 		_ = ctl.Close()
 	}
 
-	// The procedure of the README.
+	// The procedure restore follows, by hand.
 	aside := t.TempDir()
 	for _, name := range []string{"stargaite.db", "stargaite.db-wal", "stargaite.db-shm"} {
 		if err := os.Rename(filepath.Join(dir, name), filepath.Join(aside, name)); err != nil {

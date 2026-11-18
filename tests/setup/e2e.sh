@@ -2,12 +2,13 @@
 # make setup-test: setup.sh end to end (docs/design/phase-6.md section 7), on
 # a Linux host with Docker. A temporary copy of the working tree, made a git
 # repository, runs ./setup.sh install with every answer as a flag and no
-# terminal, then key, budget, telemetry and status on that installation,
-# under its own Compose project, image name and free host port, so it runs
-# beside a service on port 4000. The mock provider runs from the
-# source in the Go image, listening only on the Docker bridge's gateway
-# address, and is reached as a local provider. It removes only the project,
-# volume, images and container it created.
+# terminal, then key, budget, telemetry, remote with a self-signed
+# certificate (then renewed) and status on that installation, under its own
+# Compose project, image name and free host port, so it runs beside a
+# service on port 4000. The mock provider runs from the source in the Go
+# image, listening only on the Docker bridge's gateway address, and is
+# reached as a local provider. It removes only the project, volume, images
+# and container it created.
 set -u
 
 fail() {
@@ -15,15 +16,16 @@ fail() {
 	exit 1
 }
 
-# free_port HOST: a port nothing listens on at HOST.
+# free_port HOST...: a port nothing listens on at any HOST.
 free_port() {
-	local i p
+	local i p h
 	for ((i = 0; i < 50; i++)); do
 		p=$((20000 + RANDOM % 20000))
-		if ! (exec 3<>"/dev/tcp/$1/$p") 2>/dev/null; then
-			echo "$p"
-			return 0
-		fi
+		for h; do
+			(exec 3<>"/dev/tcp/$h/$p") 2>/dev/null && continue 2
+		done
+		echo "$p"
+		return 0
 	done
 	return 1
 }
@@ -45,7 +47,7 @@ cleanup() {
 }
 
 main() {
-	local root gw mport port key want out code i
+	local root gw mport port key want out code i cert a
 	: "${GO_IMAGE:?GO_IMAGE names the Go image, as the Makefile sets it}"
 	root=$(cd "$(dirname "$0")/../.." && pwd) || fail "no repository root"
 	tree=$(mktemp -d "${TMPDIR:-/tmp}/stargaite-setup-test.XXXXXX") || fail "no temporary directory"
@@ -66,7 +68,6 @@ main() {
 	gw=$(docker run --rm --add-host gateway:host-gateway "$GO_IMAGE" getent hosts gateway) || fail "the bridge's gateway address was not found"
 	gw=${gw%% *}
 	mport=$(free_port "$gw") || fail "no free port at $gw"
-	port=$(free_port 127.0.0.1) || fail "no free port on loopback"
 	docker run -d --name "$project-mock" --network host --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$tree:/src:ro" -w /src \
 		"$GO_IMAGE" go run ./tests/mockprovider/cmd/mockprovider -listen "$gw:$mport" >/dev/null || fail "the mock provider did not start"
 	for ((i = 0; i < 300; i++)); do
@@ -74,6 +75,8 @@ main() {
 		sleep 1
 	done
 	((i < 300)) || fail "the mock provider is not reachable at $gw:$mport: $(docker logs "$project-mock" 2>&1 | tail -5)"
+	# Picked once the mock listens, free on both addresses remote publishes on.
+	port=$(free_port 127.0.0.1 "$gw") || fail "no free port on loopback and $gw"
 
 	# The credential holds $, " #", a space and an inner \, which .env must
 	# carry byte for byte.
@@ -118,6 +121,26 @@ main() {
 	[[ $(curl -fsS --max-time 10 "http://$gw:$mport/mock/calls" | jq --arg a "$otlp" '[.[] | select(.Path == "/v1/traces")] | last |
 		.Header["X-E2e-Token"] == [$a] and .Header.Authorization == null and .Header["X-Langfuse-Ingestion-Version"] == null') == true ]] ||
 		fail "the last span did not carry the OTLP credential alone"
+	# Remote access with a self-signed certificate, published on loopback and
+	# on the bridge's gateway address, which only this host reaches: HTTPS
+	# with --cacert on both, plain HTTP no more, then a first answer and the
+	# CLI (status below) over TLS.
+	again remote --address "$gw" --tls self-signed --yes
+	[[ $out == *"https on $gw:$port: ready"* && $out == *"the certificate expires on "* ]] || fail "remote did not check HTTPS on $gw:$port"
+	for a in 127.0.0.1 "$gw"; do
+		curl -fsS --max-time 10 -o /dev/null --cacert "$tree/tls/cert.pem" "https://$a:$port/health/ready" || fail "no HTTPS with --cacert on $a:$port"
+	done
+	if curl -fsS --max-time 10 -o /dev/null "http://127.0.0.1:$port/health/ready" 2>/dev/null; then
+		fail "plain HTTP still answers on 127.0.0.1:$port"
+	fi
+	# Run again without --address, it renews: the addresses kept, and the
+	# container recreated, so it serves the new certificate, which remote's
+	# own HTTPS checks trust.
+	cert=$(<"$tree/tls/cert.pem")
+	again remote --tls self-signed --yes
+	[[ $(<"$tree/tls/cert.pem") != "$cert" && $out == *"https on $gw:$port: ready"* ]] || fail "remote again did not renew the certificate on $gw:$port"
+	again key --alias main --key-name e2e-3
+	[[ $out == *"answer: mock reply"* ]] || fail "no first answer over HTTPS"
 	again status
 	[[ $out == *"version: $want running, $want in this clone"* && $out == *"provider mock: credential resolved"* &&
 		$out == *"credentials resolved"* ]] || fail "status does not show the versions and the credentials"

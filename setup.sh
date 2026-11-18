@@ -13,7 +13,7 @@
 set -u
 
 override_marker='# Written by setup.sh from its "# setup:" lines below; it rewrites this file whole.'
-tmp_file="" agreed=0
+tmp_file="" agreed=0 tls_args=() admin=() published=""
 provider="" model="" alias="" key_name="" protocol="" provider_json="" key_value="" client_key=""
 declare -A opt=()
 
@@ -203,44 +203,91 @@ env_set() {
 	tmp_file=""
 }
 
-# override_set KEY VALUE NEED FIELD: compose.override.yaml regenerated whole
-# from its "# setup: KEY=VALUE" lines, with KEY set to VALUE, through agree;
-# false when nothing changes. An override without the marker on its first
-# line is the reader's own and is never touched: when it holds NEED, nothing
-# changes; otherwise the step stops, asking for NEED in FIELD of the service.
+# override_set NEED FIELD KEY=VALUE...: compose.override.yaml regenerated
+# whole from its "# setup: KEY=VALUE" lines, each KEY set to VALUE (an empty
+# VALUE drops it), through agree; false when nothing changes. An override
+# without the marker on its first line is the reader's own and is never
+# touched: when it holds NEED, nothing changes; otherwise the step stops,
+# asking for NEED in FIELD of the service, or, without NEED, to move it away.
+# TLS (remote) mounts tls/, gives serve the certificate, publishes the host
+# port on each address in place of compose.yaml's and maps the certificate's
+# name to loopback, where the admin listener is.
 override_set() {
 	local -A set=()
-	local -a keys=()
-	local line k
+	local -a keys=() hosts=() addrs=()
+	local line k p need=$1 field=$2 change=""
+	shift 2
 	if [[ -f compose.override.yaml ]]; then
 		if ! { IFS= read -r line && [[ $line == "$override_marker" ]]; } <compose.override.yaml; then
-			[[ $(<compose.override.yaml) == *"$3"* ]] && return 1
-			die "compose.override.yaml was not written by setup.sh, so it is left as it is: add \"$3\" to the $4 of its stargaite service yourself, or move it away and run this again"
+			[[ -n $need && $(<compose.override.yaml) == *"$need"* ]] && return 1
+			die "compose.override.yaml was not written by setup.sh, so it is left as it is: ${need:+add \"$need\" to the $field of its stargaite service yourself, or }move it away and run this again"
 		fi
 		while IFS= read -r line; do
 			[[ $line =~ ^'# setup: '([a-z_]+)=(.*)$ ]] || continue
 			keys+=("${BASH_REMATCH[1]}")
 			set[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
 		done <compose.override.yaml
-		[[ ${set[$1]-} == "$2" ]] && return 1
-		agreed=0 # a replacement is confirmed although the recreate was
-		agree "compose.override.yaml is rewritten with $1=$2, keeping its other \"# setup:\" lines"
-	else
-		agree "writing compose.override.yaml with $1=$2"
 	fi
-	[[ -v "set[$1]" ]] || keys+=("$1")
-	set[$1]=$2
+	for p; do
+		[[ ${set[${p%%=*}]-} == "${p#*=}" ]] || change+=" $p"
+	done
+	[[ -n $change ]] || return 1
+	if [[ -f compose.override.yaml ]]; then
+		agreed=0 # a replacement is confirmed although the recreate was
+		agree "compose.override.yaml is rewritten with$change, keeping its other \"# setup:\" lines"
+	else
+		agree "writing compose.override.yaml with$change"
+	fi
+	for p; do
+		k=${p%%=*}
+		[[ -v "set[$k]" ]] || keys+=("$k")
+		set[$k]=${p#*=}
+	done
+	[[ -n ${set[host_gateway]-} ]] && hosts+=(host.docker.internal:host-gateway)
+	[[ -n ${set[tls]-} ]] && hosts+=("${set[tls_name]}:127.0.0.1")
+	read -ra addrs <<<"${set[addresses]-}"
 	tmp_file=$(mktemp compose.override.XXXXXXXX) || die "no temporary file beside compose.override.yaml"
 	{
 		printf '%s\n' "$override_marker"
 		for k in "${keys[@]}"; do
-			printf '# setup: %s=%s\n' "$k" "${set[$k]}"
+			[[ -n ${set[$k]} ]] && printf '# setup: %s=%s\n' "$k" "${set[$k]}"
 		done
 		printf 'services:\n  stargaite:\n'
-		[[ -n ${set[host_gateway]-} ]] && printf '    extra_hosts:\n      - "host.docker.internal:host-gateway"\n'
+		((${#hosts[@]})) && printf '    extra_hosts:\n' && printf '      - "%s"\n' "${hosts[@]}"
+		if [[ -n ${set[tls]-} ]]; then
+			printf '    command: ["serve", "--listen", "0.0.0.0:4000", "--tls-cert", "/tls/cert.pem", "--tls-key", "/tls/key.pem"]\n    ports: !override\n'
+			printf '      - "%s:${STARGAITE_PORT:-4000}:4000"\n' "${addrs[@]}"
+			printf '    volumes:\n      - ./tls:/tls:ro\n'
+			[[ -z ${set[tls_group]-} ]] || printf '    group_add:\n      - "%s"\n' "${set[tls_group]}"
+		fi
 	} >"$tmp_file" || die "compose.override.yaml was not written"
 	mv -f -- "$tmp_file" compose.override.yaml || die "compose.override.yaml was not written"
 	tmp_file=""
+}
+
+# tls_state: from the override's "# setup:" lines, how the script reaches the
+# proxy (rule 7): base_url; tls_args, each curl's way to the certificate's
+# name on loopback and the certificate it trusts; and admin, the variables
+# each CLI call gets on docker compose exec, which stay out of the service's
+# environment, where SSL_CERT_FILE would also root serve's provider
+# connections; and published, the addresses remote last published on.
+tls_state() {
+	local line name="" ca=""
+	base_url=http://127.0.0.1:$port/v1 tls_args=() admin=() published=""
+	[[ -f compose.override.yaml ]] || return 0
+	while IFS= read -r line; do
+		[[ $line =~ ^'# setup: tls_name='(.*)$ ]] && name=${BASH_REMATCH[1]}
+		[[ $line =~ ^'# setup: tls_ca='(.*)$ ]] && ca=${BASH_REMATCH[1]}
+		[[ $line =~ ^'# setup: addresses='(.*)$ ]] && published=${BASH_REMATCH[1]}
+	done <compose.override.yaml
+	[[ -n $name ]] || return 0
+	base_url=https://$name:$port/v1
+	tls_args=(--resolve "$name:$port:127.0.0.1")
+	admin=(-e "STARGAITE_ADMIN_URL=https://$name:4001")
+	if [[ -n $ca ]]; then
+		tls_args+=(--cacert "tls/$ca")
+		admin+=(-e "SSL_CERT_FILE=/tls/$ca")
+	fi
 }
 
 # field JSON ARGS...: jq -r ARGS over JSON given on standard input, never as
@@ -252,7 +299,7 @@ field() {
 }
 
 # ctl ARGS...: the CLI in the container, standard input closed.
-ctl() { docker compose exec -T stargaite /stargaite "$@" </dev/null; }
+ctl() { docker compose exec -T "${admin[@]}" stargaite /stargaite "$@" </dev/null; }
 
 # cli WORD WORD ARGS...: one CLI command in the container, with --json; the
 # answer is in $reply. Its findings, warnings included, are printed; a failure
@@ -336,11 +383,12 @@ check_machine() {
 wait_ready() {
 	local i end=$((SECONDS + 120))
 	for ((i = 0; i < 120 && SECONDS < end; i++)); do
-		curl -fsS --max-time 2 -o /dev/null "http://127.0.0.1:$port/health/ready" 2>/dev/null && return 0
+		curl -fsS --max-time 2 -o /dev/null "${tls_args[@]}" "${base_url%/v1}/health/ready" 2>/dev/null && return 0
 		sleep 1
 	done
 	say "not ready within 120 s; the last 30 log lines:"
 	docker compose logs --tail 30 stargaite
+	((${#tls_args[@]} == 0)) || say "./setup.sh remote again repairs a remote that did not finish"
 	exit 1
 }
 
@@ -417,7 +465,7 @@ reach() {
 # gateway URL: the host-gateway line in the override when URL is on
 # host.docker.internal.
 gateway() {
-	[[ $1 == *//host.docker.internal* ]] && override_set host_gateway 1 host.docker.internal:host-gateway extra_hosts
+	[[ $1 == *//host.docker.internal* ]] && override_set host.docker.internal:host-gateway extra_hosts host_gateway=1
 }
 
 # step_provider: the provider, from a preset or another compatible service,
@@ -635,7 +683,7 @@ step_answer() {
 	say "one test chat completion through the proxy: a paid call through alias $alias, capped at 256 output tokens, never retried"
 	body=$(jq -nc --arg m "$alias" '{model: $m, max_tokens: 256, messages: [{role: "user", content: "Say hello in one short sentence."}]}')
 	out=$(curl_auth Authorization "Bearer $client_key" -H 'Content-Type: application/json' -d "$body" \
-		-D - -w '\n%{http_code} %{time_total}' "$base_url/chat/completions") || {
+		-D - -w '\n%{http_code} %{time_total}' "${tls_args[@]}" "$base_url/chat/completions") || {
 		code=$?
 		say "the test call did not complete (curl exit $code); the last 30 log lines:"
 		docker compose logs --tail 30 stargaite
@@ -653,8 +701,8 @@ step_answer() {
 	say "finish_reason: $(field "$out" '.choices[0].finish_reason // "-"'), $time s, from ${served:--}"
 }
 
-# machine: the host port, from --port or .env (4000 without either), and the
-# checks of check_machine.
+# machine: the host port, from --port or .env (4000 without either), the
+# checks of check_machine and how the proxy is reached.
 machine() {
 	port=4000
 	env_get port STARGAITE_PORT
@@ -665,12 +713,13 @@ machine() {
 		usage_error "--port takes a port number, 1 to 65535"
 	fi
 	check_machine
-	base_url=http://127.0.0.1:$port/v1
+	tls_state
 }
 
 # running: a container that runs, then machine and readiness, which every
-# subcommand but install and status needs. Only Compose answering with none
-# means none runs; a Docker or Compose that fails is named by machine.
+# subcommand but install, status and remote needs. Only Compose answering
+# with none means none runs; a Docker or Compose that fails is named by
+# machine.
 running() {
 	local id
 	id=$(docker compose ps -q 2>/dev/null) && [[ -z $id ]] && die "no container runs here: ./setup.sh install starts it"
@@ -785,6 +834,121 @@ status() {
 		then "credentials resolved" else "no credential" end) end'
 }
 
+# remote: the data plane published on loopback and the addresses given,
+# always with TLS (SEC-6): the reader's certificate, or a self-signed leaf
+# made here. Its files go to tls/, readable by the container's uid 65532: as
+# root, owned by it; otherwise by the reader's primary group, which the
+# override adds to the container, so rootless Docker and user-namespace
+# remapping, where that group is another, are refused. serve reads the
+# certificate only at start: run again, it renews it. It makes no CLI call
+# before its own recreate, so a container that exists is enough, ready or
+# not: run again, it also repairs a run that failed to start the container,
+# or a certificate that no longer verifies. The addresses default to those
+# published (rule 7), so a renewal keeps them.
+remote() {
+	local a m id host="" addresses choice name cert key ca="" cafile="" gid="" owner=65532:65532 n=0 san names out old="" addrs=() modes=(0700 0600)
+	local o='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+	id=$(docker compose ps -a -q 2>/dev/null) && [[ -z $id ]] && die "no container here: ./setup.sh install makes it"
+	machine
+	[[ $(docker info --format '{{.SecurityOptions}}' 2>/dev/null) =~ name=(rootless|userns) ]] &&
+		die "Docker runs rootless or with user-namespace remapping here, so the container's uid and groups are not this host's and tls/ cannot be made readable to it; nothing was changed"
+	command -v hostname >/dev/null && host=$(hostname -I 2>/dev/null) && host=${host% }
+	interactive && [[ -n $host ]] && say "this host's addresses: $host"
+	a=${published#127.0.0.1}
+	a=${a# }
+	ask addresses address "${a// /,}" "the addresses to publish on beside 127.0.0.1, separated by commas; 127.0.0.1 alone for loopback only" optional
+	IFS=', ' read -ra addrs <<<"$addresses"
+	out=127.0.0.1
+	for a in "${addrs[@]}"; do
+		[[ $a =~ ^$o(\.$o){3}$ ]] || usage_error "--address takes IPv4 addresses of this host, such as 192.0.2.10, separated by commas: not $a"
+		[[ " $out " == *" $a "* ]] && continue
+		[[ -z $host || $a == 0.0.0.0 || " $host " == *" $a "* ]] || usage_error "$a is not an address of this host, which has $host"
+		out+=" $a"
+	done
+	# A generated certificate names each address given; 0.0.0.0, which no
+	# client dials, stands for this host's IPv4 addresses.
+	names=$out
+	[[ " $out " == *" 0.0.0.0 "* ]] && out=0.0.0.0 names+=" $host"
+	read -ra addrs <<<"$out"
+	ask choice tls "" "the certificate: own (yours, with its key) or self-signed (made here with openssl)"
+	if [[ $choice == own ]]; then
+		ask cert tls-cert "" "the absolute path of the certificate chain, in PEM"
+		ask key tls-key "" "the absolute path of its private key, in PEM"
+		ask name tls-name "" "the name on it that the admin CLI reaches it by"
+		ask ca tls-ca "" "the absolute path of the certificate of the private CA that signed it; empty for a public CA" optional
+		for a in "$cert" "$key" ${ca:+"$ca"}; do
+			[[ $a == /* ]] || usage_error "--tls-cert, --tls-key and --tls-ca take absolute paths: not $a"
+			[[ -f $a && -r $a ]] || die "$a is not a file setup.sh can read; nothing was changed"
+		done
+		[[ -n $ca ]] && cafile=ca.pem
+	elif [[ $choice == self-signed ]]; then
+		[[ -v opt[tls-cert] || -v opt[tls-key] || -v opt[tls-name] || -v opt[tls-ca] ]] &&
+			usage_error "--tls-cert, --tls-key, --tls-name and --tls-ca are for --tls own"
+		command -v openssl >/dev/null || die "openssl makes the self-signed certificate: see https://openssl-library.org/source/, or give yours with --tls own"
+		[[ $out == 0.0.0.0 && -z $host ]] &&
+			say "warning: this host's addresses are unknown here (no hostname -I), so the certificate names only those given beside 0.0.0.0 in --address"
+		name=localhost cafile=cert.pem
+	else
+		usage_error "--tls takes own or self-signed"
+	fi
+	[[ $name =~ ^[A-Za-z0-9.-]+$ ]] || usage_error "--tls-name takes a host name, such as proxy.example.com"
+	if [[ $(id -u) != 0 ]]; then
+		gid=$(id -g) modes=(0750 0640)
+		owner=:$gid
+		if command -v getent >/dev/null; then
+			while IFS=: read -r _ _ _ a _; do [[ $a == "$gid" ]] && ((n++)); done < <(timeout 10 getent passwd)
+			# The reader's own name among the group's members is no other one.
+			IFS=: read -r _ _ _ m < <(timeout 10 getent group "$gid") && m=,$m, && m=${m//,$(id -un),/,} && [[ -n ${m//,/} ]] && n=2
+		fi
+		((n > 1)) && say "warning: group $gid, which the container joins to read tls/, has other members, who can read its key too"
+	fi
+	say "tls/ gets the certificate and its key, and from now on the data plane speaks HTTPS only: every client, local ones too, needs https:// and to trust the certificate"
+	[[ -f compose.override.yaml ]] && old=$(<compose.override.yaml)
+	override_set "" "" "tls=$choice" "tls_name=$name" "tls_ca=$cafile" "tls_group=$gid" "addresses=${addrs[*]}" ||
+		agree "the certificate and key in tls/ are replaced"
+	if ! (
+		umask 077
+		mkdir -p tls || exit 1
+		if [[ $choice == own ]]; then
+			cp -- "$cert" tls/cert.pem && cp -- "$key" tls/key.pem && { [[ -z $ca ]] || cp -- "$ca" tls/ca.pem; }
+		else
+			san=DNS:localhost${HOSTNAME:+,DNS:$HOSTNAME}
+			for a in $names; do
+				[[ $a =~ ^$o(\.$o){3}$ && $a != 0.0.0.0 && $san, != *",IP:$a,"* ]] && san+=,IP:$a
+			done
+			out=$(openssl req -x509 -config <(printf '[req]\ndistinguished_name = dn\n[dn]\n') -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+				-keyout tls/key.pem -out tls/cert.pem -days 825 -subj /CN=localhost -addext "subjectAltName=$san" \
+				-addext basicConstraints=critical,CA:FALSE -addext extendedKeyUsage=serverAuth 2>&1) || { say "$out"; exit 1; }
+		fi
+	) || ! chown -R "$owner" tls || ! chmod "${modes[0]}" tls || ! chmod "${modes[1]}" tls/*; then
+		# The override put back as it was, so the next run reads the old state.
+		if [[ -n $old ]]; then printf '%s\n' "$old" >compose.override.yaml; else rm -f -- compose.override.yaml; fi &&
+			die "tls/ was not written, or not given its owner and modes; compose.override.yaml is as it was"
+		die "tls/ was not written, and compose.override.yaml was not put back: move it away and run this again"
+	fi
+	tls_state
+	# Compose recreates only a container whose configuration changed, and a
+	# renewal changes none.
+	(compose_up --no-build --force-recreate) || die "./setup.sh remote again${cert:+, with a certificate and key that match,} repairs it"
+	for a in "${addrs[@]}"; do
+		curl -fsS --max-time 30 -o /dev/null --resolve "$name:$port:$a" "${tls_args[@]:2}" "https://$name:$port/health/ready" ||
+			die "the data plane did not answer over HTTPS on $a:$port"
+		say "https on $a:$port: ready"
+	done
+	a=${addrs[*]}
+	a=${a#127.0.0.1 }
+	[[ $a == 0.0.0.0 ]] && a="this host"
+	[[ $a == 127.0.0.1 ]] ||
+		say "warning: Docker publishes past ufw and firewalld: every machine that reaches $a reaches port $port; limit it in your network's firewall or in the DOCKER-USER chain"
+	command -v openssl >/dev/null && out=$(openssl x509 -enddate -noout -in tls/cert.pem 2>/dev/null) && say "the certificate expires on ${out#*=}; ./setup.sh remote again renews it"
+	if [[ $choice == self-signed ]]; then
+		say "clients trust this one certificate, tls/cert.pem copied to their machine, beside their own bundle: curl --cacert cert.pem;"
+		say "  Python (requests, httpx) verify=\"cert.pem\"; Node.js NODE_EXTRA_CA_CERTS=cert.pem; or the system's trust store"
+	fi
+	say "base URL $base_url here; elsewhere, https://<an address the certificate holds>:$port/v1"
+	say "the CLI from this directory: alias stargaite='docker compose exec -T ${admin[*]} stargaite /stargaite'"
+}
+
 install() {
 	machine
 	start
@@ -795,7 +959,7 @@ install() {
 	step_key && step_answer
 	say ""
 	say "Ready. Point an OpenAI-compatible client at base URL $base_url, with model $alias and its key, such as:"
-	say "  curl $base_url/chat/completions -H \"Authorization: Bearer sk-stargaite-...\" -d '{\"model\":\"$alias\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
+	say "  curl ${tls_args[2]:+${tls_args[*]:2} }$base_url/chat/completions -H \"Authorization: Bearer sk-stargaite-...\" -d '{\"model\":\"$alias\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
 	say "Run ./setup.sh again to resume or check this installation; ./setup.sh help lists what it does."
 }
 
@@ -818,6 +982,8 @@ subcommands:
             of the targets it reaches unpriced are asked first
   telemetry traces to Langfuse or any OTLP endpoint, replacing what was set
             whole, then telemetry test
+  remote    publish the data plane beyond loopback, always with TLS: your
+            certificate or a self-signed one; run again, it renews it
   status    the running and the clone's versions, each credential's state
   help      this text
 
@@ -858,6 +1024,17 @@ telemetry flags, with --key-env, --replace, --allow-private-network and --yes:
                             hold Langfuse's keys; typed hidden otherwise
   --header-name <name>      an OTLP header that carries a credential (none)
 
+remote flags, with --yes:
+  --address <a,b>           IPv4 addresses of this host to publish on beside
+                            127.0.0.1 (those published; none the first time)
+  --tls <choice>            own, your certificate, or self-signed, made here
+  --tls-cert <file>, --tls-key <file>
+                            your certificate chain and its key, in PEM, as
+                            absolute paths
+  --tls-name <name>         the name on it that the admin CLI reaches it by
+  --tls-ca <file>           the private CA that signed it, as an absolute
+                            path (none: a public CA)
+
 Paid calls: one targets verify (a call per reasoning level the target
 declares) unless the target is verified, and one test chat completion, each
 capped at 256 output tokens, announced first and never retried."
@@ -875,7 +1052,7 @@ main() {
 		cd -- "${BASH_SOURCE[0]%/*}" || exit 1
 	fi
 	[[ -f compose.yaml ]] || die "compose.yaml is not beside setup.sh: run it from the clone of stargaite"
-	local sub=${1-} menu=(provider alias key budget telemetry status)
+	local sub=${1-} menu=(provider alias key budget telemetry status remote)
 	local pf="provider base-url protocol api-key-env key-env" bf="replace allow-private-network yes"
 	shift
 	# With no subcommand at a terminal: install, or a menu once it exists.
@@ -884,9 +1061,9 @@ main() {
 		sub=install
 		if [[ -n $(docker compose ps -a -q 2>/dev/null) ]]; then
 			say "this installation exists; ./setup.sh help says what each choice does:"
-			say "  1) provider  2) alias  3) key  4) budget  5) telemetry  6) status"
+			say "  1) provider  2) alias  3) key  4) budget  5) telemetry  6) status  7) remote"
 			read -r -p "what to do: a number or a name: " sub || die "no answer to: what to do"
-			[[ $sub =~ ^[1-6]$ ]] && sub=${menu[sub - 1]}
+			[[ $sub =~ ^[1-7]$ ]] && sub=${menu[sub - 1]}
 		fi
 	fi
 	case $sub in
@@ -896,6 +1073,7 @@ main() {
 	key) parse_flags "alias key-name rpm-limit" "" "$@"; running; alias_kept || die "alias $alias does not exist: ./setup.sh alias makes it"; if step_key; then step_answer; fi ;;
 	budget) parse_flags "on limit-usd reset input-price output-price" "yes" "$@"; running; budget ;;
 	telemetry) parse_flags "backend endpoint langfuse-public-env langfuse-secret-env header-name key-env" "$bf" "$@"; running; telemetry ;;
+	remote) parse_flags "address tls tls-cert tls-key tls-name tls-ca" "yes" "$@"; remote ;;
 	status) parse_flags "" "" "$@"; status ;;
 	help | --help | -h) usage ;;
 	*) usage_error "unknown subcommand \"$sub\"; ./setup.sh help lists them" ;;

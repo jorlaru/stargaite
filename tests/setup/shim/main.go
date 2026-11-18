@@ -1,14 +1,17 @@
 // Command shim stands in for every external command setup.sh runs in the
 // tests of tests/setup (see setup_test.go), which link it under each name:
 // it appends a record of the call to $SETUP_LOG, then answers as a fake
-// (docker, curl, id, stat, sleep) or runs the real command; FAKE_TIMEOUT
-// replaces the 1200 s bound given to the real timeout. A separate
-// binary, built once without the race detector, so each call starts fast.
+// (docker, curl, id, stat, sleep, chown, hostname, getent) or runs the real
+// command; FAKE_TIMEOUT replaces the 1200 s bound given to the real timeout.
+// A separate binary, built once without the race detector, so each call
+// starts fast.
 package main
 
 import (
 	"bufio"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"maps"
@@ -33,12 +36,19 @@ type record struct {
 }
 
 // state is what the fake docker knows between calls: whether the container
-// exists, the variable names of .env it was last created with, and the
+// runs, or exists stopped, the variable names of .env it was last created
+// with, whether its override gave serve a certificate, so both listeners
+// speak TLS, the override it was last started with and the certificate it
+// serves, read from tls/ only when it starts anew, as serve does, and the
 // configuration the fake CLI holds: budgets by scope (instance, alias:<name>
 // or key:<name>) and the telemetry flags given since the last unset, merged
 // as telemetry set merges its patch.
 type state struct {
 	Up        bool                         `json:"up"`
+	Stopped   bool                         `json:"stopped"`
+	TLS       bool                         `json:"tls"`
+	Override  string                       `json:"override"`
+	Cert      string                       `json:"cert"`
 	Env       []string                     `json:"env"`
 	Providers map[string]map[string]string `json:"providers"`
 	Targets   map[string]map[string]any    `json:"targets"`
@@ -77,10 +87,24 @@ func shim(name string, args []string) int {
 	case name == "id" && slices.Equal(args, []string{"-u"}):
 		fmt.Println(env("FAKE_UID", "1000"))
 		return 0
+	case name == "id" && slices.Equal(args, []string{"-un"}):
+		fmt.Println("me")
+		return 0
 	case name == "stat" && slices.Equal(args, []string{"-c", "%u", "."}):
 		fmt.Println(env("FAKE_OWNER", "1000"))
 		return 0
-	case name == "sleep":
+	case name == "hostname" && slices.Equal(args, []string{"-I"}):
+		fmt.Println(env("FAKE_ADDRESSES", "192.0.2.10 198.51.100.7 "))
+		return 0
+	case name == "getent" && len(args) > 0:
+		// FAKE_GETENT_PASSWD lists the users; FAKE_GETENT_GROUP is the line
+		// of one group, printed only for its own gid.
+		out := env("FAKE_GETENT_"+strings.ToUpper(args[0]), "")
+		if len(args) == 1 || strings.Contains(out, ":"+args[1]+":") {
+			fmt.Print(out)
+		}
+		return 0
+	case name == "sleep", name == "chown":
 		return 0
 	case name == "timeout" && os.Getenv("FAKE_TIMEOUT") != "":
 		if i := slices.Index(args, "1200"); i >= 0 {
@@ -143,7 +167,13 @@ func envNames() []string {
 // created by up, which takes the variable names of .env at that moment, as
 // Compose gives the container the file's values when it creates it.
 // FAKE_UP=hang makes up last 30 s, a build that takes long; FAKE_UP=noenv
-// gives the container none of the variables of .env. FAKE_DOCKER=denied
+// gives the container none of the variables of .env; FAKE_UP=fail leaves it
+// stopped, as Compose does when the new one cannot bind its port. Compose
+// starts the container anew, and serve reads tls/cert.pem, when none runs,
+// when the override changed, or with --force-recreate. Once the container
+// speaks TLS, a CLI call without the admin URL of section 2 fails, as the
+// real one would. FAKE_SECURITY is what docker info gives as its security
+// options (rootless Docker names rootless). FAKE_DOCKER=denied
 // fails info and ps as a user outside the docker group sees;
 // FAKE_DOCKER=unreadable fails ps alone, as a .env Compose cannot parse does.
 func fakeDocker(args []string) int {
@@ -159,6 +189,10 @@ func fakeDocker(args []string) int {
 			fmt.Fprintln(os.Stderr, "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?")
 			return 1
 		}
+		if slices.Contains(args, "{{.SecurityOptions}}") {
+			fmt.Println(env("FAKE_SECURITY", "[name=seccomp,profile=builtin name=cgroupns]"))
+			return 0
+		}
 		fmt.Println("28.5.1")
 	case len(args) < 2 || args[0] != "compose":
 		fmt.Fprintln(os.Stderr, "fake docker: not handled:", args)
@@ -172,7 +206,7 @@ func fakeDocker(args []string) int {
 		fmt.Fprintln(os.Stderr, "failed to read .env: line 1: unterminated quoted value 'sk-hand-edited-secret")
 		return 1
 	case args[1] == "ps":
-		if st.Up {
+		if st.Up || st.Stopped && slices.Contains(args, "-a") {
 			fmt.Println("c0ffee")
 		}
 	case args[1] == "up":
@@ -180,17 +214,35 @@ func fakeDocker(args []string) int {
 			fmt.Println("fake build: 30 s")
 			time.Sleep(30 * time.Second)
 		}
-		st.Up, st.Env = true, envNames()
+		if os.Getenv("FAKE_UP") == "fail" {
+			st.Up, st.Stopped = false, true
+			fmt.Fprintln(os.Stderr, "Error response from daemon: failed to bind host port: address already in use")
+			return 1
+		}
+		override, _ := os.ReadFile("compose.override.yaml")
+		if !st.Up || string(override) != st.Override || slices.Contains(args, "--force-recreate") {
+			cert, _ := os.ReadFile("tls/cert.pem")
+			st.Cert = string(cert)
+		}
+		st.Up, st.Stopped, st.Env, st.Override = true, false, envNames(), string(override)
+		st.TLS = strings.Contains(string(override), `"--tls-cert"`)
 		if os.Getenv("FAKE_UP") == "noenv" {
 			st.Env = nil
 		}
 		fmt.Println(" Container fake-stargaite-1 Started")
 	case args[1] == "logs":
 		fmt.Println("a log line")
-	case args[1] == "exec" && slices.Equal(args[4:], []string{"/stargaite", "version", "--json"}):
-		fmt.Println(`{"version":"v0.6.0-fake"}`)
-	case args[1] == "exec" && len(args) > 4 && args[4] == "/stargaite":
-		out, code := fakeCLI(st, args[5:])
+	case args[1] == "exec" && slices.Contains(args, "/stargaite"):
+		i := slices.Index(args, "/stargaite")
+		if st.TLS && !slices.ContainsFunc(args[:i], func(a string) bool { return strings.HasPrefix(a, "STARGAITE_ADMIN_URL=https://") }) {
+			fmt.Println(`{"error":{"message":"the admin API at http://127.0.0.1:4001 did not answer: it speaks TLS","type":"api_error"}}`)
+			return 1
+		}
+		if slices.Equal(args[i+1:], []string{"version", "--json"}) {
+			fmt.Println(`{"version":"v0.6.0-fake"}`)
+			return 0
+		}
+		out, code := fakeCLI(st, args[i+1:])
 		fmt.Println(out)
 		return code
 	default:
@@ -395,7 +447,9 @@ func fakeCLI(st *state, args []string) (string, int) {
 // first answer, whose headers it puts first with -D -, the names as Go's
 // server writes them over HTTP/1.1. FAKE_MODELS picks the list's answer (list, error, empty or
 // nonjson); FAKE_CHAT=fail fails the chat completion with a 502, and
-// FAKE_CHAT=timeout fails curl itself.
+// FAKE_CHAT=timeout fails curl itself. The proxy's own URLs answer only in
+// the scheme the container speaks, as the fake docker last started it, and
+// over HTTPS not once the certificate it serves has expired.
 func fakeCurl(args []string) int {
 	var url, format string
 	quiet, headers := false, false
@@ -407,7 +461,7 @@ func fakeCurl(args []string) int {
 		case "-D":
 			headers = true
 			i++
-		case "--max-time", "-K", "-H", "-d":
+		case "--max-time", "-K", "-H", "-d", "--resolve", "--cacert":
 			i++
 		case "-w":
 			format = args[i+1]
@@ -419,6 +473,18 @@ func fakeCurl(args []string) int {
 		}
 	}
 	body, code := "", "200"
+	st := loadState()
+	proxy := strings.HasSuffix(url, "/health/ready") || strings.HasSuffix(url, "/v1/chat/completions")
+	if proxy && strings.HasPrefix(url, "https://") != st.TLS {
+		fmt.Fprintln(os.Stderr, "curl: (35) the proxy speaks", map[bool]string{false: "HTTP", true: "HTTPS"}[st.TLS], "only")
+		return 35
+	}
+	if block, _ := pem.Decode([]byte(st.Cert)); proxy && st.TLS && block != nil {
+		if cert, err := x509.ParseCertificate(block.Bytes); err == nil && time.Now().After(cert.NotAfter) {
+			fmt.Fprintln(os.Stderr, "curl: (60) SSL certificate problem: certificate has expired")
+			return 60
+		}
+	}
 	switch {
 	case strings.HasSuffix(url, "/health/ready"):
 		if os.Getenv("FAKE_READY") == "never" {

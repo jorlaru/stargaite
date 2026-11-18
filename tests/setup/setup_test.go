@@ -8,11 +8,17 @@ package setup
 
 import (
 	"bytes"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"math/big"
 	"net"
 	"os"
 	"os/exec"
@@ -28,9 +34,11 @@ import (
 
 // The commands setup.sh may run. The run's PATH holds only these, each a link
 // to the shim of ./shim, so any other external command fails the run: every
-// external command is recorded. docker, curl, id, stat and sleep answer as
-// fakes; the rest are recording pass-throughs to the real command.
-var shimNames = []string{"docker", "curl", "jq", "git", "id", "stat", "mktemp", "mv", "rm", "timeout", "sleep", "stty"}
+// external command is recorded. docker, curl, id, stat, sleep, chown and
+// hostname answer as fakes; the rest are recording pass-throughs to the real
+// command.
+var shimNames = []string{"docker", "curl", "jq", "git", "id", "stat", "mktemp", "mv", "rm", "timeout", "sleep", "stty",
+	"openssl", "mkdir", "cp", "chmod", "chown", "hostname", "getent"}
 
 // shimBin is the shim, built once for every run.
 var shimBin string
@@ -257,8 +265,8 @@ func (r *run) calls() []record {
 func (r *run) cli() []string {
 	var list []string
 	for _, c := range r.calls() {
-		if len(c.Argv) > 6 && c.Argv[0] == "docker" && c.Argv[2] == "exec" {
-			list = append(list, strings.Join(slices.DeleteFunc(slices.Clone(c.Argv[6:]), func(a string) bool { return a == "--json" }), " "))
+		if i := slices.Index(c.Argv, "/stargaite"); i > 0 && c.Argv[0] == "docker" && c.Argv[2] == "exec" {
+			list = append(list, strings.Join(slices.DeleteFunc(slices.Clone(c.Argv[i+1:]), func(a string) bool { return a == "--json" }), " "))
 		}
 	}
 	return list
@@ -986,6 +994,18 @@ func TestSetupPrompts(t *testing.T) {
 	if got := r.cli()[before:]; code != 0 || !strings.Contains(out, "alias main exists, toward openai/gpt-b; kept") || !slices.Equal(got, []string{"models list"}) {
 		t.Errorf("alias kept: exit %d, %q:\n%s", code, got, out)
 	}
+
+	// remote lists this host's addresses, asks for those to publish on and
+	// the certificate, then confirms.
+	code, out = r.pty([]string{"remote"},
+		step{"separated by commas; 127.0.0.1 alone for loopback only: ", "192.0.2.10"},
+		step{"the certificate: own (yours, with its key) or self-signed (made here with openssl): ", "self-signed"},
+		step{"continue? [y/N]: ", "y"},
+	)
+	if code != 0 || !strings.Contains(out, "this host's addresses: 192.0.2.10 198.51.100.7\r\n") || !strings.Contains(out, "https on 192.0.2.10:") ||
+		!strings.Contains(r.file("compose.override.yaml"), "# setup: addresses=127.0.0.1 192.0.2.10\n") {
+		t.Errorf("remote: exit %d:\n%s", code, out)
+	}
 }
 
 // TestSetupSecrets: a credential reaches .env (mode 0600) byte for byte and
@@ -1081,18 +1101,513 @@ func TestSetupOverride(t *testing.T) {
 		t.Errorf("an override that holds the line: exit %d, %q:\n%s", code, r.file("compose.override.yaml"), out)
 	}
 
+	// The control: an override that holds TLS, as remote writes it, keeps it
+	// when the local provider's line joins.
 	r = newRun(t, nil)
-	marked := "# Written by setup.sh from its \"# setup:\" lines below; it rewrites this file whole.\n# setup: tls=self-signed\nservices:\n  stargaite:\n"
+	marker := "# Written by setup.sh from its \"# setup:\" lines below; it rewrites this file whole.\n"
+	setup := "# setup: tls=self-signed\n# setup: tls_name=localhost\n# setup: tls_ca=cert.pem\n# setup: addresses=127.0.0.1\n"
+	tls := "    command: [\"serve\", \"--listen\", \"0.0.0.0:4000\", \"--tls-cert\", \"/tls/cert.pem\", \"--tls-key\", \"/tls/key.pem\"]\n" +
+		"    ports: !override\n      - \"127.0.0.1:${STARGAITE_PORT:-4000}:4000\"\n    volumes:\n      - ./tls:/tls:ro\n"
+	marked := marker + setup + "services:\n  stargaite:\n    extra_hosts:\n      - \"localhost:127.0.0.1\"\n" + tls
 	if err := os.WriteFile(filepath.Join(r.dir, "compose.override.yaml"), []byte(marked), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if code, out := r.exec(local...); code != 0 {
 		t.Fatalf("control: exit %d:\n%s", code, out)
 	}
-	want := "# Written by setup.sh from its \"# setup:\" lines below; it rewrites this file whole.\n# setup: tls=self-signed\n# setup: host_gateway=1\n" +
-		"services:\n  stargaite:\n    extra_hosts:\n      - \"host.docker.internal:host-gateway\"\n"
+	want := marker + setup + "# setup: host_gateway=1\nservices:\n  stargaite:\n    extra_hosts:\n      - \"host.docker.internal:host-gateway\"\n" +
+		"      - \"localhost:127.0.0.1\"\n" + tls
 	if got := r.file("compose.override.yaml"); got != want {
 		t.Errorf("override:\n%s\nwant:\n%s", got, want)
+	}
+	if !slices.Contains(r.cli(), "providers add --base-url http://host.docker.internal:11434/v1 --allow-private-network -- ollama") {
+		t.Errorf("CLI calls: %q", r.cli())
+	}
+}
+
+// TestSetupRemote: remote publishes the data plane beyond loopback only with
+// TLS (SEC-6). Self-signed, as a user: tls/ is 0750 and its files 0640, of
+// the reader's group, which group_add gives the container; the override
+// gives serve the certificate, publishes the port on loopback and each
+// address with !override and maps the name to loopback; the leaf is CA:FALSE,
+// serverAuth only, and names every address; every later CLI call carries the
+// admin URL and the certificate (the fake CLI fails without them, as the
+// real one does), and every curl speaks HTTPS. The reader's certificate, as
+// root: tls/ owned by uid 65532, 0700 and 0600, the files copied as given, a
+// private CA trusted per call and a public one not named. Run again, it
+// renews keeping the addresses, and repairs a run whose container did not
+// start, or a certificate that no longer verifies; a tls/ it cannot write
+// leaves the override as it was. Controls: an address beyond loopback
+// without a certificate, one that is not this host's, rootless Docker and
+// the reader's own override are refused, with nothing written.
+func TestSetupRemote(t *testing.T) {
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Fatal("openssl makes the self-signed certificate: ", err)
+	}
+	marker := "# Written by setup.sh from its \"# setup:\" lines below; it rewrites this file whole.\n"
+	// compose.yaml's command, the TLS flags in place of --behind-tls-proxy.
+	compose, err := os.ReadFile(filepath.Join("..", "..", "compose.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, command, _ := strings.Cut(string(compose), "\n    command: ")
+	command, _, _ = strings.Cut(command, "\n")
+	if !strings.Contains(command, `"--behind-tls-proxy"`) {
+		t.Fatalf("compose.yaml's command has no --behind-tls-proxy: %s", command)
+	}
+	command = "    command: " + strings.Replace(command, `"--behind-tls-proxy"`, `"--tls-cert", "/tls/cert.pem", "--tls-key", "/tls/key.pem"`, 1) + "\n"
+	published := func(addrs ...string) string {
+		s := "    ports: !override\n"
+		for _, a := range addrs {
+			s += "      - \"" + a + ":${STARGAITE_PORT:-4000}:4000\"\n"
+		}
+		return s + "    volumes:\n      - ./tls:/tls:ro\n"
+	}
+	mode := func(r *run, name string) fs.FileMode {
+		t.Helper()
+		info, err := os.Stat(filepath.Join(r.dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return info.Mode().Perm()
+	}
+	// certOf is the certificate in tls/cert.pem, ipsOf the addresses on it.
+	certOf := func(t *testing.T, r *run) *x509.Certificate {
+		t.Helper()
+		block, _ := pem.Decode([]byte(r.file("tls/cert.pem")))
+		if block == nil {
+			t.Fatalf("no PEM certificate: %q", r.file("tls/cert.pem"))
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cert
+	}
+	ipsOf := func(cert *x509.Certificate) string {
+		var list []string
+		for _, ip := range cert.IPAddresses {
+			list = append(list, ip.String())
+		}
+		return strings.Join(list, " ")
+	}
+	// execs are the docker compose exec calls of the CLI from the n-th
+	// recorded call on.
+	execs := func(r *run, n int) []string {
+		var list []string
+		for _, c := range r.calls()[n:] {
+			if c.Argv[0] == "docker" && slices.Contains(c.Argv, "/stargaite") {
+				list = append(list, strings.Join(c.Argv, " "))
+			}
+		}
+		return list
+	}
+	// ready checks that every readiness check from the n-th recorded call on
+	// reaches name on an address and trusts the certificate of cacert.
+	ready := func(t *testing.T, r *run, n int, name, port, cacert string) {
+		t.Helper()
+		for _, c := range r.calls()[n:] {
+			if line := strings.Join(c.Argv, " "); c.Argv[0] == "curl" && strings.HasSuffix(line, "/health/ready") &&
+				(!strings.Contains(line, " --resolve "+name+":"+port+":") || !strings.Contains(line, cacert)) {
+				t.Errorf("a readiness check without --resolve or %q: %s", cacert, line)
+			}
+		}
+	}
+
+	t.Run("self-signed", func(t *testing.T) {
+		r := newRun(t, []string{"SRC=v"})
+		port := freePort(t)
+		if code, out := r.exec(acme(port)...); code != 0 {
+			t.Fatalf("install: exit %d:\n%s", code, out)
+		}
+		args := []string{"remote", "--address", "192.0.2.10,198.51.100.7,192.0.2.10", "--tls", "self-signed"}
+		files := r.written()
+		code, out := r.exec(args...)
+		if _, err := os.Stat(filepath.Join(r.dir, "tls")); code != 2 || !strings.Contains(out, "missing --yes: writing compose.override.yaml with tls=self-signed") ||
+			r.written() != files || !os.IsNotExist(err) {
+			t.Errorf("without --yes: exit %d, tls/ %v:\n%s", code, err, out)
+		}
+		n := len(r.calls())
+		code, out = r.exec(append(args, "--yes")...)
+		if code != 0 {
+			t.Fatalf("exit %d:\n%s", code, out)
+		}
+		gid := strconv.Itoa(os.Getegid())
+		want := marker + "# setup: tls=self-signed\n# setup: tls_name=localhost\n# setup: tls_ca=cert.pem\n# setup: tls_group=" + gid +
+			"\n# setup: addresses=127.0.0.1 192.0.2.10 198.51.100.7\nservices:\n  stargaite:\n    extra_hosts:\n      - \"localhost:127.0.0.1\"\n" +
+			command + published("127.0.0.1", "192.0.2.10", "198.51.100.7") + "    group_add:\n      - \"" + gid + "\"\n"
+		if got := r.file("compose.override.yaml"); got != want {
+			t.Errorf("override:\n%s\nwant:\n%s", got, want)
+		}
+		if mode(r, "tls") != 0o750 || mode(r, "tls/cert.pem") != 0o640 || mode(r, "tls/key.pem") != 0o640 || r.count("chown", "chown -R :"+gid+" tls") != 1 {
+			t.Errorf("tls/ %v, cert %v, key %v, chown %d", mode(r, "tls"), mode(r, "tls/cert.pem"), mode(r, "tls/key.pem"), r.count("chown", ""))
+		}
+		cert := certOf(t, r)
+		host, err := os.Hostname()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !cert.BasicConstraintsValid || cert.IsCA || !slices.Equal(cert.ExtKeyUsage, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}) ||
+			!slices.Contains(cert.DNSNames, "localhost") || !slices.Contains(cert.DNSNames, host) || cert.NotAfter.Sub(cert.NotBefore) != 825*24*time.Hour {
+			t.Errorf("certificate: CA %v (valid %v), usages %v, names %q, valid %s", cert.IsCA, cert.BasicConstraintsValid, cert.ExtKeyUsage,
+				cert.DNSNames, cert.NotAfter.Sub(cert.NotBefore))
+		}
+		if ips := ipsOf(cert); ips != "127.0.0.1 192.0.2.10 198.51.100.7" {
+			t.Errorf("addresses on the certificate: %s", ips)
+		}
+		for _, a := range []string{"127.0.0.1", "192.0.2.10", "198.51.100.7"} {
+			c := r.count("curl", "--resolve localhost:"+port+":"+a+" --cacert tls/cert.pem https://localhost:"+port+"/health/ready")
+			if c < 1 {
+				t.Errorf("no HTTPS check on %s", a)
+			}
+		}
+		for _, s := range []string{"tls/ gets the certificate and its key, and from now on the data plane speaks HTTPS only", "https on 192.0.2.10:" + port + ": ready",
+			"warning: Docker publishes past ufw and firewalld: every machine that reaches 192.0.2.10 198.51.100.7 reaches port " + port + ";",
+			"the certificate expires on ", "curl --cacert cert.pem", "NODE_EXTRA_CA_CERTS=cert.pem",
+			"base URL https://localhost:" + port + "/v1 here",
+			"alias stargaite='docker compose exec -T -e STARGAITE_ADMIN_URL=https://localhost:4001 -e SSL_CERT_FILE=/tls/cert.pem stargaite /stargaite'"} {
+			if !strings.Contains(out, s) {
+				t.Errorf("no %q in:\n%s", s, out)
+			}
+		}
+		if r.count("docker", "compose up -d --no-build") != 2 {
+			t.Errorf("%d recreates, want 2", r.count("docker", "compose up -d --no-build"))
+		}
+
+		// Every later CLI call carries the admin URL and the certificate,
+		// every readiness check the name and the certificate, and the first
+		// answer goes over HTTPS.
+		ready(t, r, n, "localhost", port, " --cacert tls/cert.pem ")
+		n = len(r.calls())
+		if code, out := r.exec("key", "--alias", "main", "--key-name", "second"); code != 0 || !strings.Contains(out, "answer: fake reply") {
+			t.Errorf("key: exit %d:\n%s", code, out)
+		}
+		if code, out := r.exec("status"); code != 0 || !strings.Contains(out, "provider acme: credential resolved") {
+			t.Errorf("status: exit %d:\n%s", code, out)
+		}
+		for _, c := range execs(r, n) {
+			if !strings.Contains(c, "docker compose exec -T -e STARGAITE_ADMIN_URL=https://localhost:4001 -e SSL_CERT_FILE=/tls/cert.pem stargaite /stargaite ") {
+				t.Errorf("a CLI call without the admin variables: %s", c)
+			}
+		}
+		ready(t, r, n, "localhost", port, " --cacert tls/cert.pem ")
+		if c := r.curlOf("https://localhost:" + port + "/v1/chat/completions"); !strings.Contains(strings.Join(c.Argv, " "), "--resolve localhost:"+port+":127.0.0.1 --cacert tls/cert.pem") {
+			t.Errorf("first answer: %q", c.Argv)
+		}
+
+		// Run again without --address, it renews keeping the addresses: a
+		// new certificate, the container recreated although its
+		// configuration did not change; not without --yes.
+		old, up := r.file("tls/cert.pem"), r.count("docker", "compose up")
+		code, out = r.exec("remote", "--tls", "self-signed")
+		if code != 2 || !strings.Contains(out, "missing --yes: the certificate and key in tls/ are replaced") || r.file("tls/cert.pem") != old ||
+			r.count("docker", "compose up") != up {
+			t.Errorf("renew without --yes: exit %d, %d ups after %d:\n%s", code, r.count("docker", "compose up"), up, out)
+		}
+		code, out = r.exec("remote", "--tls", "self-signed", "--yes")
+		if code != 0 || !strings.Contains(out, "the certificate and key in tls/ are replaced, and the container is then recreated") ||
+			r.file("tls/cert.pem") == old || r.file("compose.override.yaml") != want || r.count("docker", "compose up -d --no-build --force-recreate") != 2 {
+			t.Errorf("renew: exit %d:\n%s\noverride:\n%s", code, out, r.file("compose.override.yaml"))
+		}
+	})
+
+	t.Run("own certificate as root", func(t *testing.T) {
+		src := t.TempDir()
+		for name, text := range map[string]string{"chain.pem": "CHAIN\n", "key.pem": "KEY\n", "ca.pem": "CA\n"} {
+			if err := os.WriteFile(filepath.Join(src, name), []byte(text), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		own := []string{"remote", "--address", "192.0.2.10", "--tls", "own", "--tls-cert", filepath.Join(src, "chain.pem"),
+			"--tls-key", filepath.Join(src, "key.pem"), "--tls-name", "proxy.example.com", "--yes"}
+		for _, c := range []struct {
+			name, ca, cacert string
+			admin            string
+		}{
+			{"private CA", "ca.pem", " --cacert tls/ca.pem", "-e STARGAITE_ADMIN_URL=https://proxy.example.com:4001 -e SSL_CERT_FILE=/tls/ca.pem stargaite"},
+			{"public CA", "", "", "-e STARGAITE_ADMIN_URL=https://proxy.example.com:4001 stargaite"},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				r := newRun(t, []string{"SRC=v", "FAKE_UID=0", "FAKE_OWNER=0"})
+				port := freePort(t)
+				if code, out := r.exec(acme(port)...); code != 0 {
+					t.Fatalf("install: exit %d:\n%s", code, out)
+				}
+				args := own
+				if c.ca != "" {
+					args = append(slices.Clone(own), "--tls-ca", filepath.Join(src, "ca.pem"))
+				}
+				n := len(r.calls())
+				code, out := r.exec(args...)
+				if code != 0 {
+					t.Fatalf("exit %d:\n%s", code, out)
+				}
+				ready(t, r, n, "proxy.example.com", port, c.cacert)
+				ca := ""
+				if c.ca != "" {
+					ca = "# setup: tls_ca=ca.pem\n"
+				}
+				want := marker + "# setup: tls=own\n# setup: tls_name=proxy.example.com\n" + ca + "# setup: addresses=127.0.0.1 192.0.2.10\n" +
+					"services:\n  stargaite:\n    extra_hosts:\n      - \"proxy.example.com:127.0.0.1\"\n" + command + published("127.0.0.1", "192.0.2.10")
+				if got := r.file("compose.override.yaml"); got != want {
+					t.Errorf("override:\n%s\nwant:\n%s", got, want)
+				}
+				if r.file("tls/cert.pem") != "CHAIN\n" || r.file("tls/key.pem") != "KEY\n" || mode(r, "tls") != 0o700 || mode(r, "tls/cert.pem") != 0o600 ||
+					mode(r, "tls/key.pem") != 0o600 || r.count("chown", "chown -R 65532:65532 tls") != 1 {
+					t.Errorf("tls/: %v %v %v, chown %d", mode(r, "tls"), mode(r, "tls/cert.pem"), mode(r, "tls/key.pem"), r.count("chown", "65532"))
+				}
+				if _, err := os.Stat(filepath.Join(r.dir, "tls", "ca.pem")); (c.ca != "") != (err == nil) {
+					t.Errorf("tls/ca.pem: %v", err)
+				}
+				if r.count("curl", "--resolve proxy.example.com:"+port+":192.0.2.10"+c.cacert+" https://proxy.example.com:"+port+"/health/ready") != 1 ||
+					strings.Contains(out, "NODE_EXTRA_CA_CERTS") {
+					t.Errorf("HTTPS checks or trust lines:\n%s", out)
+				}
+				n = len(r.calls())
+				if code, out := r.exec("status"); code != 0 {
+					t.Errorf("status: exit %d:\n%s", code, out)
+				}
+				for _, e := range execs(r, n) {
+					if !strings.Contains(e, " exec -T "+c.admin+" /stargaite ") {
+						t.Errorf("a CLI call without %q: %s", c.admin, e)
+					}
+				}
+			})
+		}
+	})
+
+	// A remote whose container did not start leaves it stopped: run again
+	// with the right answer, it repairs it; 0.0.0.0 stands alone, and the
+	// certificate names the addresses given and this host's instead.
+	t.Run("repairs a failed start", func(t *testing.T) {
+		r := newRun(t, []string{"SRC=v"})
+		if code, out := r.exec("remote", "--tls", "self-signed", "--yes"); code != 1 || !strings.Contains(out, "no container here: ./setup.sh install makes it") {
+			t.Errorf("before install: exit %d:\n%s", code, out)
+		}
+		port := freePort(t)
+		if code, out := r.exec(acme(port)...); code != 0 {
+			t.Fatalf("install: exit %d:\n%s", code, out)
+		}
+		r.env = append(r.env, "FAKE_UP=fail")
+		if code, out := r.exec("remote", "--address", "192.0.2.10", "--tls", "self-signed", "--yes"); code != 1 || !strings.Contains(out, "docker compose up failed") ||
+			!strings.Contains(out, "setup.sh: ./setup.sh remote again repairs it") {
+			t.Errorf("failed start: exit %d:\n%s", code, out)
+		}
+		r.env = r.env[:len(r.env)-1]
+		code, out := r.exec("remote", "--address", "198.51.100.7,0.0.0.0", "--tls", "self-signed", "--yes")
+		if code != 0 || !strings.Contains(out, "https on 0.0.0.0:"+port+": ready") || strings.Contains(out, "https on 198.51.100.7") ||
+			!strings.Contains(r.file("compose.override.yaml"), "# setup: addresses=0.0.0.0\n") || !strings.Contains(r.file("compose.override.yaml"), "      - \"0.0.0.0:${STARGAITE_PORT:-4000}:4000\"\n    volumes:") {
+			t.Errorf("repair: exit %d:\n%s\noverride:\n%s", code, out, r.file("compose.override.yaml"))
+		}
+		if ips := ipsOf(certOf(t, r)); ips != "127.0.0.1 198.51.100.7 192.0.2.10" || !strings.Contains(out, "every machine that reaches this host reaches port "+port+";") {
+			t.Errorf("addresses on the certificate: %s:\n%s", ips, out)
+		}
+		r.env = append(r.env, "FAKE_ADDRESSES=192.0.2.10 2001:db8::1 198.51.100.7 ")
+		if code, out := r.exec("remote", "--address", "0.0.0.0", "--tls", "self-signed", "--yes"); code != 0 || ipsOf(certOf(t, r)) != "127.0.0.1 192.0.2.10 198.51.100.7" {
+			t.Errorf("0.0.0.0 alone: exit %d, addresses on the certificate %s:\n%s", code, ipsOf(certOf(t, r)), out)
+		}
+	})
+
+	// openssl is checked for self-signed only: without it, self-signed is
+	// refused with nothing written, and own works, with no expiry line.
+	t.Run("without openssl", func(t *testing.T) {
+		r := newRun(t, []string{"SRC=v"}, "openssl")
+		if code, out := r.exec(acme(freePort(t))...); code != 0 {
+			t.Fatalf("install: exit %d:\n%s", code, out)
+		}
+		files, up := r.written(), r.count("docker", "compose up")
+		code, out := r.exec("remote", "--address", "192.0.2.10", "--tls", "self-signed", "--yes")
+		if _, err := os.Stat(filepath.Join(r.dir, "tls")); code != 1 || !strings.Contains(out, "openssl makes the self-signed certificate") ||
+			r.written() != files || !os.IsNotExist(err) || r.count("docker", "compose up") != up {
+			t.Errorf("self-signed: exit %d, tls/ %v:\n%s", code, err, out)
+		}
+		abs, err := filepath.Abs("setup_test.go")
+		if err != nil {
+			t.Fatal(err)
+		}
+		code, out = r.exec("remote", "--address", "192.0.2.10", "--tls", "own", "--tls-cert", abs, "--tls-key", abs, "--tls-name", "proxy.example.com", "--yes")
+		if code != 0 || strings.Contains(out, "the certificate expires on") || !strings.Contains(out, "https on 192.0.2.10:") {
+			t.Errorf("own: exit %d:\n%s", code, out)
+		}
+	})
+
+	// The group the container joins to read tls/ is warned of when another
+	// user has it as primary group or it lists members, as NSS reports them.
+	t.Run("group members", func(t *testing.T) {
+		gid := strconv.Itoa(os.Getegid())
+		warning := "warning: group " + gid + ", which the container joins to read tls/, has other members, who can read its key too"
+		r := newRun(t, []string{"SRC=v"})
+		if code, out := r.exec(acme(freePort(t))...); code != 0 {
+			t.Fatalf("install: exit %d:\n%s", code, out)
+		}
+		env := r.env
+		me := "me:x:1000:" + gid + "::/home/me:/bin/sh\n"
+		for _, c := range []struct {
+			passwd, group string
+			warn          bool
+		}{
+			{me, "me:x:" + gid + ":\n", false},
+			{me + "you:x:1001:" + gid + "::/home/you:/bin/sh\n", "me:x:" + gid + ":\n", true},
+			{me, "users:x:" + gid + ":you\n", true},
+			{me, "users:x:" + gid + ":me\n", false},
+			{me, "users:x:" + gid + ":me,you\n", true},
+		} {
+			r.env = append(slices.Clone(env), "FAKE_GETENT_PASSWD="+c.passwd, "FAKE_GETENT_GROUP="+c.group)
+			if code, out := r.exec("remote", "--address", "192.0.2.10", "--tls", "self-signed", "--yes"); code != 0 || strings.Contains(out, warning) != c.warn {
+				t.Errorf("%q %q: exit %d, want warning %v:\n%s", c.passwd, c.group, code, c.warn, out)
+			}
+		}
+	})
+
+	// Without hostname and getent: no error line, and 0.0.0.0 alone is warned
+	// of, its certificate naming no address of this host. The flags of own are
+	// refused with self-signed. Once remote is on, install again prints a
+	// client example that trusts the certificate, and a container that never
+	// gets ready names remote as the repair.
+	t.Run("without hostname and getent", func(t *testing.T) {
+		r := newRun(t, []string{"SRC=v"}, "hostname", "getent")
+		port := freePort(t)
+		if code, out := r.exec(acme(port)...); code != 0 {
+			t.Fatalf("install: exit %d:\n%s", code, out)
+		}
+		files := r.written()
+		code, out := r.exec("remote", "--tls", "self-signed", "--tls-name", "proxy.example.com", "--yes")
+		if code != 2 || !strings.Contains(out, "--tls-cert, --tls-key, --tls-name and --tls-ca are for --tls own") || r.written() != files {
+			t.Errorf("own flags with self-signed: exit %d:\n%s", code, out)
+		}
+		code, out = r.exec("remote", "--address", "0.0.0.0", "--tls", "self-signed", "--yes")
+		if code != 0 || strings.Contains(out, "not found") || strings.Contains(out, "getent") || ipsOf(certOf(t, r)) != "127.0.0.1" ||
+			!strings.Contains(out, "warning: this host's addresses are unknown here (no hostname -I), so the certificate names only those given beside 0.0.0.0") {
+			t.Errorf("0.0.0.0: exit %d, addresses on the certificate %s:\n%s", code, ipsOf(certOf(t, r)), out)
+		}
+		if code, out := r.exec(acme(port)...); code != 0 || !strings.Contains(out, "  curl --cacert tls/cert.pem https://localhost:"+port+"/v1/chat/completions -H") {
+			t.Errorf("install again: exit %d:\n%s", code, out)
+		}
+		r.env = append(r.env, "FAKE_READY=never")
+		if code, out := r.exec("key", "--alias", "main", "--key-name", "second"); code != 1 || !strings.Contains(out, "a log line\n./setup.sh remote again repairs a remote that did not finish") {
+			t.Errorf("never ready: exit %d:\n%s", code, out)
+		}
+	})
+
+	// tls/ that cannot be written (a file in its place) leaves the override
+	// byte for byte, so the next run reads the state that works.
+	t.Run("tls write fails", func(t *testing.T) {
+		r := newRun(t, []string{"SRC=v"})
+		if code, out := r.exec(acme(freePort(t))...); code != 0 {
+			t.Fatalf("install: exit %d:\n%s", code, out)
+		}
+		if code, out := r.exec("remote", "--address", "192.0.2.10", "--tls", "self-signed", "--yes"); code != 0 {
+			t.Fatalf("remote: exit %d:\n%s", code, out)
+		}
+		before := r.file("compose.override.yaml")
+		tls := filepath.Join(r.dir, "tls")
+		if err := os.RemoveAll(tls); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(tls, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		code, out := r.exec("remote", "--address", "198.51.100.7", "--tls", "self-signed", "--yes")
+		if code != 1 || !strings.Contains(out, "tls/ was not written, or not given its owner and modes; compose.override.yaml is as it was") ||
+			r.file("compose.override.yaml") != before {
+			t.Errorf("exit %d:\n%s\noverride:\n%s", code, out, r.file("compose.override.yaml"))
+		}
+		if code, out := r.exec("status"); code != 0 {
+			t.Errorf("status after: exit %d:\n%s", code, out)
+		}
+	})
+
+	// The certificate the container serves has expired, so no readiness
+	// check passes: remote still renews it, and the container serves the
+	// new one.
+	t.Run("renews an expired certificate", func(t *testing.T) {
+		r := newRun(t, []string{"SRC=v"})
+		port := freePort(t)
+		if code, out := r.exec(acme(port)...); code != 0 {
+			t.Fatalf("install: exit %d:\n%s", code, out)
+		}
+		if code, out := r.exec("remote", "--address", "192.0.2.10", "--tls", "self-signed", "--yes"); code != 0 {
+			t.Fatalf("remote: exit %d:\n%s", code, out)
+		}
+		before := r.file("compose.override.yaml")
+		priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), DNSNames: []string{"localhost"},
+			NotBefore: time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC), NotAfter: time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &priv.PublicKey, priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expired := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+		if err := os.WriteFile(filepath.Join(r.dir, "tls", "cert.pem"), expired, 0o640); err != nil {
+			t.Fatal(err)
+		}
+		// The container restarted on it, as one does 825 days on.
+		restart := exec.Command(filepath.Join(r.shims, "docker"), "compose", "up", "-d", "--force-recreate")
+		restart.Env, restart.Dir = r.env, r.dir
+		if out, err := restart.CombinedOutput(); err != nil {
+			t.Fatalf("restart: %v: %s", err, out)
+		}
+		if code, out := r.exec("key", "--alias", "main", "--key-name", "k2"); code != 1 || !strings.Contains(out, "not ready within 120 s") {
+			t.Fatalf("the shim does not refuse the expired certificate: exit %d:\n%s", code, out)
+		}
+		code, out := r.exec("remote", "--tls", "self-signed", "--yes")
+		if code != 0 || !strings.Contains(out, "the certificate and key in tls/ are replaced") || !strings.Contains(out, "https on 192.0.2.10:"+port+": ready") ||
+			r.file("tls/cert.pem") == string(expired) || r.file("compose.override.yaml") != before {
+			t.Errorf("renew: exit %d:\n%s", code, out)
+		}
+	})
+
+	// Refused, with nothing written: an address beyond loopback without a
+	// certificate, an unreadable one or a relative path, a wrong address, one
+	// that is not this host's, a wrong choice, rootless Docker or
+	// user-namespace remapping, and the reader's own override.
+	abs, err := filepath.Abs("setup_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		env  []string
+		args []string
+		code int
+		want string
+		mine bool
+	}{
+		{nil, []string{"--address", "192.0.2.10", "--yes"}, 2, "missing --tls: the certificate", false},
+		{nil, []string{"--address", "192.0.2.10", "--tls", "own", "--tls-key", "k.pem", "--tls-name", "proxy.example.com", "--yes"}, 2, "missing --tls-cert", false},
+		{nil, []string{"--address", "192.0.2.10", "--tls", "own", "--tls-cert", "/nonexistent/nope.pem", "--tls-key", abs, "--tls-name", "p", "--yes"}, 1,
+			"/nonexistent/nope.pem is not a file setup.sh can read; nothing was changed", false},
+		{nil, []string{"--tls", "own", "--tls-cert", abs, "--tls-key", "setup.sh", "--tls-name", "p", "--yes"}, 2,
+			"--tls-cert, --tls-key and --tls-ca take absolute paths: not setup.sh", false},
+		{nil, []string{"--address", "192.0.2", "--tls", "self-signed", "--yes"}, 2, "--address takes IPv4 addresses", false},
+		{nil, []string{"--address", "192.0.2.256", "--tls", "self-signed", "--yes"}, 2, "--address takes IPv4 addresses", false},
+		{nil, []string{"--address", "192.0.2.10,203.0.113.5", "--tls", "self-signed", "--yes"}, 2,
+			"203.0.113.5 is not an address of this host, which has 192.0.2.10 198.51.100.7", false},
+		{nil, []string{"--tls", "plain", "--yes"}, 2, "--tls takes own or self-signed", false},
+		{nil, []string{"--tls", "own", "--tls-cert", abs, "--tls-key", abs, "--tls-name", "a b", "--yes"}, 2, "--tls-name takes a host name", false},
+		{[]string{"FAKE_SECURITY=[name=seccomp,profile=builtin name=rootless name=cgroupns]"}, []string{"--tls", "self-signed", "--yes"}, 1, "Docker runs rootless", false},
+		{[]string{"FAKE_SECURITY=[name=userns name=seccomp,profile=builtin]"}, []string{"--tls", "self-signed", "--yes"}, 1, "user-namespace remapping", false},
+		{nil, []string{"--tls", "self-signed", "--yes"}, 1, "compose.override.yaml was not written by setup.sh, so it is left as it is: move it away and run this again", true},
+	} {
+		t.Run(strings.Join(append(c.env, c.args...), " "), func(t *testing.T) {
+			r := newRun(t, append([]string{"SRC=v"}, c.env...))
+			if code, out := r.exec(acme(freePort(t))...); code != 0 {
+				t.Fatalf("install: exit %d:\n%s", code, out)
+			}
+			if c.mine {
+				if err := os.WriteFile(filepath.Join(r.dir, "compose.override.yaml"), []byte("services: {}\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			files, up := r.written(), r.count("docker", "compose up")
+			code, out := r.exec(append([]string{"remote"}, c.args...)...)
+			if _, err := os.Stat(filepath.Join(r.dir, "tls")); code != c.code || !strings.Contains(out, c.want) || r.written() != files ||
+				!os.IsNotExist(err) || r.count("docker", "compose up") != up || r.count("openssl", "") != 0 {
+				t.Errorf("exit %d, want %d and %q; tls/ %v:\n%s", code, c.code, c.want, err, out)
+			}
+		})
 	}
 }
 
@@ -1306,7 +1821,7 @@ func TestSetupBounds(t *testing.T) {
 	t.Run("never ready", func(t *testing.T) {
 		r := newRun(t, []string{"SRC=v", "FAKE_READY=never"})
 		code, out := r.exec(acme(freePort(t))...)
-		if code != 1 || !strings.Contains(out, "not ready within 120 s; the last 30 log lines:\na log line") ||
+		if code != 1 || !strings.Contains(out, "not ready within 120 s; the last 30 log lines:\na log line") || strings.Contains(out, "remote again") ||
 			r.count("curl", "/health/ready") != 120 || r.count("docker", "compose logs --tail 30 stargaite") != 1 || len(r.cli()) != 0 {
 			t.Errorf("exit %d, %d readiness checks:\n%s", code, r.count("curl", "/health/ready"), out)
 		}

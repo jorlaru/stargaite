@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jorlaru/stargaite/internal/admintest"
 	"github.com/jorlaru/stargaite/internal/cli"
@@ -109,6 +110,7 @@ type world struct {
 	models *modelList
 	mu     sync.Mutex
 	argvs  []string
+	docs   []string // the standard input of each apply
 }
 
 func newWorld(t *testing.T) *world {
@@ -158,15 +160,34 @@ func (w *world) addWith(u *ui.UI) (string, error) {
 
 // addCtx is addWith under ctx.
 func (w *world) addCtx(ctx context.Context, u *ui.UI) (string, error) {
-	record := func(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+	return u.Run(ctx, addSteps(), func(ctx context.Context) (string, error) {
+		return AddProviders(ctx, u, w.proxy(), w.h)
+	})
+}
+
+// proxy is the world's CLI, every argv recorded, and the document of each
+// apply (a verify's standard input is a pipe left open, so only apply's).
+func (w *world) proxy() *proxy.Proxy {
+	return proxy.New(func(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 		w.mu.Lock()
 		w.argvs = append(w.argvs, strings.Join(args, " "))
 		w.mu.Unlock()
+		if len(args) > 0 && args[0] == "apply" && stdin != nil {
+			doc, _ := io.ReadAll(stdin)
+			w.mu.Lock()
+			w.docs = append(w.docs, string(doc))
+			w.mu.Unlock()
+			stdin = bytes.NewReader(doc)
+		}
 		return w.runner(ctx, args, stdin, stdout, stderr)
-	}
-	return u.Run(ctx, addSteps(), func(ctx context.Context) (string, error) {
-		return AddProviders(ctx, u, proxy.New(record), w.h)
 	})
+}
+
+// applied is the document of each apply the task sent.
+func (w *world) applied() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return slices.Clone(w.docs)
 }
 
 // cli is every argv the task gave the CLI.
@@ -504,22 +525,25 @@ func TestAddProvidersUpFails(t *testing.T) {
 const leave = "<esc>"
 
 // scripted is a front that answers each question by its ID, from a list in
-// order, and records the prompts asked. A work question waits for its work.
+// order, and records the prompts asked. A work question waits for its work,
+// or answers Esc once leaveWork, polled every 10 ms, says so.
 type scripted struct {
-	mu      sync.Mutex
-	answers map[string][]string
-	asked   []string
-	out     strings.Builder
+	mu        sync.Mutex
+	answers   map[string][]string
+	asked     []string
+	questions []ui.Question
+	out       strings.Builder
+	leaveWork func(ui.Question) bool
 }
 
 func (s *scripted) Ask(ctx context.Context, q ui.Question) (string, error) {
 	if q.Kind == ui.KindWork {
-		<-ctx.Done()
-		return "", ctx.Err()
+		return s.work(ctx, q)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.asked = append(s.asked, q.Prompt)
+	s.questions = append(s.questions, q)
 	list := s.answers[q.ID]
 	if len(list) == 0 {
 		return "", errors.New("no answer for " + q.ID)
@@ -529,6 +553,22 @@ func (s *scripted) Ask(ctx context.Context, q ui.Question) (string, error) {
 		return "", ui.ErrLeave
 	}
 	return list[0], nil
+}
+
+// work waits for the work to end, or for leaveWork to leave it.
+func (s *scripted) work(ctx context.Context, q ui.Question) (string, error) {
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-tick.C:
+			if s.leaveWork != nil && s.leaveWork(q) {
+				return "", ui.ErrLeave
+			}
+		}
+	}
 }
 
 func (s *scripted) Show(_ context.Context, text string) error {
@@ -832,7 +872,7 @@ func TestFreeCheck(t *testing.T) {
 		{"openai", "https://api.openai.com/v1", ""},
 		{"evil", "https://openrouter.ai.evil.test/v1", ""},
 	} {
-		p := &picked{name: row.name, res: proxy.Provider{Protocol: "openai", BaseURL: row.url, AllowPrivateNetwork: true}}
+		p := proxy.Provider{Name: row.name, Protocol: "openai", BaseURL: row.url, AllowPrivateNetwork: true}
 		want := host.Provider{Protocol: "openai", BaseURL: row.url, Key: "k", Path: row.path, AllowPrivate: true}
 		if got := freeCheck(p, "k"); got != want {
 			t.Errorf("%s at %s: %+v, want %+v", row.name, row.url, got, want)
@@ -912,6 +952,30 @@ func TestAddProvidersEscLeaves(t *testing.T) {
 	}
 	if w.file(".env") != env || len(w.models.requests()) != 0 {
 		t.Errorf(".env %q, requests %q", w.file(".env"), w.models.requests())
+	}
+}
+
+// TestAddProvidersEscDuringCheck: Esc while the free check waits for a
+// model list that stalls leaves at once, and nothing is written.
+func TestAddProvidersEscDuringCheck(t *testing.T) {
+	w := newWorld(t)
+	w.listed("acme", "ANTHROPIC_API_KEY", w.models.port())
+	w.models.stall = func() {}
+	files := w.files()
+	s := &scripted{answers: map[string][]string{"provider": {"acme"}, "key-env": {"good"}},
+		leaveWork: func(q ui.Question) bool { return strings.HasPrefix(q.Prompt, "checking the key of acme") }}
+	done := make(chan error, 1)
+	go func() { _, err := w.addWith(ui.New(s, nil)); done <- err }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, ui.ErrLeave) {
+			t.Fatalf("err = %v\n%s", err, s.output())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Esc did not stop the free check within 2 s")
+	}
+	if !maps.Equal(files, w.files()) || w.ups() != 0 {
+		t.Errorf("ups %d, files %q", w.ups(), w.files())
 	}
 }
 

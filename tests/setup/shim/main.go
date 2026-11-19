@@ -358,7 +358,7 @@ func cliArgs(args []string) (map[string][]string, []string) {
 		switch {
 		case args[i] == "--":
 			return flags, args[i+1:]
-		case a == "json" || a == "allow-private-network":
+		case slices.Contains([]string{"json", "allow-private-network", "until-stdin-closes", "dry-run", "yes"}, a):
 			flags[a] = append(flags[a], "true")
 		case strings.Contains(a, "="):
 			name, v, _ := strings.Cut(a, "=")
@@ -398,6 +398,18 @@ func fakeCLI(st *state, args []string) (string, int) {
 			return "credentials: resolved · reachable: yes · authorized: no (401) · bad credentials", 1
 		}
 		return "credentials: resolved · reachable: yes · authorized: yes · span: accepted (200) · trace_id=4bf92f3577b34da6a3ce929d0e0e4736", 0
+	}
+	// apply is one word: the console's dry run, apply --json --dry-run -f -,
+	// with a document on standard input.
+	if len(args) > 1 && args[0] == "apply" && args[1] == "--json" {
+		var doc struct {
+			Version *int `json:"version"`
+		}
+		in, _ := io.ReadAll(os.Stdin)
+		if json.Unmarshal(in, &doc) != nil || doc.Version == nil || *doc.Version != 1 {
+			return failure(fmt.Sprintf("fake CLI: apply takes a JSON object with \"version\":1, not %q", in))
+		}
+		return encode(map[string]any{"revision": 1, "changed": false, "diff": []any{}, "findings": []any{}}), 0
 	}
 	if len(args) < 3 || args[2] != "--json" {
 		return failure(fmt.Sprintf("fake CLI: --json is not the third argument: %q", args))

@@ -19,13 +19,13 @@ func Warnings() []Warning {
 	return []Warning{
 		{"credential_unresolved", "recreate", "%s: its key is not in the container yet: Add providers writes it to .env and recreates the container"},
 		{"url_unresolved", "", "%s: its host name did not resolve from the container; the proxy tries again on each call, so check the URL if this lasts"},
-		{"target_unverified", "check", ""},
-		{"unpriced", "", ""},
-		{"no_fallback_prices", "", ""},
+		{"target_unverified", "check", "%s is not checked yet: Make an alias or Change an alias checks it, after stating its paid calls"},
+		{"unpriced", "", "%s has no prices, so no budget counts its spend; a budget that reaches it asks them"},
+		{"no_fallback_prices", "", "%s has no prices: its cost is the provider's own report, and a call without one counts nothing"},
 		{"reasoning_undeclared", "", ""},
-		{"effort_dropped", "", ""},
+		{"effort_dropped", "", "%s: the alias's effort is not sent toward a target whose reasoning dialect is none"},
 		{"endpoint_unservable", "", ""},
-		{"unknown_alias", "", ""},
+		{"unknown_alias", "", "%s names an alias that does not exist: its calls to that alias get an error"},
 		{"unknown_provider", "", ""},
 		{"quota_beyond_retention", "", ""},
 		{"env_file_unreadable", "", ""},
@@ -45,10 +45,10 @@ func Lookup(code string) (Warning, bool) {
 }
 
 // Plain says a warning about the resource name: the row's words, or else the
-// CLI's own message and where to find it again.
+// resource and the CLI's own message.
 func Plain(code, name, message string) string {
 	if w, ok := Lookup(code); ok && w.Words != "" {
 		return fmt.Sprintf(w.Words, name)
 	}
-	return message + " (stargaite validate lists it)"
+	return name + ": " + message
 }

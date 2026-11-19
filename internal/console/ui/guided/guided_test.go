@@ -610,6 +610,9 @@ func TestFrameFits(t *testing.T) {
 			t.Fatal(r.err)
 		}
 	}
+	h.mu.Lock()
+	beforeDone := len(h.frames)
+	h.mu.Unlock()
 	h.front.Done()
 	h.ended()
 	h.mu.Lock()
@@ -617,7 +620,24 @@ func TestFrameFits(t *testing.T) {
 	if len(h.frames) < 10 {
 		t.Fatalf("only %d frames", len(h.frames))
 	}
-	for _, f := range h.frames {
+	// Every frame ends with "\n" but those drawn once the program ends (Bubble
+	// Tea draws twice then: after the update, and its final flush), which are
+	// empty, so the frame region is erased; the last frame is one of them.
+	if last := h.frames[len(h.frames)-1].Content; last != "" {
+		t.Fatalf("the last frame is not empty:\n%s", last)
+	}
+	for i, f := range h.frames {
+		if f.Content == "" {
+			if i < beforeDone {
+				t.Fatalf("frame %d of %d is empty before Done", i, len(h.frames))
+			}
+			for _, later := range h.frames[i:] {
+				if later.Content != "" {
+					t.Fatalf("frame %d is empty, and a later one is not:\n%s", i, later.Content)
+				}
+			}
+			break
+		}
 		if !strings.HasSuffix(f.Content, "\n") {
 			t.Fatalf("frame without a final newline:\n%s", f.Content)
 		}
@@ -630,6 +650,66 @@ func TestFrameFits(t *testing.T) {
 				t.Fatalf("line %q is %d wide", l, ansi.StringWidth(l))
 			}
 		}
+	}
+}
+
+// lastFrame is the content of the last frame recorded.
+func (h *harness) lastFrame() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.frames[len(h.frames)-1].Content
+}
+
+// TestNoFrameLeftOnQuit: when the program ends, its last frame is empty, so
+// no "working…" or question stays under the said lines.
+func TestNoFrameLeftOnQuit(t *testing.T) {
+	h := start(t)
+	h.waitShown("working…")
+	if err := h.front.Show(h.ctx, "Done: result line."); err != nil {
+		t.Fatal(err)
+	}
+	h.front.Done()
+	h.ended()
+	if last := h.lastFrame(); last != "" {
+		t.Fatalf("after Done the last frame is:\n%s", last)
+	}
+
+	h = start(t)
+	h.waitShown("working…")
+	h.p.Send(ctrlC)
+	h.ended()
+	if last := h.lastFrame(); last != "" {
+		t.Fatalf("after Ctrl-C at home the last frame is:\n%s", last)
+	}
+
+	h = start(t)
+	got := h.asked(homeQuestion())
+	h.waitShown("What do you want to do?")
+	h.p.Send(ctrlC)
+	h.ended()
+	answer(t, got)
+	if last := h.lastFrame(); last != "" {
+		t.Fatalf("after Ctrl-C at a question the last frame is:\n%s", last)
+	}
+}
+
+func TestGuidedPaid(t *testing.T) {
+	h := start(t)
+	q := ui.Question{ID: "check", Step: "check", Prompt: "2 paid call(s) in all", Kind: ui.KindPaid,
+		Options: []ui.Option{{Value: "check", Label: "Check it"}, {Value: "not now", Label: "Not now"}},
+		Bar:     ui.Bar{Titles: []string{"check"}}}
+	got := h.asked(q)
+	h.waitShown("> Check it")
+	h.p.Send(key(tea.KeyEnter))
+	time.Sleep(450 * time.Millisecond)
+	select {
+	case r := <-got:
+		t.Fatalf("the Enter sent at once answered %+v", r)
+	default:
+	}
+	h.p.Send(key(tea.KeyEnter))
+	if r := answer(t, got); r.err != nil || r.text != "check" {
+		t.Fatalf("answer %+v; want check", r)
 	}
 }
 

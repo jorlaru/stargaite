@@ -50,6 +50,7 @@ type Model struct {
 	holding       bool        // a reveal is shown, or just ended: lines wait
 	held          []sayMsg
 	interrupted   bool
+	quitting      bool // the program ends: its last frame is drawn empty
 }
 
 // NewModel returns the root model, titled with the console's version.
@@ -95,11 +96,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.holding, m.held = false, nil
 		return m, tea.Sequence(cmds...)
 	case doneMsg:
+		m.quitting = true
 		return m, tea.Quit
 	case tea.KeyPressMsg:
 		if m.piece == nil {
 			if msg.String() == "ctrl+c" {
-				m.interrupted = true
+				m.interrupted, m.quitting = true, true
 				return m, tea.Quit
 			}
 			return m, nil
@@ -123,7 +125,7 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	m.ask.reply <- result{text: a.Value, err: a.Err}
 	if errors.Is(a.Err, ui.ErrQuit) {
-		m.interrupted = true
+		m.interrupted, m.quitting = true, true
 		m.ask, m.piece = nil, nil
 		return m, tea.Quit
 	}
@@ -162,13 +164,20 @@ func newPiece(q ui.Question) piece.Piece {
 		return piece.Secret(q)
 	case ui.KindWork:
 		return piece.Work(q)
+	case ui.KindPaid:
+		return piece.Paid(q)
 	}
 	return piece.Pick(q)
 }
 
 // View implements tea.Model. The content always ends with "\n", so the last
-// line stays when the program exits (research: RB section 0.5).
+// line stays when the program exits (research: RB section 0.5); once the
+// program ends it is empty, and Bubble Tea's final flush erases the frame,
+// so no "working…" stays under the said lines.
 func (m Model) View() tea.View {
+	if m.quitting {
+		return tea.View{}
+	}
 	lines := []string{ansi.Truncate("StargAIte console "+m.version, m.width, "…")}
 	if m.ask != nil && m.ask.q.Bar.Current >= 0 {
 		lines = append(lines, stepBar(m.ask.q.Bar, m.width))

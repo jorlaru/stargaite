@@ -48,8 +48,8 @@ func (h *Host) EnvGet(name string) (value string, ok bool, err error) {
 // as setup.sh's env_set does. The value must be one .env can hold; no error
 // holds it.
 func (h *Host) EnvSet(name, value string) error {
-	if !regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(name) {
-		return fmt.Errorf("%q is not a variable name", name)
+	if err := varName(name); err != nil {
+		return err
 	}
 	if err := ui.Storable(name, value); err != nil {
 		return err
@@ -70,6 +70,45 @@ func (h *Host) EnvSet(name, value string) error {
 		b.WriteString(name + "='" + value + "'\n")
 	}
 	return h.replace(".env", ".env.", b.String())
+}
+
+// EnvUnset removes every NAME= line of .env, keeping every other byte. A
+// missing .env, or one without the line, is removed false, and nothing is
+// written.
+func (h *Host) EnvUnset(name string) (removed bool, err error) {
+	if err := varName(name); err != nil {
+		return false, err
+	}
+	data, err := os.ReadFile(filepath.Join(h.Dir, ".env"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf(".env: %w", err)
+	}
+	var b strings.Builder
+	for _, line := range strings.SplitAfter(string(data), "\n") {
+		if strings.HasPrefix(line, name+"=") {
+			removed = true
+			continue
+		}
+		b.WriteString(line)
+	}
+	if !removed {
+		return false, nil
+	}
+	if err := h.replace(".env", ".env.", b.String()); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// varName refuses what cannot be a variable's name in .env.
+func varName(name string) error {
+	if !regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(name) {
+		return fmt.Errorf("%q is not a variable name", name)
+	}
+	return nil
 }
 
 // Override is compose.override.yaml as setup.sh's override_set reads it: its

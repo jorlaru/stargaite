@@ -63,7 +63,7 @@ func clone(t *testing.T, ps string) *host.Host {
 	return host.New(t.TempDir())
 }
 
-func run(t *testing.T, h *host.Host, runner proxy.Runner) (string, error) {
+func seeWhatExists(t *testing.T, h *host.Host, runner proxy.Runner) (string, error) {
 	t.Helper()
 	var out bytes.Buffer
 	got, err := SeeWhatExists(context.Background(), ui.New(plain.New(&out), nil), proxy.New(runner), h)
@@ -94,7 +94,7 @@ func TestSeeWhatExistsExample(t *testing.T) {
 		strings.NewReader(""), &applied, &errOut); code != 0 {
 		t.Fatalf("apply: exit %d:\n%s%s", code, applied.String(), errOut.String())
 	}
-	out, err := run(t, clone(t, "c0ffee\n"), cliRunner(env))
+	out, err := seeWhatExists(t, clone(t, "c0ffee\n"), cliRunner(env))
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -117,7 +117,7 @@ func TestSeeWhatExistsExample(t *testing.T) {
 }
 
 func TestSeeWhatExistsEmpty(t *testing.T) {
-	out, err := run(t, clone(t, "c0ffee\n"), cliRunner(admintest.Server(t)))
+	out, err := seeWhatExists(t, clone(t, "c0ffee\n"), cliRunner(admintest.Server(t)))
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -145,7 +145,7 @@ func shapes() map[string]reply {
 func TestSeeWhatExistsShapes(t *testing.T) {
 	var calls []string
 	answers := shapes()
-	out, err := run(t, clone(t, "c0ffee"), cannedRunner(t, answers, &calls))
+	out, err := seeWhatExists(t, clone(t, "c0ffee"), cannedRunner(t, answers, &calls))
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -174,7 +174,7 @@ telemetry https://otel.example.com: credentials unresolved: A, B
 		{`{"telemetry":null}`, "telemetry: not set"},
 	} {
 		answers["telemetry status --json"] = reply{tc.telemetry, 0}
-		out, err := run(t, clone(t, "c0ffee"), cannedRunner(t, answers, &calls))
+		out, err := seeWhatExists(t, clone(t, "c0ffee"), cannedRunner(t, answers, &calls))
 		if err != nil || !strings.HasSuffix(out, "\n"+tc.want+"\n") {
 			t.Fatalf("%s: %v\n%s", tc.telemetry, err, out)
 		}
@@ -183,7 +183,7 @@ telemetry https://otel.example.com: credentials unresolved: A, B
 
 func TestSeeWhatExistsNothingRuns(t *testing.T) {
 	var calls []string
-	out, err := run(t, clone(t, ""), cannedRunner(t, nil, &calls))
+	out, err := seeWhatExists(t, clone(t, ""), cannedRunner(t, nil, &calls))
 	if err != nil || out != "version: dev in this clone; no container runs (./setup.sh install starts it)\n" {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -198,7 +198,7 @@ func TestSeeWhatExistsCleansProxyText(t *testing.T) {
 	answers["models list --json"] = reply{`{"models":[{"name":"a\u001b[2Jb","targets":["acme/a"]}]}`, 0}
 	answers["targets list --json"] = reply{`{"targets":[{"id":"acme/a"},{"id":"x/\u001b]52;c;aGk=\u0007"}]}`, 0}
 	answers["telemetry status --json"] = reply{`{"telemetry":{"otlp_endpoint":"https://otel.example.com/\u202egpj"}}`, 0}
-	out, err := run(t, clone(t, "c0ffee"), cannedRunner(t, answers, &calls))
+	out, err := seeWhatExists(t, clone(t, "c0ffee"), cannedRunner(t, answers, &calls))
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -214,7 +214,7 @@ func TestSeeWhatExistsStopsOnError(t *testing.T) {
 	var calls []string
 	answers := shapes()
 	answers["keys list --json"] = reply{`{"error":{"message":"the admin API was not reached: refused"}}`, 1}
-	out, err := run(t, clone(t, "c0ffee"), cannedRunner(t, answers, &calls))
+	out, err := seeWhatExists(t, clone(t, "c0ffee"), cannedRunner(t, answers, &calls))
 	if err == nil || err.Error() != "stargaite keys list: the admin API was not reached: refused" {
 		t.Fatalf("err = %v", err)
 	}
@@ -231,7 +231,7 @@ func TestSeeWhatExistsDockerFails(t *testing.T) {
 	}
 	t.Setenv("PATH", bin)
 	var calls []string
-	out, err := run(t, host.New(t.TempDir()), cannedRunner(t, nil, &calls))
+	out, err := seeWhatExists(t, host.New(t.TempDir()), cannedRunner(t, nil, &calls))
 	if err == nil || err.Error() != "docker compose ps failed with exit 1" || out != "" || len(calls) != 0 {
 		t.Fatalf("err = %v, out %q, calls %q", err, out, calls)
 	}
@@ -239,7 +239,7 @@ func TestSeeWhatExistsDockerFails(t *testing.T) {
 
 func TestMenuFresh(t *testing.T) {
 	m := Menu()
-	if len(m) != 2 || m[0].Group != "This machine" || m[0].Label != "See what exists" || m[0].Sub != "status" ||
+	if len(m) != 5 || m[0].Group != "This machine" || m[0].Label != "See what exists" || m[0].Sub != "status" ||
 		len(m[0].Steps) != 1 || m[0].Steps[0] != (ui.Step{ID: "show", Title: "what exists"}) || m[0].Run == nil {
 		t.Fatalf("Menu() = %+v", m)
 	}
@@ -259,6 +259,38 @@ func TestMenuFresh(t *testing.T) {
 	}
 	if !slices.Equal(titles, []string{"which", "add", "key", "write", "recreate"}) {
 		t.Fatalf("addSteps() = %+v", addSteps())
+	}
+	for i, e := range []struct {
+		group, label string
+		steps        []ui.Step
+		titles       []string
+	}{
+		{"Providers", "Change a provider", changeProviderSteps(), []string{"which", "change", "key", "recreate", "check"}},
+		{"Models your apps call", "Make an alias", makeSteps(), []string{"name", "model", "fallbacks", "settings", "check", "make"}},
+		{"Models your apps call", "Change an alias", changeAliasSteps(), []string{"which", "change", "settings", "check"}},
+	} {
+		got := m[i+2]
+		if got.Group != e.group || got.Label != e.label || !slices.Equal(got.Steps, e.steps) || got.Run == nil {
+			t.Fatalf("Menu()[%d] = %+v", i+2, got)
+		}
+		var titles []string
+		for _, s := range e.steps {
+			if s.ID != s.Title {
+				t.Fatalf("%s steps = %+v", e.label, e.steps)
+			}
+			titles = append(titles, s.Title)
+		}
+		if !slices.Equal(titles, e.titles) {
+			t.Fatalf("%s steps = %+v", e.label, e.steps)
+		}
+	}
+	if m[2].Sub != "" || m[4].Sub != "" || m[2].Flags != nil || m[4].Flags != nil {
+		t.Fatalf("Change a provider or Change an alias has a subcommand: %+v, %+v", m[2], m[4])
+	}
+	if m[3].Sub != "alias" || !slices.Equal(m[3].Flags, []string{"provider", "base-url", "protocol", "api-key-env", "key-env", "model", "alias",
+		"fallback", "max-output-tokens", "effort", "input-price", "output-price"}) ||
+		!slices.Equal(m[3].Bools, []string{"replace", "allow-private-network", "yes", "reverify"}) {
+		t.Fatalf("Menu()[3] = %+v", m[3])
 	}
 	m[0].Label = "changed"
 	m[0].Steps[0].Title = "changed"

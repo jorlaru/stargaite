@@ -31,6 +31,20 @@ func TestSessionCaps(t *testing.T) {
 	refused(t, "Open(1) after 12", err, "this step states 1 paid calls and this console run has 0 left of 12")
 }
 
+// TestSessionFits: Fits refuses as Open does, with the same texts, and
+// debits nothing.
+func TestSessionFits(t *testing.T) {
+	s := NewSession()
+	refused(t, "Fits(13)", s.Fits(13), "this step states 13 paid calls and this console run has 12 left of 12")
+	refused(t, "Fits(0)", s.Fits(0), "a paid step states at least one call")
+	if err := s.Fits(12); err != nil {
+		t.Fatalf("Fits(12): %v", err)
+	}
+	if _, err := s.Open(12); err != nil {
+		t.Fatalf("Open(12) after Fits(12): %v: Fits debited", err)
+	}
+}
+
 // TestBudgetTake: a budget gives exactly what its step stated, and a call
 // with no budget is refused.
 func TestBudgetTake(t *testing.T) {

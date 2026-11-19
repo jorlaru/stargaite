@@ -34,5 +34,12 @@ func Menu() []Entry {
 			Flags: []string{"provider", "base-url", "protocol", "api-key-env", "key-env"},
 			Bools: []string{"replace", "allow-private-network", "yes"},
 			Steps: addSteps(), Run: AddProviders},
+		{Group: "Providers", Label: "Change a provider", Steps: changeProviderSteps(), Run: ChangeProvider},
+		{Group: "Models your apps call", Label: "Make an alias", Sub: "alias",
+			Flags: []string{"provider", "base-url", "protocol", "api-key-env", "key-env", "model", "alias", "fallback",
+				"max-output-tokens", "effort", "input-price", "output-price"},
+			Bools: []string{"replace", "allow-private-network", "yes", "reverify"},
+			Steps: makeSteps(), Run: MakeAlias},
+		{Group: "Models your apps call", Label: "Change an alias", Steps: changeAliasSteps(), Run: ChangeAlias},
 	}
 }

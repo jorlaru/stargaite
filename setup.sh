@@ -1106,8 +1106,8 @@ subcommands:
             what exists (the default at a terminal before it exists; a menu
             of the others after)
   provider  add providers and their keys; each key is checked for free before it is written
-  alias     an alias toward a provider's model, the target verified first;
-            one that exists (--alias, main) is kept, with no paid call
+  alias     an alias toward a provider's model, with fallbacks from any provider (--fallback a/m,b/m);
+            its new targets are checked first, each paid call counted and announced
   key       a client key for an alias (--alias, main), then a first answer
   budget    a spending limit on the instance, an alias or a key; the prices
             of the targets it reaches unpriced are asked first
@@ -1141,6 +1141,8 @@ install flags, which provider, alias and key take for their steps:
   --alias <name>            the alias clients call (main)
   --max-output-tokens <n>   the alias's output cap, for an anthropic target (8192)
   --effort <level>          the alias's default reasoning effort (none)
+  --fallback <p/m,…>        alias only: its fallbacks, in order, of providers
+                            added; alias also takes budget's price flags
   --key-name <name>         the client key's name (my-app)
   --rpm-limit <n>           the client key's requests a minute (60)
   --yes                     confirm a change that replaces something or
@@ -1212,7 +1214,7 @@ main() {
 	case $sub in
 	install) parse_flags "port $pf model alias max-output-tokens effort key-name rpm-limit" "$bf reverify" "$@"; install ;;
 	provider) console provider "$@" ;;
-	alias) parse_flags "$pf model alias max-output-tokens effort" "$bf reverify" "$@"; running; alias_kept || { step_provider; step_model; step_target; step_alias; } ;;
+	alias) console alias "$@" ;;
 	key) parse_flags "alias key-name rpm-limit" "" "$@"; running; alias_kept || die "alias $alias does not exist: ./setup.sh alias makes it"; if step_key; then step_answer; fi ;;
 	budget) parse_flags "on limit-usd reset input-price output-price" "yes" "$@"; running; budget ;;
 	telemetry) parse_flags "backend endpoint langfuse-public-env langfuse-secret-env header-name key-env" "$bf" "$@"; running; telemetry ;;

@@ -65,7 +65,8 @@ func noCharm(deps []string) error {
 
 func TestNoCharmBelowFronts(t *testing.T) {
 	deps := goList(t, "-deps", "./internal/console/ui", "./internal/console/ui/plain", "./internal/console/task",
-		"./internal/console/proxy", "./internal/console/host", "./internal/console/paid", "./internal/console/rules")
+		"./internal/console/proxy", "./internal/console/host", "./internal/console/paid", "./internal/console/rules",
+		"./internal/console/families")
 	expect(t, noCharm, deps, append(deps, "charm.land/bubbletea/v2"))
 	expect(t, noCharm, deps, append(deps, "github.com/charmbracelet/colorprofile"))
 }

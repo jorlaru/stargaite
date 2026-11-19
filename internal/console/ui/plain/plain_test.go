@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
@@ -54,6 +55,24 @@ func TestPlainMissingWithPrompt(t *testing.T) {
 	var usage *ui.UsageError
 	if !errors.As(err, &usage) || err.Error() != "missing --yes: writing x" {
 		t.Fatalf("err = %v, want missing --yes: writing x", err)
+	}
+}
+
+// TestAsks: the plain front never asks; the other half is in ui's tests.
+func TestAsks(t *testing.T) {
+	if ui.New(New(io.Discard), nil).Asks() {
+		t.Fatal("the plain front asks")
+	}
+}
+
+func TestPlainPaid(t *testing.T) {
+	var out bytes.Buffer
+	got, err := New(&out).Ask(context.Background(), ui.Question{ID: "check", Kind: ui.KindPaid, Prompt: "2 paid call(s) in all"})
+	if err != nil || got != "check" {
+		t.Fatalf("got %q, %v; want check", got, err)
+	}
+	if out.String() != "2 paid call(s) in all\n" {
+		t.Fatalf("stdout = %q", out.String())
 	}
 }
 

@@ -147,7 +147,7 @@ Run again on an installation, it offers a menu, or takes a subcommand; `./setup.
 |---|---|
 | `install` | The steps above; the default at a terminal before the container exists |
 | `provider` | Add providers and their keys in one go; each key is checked for free (its model list) before it is written to `.env`, and the container is recreated once |
-| `alias` | An alias toward a provider's model, the target verified first |
+| `alias` | An alias toward a provider's model, with fallbacks from any provider; its new targets are checked first, each paid call announced |
 | `key` | A client key for an alias, then a first answer with it |
 | `budget` | A spending limit on the instance, an alias or a key; the prices of the targets it reaches unpriced are asked first |
 | `telemetry` | Traces to Langfuse or any OTLP endpoint, then `telemetry test` |

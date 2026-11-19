@@ -152,6 +152,17 @@ func TestAskCleansQuestion(t *testing.T) {
 	}
 }
 
+func TestAskCleansGroup(t *testing.T) {
+	front := &fakeFront{t: t, answers: []string{"v"}}
+	q := Question{ID: "model", Options: []Option{{Value: "v", Label: "v", Group: "x-ai\x1b[2J · Other"}}}
+	if _, err := New(front, nil).Pick(context.Background(), q); err != nil {
+		t.Fatal(err)
+	}
+	if g := front.asked[0].Options[0].Group; g != "x-ai[2J · Other" {
+		t.Fatalf("group %q: not cleaned", g)
+	}
+}
+
 func TestStepOutsideTable(t *testing.T) {
 	u := New(refusingFront{t}, nil)
 	_, err := u.Text(context.Background(), Question{ID: "name", Step: "model"})
@@ -406,6 +417,85 @@ func TestSecretRefusedValue(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "it's") {
 		t.Fatalf("the error holds the value: %v", err)
+	}
+}
+
+// paidQuestion is a check's paid step.
+func paidQuestion() Question { return Question{ID: "check", Prompt: "2 paid call(s) in all"} }
+
+func TestPaidFront(t *testing.T) {
+	ctx := context.Background()
+	front := &fakeFront{t: t, answers: []string{"check"}}
+	u := New(front, nil)
+	b, err := u.Paid(ctx, paidQuestion(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := front.asked[0]
+	want := []Option{{Value: "check", Label: "Check it"}, {Value: "not now", Label: "Not now"}}
+	if q.Kind != KindPaid || !slices.Equal(q.Options, want) || q.Prompt != "2 paid call(s) in all" {
+		t.Fatalf("the front got %+v", q)
+	}
+	if err := b.Take(2); err != nil {
+		t.Fatalf("Take(2): %v", err)
+	}
+	if b.Take(1) == nil {
+		t.Fatal("Take(1) after 2 of 2: the budget gave more than stated")
+	}
+
+	u = New(&fakeFront{t: t, answers: []string{"not now"}}, nil)
+	if b, err := u.Paid(ctx, paidQuestion(), 2); b != nil || err != nil {
+		t.Fatalf("not now: got %v, %v; want nil, nil", b, err)
+	}
+	u.front = &fakeFront{t: t, answers: []string{"check"}}
+	if _, err := u.Paid(ctx, paidQuestion(), 12); err != nil {
+		t.Fatalf("Paid(12) after not now: %v: something was debited", err)
+	}
+
+	if _, err := New(errFront{}, nil).Paid(ctx, paidQuestion(), 2); !errors.Is(err, ErrLeave) {
+		t.Fatalf("err = %v, want ErrLeave as is", err)
+	}
+}
+
+func TestPaidNeverFromFlags(t *testing.T) {
+	front := &fakeFront{t: t, answers: []string{"check"}}
+	b, err := New(front, map[string]string{"check": "not now"}).Paid(context.Background(), paidQuestion(), 1)
+	if err != nil || b == nil || len(front.asked) != 1 {
+		t.Fatalf("got %v, %v, asked %d; want the front asked and its answer taken", b, err, len(front.asked))
+	}
+}
+
+func TestPaidOverSession(t *testing.T) {
+	ctx := context.Background()
+	u := New(&fakeFront{t: t, answers: []string{"check"}}, nil)
+	if _, err := u.Paid(ctx, paidQuestion(), 10); err != nil {
+		t.Fatal(err)
+	}
+	u.front = refusingFront{t}
+	_, err := u.Paid(ctx, paidQuestion(), 3)
+	if err == nil || err.Error() != "this step states 3 paid calls and this console run has 2 left of 12" {
+		t.Fatalf("err = %v, want the session's refusal before asking", err)
+	}
+}
+
+func TestPaidStep(t *testing.T) {
+	u := New(refusingFront{t}, nil)
+	_, err := u.Run(context.Background(), []Step{{ID: "model", Title: "model"}}, func(ctx context.Context) (string, error) {
+		q := paidQuestion()
+		q.Step = "check"
+		_, err := u.Paid(ctx, q, 1)
+		return "", err
+	})
+	if err == nil || err.Error() != `ui: question check: step "check" is not in the task's table` {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+// TestAsks: a front without an Asks method asks; the plain front's half is
+// in its own package.
+func TestAsks(t *testing.T) {
+	if !New(refusingFront{t}, nil).Asks() {
+		t.Fatal("a front without Asks does not ask")
 	}
 }
 

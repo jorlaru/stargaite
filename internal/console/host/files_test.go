@@ -204,3 +204,56 @@ func TestPlane(t *testing.T) {
 		t.Fatalf("bad name: %v", err)
 	}
 }
+
+func TestEnvUnset(t *testing.T) {
+	for _, tc := range []struct {
+		name, before, after string
+		removed             bool
+	}{
+		{"middle", "A=1\nK='x'\nB=2\n", "A=1\nB=2\n", true},
+		{"last without newline", "A=1\nK='x'", "A=1\n", true},
+		{"twice", "K='x'\nA=1\r\nK=y\nB=2", "A=1\r\nB=2", true},
+		{"absent", "A=1\nKK=2\n# K=3\nB=2", "A=1\nKK=2\n# K=3\nB=2", false},
+	} {
+		h := New(t.TempDir())
+		env := filepath.Join(h.Dir, ".env")
+		write(t, env, tc.before)
+		removed, err := h.EnvUnset("K")
+		if err != nil || removed != tc.removed {
+			t.Fatalf("%s: removed %v, %v; want %v", tc.name, removed, err, tc.removed)
+		}
+		if got := read(t, env); got != tc.after {
+			t.Fatalf("%s: .env = %q, want %q", tc.name, got, tc.after)
+		}
+		want := os.FileMode(0o644) // write's: an .env not written keeps its mode
+		if tc.removed {
+			want = 0o600
+		}
+		if info, err := os.Stat(env); err != nil || info.Mode().Perm() != want {
+			t.Fatalf("%s: mode %v, %v; want %v", tc.name, info.Mode().Perm(), err, want)
+		}
+	}
+	h := New(t.TempDir())
+	if removed, err := h.EnvUnset("K"); removed || err != nil {
+		t.Fatalf("no .env: removed %v, %v", removed, err)
+	}
+	if _, err := os.Stat(filepath.Join(h.Dir, ".env")); !os.IsNotExist(err) {
+		t.Fatalf("no .env: one was written: %v", err)
+	}
+	write(t, filepath.Join(h.Dir, ".env"), "A=1\n")
+	if _, err := h.EnvUnset("A-B"); err == nil || err.Error() != `"A-B" is not a variable name` {
+		t.Fatalf("A-B: %v", err)
+	}
+	if got := read(t, filepath.Join(h.Dir, ".env")); got != "A=1\n" {
+		t.Fatalf("a refused name changed .env: %q", got)
+	}
+}
+
+func TestEnvUnsetLeavesNoTemp(t *testing.T) {
+	h := New(t.TempDir())
+	write(t, filepath.Join(h.Dir, ".env"), "A=1\nK=2\n")
+	if _, err := h.EnvUnset("K"); err != nil {
+		t.Fatal(err)
+	}
+	noTemp(t, h.Dir, ".env", ".env.")
+}

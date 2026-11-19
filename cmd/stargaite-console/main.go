@@ -47,14 +47,21 @@ const (
 // ended or a signal came: a command's process group gets 10 s to stop.
 const sessionBound = 12 * time.Second
 
-const usage = `usage: stargaite-console [provider | status | help] [flags] [--version]
+const usage = `usage: stargaite-console [provider | alias | status | help] [flags] [--version]
 At a terminal with no subcommand: the guided console.
   provider  add providers and their keys; each key is checked for free before it is written
             --provider <a,b>   presets, a provider already added, or one new name
             --base-url <url>   --protocol <openai|anthropic>   --api-key-env <VAR|none>
             --key-env <VAR> or <name=VAR,…>   names the variable that holds a key
             --replace   --allow-private-network   --yes
+  alias     an alias toward a provider's model, kept when it exists; with --fallback it gets fallbacks
+            --alias <name> (main)   --provider <name>   --model <id>   --fallback <provider/model,…>
+            --effort <level>   --max-output-tokens <n>   --input-price <usd>   --output-price <usd>   --reverify
+            and, when --provider is not added yet, provider's flags
+            its new targets are checked first: each paid call is announced, capped at 256 output tokens, never retried
   status    what exists: providers, aliases, targets without an alias, keys, budgets, telemetry and both versions
+For what has no flag here (reorder an alias, see what it sends, change a provider): the guided console,
+or the stargaite command: docker compose exec -T stargaite /stargaite help
 `
 
 func main() {

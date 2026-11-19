@@ -79,6 +79,10 @@ func TestTextDefaultShown(t *testing.T) {
 	if !strings.Contains(v, "[a[2Jb]") || strings.Contains(v, "\x1b") {
 		t.Fatalf("default not cleaned: %q", v)
 	}
+	q.Default = "" // an empty default (Enter for none) shows no empty brackets
+	if v := Text(q).View(80, 24); !strings.HasPrefix(v, "Name?\n") || strings.Contains(v, "[]") {
+		t.Fatalf("empty default shown: %q", v)
+	}
 }
 
 func TestTextPasteMultiLineIgnored(t *testing.T) {

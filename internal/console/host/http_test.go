@@ -259,6 +259,15 @@ func TestListModelsLimit(t *testing.T) {
 	if ids, _, err := New(t.TempDir()).ListModels(context.Background(), Provider{Protocol: "openai", BaseURL: srv.URL, AllowPrivate: true}); err == nil || ids != nil {
 		t.Fatalf("a 2 MiB answer: ids %d, err %v", len(ids), err)
 	}
+	ids, _, err := New(t.TempDir()).ListModels(context.Background(), Provider{Protocol: "openai", BaseURL: srv.URL, AllowPrivate: true, Limit: 8 << 20})
+	if err != nil || len(ids) != 1 {
+		t.Fatalf("a 2 MiB answer under an 8 MiB limit: ids %d, err %v", len(ids), err)
+	}
+	over, _ := serve(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = fmt.Fprint(w, strings.Repeat("x", 8<<20+1)) })
+	_, _, err = New(t.TempDir()).ListModels(context.Background(), Provider{Protocol: "openai", BaseURL: over.URL, AllowPrivate: true, Limit: 8 << 20})
+	if err == nil || err.Error() != "the model list at "+over.URL+"/models was not read: the answer is over 8 MiB" {
+		t.Fatalf("over 8 MiB: err %v", err)
+	}
 }
 
 // readyHost is a clone whose .env publishes srv's port.

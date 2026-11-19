@@ -76,7 +76,7 @@ func AddProviders(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host) 
 	if err != nil {
 		return "", err
 	}
-	var run []*picked
+	var chosen []*picked
 	var writes []envWrite // the keys for .env, written once every question is answered
 	for _, n := range names {
 		p, err := r.provider(ctx, n)
@@ -90,21 +90,21 @@ func AddProviders(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host) 
 		if w != nil {
 			writes = append(writes, *w)
 		}
-		run = append(run, p)
+		chosen = append(chosen, p)
 	}
-	wrote, err := r.write(ctx, run, writes)
+	wrote, err := r.write(ctx, chosen, writes)
 	if err != nil {
 		return "", err
 	}
-	if err := r.recreate(ctx, run, wrote); err != nil {
+	if err := r.recreate(ctx, chosen, wrote); err != nil {
 		return "", err
 	}
-	if err := r.resolves(ctx, run); err != nil {
+	if err := r.resolves(ctx, chosen); err != nil {
 		return "", err
 	}
-	r.warn(ctx, run)
-	parts := make([]string, len(run))
-	for i, p := range run {
+	r.warn(ctx, chosen)
+	parts := make([]string, len(chosen))
+	for i, p := range chosen {
 		verb := " kept, "
 		if p.added {
 			verb = " added, "
@@ -117,14 +117,7 @@ func AddProviders(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host) 
 // start checks the container runs and is ready, and reads the presets and
 // the providers.
 func (r *adding) start(ctx context.Context) error {
-	runs, err := r.h.ContainerRuns(ctx)
-	switch {
-	case err != nil:
-		return err
-	case !runs:
-		return errors.New("no container runs here: ./setup.sh install starts it")
-	}
-	if err := r.h.WaitReady(ctx, r.sayer(ctx)); err != nil {
+	if err := ready(ctx, r.u, r.h, "which"); err != nil {
 		return err
 	}
 	var presets proxy.PresetsReply
@@ -205,7 +198,7 @@ func distinct(names []string) []string {
 // compatible service, with the questions each asks.
 func (r *adding) provider(ctx context.Context, n string) (*picked, error) {
 	if p, ok := r.listedAs(n); ok {
-		r.say(ctx, "provider "+n+" exists; kept")
+		say(ctx, r.u, "provider "+n+" exists; kept")
 		return &picked{name: n, res: p}, nil
 	}
 	url, flags, err := r.describe(ctx, n)
@@ -219,7 +212,7 @@ func (r *adding) provider(ctx context.Context, n string) (*picked, error) {
 	if private {
 		flags = append(flags, "--allow-private-network")
 	}
-	r.say(ctx, "adding provider "+n)
+	say(ctx, r.u, "adding provider "+n)
 	var change proxy.ProviderChange
 	if err := r.px.Call(ctx, &change, "providers add", append([]string{"--base-url", url}, flags...), n); err != nil {
 		return nil, err
@@ -246,7 +239,7 @@ func (r *adding) describe(ctx context.Context, n string) (string, []string, erro
 		url, err := r.u.Text(ctx, urlQ)
 		return url, nil, err
 	}
-	r.say(ctx, n+" is not a preset: another OpenAI- or Anthropic-compatible service")
+	say(ctx, r.u, n+" is not a preset: another OpenAI- or Anthropic-compatible service")
 	protocol, err := r.u.Pick(ctx, ui.Question{ID: "protocol", Flag: "protocol", Step: "add", Prompt: "its protocol",
 		Options: []ui.Option{{Value: "openai", Label: "openai"}, {Value: "anthropic", Label: "anthropic"}}, Default: "openai", HasDefault: true})
 	if err != nil {
@@ -284,7 +277,7 @@ func variableOf(n string) string {
 // bridge address, which is private; for plain HTTP the reader is asked.
 func (r *adding) reach(ctx context.Context, n, url string) (string, bool, error) {
 	if moved, ok := host.ToContainer(url); ok {
-		r.say(ctx, "localhost inside the container is the container: "+n+" is reached at "+moved+
+		say(ctx, r.u, "localhost inside the container is the container: "+n+" is reached at "+moved+
 			", the host's bridge address, so it must listen beyond the host's loopback (Ollama binds 127.0.0.1 unless OLLAMA_HOST=0.0.0.0)")
 		return moved, true, nil
 	}
@@ -307,7 +300,7 @@ func (r *adding) key(ctx context.Context, p *picked, writes []envWrite) (string,
 		return "no key", nil, nil
 	}
 	if i := slices.IndexFunc(writes, func(w envWrite) bool { return w.name == v }); i >= 0 {
-		r.say(ctx, v+" is asked once, for "+writes[i].by+": "+p.name+" uses the same key")
+		say(ctx, r.u, v+" is asked once, for "+writes[i].by+": "+p.name+" uses the same key")
 		return "key kept in .env", nil, nil
 	}
 	_, inEnv, err := r.h.EnvGet(v)
@@ -321,54 +314,15 @@ func (r *adding) key(ctx context.Context, p *picked, writes []envWrite) (string,
 			return "", nil, err
 		}
 		if !replace {
-			r.say(ctx, v+" is in .env; kept")
+			say(ctx, r.u, v+" is in .env; kept")
 			return "key kept in .env", nil, nil
 		}
 	}
-	key, checked, err := r.checkKey(ctx, p)
+	key, checked, err := checkKey(ctx, r.u, r.h, "key", p.res)
 	if err != nil {
 		return "", nil, err
 	}
 	return checked, &envWrite{name: v, value: key, by: p.name}, nil
-}
-
-// checkKey asks p's key and checks it with one free call, asking again while
-// the provider refuses it: three times at most, once from the flags. A
-// check that cannot tell keeps the key; only the status decides.
-func (r *adding) checkKey(ctx context.Context, p *picked) (key, checked string, err error) {
-	q := ui.Question{ID: "key-env", Flag: "key-env", Item: p.name, Prompt: p.res.APIKeyEnv, Step: "key"}
-	for tries := 1; ; tries++ {
-		key, err := r.u.Secret(ctx, q)
-		if err != nil {
-			return "", "", err
-		}
-		check := freeCheck(p, key)
-		_, status, err := r.h.ListModels(ctx, check)
-		switch {
-		case err != nil && ctx.Err() != nil:
-			return "", "", err
-		case status/100 == 2:
-			r.say(ctx, p.name+": key checked")
-			return key, "key checked", nil
-		case status == 401 || status == 403:
-			r.say(ctx, fmt.Sprintf("%s refused the key (%d)", p.name, status))
-			if r.u.Given(q) || tries == 3 {
-				return "", "", fmt.Errorf("%s refused the key %d time(s); nothing was written for it", p.name, tries)
-			}
-		case status != 0:
-			r.say(ctx, fmt.Sprintf("%s: key not checked: %s answered %d", p.name, check.URL(), status))
-			return key, "key not checked", nil
-		default:
-			r.say(ctx, p.name+": key not checked: "+err.Error())
-			return key, "key not checked", nil
-		}
-	}
-}
-
-// freeCheck is the free check of key for p, where p is stored.
-func freeCheck(p *picked, key string) host.Provider {
-	return host.Provider{Protocol: p.res.Protocol, BaseURL: p.res.BaseURL, Key: key, Path: keyCheckPath(p.res.BaseURL),
-		AllowPrivate: p.res.AllowPrivateNetwork}
 }
 
 // write agrees every change, then makes them: the keys to .env, then the
@@ -386,7 +340,7 @@ func (r *adding) write(ctx context.Context, run []*picked, writes []envWrite) (b
 	}
 	switch {
 	case gateway && o.Exists():
-		err = r.confirm(ctx, "write", `compose.override.yaml is rewritten with host_gateway=1, keeping its other "# setup:" lines`+recreates)
+		err = r.consent(ctx, "write", `compose.override.yaml is rewritten with host_gateway=1, keeping its other "# setup:" lines`+recreates)
 	case gateway:
 		err = r.agree(ctx, "writing compose.override.yaml with host_gateway=1")
 	}
@@ -448,32 +402,19 @@ func (r *adding) recreate(ctx context.Context, run []*picked, wrote bool) error 
 		return nil
 	}
 	if !r.agreed {
-		if err := r.confirm(ctx, "recreate", "the container is recreated to read "+strings.Join(unread, ", ")+
+		if err := r.consent(ctx, "recreate", "the container is recreated to read "+strings.Join(unread, ", ")+
 			": requests in flight are given time to finish, and the rate-limit windows restart"); err != nil {
 			return err
 		}
 	}
-	r.say(ctx, "recreating the container")
-	if wrote {
-		// The next run finds the files kept and does not recreate. Said
-		// before the recreate, so a stop at any point, Ctrl-C included,
-		// leaves it shown, and it claims nothing about how far it got.
-		r.say(ctx, "the files are written: if the recreate stops before the container is recreated, "+
-			"docker compose up -d --no-build in this clone does it")
-	}
-	return r.u.Work(ctx, ui.Question{ID: "recreate", Step: "recreate", Prompt: "recreating the container and waiting until it is ready"},
-		func(ctx context.Context) error { return r.h.Up(ctx, r.sayer(ctx), "--no-build") })
+	return recreate(ctx, r.u, r.h, "recreate", wrote)
 }
 
 // resolves reads each provider back: its credential must now resolve.
 func (r *adding) resolves(ctx context.Context, run []*picked) error {
 	for _, p := range run {
-		var shown proxy.ProviderReply
-		if err := r.px.Call(ctx, &shown, "providers show", nil, p.name); err != nil {
+		if err := resolved(ctx, r.px, p.name, p.res.APIKeyEnv); err != nil {
 			return err
-		}
-		if shown.Credential != "resolved" && shown.Credential != "none" {
-			return fmt.Errorf("the credential of %s does not resolve: %s is not in the container's environment", p.name, p.res.APIKeyEnv)
 		}
 	}
 	return nil
@@ -485,7 +426,7 @@ func (r *adding) warn(ctx context.Context, run []*picked) {
 	for _, p := range run {
 		for _, f := range p.findings {
 			if w, ok := rules.Lookup(f.Code); !ok || w.Held != "recreate" {
-				r.say(ctx, rules.Plain(f.Code, f.Resource, f.Message))
+				say(ctx, r.u, rules.Plain(f.Code, f.Resource, f.Message))
 			}
 		}
 	}
@@ -495,53 +436,25 @@ func (r *adding) warn(ctx context.Context, run []*picked) {
 // it leads to, and asks to continue.
 func (r *adding) agree(ctx context.Context, what string) error {
 	if r.agreed {
-		r.say(ctx, what)
+		say(ctx, r.u, what)
 		return nil
 	}
-	return r.confirm(ctx, "write", what+recreates)
+	return r.consent(ctx, "write", what+recreates)
 }
 
-// confirm says text, then asks to continue, as setup.sh's confirm does:
-// without a terminal --yes answers, and its absence is a usage error that
-// names the change.
-func (r *adding) confirm(ctx context.Context, step, text string) error {
-	r.say(ctx, text)
-	yes, err := r.u.Confirm(ctx, ui.Question{ID: "yes", Flag: "yes", Step: step, Prompt: "continue?", Default: "no"})
-	var usage *ui.UsageError
-	switch {
-	case errors.As(err, &usage):
-		return &ui.UsageError{Msg: "missing --yes: " + text}
-	case err != nil:
+// consent is confirm, and notes that the reader agreed to the recreate.
+func (r *adding) consent(ctx context.Context, step, text string) error {
+	if err := confirm(ctx, r.u, step, text); err != nil {
 		return err
-	case !yes:
-		return errors.New("stopped; nothing more was changed")
 	}
 	r.agreed = true
 	return nil
 }
 
-// say prints a line of the run. A line that cannot be printed stops
-// nothing: at a terminal its one cause is the context's end, which stops the
-// next step.
-func (r *adding) say(ctx context.Context, line string) { _ = r.u.Say(ctx, line) }
-
-// sayer is say for the host's lines.
-func (r *adding) sayer(ctx context.Context) func(string) {
-	return func(line string) { r.say(ctx, line) }
-}
-
 func (r *adding) listedAs(n string) (proxy.Provider, bool) {
-	i := slices.IndexFunc(r.listed, func(p proxy.Provider) bool { return p.Name == n })
-	if i < 0 {
-		return proxy.Provider{}, false
-	}
-	return r.listed[i], true
+	return find(r.listed, func(p proxy.Provider) bool { return p.Name == n })
 }
 
 func (r *adding) presetAs(n string) (proxy.Preset, bool) {
-	i := slices.IndexFunc(r.presets, func(p proxy.Preset) bool { return p.Name == n })
-	if i < 0 {
-		return proxy.Preset{}, false
-	}
-	return r.presets[i], true
+	return find(r.presets, func(p proxy.Preset) bool { return p.Name == n })
 }

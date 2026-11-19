@@ -77,7 +77,7 @@ func (t *text) line(width int) (string, int) {
 
 func (t *text) View(width, height int) string {
 	p := t.q.Prompt
-	if t.q.HasDefault {
+	if t.q.HasDefault && t.q.Default != "" {
 		p += " [" + ui.OneLine(t.q.Default) + "]"
 	}
 	in, _ := t.line(width)

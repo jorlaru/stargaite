@@ -574,8 +574,8 @@ func TestSetupFlags(t *testing.T) {
 		}
 
 		got, out = sub("alias", "--provider", "ollama", "--model", "llama3", "--alias", "local")
-		want = []string{"models list", "providers presets", "providers list", "providers show -- ollama", "providers show -- ollama", "targets list",
-			"targets add --kind chat -- ollama/llama3", "settings show", "targets verify --max-output-tokens 256 -- ollama/llama3", "models add --target ollama/llama3 -- local"}
+		want = []string{"models list", "providers list", "targets list", "apply --dry-run -f -", "targets add --kind chat -- ollama/llama3", "settings show",
+			"targets verify --max-output-tokens 256 --until-stdin-closes -- ollama/llama3", "models add --target ollama/llama3 -- local"}
 		if !slices.Equal(got, want) || !strings.Contains(out, "provider ollama exists; kept") {
 			t.Errorf("alias: %q, want %q:\n%s", got, want, out)
 		}
@@ -975,8 +975,7 @@ func TestSetupNoTTY(t *testing.T) {
 		{without(otlp, "--yes"), "missing --yes: writing OTLP_AUTHORIZATION to .env, and the container is then recreated", []string{"telemetry status"}},
 		{[]string{"provider", "--provider", "ollama"}, "missing --yes: writing compose.override.yaml with host_gateway=1", []string{"providers presets", "providers list",
 			"providers add --base-url http://host.docker.internal:11434/v1 --allow-private-network -- ollama"}},
-		{[]string{"alias", "--provider", "acme", "--alias", "other"}, "missing --model", []string{"models list", "providers presets", "providers list",
-			"providers show -- acme", "providers show -- acme"}},
+		{[]string{"alias", "--provider", "acme", "--alias", "other"}, "missing --model", []string{"models list", "providers list"}},
 		{[]string{"status", "--json"}, "unknown flag --json", nil},
 		{[]string{"key", "extra"}, "unexpected argument: extra", nil},
 	} {
@@ -1100,14 +1099,6 @@ func TestSetupPrompts(t *testing.T) {
 	)
 	if code != 0 || !strings.Contains(out, "no key made; the first answer is skipped") {
 		t.Errorf("key skipped: exit %d:\n%s", code, out)
-	}
-
-	// alias asks the alias's name first: one that exists is kept, with no
-	// other question and no other call.
-	before = len(r.cli())
-	code, out = r.pty([]string{"alias"}, step{"a name for the alias your clients call [main]: ", ""})
-	if got := r.cli()[before:]; code != 0 || !strings.Contains(out, "alias main exists, toward openai/gpt-b; kept") || !slices.Equal(got, []string{"models list"}) {
-		t.Errorf("alias kept: exit %d, %q:\n%s", code, got, out)
 	}
 
 	// remote lists this host's addresses, asks for those to publish on and

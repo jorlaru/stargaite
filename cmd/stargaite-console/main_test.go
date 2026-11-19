@@ -118,7 +118,7 @@ func TestVersionFirst(t *testing.T) {
 func TestUsage(t *testing.T) {
 	env, log := fake(t, replies)
 	out, _, code := runConsole(t, console, env, "help")
-	if code != 0 || !strings.HasPrefix(out, "usage: stargaite-console [provider | status | help] [flags] [--version]\n") {
+	if code != 0 || !strings.HasPrefix(out, "usage: stargaite-console [provider | alias | status | help] [flags] [--version]\n") {
 		t.Fatalf("help: exit %d\n%s", code, out)
 	}
 	for _, c := range []struct {
@@ -141,14 +141,21 @@ func TestUsage(t *testing.T) {
 
 func TestUsageText(t *testing.T) {
 	out, _, _ := runConsole(t, console, nil, "--help")
-	want := "usage: stargaite-console [provider | status | help] [flags] [--version]\n" +
+	want := "usage: stargaite-console [provider | alias | status | help] [flags] [--version]\n" +
 		"At a terminal with no subcommand: the guided console.\n" +
 		"  provider  add providers and their keys; each key is checked for free before it is written\n" +
 		"            --provider <a,b>   presets, a provider already added, or one new name\n" +
 		"            --base-url <url>   --protocol <openai|anthropic>   --api-key-env <VAR|none>\n" +
 		"            --key-env <VAR> or <name=VAR,…>   names the variable that holds a key\n" +
 		"            --replace   --allow-private-network   --yes\n" +
-		"  status    what exists: providers, aliases, targets without an alias, keys, budgets, telemetry and both versions\n"
+		"  alias     an alias toward a provider's model, kept when it exists; with --fallback it gets fallbacks\n" +
+		"            --alias <name> (main)   --provider <name>   --model <id>   --fallback <provider/model,…>\n" +
+		"            --effort <level>   --max-output-tokens <n>   --input-price <usd>   --output-price <usd>   --reverify\n" +
+		"            and, when --provider is not added yet, provider's flags\n" +
+		"            its new targets are checked first: each paid call is announced, capped at 256 output tokens, never retried\n" +
+		"  status    what exists: providers, aliases, targets without an alias, keys, budgets, telemetry and both versions\n" +
+		"For what has no flag here (reorder an alias, see what it sends, change a provider): the guided console,\n" +
+		"or the stargaite command: docker compose exec -T stargaite /stargaite help\n"
 	if out != want {
 		t.Fatalf("usage:\n%q\nwant:\n%q", out, want)
 	}
@@ -520,6 +527,21 @@ func TestProviderPlainMissing(t *testing.T) {
 		t.Fatalf("exit %d, stdout %q, stderr %q", code, out, errOut)
 	}
 	want := "compose ps -q\ncompose exec -T stargaite /stargaite providers presets --json\ncompose exec -T stargaite /stargaite providers list --json\n"
+	if l := readLog(t, log); l != want {
+		t.Fatalf("docker log %q", l)
+	}
+}
+
+// Without a terminal, alias asks nothing: a missing --model exits 2 naming
+// it, after reading only what it needs to name the question.
+func TestAliasPlainMissing(t *testing.T) {
+	env, log := fake(t, replies)
+	bin, _, _ := ownClone(t, nil)
+	_, errOut, code := runConsole(t, bin, env, "alias", "--provider", "acme", "--alias", "other")
+	if code != 2 || errOut != "stargaite-console: missing --model: the model id at acme\n" {
+		t.Fatalf("exit %d, stderr %q", code, errOut)
+	}
+	want := "compose ps -q\ncompose exec -T stargaite /stargaite models list --json\ncompose exec -T stargaite /stargaite providers list --json\n"
 	if l := readLog(t, log); l != want {
 		t.Fatalf("docker log %q", l)
 	}

@@ -1,6 +1,7 @@
 package host
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -38,6 +39,7 @@ type Provider struct {
 	Key          string // "" sends no credential header
 	Path         string // "" is the protocol's model list; otherwise the GET's path after the base URL
 	AllowPrivate bool   // the provider's stored allow_private_network
+	Limit        int    // the largest answer read, in bytes; 0 is httpLimit
 }
 
 // URL is the check's URL, as setup.sh's list_models builds it: the host-side
@@ -76,7 +78,7 @@ func (h *Host) ListModels(ctx context.Context, p Provider) (ids []string, status
 	case p.Key != "":
 		req.Header.Set("Authorization", "Bearer "+p.Key)
 	}
-	body, status, err := h.get(h.client(p.AllowPrivate, nil, "", ""), req)
+	body, status, err := h.get(h.client(p.AllowPrivate, nil, "", ""), req, cmp.Or(p.Limit, httpLimit))
 	switch {
 	case ctx.Err() != nil:
 		return nil, 0, fmt.Errorf("the model list at %s was not read: %w", u, ctx.Err())
@@ -124,7 +126,7 @@ func (h *Host) isReady(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, status, err := h.get(h.client(true, pool, "127.0.0.1:"+strconv.Itoa(p.Port), p.Name), req)
+	_, status, err := h.get(h.client(true, pool, "127.0.0.1:"+strconv.Itoa(p.Port), p.Name), req, httpLimit)
 	switch {
 	case err != nil:
 		return fmt.Errorf("/health/ready: %w", err)
@@ -134,19 +136,20 @@ func (h *Host) isReady(ctx context.Context) error {
 	return nil
 }
 
-// get sends req and reads at most httpLimit of the answer.
-func (h *Host) get(c *http.Client, req *http.Request) ([]byte, int, error) {
+// get sends req and reads at most limit bytes of the answer, a whole number
+// of MiB.
+func (h *Host) get(c *http.Client, req *http.Request, limit int) ([]byte, int, error) {
 	resp, err := c.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, httpLimit+1))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
 	switch {
 	case err != nil:
 		return nil, 0, err
-	case len(body) > httpLimit:
-		return nil, 0, errors.New("the answer is over 1 MiB")
+	case len(body) > limit:
+		return nil, 0, fmt.Errorf("the answer is over %d MiB", limit>>20)
 	}
 	return body, resp.StatusCode, nil
 }

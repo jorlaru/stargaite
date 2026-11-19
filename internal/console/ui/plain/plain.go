@@ -16,15 +16,22 @@ type Front struct{ out io.Writer }
 // New returns the plain front writing to stdout.
 func New(stdout io.Writer) *Front { return &Front{out: stdout} }
 
+// Asks says the plain front never asks the reader.
+func (f *Front) Asks() bool { return false }
+
 // Ask answers a question without asking. A reveal writes its value alone on
-// a line, so a script can capture it; a work question waits for its work to
-// end; any other question takes its default, or is a usage error naming the
-// flag that answers it, and its prompt.
+// a line, so a script can capture it; a paid step writes its prompt, the
+// count, and is checked, since naming the task is the consent; a work
+// question waits for its work to end; any other question takes its default,
+// or is a usage error naming the flag that answers it, and its prompt.
 func (f *Front) Ask(ctx context.Context, q ui.Question) (string, error) {
 	switch {
 	case q.Kind == ui.KindReveal:
 		_, err := io.WriteString(f.out, q.Value+"\n")
 		return "", err
+	case q.Kind == ui.KindPaid:
+		_, err := io.WriteString(f.out, q.Prompt+"\n")
+		return "check", err
 	case q.Kind == ui.KindWork:
 		<-ctx.Done()
 		return "", ctx.Err()

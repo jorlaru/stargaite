@@ -178,6 +178,77 @@ func TestPickNoMatch(t *testing.T) {
 	}
 }
 
+// unmarked is a line of a pick without its cursor mark.
+func unmarked(l string) string { return strings.TrimPrefix(strings.TrimPrefix(l, "> "), "  ") }
+
+// lineBefore is the line of view just above the row want, unmarked, or fails.
+func lineBefore(t *testing.T, view, want string) string {
+	t.Helper()
+	lines := strings.Split(view, "\n")
+	for i, l := range lines {
+		if unmarked(l) == want && i > 0 {
+			return unmarked(lines[i-1])
+		}
+	}
+	t.Fatalf("no row %q in\n%s", want, view)
+	return ""
+}
+
+func TestPickGroups(t *testing.T) {
+	q := ui.Question{ID: "model", Step: "model", Prompt: "Which model?", Kind: ui.KindPick, Options: []ui.Option{
+		{Value: "a1", Label: "a1", Group: "A"}, {Value: "a2", Label: "a2", Group: "A"},
+		{Value: "b1", Label: "b1", Group: "B"}, {Value: "x", Label: "x"}}}
+	v := Pick(q).View(80, 24)
+	if lineBefore(t, v, "a1") != "── A" || lineBefore(t, v, "a2") != "a1" ||
+		lineBefore(t, v, "b1") != "── B" || lineBefore(t, v, "x") != "b1" {
+		t.Fatalf("headings:\n%s", v)
+	}
+	p, _ := send(t, Pick(q), keyDown)
+	if v := p.View(80, 24); !strings.Contains(v, "> a2") {
+		t.Fatalf("down from a1:\n%s", v)
+	}
+	if _, a := send(t, p, keyDown, keyEnter); a == nil || a.Value != "b1" {
+		t.Fatalf("down from a2, enter: %+v; want b1, the heading skipped", a)
+	}
+	p, _ = send(t, Pick(q), typed("b")...)
+	v = p.View(80, 24)
+	if lineBefore(t, v, "b1") != "── B" || strings.Contains(v, "A") || strings.Contains(v, "a1") {
+		t.Fatalf("filter b:\n%s", v)
+	}
+	// The filter reads the group as well as the label.
+	q.Options = append(q.Options, ui.Option{Value: "q1", Label: "q1", Group: "Zed"})
+	p, _ = send(t, Pick(q), typed("zed")...)
+	if v = p.View(80, 24); lineBefore(t, v, "q1") != "── Zed" {
+		t.Fatalf("filter zed:\n%s", v)
+	}
+}
+
+func TestPickGroupsWindow(t *testing.T) {
+	q := ui.Question{ID: "model", Step: "model", Prompt: "Which model?", Kind: ui.KindPick}
+	for i := range 100 {
+		id := fmt.Sprintf("model-%03d", i)
+		q.Options = append(q.Options, ui.Option{Value: id, Label: id, Group: fmt.Sprintf("Vendor %d", i/10)})
+	}
+	var downs []tea.Msg
+	for range 99 {
+		downs = append(downs, keyDown)
+	}
+	p, _ := send(t, Pick(q), downs...)
+	v := p.View(80, 20)
+	fits(t, v, 80, 20)
+	if !strings.Contains(v, "> model-099") {
+		t.Fatalf("the cursor row is hidden:\n%s", v)
+	}
+	lines := strings.Split(v, "\n") // prompt, filter, then the window
+	var n int
+	if _, err := fmt.Sscanf(strings.TrimSpace(lines[3]), "model-%d", &n); err != nil {
+		t.Fatalf("line 3 is not a row (%v):\n%s", err, v)
+	}
+	if lines[2] != fmt.Sprintf("── Vendor %d", n/10) {
+		t.Fatalf("the window's first row has no heading:\n%s", v)
+	}
+}
+
 func TestPickMoves(t *testing.T) {
 	_, a := send(t, Pick(hundred("model")), keyUp, keyDown, keyDown, keyUp, keyEnter)
 	if a == nil || a.Value != "v:vendor-00/model-001" {

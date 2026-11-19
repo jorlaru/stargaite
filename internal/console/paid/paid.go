@@ -20,14 +20,23 @@ type Session struct{ left int }
 // NewSession returns a run's session, with MaxPerRun calls left.
 func NewSession() *Session { return &Session{left: MaxPerRun} }
 
+// Fits refuses the calls a step states when Open would, and debits nothing,
+// so a step can be refused before the reader is asked.
+func (s *Session) Fits(calls int) error {
+	switch {
+	case calls < 1:
+		return errors.New("a paid step states at least one call")
+	case calls > s.left:
+		return fmt.Errorf("this step states %d paid calls and this console run has %d left of %d", calls, s.left, MaxPerRun)
+	}
+	return nil
+}
+
 // Open debits the calls a step states, at once, and returns a budget of
 // exactly that many.
 func (s *Session) Open(calls int) (*Budget, error) {
-	switch {
-	case calls < 1:
-		return nil, errors.New("a paid step states at least one call")
-	case calls > s.left:
-		return nil, fmt.Errorf("this step states %d paid calls and this console run has %d left of %d", calls, s.left, MaxPerRun)
+	if err := s.Fits(calls); err != nil {
+		return nil, err
 	}
 	s.left -= calls
 	return &Budget{left: calls}, nil

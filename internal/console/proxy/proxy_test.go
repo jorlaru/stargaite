@@ -3,9 +3,11 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json/v2"
 	"errors"
 	"io"
 	"net/http/httptest"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -103,7 +105,8 @@ func TestCallRealShapes(t *testing.T) {
 	if version.Version != "dev" {
 		t.Errorf("version = %q", version.Version)
 	}
-	anthropic := Provider{Name: "anthropic", Credential: "resolved", Protocol: "anthropic", BaseURL: "https://api.anthropic.com", APIKeyEnv: "ANTHROPIC_API_KEY"}
+	anthropic := Provider{Name: "anthropic", Credential: "resolved", Protocol: "anthropic", BaseURL: "https://api.anthropic.com",
+		APIKeyEnv: "ANTHROPIC_API_KEY"}
 	if !slices.Contains(providers.Providers, anthropic) {
 		t.Errorf("providers = %+v", providers.Providers)
 	}
@@ -157,6 +160,63 @@ func TestCallRealShapes(t *testing.T) {
 		if change.Resource.Name != name || change.Resource.AllowPrivateNetwork != private || change.Findings == nil {
 			t.Errorf("providers add %s = %+v", name, change)
 		}
+	}
+	if settings.Timeouts.TotalMS <= 0 {
+		t.Errorf("settings timeouts = %+v", settings.Timeouts)
+	}
+	changeShapes(t, px)
+}
+
+// changeShapes: the answers of the changes C60 makes, and the members it
+// reads, through the real CLI. Provider mock is on a closed port: nothing
+// here calls it.
+func changeShapes(t *testing.T, px *Proxy) {
+	t.Helper()
+	ctx := context.Background()
+	call := func(reply Reply, words string, flags []string, positionals ...string) {
+		t.Helper()
+		if err := px.Call(ctx, reply, words, flags, positionals...); err != nil {
+			t.Fatalf("%s: %v", words, err)
+		}
+	}
+	call(&ProviderChange{}, "providers add", []string{"--protocol", "openai", "--base-url", "http://127.0.0.1:9/v1",
+		"--allow-private-network", "--billing", "none"}, "mock")
+	var added TargetChange
+	call(&added, "targets add", []string{"--kind", "chat", "--level", "low", "--level", "high", "--can-disable"}, "mock/m")
+	if r := added.Resource.Reasoning; added.Resource.ID != "mock/m" || r == nil || !slices.Equal(r.Levels, []string{"low", "high"}) ||
+		r.CanDisable == nil || !*r.CanDisable || added.Findings == nil {
+		t.Errorf("targets add mock/m = %+v", added)
+	}
+	var targets TargetsReply
+	call(&targets, "targets list", nil)
+	if i := slices.IndexFunc(targets.Targets, func(x Target) bool { return x.ID == "mock/m" }); i < 0 || targets.Targets[i].VerifiedAt != 0 {
+		t.Errorf("targets list = %+v", targets.Targets)
+	}
+	var set Change
+	call(&set, "providers set", []string{"--total-ms", "9000"}, "mock")
+	var providers ProvidersReply
+	call(&providers, "providers list", nil)
+	if i := slices.IndexFunc(providers.Providers, func(p Provider) bool { return p.Name == "mock" }); i < 0 ||
+		providers.Providers[i].Timeouts.TotalMS != 9000 {
+		t.Errorf("providers list = %+v", providers.Providers)
+	}
+	call(&Change{}, "models add", []string{"--target", "mock/m", "--max-output-tokens", "100", "--effort", "low", "--effort-mode", "default"}, "x")
+	var models ModelsReply
+	call(&models, "models list", nil)
+	if i := slices.IndexFunc(models.Models, func(m Model) bool { return m.Name == "x" }); i < 0 ||
+		models.Models[i].MaxOutputTokens != 100 || models.Models[i].Reasoning.Effort != "low" {
+		t.Errorf("models list = %+v", models.Models)
+	}
+	var explained ExplainReply
+	call(&explained, "models explain", nil, "x")
+	if len(explained.Targets) != 1 || explained.Targets[0].Target != "mock/m" {
+		t.Errorf("models explain x = %+v", explained)
+	}
+	for _, c := range []struct {
+		words, name string
+	}{{"models remove", "x"}, {"targets remove", "mock/m"}, {"providers remove", "mock"}} {
+		var removed Change
+		call(&removed, c.words, []string{"--yes"}, c.name)
 	}
 }
 
@@ -419,7 +479,7 @@ func TestVerifyCancelAtServer(t *testing.T) {
 	select {
 	case err := <-done:
 		want := "the check of mock/m was stopped: the call in flight may still be billed"
-		if err == nil || !strings.HasPrefix(err.Error(), want) || !errors.Is(err, context.Canceled) {
+		if err == nil || err.Error() != want || !errors.Is(err, context.Canceled) {
 			t.Errorf("err = %v, want %q wrapping context.Canceled", err, want)
 		}
 	case <-time.After(5 * time.Second):
@@ -548,5 +608,164 @@ func TestVerifyEndedContext(t *testing.T) {
 	}
 	if err := b.Take(1); err != nil {
 		t.Fatalf("the budget was spent: %v", err)
+	}
+}
+
+// cliDo runs one CLI command in process against env, and fails on a non-zero
+// exit.
+func cliDo(t *testing.T, env map[string]string, args ...string) string {
+	t.Helper()
+	var out, errOut bytes.Buffer
+	if code := cli.Main(args, func(k string) string { return env[k] }, strings.NewReader(""), &out, &errOut); code != 0 {
+		t.Fatalf("%q: exit %d: %s%s", args, code, out.String(), errOut.String())
+	}
+	return out.String()
+}
+
+// hasFinding reports whether findings hold one of code on resource, of
+// severity when it is not "".
+func hasFinding(findings []Finding, severity, code, resource string) bool {
+	return slices.ContainsFunc(findings, func(f Finding) bool {
+		return f.Code == code && f.Resource == resource && (severity == "" || f.Severity == severity)
+	})
+}
+
+// TestDryRunNeedsPrices: under a budget, a new pay-per-use target without
+// prices is the refusal's unpriced_under_budget, returned as a finding; with
+// prices it is not; nothing is written either way.
+func TestDryRunNeedsPrices(t *testing.T) {
+	env := admintest.Server(t)
+	cliDo(t, env, "settings", "set", "--budget", "limit_usd=1,reset_interval=never")
+	cliDo(t, env, "providers", "add", "acme", "--protocol", "openai", "--base-url", "https://api.acme.example/v1", "--billing", "pay_per_use")
+	before := cliDo(t, env, "export", "--json")
+	px := New(cliRunner(env))
+	decl := AliasDecl{}.With("targets", []string{"acme/m1"})
+	findings, err := px.DryRun(context.Background(), []NewTarget{{ID: "acme/m1"}}, "x", decl)
+	if err != nil || !hasFinding(findings, "error", "unpriced_under_budget", "targets/acme/m1") {
+		t.Fatalf("unpriced: %+v, %v; want unpriced_under_budget on targets/acme/m1", findings, err)
+	}
+	today := time.Now().Format(time.DateOnly)
+	findings, err = px.DryRun(context.Background(), []NewTarget{{ID: "acme/m1", Pricing: &Pricing{In: 1.5, Out: 6, AsOf: today}}}, "x", decl)
+	if err != nil || hasFinding(findings, "", "unpriced_under_budget", "targets/acme/m1") {
+		t.Fatalf("priced: %+v, %v; want no unpriced_under_budget", findings, err)
+	}
+	if after := cliDo(t, env, "export", "--json"); after != before {
+		t.Fatalf("a dry run changed the configuration:\n%s\nwas\n%s", after, before)
+	}
+}
+
+// teeRunner is run that also keeps the last answer.
+func teeRunner(run Runner, last *[]byte) Runner {
+	return func(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+		var out bytes.Buffer
+		code, err := run(ctx, args, stdin, io.MultiWriter(stdout, &out), stderr)
+		*last = out.Bytes()
+		return code, err
+	}
+}
+
+// TestDryRunWholeAlias: an alias's whole declaration, as models show gives
+// it, applied in a dry run changes nothing, so its budget, effort and cap
+// survive the round trip and judge the scopes as before.
+func TestDryRunWholeAlias(t *testing.T) {
+	env := admintest.Server(t)
+	cliDo(t, env, "providers", "add", "mock", "--protocol", "openai", "--base-url", "http://127.0.0.1:9/v1",
+		"--allow-private-network", "--billing", "pay_per_use")
+	cliDo(t, env, "targets", "add", "mock/m", "--kind", "chat", "--level", "low", "--level", "high",
+		"--pricing", "input_per_million=1,output_per_million=2,as_of=2026-11-01")
+	cliDo(t, env, "models", "add", "a", "--target", "mock/m", "--max-output-tokens", "100", "--effort", "low",
+		"--effort-mode", "default", "--budget", "limit_usd=2,reset_interval=never")
+	var last []byte
+	px := New(teeRunner(cliRunner(env), &last))
+	var decl AliasDecl
+	if err := px.Call(context.Background(), &decl, "models show", nil, "a"); err != nil {
+		t.Fatal(err)
+	}
+	findings, err := px.DryRun(context.Background(), nil, "a", decl.With("targets", []string{"mock/m"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range findings {
+		if f.Severity == "error" || (strings.HasPrefix(f.Code, "unpriced") && f.Resource == "targets/mock/m") {
+			t.Errorf("finding %+v", f)
+		}
+	}
+	var answer struct {
+		Diff []any `json:"diff"`
+	}
+	if err := json.Unmarshal(last, &answer); err != nil || len(answer.Diff) != 0 {
+		t.Fatalf("diff %v, %v; want empty:\n%s", answer.Diff, err, last)
+	}
+}
+
+// TestDryRunOutputCap: a new target of an anthropic provider, in an alias
+// without a cap, is the refusal's output_cap_required.
+func TestDryRunOutputCap(t *testing.T) {
+	env := admintest.Server(t)
+	cliDo(t, env, "providers", "add", "acme", "--protocol", "anthropic", "--base-url", "https://api.acme.example", "--billing", "none")
+	findings, err := New(cliRunner(env)).DryRun(context.Background(), []NewTarget{{ID: "acme/m"}}, "x",
+		AliasDecl{}.With("targets", []string{"acme/m"}))
+	if err != nil || !slices.ContainsFunc(findings, func(f Finding) bool { return f.Code == "output_cap_required" && f.Severity == "error" }) {
+		t.Fatalf("%+v, %v; want output_cap_required", findings, err)
+	}
+}
+
+// TestDryRunOtherFailure: an exit that is no refusal follows Call's rule,
+// naming apply and never quoting the output.
+func TestDryRunOtherFailure(t *testing.T) {
+	for _, tc := range []struct {
+		out  string
+		code int
+	}{{"usage: sk-hand-edited-secret\n", 2}, {"sk-hand-edited-secret\n", 1}, {`{"error":{"message":"no","findings":[]}}`, 1}} {
+		_, err := New(canned(tc.out, tc.code, nil)).DryRun(context.Background(), nil, "x", AliasDecl{}.With("targets", []string{"a/m"}))
+		if err == nil || !strings.HasPrefix(err.Error(), "stargaite apply: ") || strings.Contains(err.Error(), "sk-") {
+			t.Errorf("%q exit %d: err = %v", tc.out, tc.code, err)
+		}
+	}
+}
+
+// TestDryRunStdin: the dry run's argv, and the document it sends on standard
+// input: version 1, the new targets with their prices, the alias without its
+// name.
+func TestDryRunStdin(t *testing.T) {
+	var argv [][]string
+	var stdins []string
+	run := func(_ context.Context, args []string, stdin io.Reader, stdout, _ io.Writer) (int, error) {
+		argv = append(argv, args)
+		data, _ := io.ReadAll(stdin)
+		stdins = append(stdins, string(data))
+		_, _ = io.WriteString(stdout, `{"revision":1,"changed":false,"diff":[],"findings":[]}`)
+		return 0, nil
+	}
+	px := New(run)
+	today := time.Now().Format(time.DateOnly)
+	decl := AliasDecl{}.With("name", "x").With("targets", []string{"acme/a", "acme/b"}).With("max_output_tokens", 100)
+	targets := []NewTarget{{ID: "acme/a", Pricing: &Pricing{In: 1.5, Out: 6, AsOf: today}}, {ID: "acme/b"}}
+	if _, err := px.DryRun(context.Background(), targets, "x", decl); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := px.DryRun(context.Background(), nil, "x", decl); err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{{"apply", "--json", "--dry-run", "-f", "-"}, {"apply", "--json", "--dry-run", "-f", "-"}}
+	if !slices.EqualFunc(argv, want, slices.Equal) {
+		t.Fatalf("argv = %q, want %q", argv, want)
+	}
+	for i, wantDoc := range []string{
+		`{"version":1,"targets":{"acme/a":{"kind":"chat","pricing":{"input_per_million":1.5,"output_per_million":6,"as_of":"` + today + `"}},` +
+			`"acme/b":{"kind":"chat"}},"models":{"x":{"targets":["acme/a","acme/b"],"max_output_tokens":100}}}`,
+		`{"version":1,"models":{"x":{"targets":["acme/a","acme/b"],"max_output_tokens":100}}}`,
+	} {
+		var got, wanted any
+		if err := json.Unmarshal([]byte(stdins[i]), &got); err != nil {
+			t.Fatalf("stdin %d is not JSON: %v: %s", i, err, stdins[i])
+		}
+		_ = json.Unmarshal([]byte(wantDoc), &wanted)
+		if !reflect.DeepEqual(got, wanted) {
+			t.Errorf("stdin %d = %s\nwant %s", i, stdins[i], wantDoc)
+		}
+	}
+	if decl["name"] == nil {
+		t.Error("DryRun changed the caller's declaration")
 	}
 }

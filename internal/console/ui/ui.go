@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/jorlaru/stargaite/internal/console/paid"
 )
 
 // ErrLeave is Esc on a question: the reader leaves the task.
@@ -41,10 +43,12 @@ const (
 	KindPickMany
 	KindSecret
 	KindWork
+	KindPaid
 )
 
-// Option is one choice of a pick: Value is the answer, Label what is shown.
-type Option struct{ Value, Label string }
+// Option is one choice of a pick: Value is the answer, Label what is shown,
+// Group the heading a pick draws above it ("" for none).
+type Option struct{ Value, Label, Group string }
 
 // Step is one row of a task's step table.
 type Step struct{ ID, Title string }
@@ -86,6 +90,7 @@ type UI struct {
 	bare    map[string]bareUse // per ID: the first item a bare per-item value answered
 	steps   []Step             // the running task's table; nil outside a task
 	inTask  bool
+	session *paid.Session // the run's paid calls; only Paid opens a step on it
 }
 
 // bareUse is the item, and the prompt it asked, that a per-item flag given
@@ -94,7 +99,14 @@ type bareUse struct{ item, prompt string }
 
 // New returns a UI that takes answers from the flags first, then from front.
 func New(front Front, answers map[string]string) *UI {
-	return &UI{front: front, answers: answers, bare: map[string]bareUse{}}
+	return &UI{front: front, answers: answers, bare: map[string]bareUse{}, session: paid.NewSession()}
+}
+
+// Asks reports whether the front asks the reader: false for a front whose
+// Asks method says so (the plain one).
+func (u *UI) Asks() bool {
+	f, ok := u.front.(interface{ Asks() bool })
+	return !ok || f.Asks()
 }
 
 // WithEnv sets the environment a secret's flag names its variable in, and
@@ -234,6 +246,33 @@ func (u *UI) Reveal(ctx context.Context, q Question) error {
 	return err
 }
 
+// Paid asks the reader to order a paid step of calls calls, "Check it" or
+// "Not now", and opens its budget on "Check it". A step the run's session
+// cannot hold is refused before asking. Not now is a nil budget and no error.
+// It never takes an answer from the flags: in flags mode naming the task is
+// the consent, and the plain front answers "Check it" (design section 3).
+func (u *UI) Paid(ctx context.Context, q Question, calls int) (*paid.Budget, error) {
+	q.Kind = KindPaid
+	q.Options = []Option{{Value: "check", Label: "Check it"}, {Value: "not now", Label: "Not now"}}
+	if err := u.session.Fits(calls); err != nil {
+		return nil, err
+	}
+	q, err := u.prepare(q)
+	if err != nil {
+		return nil, err
+	}
+	a, err := u.front.Ask(ctx, q)
+	switch {
+	case err != nil:
+		return nil, err
+	case a == "not now":
+		return nil, nil
+	case a != "check":
+		return nil, fmt.Errorf("ui: question %s: %s is not one of check, not now", q.ID, a)
+	}
+	return u.session.Open(calls)
+}
+
 // Say prints one line of untrusted text.
 func (u *UI) Say(ctx context.Context, line string) error {
 	return u.front.Show(ctx, OneLine(line))
@@ -244,8 +283,8 @@ func (u *UI) Show(ctx context.Context, text string) error {
 	return u.front.Show(ctx, MultiLine(text))
 }
 
-// prepare checks q's step and returns the copy a front gets: prompt and
-// labels cleaned, the step bar set. Values and Default stay, as answers.
+// prepare checks q's step and returns the copy a front gets: prompt,
+// labels and groups cleaned, the step bar set. Values and Default stay, as answers.
 func (u *UI) prepare(q Question) (Question, error) {
 	bar := Bar{Current: -1}
 	if u.inTask {
@@ -262,6 +301,7 @@ func (u *UI) prepare(q Question) (Question, error) {
 	q.Options = slices.Clone(q.Options)
 	for i := range q.Options {
 		q.Options[i].Label = OneLine(q.Options[i].Label)
+		q.Options[i].Group = OneLine(q.Options[i].Group)
 	}
 	return q, nil
 }

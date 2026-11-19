@@ -190,8 +190,14 @@ func TestRowsWellFormed(t *testing.T) {
 	for _, w := range Warnings() {
 		held[w.Code] = w.Held
 	}
-	if held["credential_unresolved"] != "recreate" || held["target_unverified"] != "check" || held["url_unresolved"] != "" {
+	if held["credential_unresolved"] != "recreate" || held["target_unverified"] != "check" || held["url_unresolved"] != "" ||
+		held["unpriced"] != "" || held["no_fallback_prices"] != "" || held["effort_dropped"] != "" {
 		t.Errorf("held = %v", held)
+	}
+	for code, words := range c60Words {
+		if w, ok := Lookup(code); !ok || w.Words != words {
+			t.Errorf("%s: words %q, want %q", code, w.Words, words)
+		}
 	}
 	// A fresh slice each call: a caller's change does not reach the table.
 	w := Warnings()
@@ -201,9 +207,29 @@ func TestRowsWellFormed(t *testing.T) {
 	}
 }
 
+// c60Words are the words of the warnings Make an alias, Change an alias and
+// Change a provider can raise.
+var c60Words = map[string]string{
+	"target_unverified":  "%s is not checked yet: Make an alias or Change an alias checks it, after stating its paid calls",
+	"unpriced":           "%s has no prices, so no budget counts its spend; a budget that reaches it asks them",
+	"no_fallback_prices": "%s has no prices: its cost is the provider's own report, and a call without one counts nothing",
+	"effort_dropped":     "%s: the alias's effort is not sent toward a target whose reasoning dialect is none",
+	"unknown_alias":      "%s names an alias that does not exist: its calls to that alias get an error",
+}
+
 // TestPlain: a row with words says them with the resource's name; any other
 // code says the CLI's own message and where to find it again.
 func TestPlain(t *testing.T) {
+	for code, words := range map[string]string{
+		"target_unverified":  "targets/a is not checked yet: Make an alias or Change an alias checks it, after stating its paid calls",
+		"unpriced":           "targets/a has no prices, so no budget counts its spend; a budget that reaches it asks them",
+		"no_fallback_prices": "targets/a has no prices: its cost is the provider's own report, and a call without one counts nothing",
+		"effort_dropped":     "targets/a: the alias's effort is not sent toward a target whose reasoning dialect is none",
+	} {
+		if got := Plain(code, "targets/a", "x"); got != words {
+			t.Errorf("%s: %q, want %q", code, got, words)
+		}
+	}
 	want := "providers/acme: its host name did not resolve from the container; the proxy tries again on each call, so check the URL if this lasts"
 	if got := Plain("url_unresolved", "providers/acme", "x"); got != want {
 		t.Errorf("url_unresolved: %q, want %q", got, want)
@@ -213,8 +239,8 @@ func TestPlain(t *testing.T) {
 		t.Errorf("credential_unresolved: %q, want %q", got, want)
 	}
 	msg := "pay-per-use target with neither prices nor a provider cost report: its usage has no cost"
-	for _, code := range []string{"unpriced", "never_heard_of"} {
-		if got := Plain(code, "targets/a", msg); got != msg+" (stargaite validate lists it)" {
+	for _, code := range []string{"reasoning_undeclared", "never_heard_of"} {
+		if got := Plain(code, "targets/a", msg); got != "targets/a: "+msg {
 			t.Errorf("%s: %q", code, got)
 		}
 	}

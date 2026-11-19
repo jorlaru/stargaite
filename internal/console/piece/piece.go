@@ -1,6 +1,6 @@
 // Package piece is the guided console's questions as Bubble Tea input: a
 // pick, a multi-pick, a line of text, a hidden secret, a yes-or-no confirm,
-// and the work under way. A piece takes messages and
+// a paid step, and the work under way. A piece takes messages and
 // returns its answer, and draws itself in the size it is given. It knows no
 // task, proxy or host (docs/design/phase-7.md section 5).
 package piece

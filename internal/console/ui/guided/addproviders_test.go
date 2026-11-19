@@ -38,6 +38,7 @@ type addWorld struct {
 	log      string
 	mu       sync.Mutex
 	requests int
+	stall    bool // the model list answers nothing until its request ends
 }
 
 // newAddWorld builds the fixture; up is the shell of the fake's compose up.
@@ -57,7 +58,12 @@ func newAddWorld(t *testing.T, up string) *addWorld {
 		}
 		w.mu.Lock()
 		w.requests++
+		stall := w.stall
 		w.mu.Unlock()
+		if stall {
+			<-r.Context().Done()
+			return
+		}
 		if r.Header.Get("Authorization") != "Bearer good" {
 			rw.WriteHeader(http.StatusUnauthorized)
 			return
@@ -91,20 +97,25 @@ func (w *addWorld) env(t *testing.T) string {
 	return string(b)
 }
 
-// add runs Add providers through the guided front, with the steps of its
-// entry in the menu, on its own goroutine, and sends its result and error;
-// the result is also said, as the console says it.
+// add runs Add providers through the guided front.
 func (w *addWorld) add(h *harness, answers map[string]string) <-chan runAdd {
+	return runTask(h, "Add providers", w.px, w.h, answers)
+}
+
+// runTask runs the menu's task labelled label through the guided front, with
+// the steps of its entry, on its own goroutine, and sends its result and
+// error; the result is also said, as the console says it.
+func runTask(h *harness, label string, px *proxy.Proxy, hst *host.Host, answers map[string]string) <-chan runAdd {
 	var entry task.Entry
 	for _, e := range task.Menu() {
-		if e.Sub == "provider" {
+		if e.Label == label {
 			entry = e
 		}
 	}
 	u := ui.New(h.front, answers)
 	done := make(chan runAdd, 1)
 	go func() {
-		res, err := u.Run(h.ctx, entry.Steps, func(ctx context.Context) (string, error) { return entry.Run(ctx, u, w.px, w.h) })
+		res, err := u.Run(h.ctx, entry.Steps, func(ctx context.Context) (string, error) { return entry.Run(ctx, u, px, hst) })
 		if err == nil {
 			err = u.Say(h.ctx, res)
 		}
@@ -255,5 +266,26 @@ func TestGuidedAddProvidersEscDuringRecreate(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(log); !bytes.Equal(b, []byte("INT\n")) {
 		t.Fatalf("the fake's log: %q", b)
+	}
+}
+
+func TestGuidedAddProvidersEscDuringFreeCheck(t *testing.T) {
+	h := start(t)
+	w := newAddWorld(t, ":")
+	w.mu.Lock()
+	w.stall = true
+	w.mu.Unlock()
+	env := w.env(t)
+	done := w.add(h, nil)
+	w.toKey(h)
+	h.p.Send(tea.PasteMsg{Content: "good"})
+	h.p.Send(key(tea.KeyEnter))
+	h.waitShown("checking the key of acme with one free call…")
+	h.p.Send(key(tea.KeyEscape))
+	if r := ended(t, done, 5*time.Second); !errors.Is(r.err, ui.ErrLeave) {
+		t.Fatalf("%+v; want ErrLeave", r)
+	}
+	if w.env(t) != env {
+		t.Errorf(".env %q", w.env(t))
 	}
 }

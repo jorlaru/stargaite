@@ -152,6 +152,19 @@ main() {
 	[[ $(curl -fsS --max-time 10 "http://$gw:$mport/mock/calls" | jq --arg a "Bearer $key" \
 		'[.[] | select(.Path == "/models" and .Header.Authorization == [$a])] | length') == 1 ]] ||
 		fail "the free check did not reach the mock with the key byte for byte"
+	# Make an alias through the console, under TLS: budget priced mock/mock above, which cleared its
+	# verification, so both targets are checked, through docker compose exec -T with a pipe as standard input.
+	again alias --alias e2e-fb --provider mock --model mock --fallback mock2/mock
+	adm=(-e STARGAITE_ADMIN_URL=https://localhost:4001 -e SSL_CERT_FILE=/tls/cert.pem)   # the admin API speaks TLS since remote
+	[[ $out == *"check mock/mock: 1 paid call(s) to mock,"* && $out == *"check mock2/mock: 1 paid call(s) to mock2,"* &&
+		$out == *"2 paid call(s) in all"* && $out == *"Done: alias e2e-fb toward mock/mock, mock2/mock."* ]] ||
+		fail "Make an alias did not check both targets and finish"
+	[[ $(cd "$tree" && docker compose exec -T "${adm[@]}" stargaite /stargaite models show e2e-fb --json | jq -c .targets) == '["mock/mock","mock2/mock"]' ]] ||
+		fail "alias e2e-fb is not toward mock/mock, mock2/mock"
+	for t in mock/mock mock2/mock; do
+		[[ $(cd "$tree" && docker compose exec -T "${adm[@]}" stargaite /stargaite targets show "$t" --json | jq '.verified_at > 0') == true ]] ||
+			fail "$t was not verified"
+	done
 	again key --alias main --key-name e2e-3
 	[[ $out == *"answer: mock reply"* ]] || fail "no first answer over HTTPS"
 	again status
@@ -177,7 +190,6 @@ main() {
 	[[ $out =~ "backing up the store to "(backups/[^ ]+\.db) ]] || fail "no backup named"
 	backup=${BASH_REMATCH[1]}
 	[[ $(stat -c %a "$tree/$backup") == 600 && -s $tree/$backup ]] || fail "$backup is empty or not mode 0600"
-	adm=(-e STARGAITE_ADMIN_URL=https://localhost:4001 -e SSL_CERT_FILE=/tls/cert.pem)
 	(cd "$tree" && docker compose exec -T "${adm[@]}" stargaite /stargaite keys create after --model main --json >/dev/null) ||
 		fail "no key made after the backup"
 	while IFS= read -r line; do

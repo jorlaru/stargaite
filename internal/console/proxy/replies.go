@@ -1,5 +1,12 @@
 package proxy
 
+import (
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"fmt"
+	"maps"
+)
+
 // The replies hold only the members the console reads; the CLI's answers
 // carry more, which decoding ignores.
 
@@ -22,12 +29,19 @@ func (*ProvidersReply) Required() []string { return []string{"providers"} }
 // Provider is a provider and the state of its credential: resolved,
 // unresolved or none.
 type Provider struct {
-	Name                string `json:"name"`
-	Credential          string `json:"credential"`
-	Protocol            string `json:"protocol"`
-	BaseURL             string `json:"base_url"`
-	APIKeyEnv           string `json:"api_key_env"`
-	AllowPrivateNetwork bool   `json:"allow_private_network"`
+	Name                string   `json:"name"`
+	Credential          string   `json:"credential"`
+	Protocol            string   `json:"protocol"`
+	BaseURL             string   `json:"base_url"`
+	APIKeyEnv           string   `json:"api_key_env"`
+	AllowPrivateNetwork bool     `json:"allow_private_network"`
+	Timeouts            Timeouts `json:"timeouts"`
+}
+
+// Timeouts is the longest one provider call may take, in ms; 0 is
+// undeclared.
+type Timeouts struct {
+	TotalMS int64 `json:"total_ms"`
 }
 
 // ProviderReply is "providers show --json": the provider's members at the
@@ -106,11 +120,16 @@ type ModelsReply struct {
 // Required names the members the answer must have.
 func (*ModelsReply) Required() []string { return []string{"models"} }
 
-// Model is an alias: its targets in order, primary first, and its budget.
+// Model is an alias: its targets in order, primary first, its budget, its
+// output cap (0 for none) and its default reasoning effort ("" for none).
 type Model struct {
-	Name    string   `json:"name"`
-	Targets []string `json:"targets"`
-	Budget  *Budget  `json:"budget"`
+	Name            string   `json:"name"`
+	Targets         []string `json:"targets"`
+	Budget          *Budget  `json:"budget"`
+	MaxOutputTokens int64    `json:"max_output_tokens"`
+	Reasoning       struct {
+		Effort string `json:"effort"`
+	} `json:"reasoning"`
 }
 
 // TargetsReply is "targets list --json".
@@ -121,9 +140,100 @@ type TargetsReply struct {
 // Required names the members the answer must have.
 func (*TargetsReply) Required() []string { return []string{"targets"} }
 
-// Target is a provider's model, "provider/upstream-model".
+// Target is a provider's model, "provider/upstream-model": its reasoning,
+// when declared, and when its check last passed (Unix ms, 0 for never or
+// since it changed).
 type Target struct {
-	ID string `json:"id"`
+	ID         string     `json:"id"`
+	Reasoning  *Reasoning `json:"reasoning"`
+	VerifiedAt int64      `json:"verified_at"`
+}
+
+// Reasoning is the levels a target accepts and whether it can stop
+// reasoning, each as declared.
+type Reasoning struct {
+	Levels     []string `json:"levels"`
+	CanDisable *bool    `json:"can_disable"`
+}
+
+// Change is the answer of an accepted change: the findings of the whole
+// configuration after it.
+type Change struct {
+	Findings []Finding `json:"findings"`
+}
+
+// Required names the members the answer must have.
+func (*Change) Required() []string { return []string{"findings"} }
+
+// TargetChange is "targets add --json": the findings and the target as
+// published.
+type TargetChange struct {
+	Findings []Finding `json:"findings"`
+	Resource Target    `json:"resource"`
+}
+
+// Required names the members the answer must have.
+func (*TargetChange) Required() []string { return []string{"findings", "resource"} }
+
+// ExplainReply is "models explain --json": what the alias would send toward
+// each target.
+type ExplainReply struct {
+	Targets []Explained `json:"targets"`
+}
+
+// Required names the members the answer must have.
+func (*ExplainReply) Required() []string { return []string{"targets"} }
+
+// Explained is one target of an explain: skipped with its code, or the
+// effort and output cap it would be sent (nil for none).
+type Explained struct {
+	Target  string `json:"target"`
+	Skipped *struct {
+		Code string `json:"code"`
+	} `json:"skipped"`
+	Effort struct {
+		Sent *string `json:"sent"`
+	} `json:"effort"`
+	MaxOutput struct {
+		Sent *int64 `json:"sent"`
+	} `json:"max_output"`
+}
+
+// AliasDecl is an alias's whole declaration as "models show --json" gives it
+// (its name and its members), kept as raw members so that nothing the
+// console does not know is lost when it is sent back.
+type AliasDecl map[string]jsontext.Value
+
+// Required names the members the answer must have.
+func (AliasDecl) Required() []string { return []string{"name", "targets"} }
+
+// With is a copy of d with member set to v's JSON. v is the console's own
+// value (ids, a number, a small struct), which always encodes.
+func (d AliasDecl) With(member string, v any) AliasDecl {
+	data, err := json.Marshal(v)
+	if err != nil {
+		panic(fmt.Sprintf("proxy: AliasDecl member %s does not encode: %v", member, err))
+	}
+	out := maps.Clone(d)
+	if out == nil {
+		out = AliasDecl{}
+	}
+	out[member] = data
+	return out
+}
+
+// NewTarget is a chat target a change would add; a nil Pricing is a target
+// without prices.
+type NewTarget struct {
+	ID      string
+	Pricing *Pricing
+}
+
+// Pricing is a target's prices in USD per million tokens, as of a date.
+type Pricing struct {
+	In   float64 `json:"input_per_million"`
+	Out  float64 `json:"output_per_million"`
+	AsOf string  `json:"as_of"`
 }
 
 // KeysReply is "keys list --json".
@@ -145,7 +255,8 @@ type Key struct {
 // SettingsReply is "settings show --json". timeouts is always in the answer;
 // budget only when spend is capped.
 type SettingsReply struct {
-	Budget *Budget `json:"budget"`
+	Budget   *Budget  `json:"budget"`
+	Timeouts Timeouts `json:"timeouts"`
 }
 
 // Required names the members the answer must have.

@@ -457,3 +457,77 @@ func TestStatusHalfTerminalIsPlain(t *testing.T) {
 		}
 	}
 }
+
+// alias at a terminal asks the alias's name first: one that exists is kept,
+// with no other question and no other CLI call.
+func TestAliasKeptAtTerminal(t *testing.T) {
+	env, log := fake(t, `case "$*" in
+"compose ps -q") echo c0ffee ;;
+"compose exec -T stargaite /stargaite models list --json") echo '{"models":[{"name":"main","targets":["openai/gpt-b"]}]}' ;;
+*) exit 9 ;;
+esac
+`)
+	bin, _, _ := ownClone(t, nil)
+	tm := onTerminalAt(t, bin, env, "alias")
+	tm.waitFor("a name for the alias", 1)
+	tm.write("\r")
+	code, after := tm.exit()
+	if code != 0 || !strings.Contains(tm.output(), "alias main exists, toward openai/gpt-b; kept") {
+		t.Fatalf("exit %d:\n%q", code, tm.output())
+	}
+	tm.restored(after)
+	var execs []string
+	for _, l := range strings.Split(readLog(t, log), "\n") {
+		if strings.HasPrefix(l, "compose exec") {
+			execs = append(execs, l)
+		}
+	}
+	if len(execs) != 1 || execs[0] != "compose exec -T stargaite /stargaite models list --json" {
+		t.Fatalf("CLI execs %q", execs)
+	}
+}
+
+// Esc while a target is checked closes the CLI's standard input, so the
+// server starts no further call: the console says the call in flight may
+// still be billed, leaves the task and makes no alias.
+func TestAliasEscDuringCheckAtTerminal(t *testing.T) {
+	const cli = `"compose exec -T stargaite /stargaite `
+	env, log := fake(t, `case "$*" in
+"compose ps -q") echo c0ffee ;;
+`+cli+`models list --json") echo '{"models":[]}' ;;
+`+cli+`providers list --json") echo '{"providers":[{"name":"acme","protocol":"openai","base_url":"http://localhost:1/v1","credential":"none"}]}' ;;
+`+cli+`targets list --json") echo '{"targets":[]}' ;;
+`+cli+`apply --json --dry-run -f -") /bin/cat >/dev/null; echo '{"revision":1,"changed":false,"diff":[],"findings":[]}' ;;
+`+cli+`targets add --json --kind chat -- acme/m1") echo '{"findings":[],"resource":{"id":"acme/m1","kind":"chat"}}' ;;
+`+cli+`settings show --json") echo '{"timeouts":{"total_ms":30000}}' ;;
+`+cli+`targets verify --json --max-output-tokens 256 --until-stdin-closes -- acme/m1") /bin/cat >/dev/null; echo eof >>"$FAKE_LOG"; `+
+		`echo '{"target":"acme/m1","ok":true,"stored":true,"calls":[{"effort":"","status":200,"output_tokens":2}]}' ;;
+*) exit 9 ;;
+esac
+`)
+	bin, _, _ := ownClone(t, nil)
+	tm := onTerminalAt(t, bin, env, "alias", "--provider", "acme", "--model", "m1", "--alias", "x")
+	tm.waitFor("Fallback 1 of 2", 1)
+	tm.write("\r") // the cursor is on "no more fallbacks"
+	tm.waitFor("a default reasoning effort", 1)
+	tm.write("\r")
+	tm.waitFor("1 paid call(s) in all", 1)
+	time.Sleep(450 * time.Millisecond)
+	tm.write("\r")
+	tm.waitFor("checking acme/m1…", 1)
+	waitLog(t, log, "targets verify")
+	sent := time.Now()
+	tm.write("\x1b")
+	code, after := tm.exit()
+	if took := time.Since(sent); code != 1 || took > 12*time.Second {
+		t.Fatalf("exit %d after %s:\n%q", code, took, tm.output())
+	}
+	tm.restored(after)
+	out := tm.output()
+	if !strings.Contains(out, "the check of acme/m1 was stopped: the call in flight may still be billed") || !strings.Contains(out, "Left Make an alias.") {
+		t.Errorf("output:\n%q", out)
+	}
+	if l := readLog(t, log); !strings.Contains(l, "\neof\n") || strings.Contains(l, "models add") {
+		t.Errorf("docker log %q", l)
+	}
+}

@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"strconv"
 	"strings"
@@ -61,14 +62,7 @@ func (p *Proxy) Call(ctx context.Context, reply Reply, words string, flags []str
 	if f := strings.Fields(words); len(f) >= 2 && f[0] == "targets" && f[1] == "verify" {
 		return errors.New("a paid command goes through Verify")
 	}
-	ctx, cancel := context.WithTimeout(ctx, cliBound)
-	defer cancel()
-	args := append(strings.Fields(words), "--json")
-	args = append(args, flags...)
-	if len(positionals) > 0 {
-		args = append(append(args, "--"), positionals...)
-	}
-	out, code, err := p.exec(ctx, args, nil)
+	out, code, err := p.call(ctx, words, flags, nil, positionals...)
 	switch {
 	case err != nil:
 		return fmt.Errorf("stargaite %s: %w", words, err)
@@ -76,6 +70,81 @@ func (p *Proxy) Call(ctx context.Context, reply Reply, words string, flags []str
 		return failure(words, out, code)
 	}
 	return decode(words, out, reply)
+}
+
+// DryRun asks what applying targets, new chat targets, and alias's whole
+// declaration would find, and publishes nothing: "apply --dry-run -f -"
+// with the document on standard input. A refusal is no error: its findings,
+// every finding of the document it would lead to, are the answer.
+func (p *Proxy) DryRun(ctx context.Context, targets []NewTarget, alias string, decl AliasDecl) ([]Finding, error) {
+	const words = "apply"
+	doc, err := dryRunDoc(targets, alias, decl)
+	if err != nil {
+		return nil, fmt.Errorf("stargaite %s: %w", words, err)
+	}
+	out, code, err := p.call(ctx, words, []string{"--dry-run", "-f", "-"}, bytes.NewReader(doc))
+	if err != nil {
+		return nil, fmt.Errorf("stargaite %s: %w", words, err)
+	}
+	if f := refusal(out); code == 1 && len(f) > 0 {
+		return f, nil
+	}
+	if code != 0 {
+		return nil, failure(words, out, code)
+	}
+	var reply Change
+	if err := decode(words, out, &reply); err != nil {
+		return nil, err
+	}
+	return reply.Findings, nil
+}
+
+// dryRunDoc is the document DryRun sends: version 1 (the only one apply
+// takes), the new chat targets, and the alias's declaration without its
+// name. Settings are not in it, and apply without --prune keeps them.
+func dryRunDoc(targets []NewTarget, alias string, decl AliasDecl) ([]byte, error) {
+	type target struct {
+		Kind    string   `json:"kind"`
+		Pricing *Pricing `json:"pricing,omitzero"`
+	}
+	model := maps.Clone(decl)
+	delete(model, "name")
+	doc := struct {
+		Version int                  `json:"version"`
+		Targets map[string]target    `json:"targets,omitempty"`
+		Models  map[string]AliasDecl `json:"models"`
+	}{Version: 1, Targets: map[string]target{}, Models: map[string]AliasDecl{alias: model}}
+	for _, t := range targets {
+		doc.Targets[t.ID] = target{Kind: "chat", Pricing: t.Pricing}
+	}
+	return json.Marshal(doc)
+}
+
+// refusal is the findings of a refused change's error envelope, or none.
+func refusal(out []byte) []Finding {
+	var envelope struct {
+		Error *struct {
+			Findings []Finding `json:"findings"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(out, &envelope) != nil || envelope.Error == nil {
+		return nil
+	}
+	return envelope.Error.Findings
+}
+
+// call runs "stargaite <words> --json <flags> [-- <positionals>]" with
+// stdin (nil for none), bounded by cliBound, and returns its answer and
+// exit code.
+func (p *Proxy) call(ctx context.Context, words string, flags []string, stdin io.Reader, positionals ...string) ([]byte, int, error) {
+	ctx, cancel := context.WithTimeout(ctx, cliBound)
+	defer cancel()
+	args := append(strings.Fields(words), "--json")
+	args = append(args, flags...)
+	if len(positionals) > 0 {
+		args = append(append(args, "--"), positionals...)
+	}
+	return p.exec(ctx, args, stdin)
 }
 
 // Verify runs one paid check of target, which states calls calls, after
@@ -125,7 +194,7 @@ func (p *Proxy) watch(ctx context.Context, target string, bound time.Duration, w
 	case <-returned:
 		return nil
 	case <-ctx.Done():
-		why = fmt.Errorf("the check of %s was stopped: the call in flight may still be billed: %w", target, ctx.Err())
+		why = stopped{"the check of " + target + " was stopped: the call in flight may still be billed", ctx.Err()}
 	case <-expiry.C:
 		why = fmt.Errorf("the check of %s did not end within %s: the call in flight may still be billed", target, bound)
 	}
@@ -139,6 +208,16 @@ func (p *Proxy) watch(ctx context.Context, target string, bound time.Duration, w
 	}
 	return why
 }
+
+// stopped is a check stopped by its context: its words for the reader, its
+// cause for errors.Is, without Go's "context canceled" in the text.
+type stopped struct {
+	msg   string
+	cause error
+}
+
+func (s stopped) Error() string { return s.msg }
+func (s stopped) Unwrap() error { return s.cause }
 
 // verdict reads a check's answer. An answer of exit 0 or 1 is a VerifyReply;
 // more calls than stated, or a failed check, is an error; anything else

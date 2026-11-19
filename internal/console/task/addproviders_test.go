@@ -115,8 +115,14 @@ type world struct {
 
 func newWorld(t *testing.T) *world {
 	t.Helper()
+	return worldOn(t, admintest.Server(t))
+}
+
+// worldOn is newWorld with the CLI pointed by env.
+func worldOn(t *testing.T, env map[string]string) *world {
+	t.Helper()
 	bin := t.TempDir()
-	w := &world{t: t, h: host.New(t.TempDir()), env: admintest.Server(t), log: filepath.Join(bin, "log")}
+	w := &world{t: t, h: host.New(t.TempDir()), env: env, log: filepath.Join(bin, "log")}
 	writeFile(t, filepath.Join(bin, "docker"), "#!/bin/sh\necho \"$*\" >>'"+w.log+"'\ncase \"$*\" in\n"+
 		"'compose ps -q') echo c0ffee ;;\n'compose up -d --no-build') ;;\n'compose logs --tail 30 stargaite') echo 'a log line' ;;\n"+
 		"*) exit 9 ;;\nesac\n", 0o755)
@@ -534,6 +540,7 @@ type scripted struct {
 	questions []ui.Question
 	out       strings.Builder
 	leaveWork func(ui.Question) bool
+	workErr   error // what leaving the work answers: ui.ErrLeave when nil
 }
 
 func (s *scripted) Ask(ctx context.Context, q ui.Question) (string, error) {
@@ -565,6 +572,9 @@ func (s *scripted) work(ctx context.Context, q ui.Question) (string, error) {
 			return "", ctx.Err()
 		case <-tick.C:
 			if s.leaveWork != nil && s.leaveWork(q) {
+				if s.workErr != nil {
+					return "", s.workErr
+				}
 				return "", ui.ErrLeave
 			}
 		}

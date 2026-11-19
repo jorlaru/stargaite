@@ -1,6 +1,7 @@
 package host
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"crypto/tls"
@@ -22,11 +23,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jorlaru/stargaite/internal/console/paid"
 	"github.com/jorlaru/stargaite/internal/console/ui"
 )
 
 const (
-	// httpBound bounds an HTTP call with a secret: the free key check.
+	// httpBound bounds an HTTP call with a secret: the free key check, and a
+	// test chat completion, every fallback attempt included.
 	httpBound = 30 * time.Second
 	// httpLimit caps an answer read.
 	httpLimit = 1 << 20
@@ -78,7 +81,7 @@ func (h *Host) ListModels(ctx context.Context, p Provider) (ids []string, status
 	case p.Key != "":
 		req.Header.Set("Authorization", "Bearer "+p.Key)
 	}
-	body, status, err := h.get(h.client(p.AllowPrivate, nil, "", ""), req, cmp.Or(p.Limit, httpLimit))
+	body, status, _, err := h.get(h.client(p.AllowPrivate, nil, "", ""), req, cmp.Or(p.Limit, httpLimit))
 	switch {
 	case ctx.Err() != nil:
 		return nil, 0, fmt.Errorf("the model list at %s was not read: %w", u, ctx.Err())
@@ -101,24 +104,12 @@ func (h *Host) ListModels(ctx context.Context, p Provider) (ids []string, status
 	return ids, status, nil
 }
 
-// isReady is one readiness check of the data plane, as setup.sh's
-// wait_ready makes it: on loopback, under TLS by the certificate's name,
-// trusting only tls/<CA> when the override names one.
-func (h *Host) isReady(ctx context.Context) error {
-	p, err := h.Plane()
+// Ready is one readiness check of the data plane, as setup.sh's wait_ready
+// makes it, bounded by h.ready.try.
+func (h *Host) Ready(ctx context.Context) error {
+	p, c, err := h.planeClient()
 	if err != nil {
 		return err
-	}
-	var pool *x509.CertPool
-	if p.CA != "" {
-		pem, err := os.ReadFile(filepath.Join(h.Dir, "tls", p.CA))
-		if err != nil {
-			return fmt.Errorf("tls/%s: %w", p.CA, err)
-		}
-		pool = x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return fmt.Errorf("tls/%s holds no certificate", p.CA)
-		}
 	}
 	try, cancel := context.WithTimeout(ctx, h.ready.try)
 	defer cancel()
@@ -126,7 +117,7 @@ func (h *Host) isReady(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, status, err := h.get(h.client(true, pool, "127.0.0.1:"+strconv.Itoa(p.Port), p.Name), req, httpLimit)
+	_, status, _, err := h.get(c, req, httpLimit)
 	switch {
 	case err != nil:
 		return fmt.Errorf("/health/ready: %w", err)
@@ -136,22 +127,119 @@ func (h *Host) isReady(ctx context.Context) error {
 	return nil
 }
 
+// planeClient is the data plane and its client: on loopback at the port,
+// under TLS by the certificate's name, trusting only tls/<CA> when the
+// override names one.
+func (h *Host) planeClient() (Plane, *http.Client, error) {
+	p, err := h.Plane()
+	if err != nil {
+		return Plane{}, nil, err
+	}
+	var pool *x509.CertPool
+	if p.CA != "" {
+		pem, err := os.ReadFile(filepath.Join(h.Dir, "tls", p.CA))
+		if err != nil {
+			return Plane{}, nil, fmt.Errorf("tls/%s: %w", p.CA, err)
+		}
+		pool = x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return Plane{}, nil, fmt.Errorf("tls/%s holds no certificate", p.CA)
+		}
+	}
+	return p, h.client(true, pool, "127.0.0.1:"+strconv.Itoa(p.Port), p.Name), nil
+}
+
+// Completion is what a test chat completion answered, every string cleaned.
+type Completion struct {
+	Status                        int
+	Content, FinishReason, Target string // choices[0]'s, and the X-Stargaite-Target header
+	Message                       string // the error message of a non-2xx answer
+	Took                          time.Duration
+}
+
+// TryCompletion takes calls from b, then sends one chat completion with key
+// toward alias through the data plane, max_tokens 256, never retried. The
+// whole request is bounded by httpBound, fallbacks included, and ctx's end
+// cancels it, which the proxy takes as the client gone: no further target is
+// called. A non-2xx answer is no error. An error never holds the key.
+func (h *Host) TryCompletion(ctx context.Context, b *paid.Budget, calls int, key, alias string) (Completion, error) {
+	if err := b.Take(calls); err != nil {
+		return Completion{}, err
+	}
+	p, c, err := h.planeClient()
+	if err != nil {
+		return Completion{}, err
+	}
+	type message struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	body, err := json.Marshal(struct {
+		Model     string    `json:"model"`
+		MaxTokens int       `json:"max_tokens"`
+		Messages  []message `json:"messages"`
+	}{alias, 256, []message{{"user", "Say hello in one short sentence."}}})
+	if err != nil {
+		return Completion{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return Completion{}, errors.New("the test call did not complete: its URL is not valid")
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	req.Header.Set("Content-Type", "application/json")
+	start := time.Now()
+	data, status, header, err := h.get(c, req, httpLimit)
+	switch {
+	case err != nil && ctx.Err() != nil:
+		return Completion{}, fmt.Errorf("the test call did not complete: %w", ctx.Err())
+	case err != nil:
+		return Completion{}, fmt.Errorf("the test call did not complete: %s", h.plain(err))
+	}
+	return completion(status, header, data, time.Since(start)), nil
+}
+
+// completion reads a test call's answer; a body that does not decode leaves
+// the answer's strings empty.
+func completion(status int, header http.Header, body []byte, took time.Duration) Completion {
+	var answer struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(body, &answer)
+	got := Completion{Status: status, Target: ui.OneLine(header.Get("X-Stargaite-Target")), Took: took}
+	switch {
+	case status/100 != 2:
+		got.Message = ui.OneLine(answer.Error.Message)
+	case len(answer.Choices) > 0:
+		got.Content, got.FinishReason = ui.OneLine(answer.Choices[0].Message.Content), ui.OneLine(answer.Choices[0].FinishReason)
+	}
+	return got
+}
+
 // get sends req and reads at most limit bytes of the answer, a whole number
-// of MiB.
-func (h *Host) get(c *http.Client, req *http.Request, limit int) ([]byte, int, error) {
+// of MiB; it returns the answer's body, status and header.
+func (h *Host) get(c *http.Client, req *http.Request, limit int) ([]byte, int, http.Header, error) {
 	resp, err := c.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
 	switch {
 	case err != nil:
-		return nil, 0, err
+		return nil, 0, nil, err
 	case len(body) > limit:
-		return nil, 0, fmt.Errorf("the answer is over %d MiB", limit>>20)
+		return nil, 0, nil, fmt.Errorf("the answer is over %d MiB", limit>>20)
 	}
-	return body, resp.StatusCode, nil
+	return body, resp.StatusCode, resp.Header, nil
 }
 
 // plain is a transport failure in plain words, without the request's URL.

@@ -8,10 +8,11 @@ import (
 	"github.com/jorlaru/stargaite/internal/console/ui"
 )
 
-// paidWait is how long after the paid step is made an Enter is taken: 400 ms
-// after it is drawn (design section 3, Paid consent), and it is drawn within
-// one frame, 1/60 s, of being made.
-const paidWait = 400*time.Millisecond + time.Second/60
+// EnterWait is how long after the paid step, or a secret's reveal, is made an
+// Enter is taken: 400 ms after it is drawn (design section 3, Paid consent
+// and The client key), and it is drawn within one frame, 1/60 s, of being
+// made.
+const EnterWait = 400*time.Millisecond + time.Second/60
 
 // paid is a paid step: q.Options, "Check it" then "Not now", on "Check it".
 type paid struct {
@@ -21,7 +22,7 @@ type paid struct {
 	now     func() time.Time
 }
 
-// Paid asks for a paid step's order. An Enter earlier than paidWait after it
+// Paid asks for a paid step's order. An Enter earlier than EnterWait after it
 // was made, a buffered one among them, is ignored, and so is any paste.
 func Paid(q ui.Question) Piece { return paidAt(q, time.Now) }
 
@@ -38,7 +39,7 @@ func (p paid) Update(msg tea.Msg) (Piece, *Answer) {
 	}
 	switch k.String() {
 	case "enter":
-		if p.now().Sub(p.created) >= paidWait && p.cursor < len(p.q.Options) {
+		if p.now().Sub(p.created) >= EnterWait && p.cursor < len(p.q.Options) {
 			return p, &Answer{Value: p.q.Options[p.cursor].Value}
 		}
 	case "up":

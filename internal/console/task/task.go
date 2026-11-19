@@ -25,11 +25,10 @@ type Entry struct {
 	Run               Func
 }
 
-// Menu returns the ported tasks, a new slice on each call.
+// Menu returns the ported tasks in design section 4.2's group order, a new
+// slice on each call.
 func Menu() []Entry {
 	return []Entry{
-		{Group: "This machine", Label: "See what exists", Sub: "status",
-			Steps: []ui.Step{{ID: "show", Title: "what exists"}}, Run: SeeWhatExists},
 		{Group: "Providers", Label: "Add providers", Sub: "provider",
 			Flags: []string{"provider", "base-url", "protocol", "api-key-env", "key-env"},
 			Bools: []string{"replace", "allow-private-network", "yes"},
@@ -41,5 +40,10 @@ func Menu() []Entry {
 			Bools: []string{"replace", "allow-private-network", "yes", "reverify"},
 			Steps: makeSteps(), Run: MakeAlias},
 		{Group: "Models your apps call", Label: "Change an alias", Steps: changeAliasSteps(), Run: ChangeAlias},
+		{Group: "Apps and agents", Label: "Give an app or agent its key", Sub: "key",
+			Flags: []string{"alias", "key-name", "rpm-limit"}, Steps: giveSteps(), Run: GiveKey},
+		{Group: "Apps and agents", Label: "Change a key", Steps: changeKeySteps(), Run: ChangeKey},
+		{Group: "This machine", Label: "See what exists", Sub: "status",
+			Steps: []ui.Step{{ID: "show", Title: "what exists"}}, Run: SeeWhatExists},
 	}
 }

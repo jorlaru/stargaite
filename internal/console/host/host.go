@@ -33,14 +33,14 @@ type Host struct {
 		tries             int
 		pause, try, bound time.Duration
 	}
-	readyCheck func(context.Context) error // one readiness check: isReady; tests replace it
+	readyCheck func(context.Context) error // one readiness check: Ready; tests replace it
 }
 
 // New returns the clone at dir.
 func New(dir string) *Host {
 	h := &Host{Dir: dir, bound: localBound, upBound: upBound, httpBound: httpBound}
 	h.ready.tries, h.ready.pause, h.ready.try, h.ready.bound = 120, time.Second, 2*time.Second, 120*time.Second
-	h.readyCheck = h.isReady
+	h.readyCheck = h.Ready
 	return h
 }
 

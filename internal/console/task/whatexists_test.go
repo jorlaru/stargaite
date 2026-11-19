@@ -239,16 +239,20 @@ func TestSeeWhatExistsDockerFails(t *testing.T) {
 
 func TestMenuFresh(t *testing.T) {
 	m := Menu()
-	if len(m) != 5 || m[0].Group != "This machine" || m[0].Label != "See what exists" || m[0].Sub != "status" ||
-		len(m[0].Steps) != 1 || m[0].Steps[0] != (ui.Step{ID: "show", Title: "what exists"}) || m[0].Run == nil {
+	if len(m) != 7 {
 		t.Fatalf("Menu() = %+v", m)
 	}
-	add := m[1]
+	see := m[6]
+	if see.Group != "This machine" || see.Label != "See what exists" || see.Sub != "status" ||
+		len(see.Steps) != 1 || see.Steps[0] != (ui.Step{ID: "show", Title: "what exists"}) || see.Run == nil {
+		t.Fatalf("Menu()[6] = %+v", see)
+	}
+	add := m[0]
 	if add.Group != "Providers" || add.Label != "Add providers" || add.Sub != "provider" ||
 		!slices.Equal(add.Flags, []string{"provider", "base-url", "protocol", "api-key-env", "key-env"}) ||
 		!slices.Equal(add.Bools, []string{"replace", "allow-private-network", "yes"}) ||
 		!slices.Equal(add.Steps, addSteps()) || add.Run == nil {
-		t.Fatalf("Menu()[1] = %+v", add)
+		t.Fatalf("Menu()[0] = %+v", add)
 	}
 	var titles []string
 	for _, s := range addSteps() {
@@ -268,10 +272,12 @@ func TestMenuFresh(t *testing.T) {
 		{"Providers", "Change a provider", changeProviderSteps(), []string{"which", "change", "key", "recreate", "check"}},
 		{"Models your apps call", "Make an alias", makeSteps(), []string{"name", "model", "fallbacks", "settings", "check", "make"}},
 		{"Models your apps call", "Change an alias", changeAliasSteps(), []string{"which", "change", "settings", "check"}},
+		{"Apps and agents", "Give an app or agent its key", giveSteps(), []string{"aliases", "name", "limits", "key", "try"}},
+		{"Apps and agents", "Change a key", changeKeySteps(), []string{"which", "change", "key", "check", "try"}},
 	} {
-		got := m[i+2]
+		got := m[i+1]
 		if got.Group != e.group || got.Label != e.label || !slices.Equal(got.Steps, e.steps) || got.Run == nil {
-			t.Fatalf("Menu()[%d] = %+v", i+2, got)
+			t.Fatalf("Menu()[%d] = %+v", i+1, got)
 		}
 		var titles []string
 		for _, s := range e.steps {
@@ -284,17 +290,20 @@ func TestMenuFresh(t *testing.T) {
 			t.Fatalf("%s steps = %+v", e.label, e.steps)
 		}
 	}
-	if m[2].Sub != "" || m[4].Sub != "" || m[2].Flags != nil || m[4].Flags != nil {
-		t.Fatalf("Change a provider or Change an alias has a subcommand: %+v, %+v", m[2], m[4])
+	if m[1].Sub != "" || m[3].Sub != "" || m[5].Sub != "" || m[1].Flags != nil || m[3].Flags != nil || m[5].Flags != nil {
+		t.Fatalf("Change a provider, Change an alias or Change a key has a subcommand: %+v, %+v, %+v", m[1], m[3], m[5])
 	}
-	if m[3].Sub != "alias" || !slices.Equal(m[3].Flags, []string{"provider", "base-url", "protocol", "api-key-env", "key-env", "model", "alias",
+	if m[2].Sub != "alias" || !slices.Equal(m[2].Flags, []string{"provider", "base-url", "protocol", "api-key-env", "key-env", "model", "alias",
 		"fallback", "max-output-tokens", "effort", "input-price", "output-price"}) ||
-		!slices.Equal(m[3].Bools, []string{"replace", "allow-private-network", "yes", "reverify"}) {
-		t.Fatalf("Menu()[3] = %+v", m[3])
+		!slices.Equal(m[2].Bools, []string{"replace", "allow-private-network", "yes", "reverify"}) {
+		t.Fatalf("Menu()[2] = %+v", m[2])
 	}
-	m[0].Label = "changed"
-	m[0].Steps[0].Title = "changed"
-	if again := Menu(); again[0].Label != "See what exists" || again[0].Steps[0].Title != "what exists" {
+	if m[4].Sub != "key" || !slices.Equal(m[4].Flags, []string{"alias", "key-name", "rpm-limit"}) || m[4].Bools != nil {
+		t.Fatalf("Menu()[4] = %+v", m[4])
+	}
+	m[6].Label = "changed"
+	m[6].Steps[0].Title = "changed"
+	if again := Menu(); again[6].Label != "See what exists" || again[6].Steps[0].Title != "what exists" {
 		t.Fatal("a change to Menu()'s result reached a second call")
 	}
 }

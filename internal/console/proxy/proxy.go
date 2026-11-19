@@ -55,11 +55,9 @@ type Proxy struct {
 func New(run Runner) *Proxy { return &Proxy{run: run, grace: stopGrace} }
 
 // Call runs "stargaite <words> --json <flags> [-- <positionals>]" and decodes
-// its answer into reply. It refuses targets verify, the paid command, which
-// only Verify runs: the CLI matches a command by its leading words, so any
-// words that start with those two.
+// its answer into reply. It refuses targets verify (isVerify).
 func (p *Proxy) Call(ctx context.Context, reply Reply, words string, flags []string, positionals ...string) error {
-	if f := strings.Fields(words); len(f) >= 2 && f[0] == "targets" && f[1] == "verify" {
+	if isVerify(words) {
 		return errors.New("a paid command goes through Verify")
 	}
 	out, code, err := p.call(ctx, words, flags, nil, positionals...)
@@ -70,6 +68,63 @@ func (p *Proxy) Call(ctx context.Context, reply Reply, words string, flags []str
 		return failure(words, out, code)
 	}
 	return decode(words, out, reply)
+}
+
+// CallRefusable is Call, but a refusal (exit 1, an error envelope holding
+// findings: nothing was published) returns those findings and no error, and
+// leaves reply untouched. An accepted change returns no findings.
+func (p *Proxy) CallRefusable(ctx context.Context, reply Reply, words string, flags []string, positionals ...string) ([]Finding, error) {
+	if isVerify(words) {
+		return nil, errors.New("a paid command goes through Verify")
+	}
+	out, code, err := p.call(ctx, words, flags, nil, positionals...)
+	if err != nil {
+		return nil, fmt.Errorf("stargaite %s: %w", words, err)
+	}
+	return settle(words, out, code, reply)
+}
+
+// NewSecret runs keys create or keys rotate (words) for key name and returns
+// its new secret, as given, and the findings. Once the command may have run,
+// an error that is not the admin API's own refusal says the secret may be
+// lost (design section 5), never quoting the answer.
+func (p *Proxy) NewSecret(ctx context.Context, words string, flags []string, name string) (string, []Finding, error) {
+	const lost = "key %s may have been made (or rotated); if so its secret is lost: Change a key rotates it"
+	out, code, err := p.call(ctx, words, flags, nil, name)
+	switch {
+	case err != nil:
+		return "", nil, fmt.Errorf("stargaite %s: %w: "+lost, words, err, name)
+	case code != 0 && answered(out):
+		return "", nil, failure(words, out, code)
+	case code != 0:
+		return "", nil, fmt.Errorf("%w: "+lost, failure(words, out, code), name)
+	}
+	var reply KeyChange
+	if decode(words, out, &reply) != nil || reply.Secrets[name] == "" {
+		return "", nil, fmt.Errorf("stargaite %s: the answer was not understood, so the new secret of key %s is lost: Change a key rotates it (%s)", words, name, stale)
+	}
+	return reply.Secrets[name], reply.Findings, nil
+}
+
+// answered reports whether out is the admin API's own error answer, which
+// changed nothing: an error envelope with a code, other than the CLI's
+// admin_unreachable (internal/cli/client.go), which it gives when no answer
+// was read.
+func answered(out []byte) bool {
+	var envelope struct {
+		Error *struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	return json.Unmarshal(out, &envelope) == nil && envelope.Error != nil && envelope.Error.Code != "" && envelope.Error.Code != "admin_unreachable"
+}
+
+// isVerify reports whether words run targets verify, the paid command, which
+// only Verify runs: the CLI matches a command by its leading words, so any
+// words that start with those two.
+func isVerify(words string) bool {
+	f := strings.Fields(words)
+	return len(f) >= 2 && f[0] == "targets" && f[1] == "verify"
 }
 
 // DryRun asks what applying targets, new chat targets, and alias's whole
@@ -86,17 +141,23 @@ func (p *Proxy) DryRun(ctx context.Context, targets []NewTarget, alias string, d
 	if err != nil {
 		return nil, fmt.Errorf("stargaite %s: %w", words, err)
 	}
+	var reply Change
+	if f, err := settle(words, out, code, &reply); f != nil || err != nil {
+		return f, err
+	}
+	return reply.Findings, nil
+}
+
+// settle reads an answer that may be a refusal: at exit 1, an error envelope
+// holding findings gives them; anything else follows Call's rule.
+func settle(words string, out []byte, code int, reply Reply) ([]Finding, error) {
 	if f := refusal(out); code == 1 && len(f) > 0 {
 		return f, nil
 	}
 	if code != 0 {
 		return nil, failure(words, out, code)
 	}
-	var reply Change
-	if err := decode(words, out, &reply); err != nil {
-		return nil, err
-	}
-	return reply.Findings, nil
+	return nil, decode(words, out, reply)
 }
 
 // dryRunDoc is the document DryRun sends: version 1 (the only one apply

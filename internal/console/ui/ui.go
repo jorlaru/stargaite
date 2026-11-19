@@ -131,6 +131,16 @@ func (u *UI) Run(ctx context.Context, steps []Step, fn func(context.Context) (st
 	return fn(ctx)
 }
 
+// RunWith is Run with presets answering questions by ID for this run only,
+// in place of the session's answers, which come back on return (a
+// suggestion's, design section 5). A nested Run keeps the presets.
+func (u *UI) RunWith(ctx context.Context, steps []Step, presets map[string]string, fn func(context.Context) (string, error)) (string, error) {
+	saved := u.answers
+	u.answers = presets
+	defer func() { u.answers = saved }()
+	return u.Run(ctx, steps, fn)
+}
+
 // Pick asks for one of q.Options.
 func (u *UI) Pick(ctx context.Context, q Question) (string, error) {
 	q.Kind = KindPick
@@ -247,13 +257,19 @@ func (u *UI) Reveal(ctx context.Context, q Question) error {
 }
 
 // Paid asks the reader to order a paid step of calls calls, "Check it" or
-// "Not now", and opens its budget on "Check it". A step the run's session
-// cannot hold is refused before asking. Not now is a nil budget and no error.
-// It never takes an answer from the flags: in flags mode naming the task is
-// the consent, and the plain front answers "Check it" (design section 3).
+// "Not now", and opens its budget on "Check it". Exactly two q.Options keep
+// their labels ("Try it", "Not now") and take those two answers' values. A
+// step the run's session cannot hold is refused before asking. Not now is a
+// nil budget and no error. It never takes an answer from the flags: in flags
+// mode naming the task is the consent, and the plain front answers "Check it"
+// (design section 3).
 func (u *UI) Paid(ctx context.Context, q Question, calls int) (*paid.Budget, error) {
 	q.Kind = KindPaid
-	q.Options = []Option{{Value: "check", Label: "Check it"}, {Value: "not now", Label: "Not now"}}
+	labels := []string{"Check it", "Not now"}
+	if len(q.Options) == 2 {
+		labels = []string{q.Options[0].Label, q.Options[1].Label}
+	}
+	q.Options = []Option{{Value: "check", Label: labels[0]}, {Value: "not now", Label: labels[1]}}
 	if err := u.session.Fits(calls); err != nil {
 		return nil, err
 	}

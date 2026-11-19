@@ -29,7 +29,7 @@ const (
 	checkMargin = 10 * time.Second
 )
 
-// run is one run of a task that changes aliases or providers: its doors,
+// run is one run of a task that changes aliases, providers or keys: its doors,
 // what it read, and what it changed.
 type run struct {
 	u         *ui.UI
@@ -38,6 +38,7 @@ type run struct {
 	providers []proxy.Provider // providers list, read by listProviders
 	targets   []proxy.Target   // targets list, read by listTargets
 	models    []proxy.Model    // models list, read by listModels
+	keys      []proxy.Key      // keys list, read by listKeys
 	made      []string         // what this run changed, said if it stops early
 	defaultMS int64            // settings show's timeouts.total_ms, read once by bound
 
@@ -486,7 +487,7 @@ func (r *run) settle(ctx context.Context, step string, a *aliasPlan) error {
 	if err != nil {
 		return err
 	}
-	if err := refusal(findings, a.asked); err != nil {
+	if err := refusal("this alias", findings, a.asked); err != nil {
 		return err
 	}
 	today := time.Now().Format(time.DateOnly)
@@ -504,18 +505,18 @@ func (r *run) settle(ctx context.Context, step string, a *aliasPlan) error {
 			t := strings.TrimPrefix(f.Resource, "targets/")
 			return f.Code == "unpriced_under_budget" && prices[t] != nil && !slices.Contains(a.added, t)
 		}
-		if err := refusal(findings, repriced); err != nil {
+		if err := refusal("this alias", findings, repriced); err != nil {
 			return err
 		}
 	}
-	repriced, err := r.addTargets(ctx, a, prices, today)
+	repriced, err := r.addTargets(ctx, a, prices)
 	if err != nil || !repriced {
 		return err
 	}
 	if findings, err = r.px.DryRun(ctx, nil, a.name, a.decl); err != nil {
 		return err
 	}
-	return refusal(findings, nil)
+	return refusal("this alias", findings, nil)
 }
 
 // asked reports whether f is a finding settle asks about: a price, the
@@ -539,9 +540,9 @@ func newTargets(ids []string, prices map[string]*proxy.Pricing) []proxy.NewTarge
 	return out
 }
 
-// refusal is the proxy's refusal of the alias, one line per error finding
-// that pass does not let through, or nil when there is none.
-func refusal(findings []proxy.Finding, pass func(proxy.Finding) bool) error {
+// refusal is the proxy's refusal of what, one line per error finding that
+// pass does not let through, or nil when there is none.
+func refusal(what string, findings []proxy.Finding, pass func(proxy.Finding) bool) error {
 	var lines []string
 	for _, f := range findings {
 		if f.Severity == "error" && (pass == nil || !pass(f)) {
@@ -551,7 +552,7 @@ func refusal(findings []proxy.Finding, pass func(proxy.Finding) bool) error {
 	if len(lines) == 0 {
 		return nil
 	}
-	return errors.New("the proxy would refuse this alias:\n" + strings.Join(lines, "\n"))
+	return errors.New("the proxy would refuse " + what + ":\n" + strings.Join(lines, "\n"))
 }
 
 // needs asks what the findings say the plan needs: the prices of each of its
@@ -568,16 +569,11 @@ func (r *run) needs(ctx context.Context, step string, a *aliasPlan, findings []p
 		if _, ok := has("unpriced_under_budget", "targets/"+t); !ok {
 			continue
 		}
-		say(ctx, r.u, t+" has no prices and a budget reaches it: its prices are asked")
-		in, err := r.price(ctx, step, t, "input")
+		p, err := r.askPrices(ctx, step, t, today)
 		if err != nil {
 			return nil, false, err
 		}
-		out, err := r.price(ctx, step, t, "output")
-		if err != nil {
-			return nil, false, err
-		}
-		prices[t] = &proxy.Pricing{In: in, Out: out, AsOf: today}
+		prices[t] = p
 	}
 	asked := len(prices) > 0
 	if _, ok := has("output_cap_required", ""); ok && a.cap == "" {
@@ -603,6 +599,21 @@ func (r *run) needs(ctx context.Context, step string, a *aliasPlan, findings []p
 	return prices, asked, nil
 }
 
+// askPrices says that a budget reaches target t without prices, then asks
+// them, as of today.
+func (r *run) askPrices(ctx context.Context, step, t, today string) (*proxy.Pricing, error) {
+	say(ctx, r.u, t+" has no prices and a budget reaches it: its prices are asked")
+	in, err := r.price(ctx, step, t, "input")
+	if err != nil {
+		return nil, err
+	}
+	out, err := r.price(ctx, step, t, "output")
+	if err != nil {
+		return nil, err
+	}
+	return &proxy.Pricing{In: in, Out: out, AsOf: today}, nil
+}
+
 // price asks t's price per million side ("input" or "output") tokens; the
 // flags answer every target that needs one.
 func (r *run) price(ctx context.Context, step, t, side string) (float64, error) {
@@ -617,17 +628,11 @@ func (r *run) price(ctx context.Context, step, t, side string) (float64, error) 
 // addTargets adds the plan's new targets, each with its prices, if any, and
 // sets the prices asked of a listed target, which clears its verification.
 // It reports whether it set a listed target's prices.
-func (r *run) addTargets(ctx context.Context, a *aliasPlan, prices map[string]*proxy.Pricing, today string) (bool, error) {
-	priced := func(p *proxy.Pricing) string {
-		return fmt.Sprintf("%s and %s USD per million input and output tokens, as of %s", usdText(p.In), usdText(p.Out), today)
-	}
-	pricing := func(p *proxy.Pricing) []string {
-		return []string{"--pricing", "input_per_million=" + usdText(p.In) + ",output_per_million=" + usdText(p.Out) + ",as_of=" + today}
-	}
+func (r *run) addTargets(ctx context.Context, a *aliasPlan, prices map[string]*proxy.Pricing) (bool, error) {
 	for _, t := range a.added {
 		flags, line := []string{"--kind", "chat"}, "adding target "+t
 		if p := prices[t]; p != nil {
-			flags, line = append(flags, pricing(p)...), line+" with prices "+priced(p)
+			flags, line = append(flags, pricingFlags(p)...), line+" with prices "+pricedText(p)
 		}
 		say(ctx, r.u, line)
 		var change proxy.TargetChange
@@ -643,16 +648,34 @@ func (r *run) addTargets(ctx context.Context, a *aliasPlan, prices map[string]*p
 		if p == nil || slices.Contains(a.added, t) {
 			continue
 		}
-		say(ctx, r.u, "setting the prices of "+t+" to "+priced(p)+", which clears its verification")
-		var change proxy.Change
-		if err := r.px.Call(ctx, &change, "targets set", pricing(p), t); err != nil {
+		if err := r.setPrices(ctx, t, p); err != nil {
 			return false, err
 		}
-		r.made = append(r.made, "prices of "+t+" set")
-		r.verifiedAt(t, 0)
 		repriced = true
 	}
 	return repriced, nil
+}
+
+// setPrices sets listed target t's prices, which clears its verification.
+func (r *run) setPrices(ctx context.Context, t string, p *proxy.Pricing) error {
+	say(ctx, r.u, "setting the prices of "+t+" to "+pricedText(p)+", which clears its verification")
+	var change proxy.Change
+	if err := r.px.Call(ctx, &change, "targets set", pricingFlags(p), t); err != nil {
+		return err
+	}
+	r.made = append(r.made, "prices of "+t+" set")
+	r.verifiedAt(t, 0)
+	return nil
+}
+
+// pricedText is prices p in words.
+func pricedText(p *proxy.Pricing) string {
+	return fmt.Sprintf("%s and %s USD per million input and output tokens, as of %s", usdText(p.In), usdText(p.Out), p.AsOf)
+}
+
+// pricingFlags is prices p as the flag of targets add or targets set.
+func pricingFlags(p *proxy.Pricing) []string {
+	return []string{"--pricing", "input_per_million=" + usdText(p.In) + ",output_per_million=" + usdText(p.Out) + ",as_of=" + p.AsOf}
 }
 
 // usdText is a price as typed: no trailing zeros.
@@ -718,8 +741,17 @@ func positiveOrEmpty(a string) error {
 
 // isUSD refuses an answer that is not a number of USD, 0 or more.
 func isUSD(a string) error {
-	if v, err := strconv.ParseFloat(a, 64); err != nil || !(v >= 0) || math.IsInf(v, 1) {
+	if isLimit(a) != nil {
 		return errors.New("--input-price and --output-price take a number of USD")
+	}
+	return nil
+}
+
+// isLimit refuses an answer that is not a number of USD, 0 or more and
+// finite; the proxy judges the rest.
+func isLimit(a string) error {
+	if v, err := strconv.ParseFloat(a, 64); err != nil || !(v >= 0) || math.IsInf(v, 1) {
+		return errors.New("a number of USD is needed")
 	}
 	return nil
 }

@@ -7,9 +7,11 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -219,7 +221,7 @@ func TestGuidedCtrlCWhileWorking(t *testing.T) {
 	env, log := fake(t, hang)
 	tm := onTerminal(t, env)
 	tm.waitFor(home, 1)
-	tm.write("\r")
+	tm.write("See what\r")
 	for deadline := time.Now().Add(10 * time.Second); !strings.Contains(readLog(t, log), "compose exec"); time.Sleep(10 * time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatalf("compose exec never ran; log %q", readLog(t, log))
@@ -239,10 +241,10 @@ func TestGuidedSeeWhatExists(t *testing.T) {
 	env, _ := fake(t, replies)
 	tm := onTerminal(t, env)
 	tm.waitFor(home, 1)
-	tm.write("\r")
+	tm.write("See what\r")
 	tm.waitFor("version: v1.2.3 running, dev in this clone", 1)
 	tm.waitFor("provider acme: credential resolved", 1)
-	tm.pressUntil("\r", "version: v1.2.3 running, dev in this clone", 2) // back at home: Enter runs it again
+	tm.pressUntil("See what\r", "version: v1.2.3 running, dev in this clone", 2) // back at home: picking it runs it again
 	tm.write("\x03")
 	if code, after := tm.exit(); code != 130 {
 		t.Fatalf("exit %d; want 130", code)
@@ -255,9 +257,9 @@ func TestGuidedTaskError(t *testing.T) {
 	env, _ := fake(t, "case \"$*\" in \"compose ps -q\") echo c0ffee ;; *) exit 1 ;; esac\n")
 	tm := onTerminal(t, env)
 	tm.waitFor(home, 1)
-	tm.write("\r")
+	tm.write("See what\r")
 	tm.waitFor("See what exists: stargaite version: failed with exit 1", 1)
-	tm.pressUntil("\r", "See what exists: stargaite version: failed with exit 1", 2) // back at home
+	tm.pressUntil("See what\r", "See what exists: stargaite version: failed with exit 1", 2) // back at home
 	tm.write("\x03")
 	if code, _ := tm.exit(); code != 130 {
 		t.Fatalf("exit %d; want 130", code)
@@ -530,4 +532,151 @@ esac
 	if l := readLog(t, log); !strings.Contains(l, "\neof\n") || strings.Contains(l, "models add") {
 		t.Errorf("docker log %q", l)
 	}
+}
+
+// key at a terminal, for a name that exists: asked again, Enter makes no
+// key, with no other CLI call.
+func TestKeyExistsAtTerminal(t *testing.T) {
+	env, log := fake(t, `case "$*" in
+"compose ps -q") echo c0ffee ;;
+"compose exec -T stargaite /stargaite models list --json") echo '{"models":[{"name":"main","targets":["acme/a"]}]}' ;;
+"compose exec -T stargaite /stargaite keys list --json") echo '{"keys":[{"name":"my-app","models":["main"]}]}' ;;
+*) exit 9 ;;
+esac
+`)
+	bin, _, _ := ownClone(t, nil)
+	tm := onTerminalAt(t, bin, env, "key")
+	tm.waitFor("Which aliases may it call?", 1)
+	tm.write("\r")
+	tm.waitFor("a name for the key", 1)
+	tm.write("\r")
+	tm.waitFor("another name, or Enter to make no key", 1)
+	tm.write("\r")
+	code, after := tm.exit()
+	if code != 0 || !strings.Contains(tm.output(), "No key made: Change a key rotates a key that exists.") {
+		t.Fatalf("exit %d:\n%q", code, tm.output())
+	}
+	tm.restored(after)
+	var execs []string
+	for _, l := range strings.Split(readLog(t, log), "\n") {
+		if strings.HasPrefix(l, "compose exec") {
+			execs = append(execs, l)
+		}
+	}
+	if want := []string{"compose exec -T stargaite /stargaite models list --json", "compose exec -T stargaite /stargaite keys list --json"}; !slices.Equal(execs, want) {
+		t.Fatalf("CLI execs %q", execs)
+	}
+}
+
+// toReveal starts key at a terminal on keyClone's world and answers it up
+// to the reveal, then waits past the reveal's guard on Enter.
+func toReveal(t *testing.T) *terminal {
+	t.Helper()
+	bin, env, _, _ := keyClone(t, http.StatusOK, chatBody)
+	tm := onTerminalAt(t, bin, env, "key")
+	for _, s := range []string{"Which aliases may it call?", "a name for the key", "the requests a minute"} {
+		tm.waitFor(s, 1)
+		tm.write("\r")
+	}
+	tm.waitFor("enter: I have stored it", 1)
+	time.Sleep(450 * time.Millisecond)
+	return tm
+}
+
+// The client key is written only on the alternate screen (design section
+// 10): stored, then Esc at the paid step; resized while shown; and on
+// SIGTERM while shown. The raw stream is checked, not an emulator.
+func TestKeyOnlyOnAltScreen(t *testing.T) {
+	leave := func(tm *terminal) {
+		tm.write("\r")
+		tm.waitFor("try it: up to 1 paid call(s)", 1)
+		time.Sleep(450 * time.Millisecond)
+		tm.write("\x1b")
+	}
+	for _, c := range []struct {
+		name string
+		do   func(*terminal)
+		want int
+	}{
+		{"stored", leave, 1},
+		{"resized", func(tm *terminal) {
+			n := len(tm.output())
+			if err := unix.IoctlSetWinsize(int(tm.slave.Fd()), unix.TIOCSWINSZ, &unix.Winsize{Row: 30, Col: 100}); err != nil {
+				t.Fatal(err)
+			}
+			if err := tm.cmd.Process.Signal(syscall.SIGWINCH); err != nil {
+				t.Fatal(err)
+			}
+			for deadline := time.Now().Add(5 * time.Second); len(tm.output()) == n; time.Sleep(10 * time.Millisecond) {
+				if time.Now().After(deadline) {
+					t.Fatal("no redraw after the resize")
+				}
+			}
+			time.Sleep(200 * time.Millisecond)
+			leave(tm)
+		}, 1},
+		{"SIGTERM", func(tm *terminal) {
+			if err := tm.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+				t.Fatal(err)
+			}
+		}, 143},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			tm := toReveal(t)
+			c.do(tm)
+			code, after := tm.exit()
+			out := tm.output()
+			if code != c.want {
+				t.Fatalf("exit %d, want %d:\n%q", code, c.want, out)
+			}
+			tm.restored(after)
+			if !strings.Contains(out, "\x1b[?1049h") || !strings.Contains(out, "\x1b[?1049l") {
+				t.Fatalf("the stream holds no alternate-screen enter (\\x1b[?1049h) or leave (\\x1b[?1049l):\n%q", out)
+			}
+			if !strings.Contains(out, keySecret) || !onAltScreenOnly(out, keySecret) {
+				t.Fatalf("the secret is missing, or written off the alternate screen:\n%q", out)
+			}
+			// Said before the key is shown, so it stays in the history (owner decision 2).
+			if i := strings.Index(out, "is made: its secret is shown next"); i < 0 || i > strings.Index(out, "\x1b[?1049h") {
+				t.Fatalf("the line that the key is made is not said before the alternate screen:\n%q", out)
+			}
+		})
+	}
+}
+
+// Ctrl-C while keys create runs, before any secret is shown: the console
+// exits 130, and what the stop may leave was said before the command ran.
+func TestKeyCtrlCDuringCreate(t *testing.T) {
+	env, _ := fake(t, strings.Replace(keyCLI, "echo '{\"findings\":[],\"secrets\"", "trap 'exit 130' INT; /bin/sleep 60 >/dev/null 2>&1 & wait; echo '{\"findings\":[],\"secrets\"", 1))
+	bin, _, _ := ownClone(t, nil)
+	tm := onTerminalAt(t, bin, env, "key")
+	for _, s := range []string{"Which aliases may it call?", "a name for the key", "the requests a minute"} {
+		tm.waitFor(s, 1)
+		tm.write("\r")
+	}
+	tm.waitFor("creating key my-app", 1)
+	time.Sleep(200 * time.Millisecond)
+	tm.write("\x03")
+	code, after := tm.exit()
+	if code != 130 || !strings.Contains(tm.output(), "if this stops before you store its secret, key my-app may be made without it: Change a key rotates it") {
+		t.Fatalf("exit %d:\n%q", code, tm.output())
+	}
+	tm.restored(after)
+}
+
+// onAltScreenOnly reports whether every occurrence of s in out lies after an
+// alternate-screen enter and before the next leave.
+func onAltScreenOnly(out, s string) bool {
+	for i := strings.Index(out, s); i >= 0; {
+		on, off := strings.LastIndex(out[:i], "\x1b[?1049h"), strings.LastIndex(out[:i], "\x1b[?1049l")
+		if on < 0 || off > on {
+			return false
+		}
+		next := strings.Index(out[i+len(s):], s)
+		if next < 0 {
+			break
+		}
+		i += len(s) + next
+	}
+	return true
 }

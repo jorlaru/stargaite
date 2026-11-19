@@ -31,6 +31,14 @@ free_port() {
 	return 1
 }
 
+# key_out NAME: what key printed for key NAME: its try announced, its
+# result, and its secret once, alone on a line.
+key_out() {
+	[[ $out == *"try alias main: up to 1 paid call(s)"* ]] || fail "key $1: the try was not announced with its count"
+	[[ $out == *"Done: key $1, which may call main."* ]] || fail "key $1: no result"
+	[[ $(grep -cE '^sk-stargaite-[a-z2-7]{12}-[a-z2-7]{52}$' <<<"$out") == 1 ]] || fail "key $1: the secret is not printed once, alone on a line"
+}
+
 # again ARGS...: ./setup.sh ARGS in the copy, without a terminal; out holds
 # what it printed, which is shown.
 again() {
@@ -106,6 +114,7 @@ main() {
 	# credential, each needing a recreate.
 	again key --alias main --key-name e2e-2
 	[[ $out == *"answer: mock reply"* ]] || fail "no first answer through the second key"
+	key_out e2e-2
 	again budget --on alias:main --limit-usd 5 --input-price 1 --output-price 2
 	[[ $out == *"setting the prices of mock/mock"* ]] || fail "the budget did not price mock/mock first"
 	[[ $(cd "$tree" && docker compose exec -T stargaite /stargaite models show main --json | jq -c .budget) == '{"limit_usd":5,"reset_interval":"monthly"}' ]] ||
@@ -167,6 +176,8 @@ main() {
 	done
 	again key --alias main --key-name e2e-3
 	[[ $out == *"answer: mock reply"* ]] || fail "no first answer over HTTPS"
+	key_out e2e-3
+	grep -qE 'curl --cacert tls/[^ ]+ https://[^ ]+/v1/chat/completions' <<<"$out" || fail "no example call over HTTPS with the CA"
 	again status
 	[[ $out == *"version: $want running, $want in this clone"* && $out == *"provider mock: credential resolved"* &&
 		$out == *"credentials resolved"* ]] || fail "status does not show the versions and the credentials"

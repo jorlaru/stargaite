@@ -244,13 +244,49 @@ type KeysReply struct {
 // Required names the members the answer must have.
 func (*KeysReply) Required() []string { return []string{"keys"} }
 
-// Key is a client key: the aliases it may call (["*"] for every one) and
-// its budget.
+// Key is a client key: the aliases it may call (["*"] for every one), its
+// budget, its limits (nil for none declared) and its secrets.
 type Key struct {
-	Name   string   `json:"name"`
-	Models []string `json:"models"`
-	Budget *Budget  `json:"budget"`
+	Name        string   `json:"name"`
+	Models      []string `json:"models"`
+	Budget      *Budget  `json:"budget"`
+	RPMLimit    *int64   `json:"rpm_limit"`
+	MaxParallel *int64   `json:"max_parallel_requests"`
+	Secrets     []Secret `json:"secrets"`
 }
+
+// Secret is one of a key's secrets: ValidUntil is 0 for the secret in use,
+// else the end of its grace, in Unix ms.
+type Secret struct {
+	ValidUntil int64 `json:"valid_until"`
+}
+
+// KeyChange is "keys create" or "keys rotate": the findings, and the new
+// secret by key name.
+type KeyChange struct {
+	Findings []Finding         `json:"findings"`
+	Secrets  map[string]string `json:"secrets"`
+}
+
+// Required names the members the answer must have.
+func (*KeyChange) Required() []string { return []string{"findings", "secrets"} }
+
+// ExportReply is "export --json", only what the home counts. Every member
+// but version is absent when empty.
+type ExportReply struct {
+	Version   int                       `json:"version"`
+	Providers map[string]jsontext.Value `json:"providers"`
+	Models    map[string]struct {
+		Targets []string `json:"targets"`
+	} `json:"models"`
+	Keys     map[string]jsontext.Value `json:"keys"`
+	Settings struct {
+		Budget *Budget `json:"budget"`
+	} `json:"settings"`
+}
+
+// Required names the members the answer must have.
+func (*ExportReply) Required() []string { return []string{"version"} }
 
 // SettingsReply is "settings show --json". timeouts is always in the answer;
 // budget only when spend is capped.

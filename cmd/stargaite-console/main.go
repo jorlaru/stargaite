@@ -47,7 +47,10 @@ const (
 // ended or a signal came: a command's process group gets 10 s to stop.
 const sessionBound = 12 * time.Second
 
-const usage = `usage: stargaite-console [provider | alias | status | help] [flags] [--version]
+// homeBound is how long the home reads what exists before each pick.
+const homeBound = 15 * time.Second
+
+const usage = `usage: stargaite-console [provider | alias | key | status | help] [flags] [--version]
 At a terminal with no subcommand: the guided console.
   provider  add providers and their keys; each key is checked for free before it is written
             --provider <a,b>   presets, a provider already added, or one new name
@@ -59,8 +62,11 @@ At a terminal with no subcommand: the guided console.
             --effort <level>   --max-output-tokens <n>   --input-price <usd>   --output-price <usd>   --reverify
             and, when --provider is not added yet, provider's flags
             its new targets are checked first: each paid call is announced, capped at 256 output tokens, never retried
+  key       a client key for one or more aliases, shown once, then one test call through the first
+            --alias <a,b> (main)   --key-name <name> (my-app)   --rpm-limit <n> (60)
+            the test call is announced first: up to one paid call per target of that alias, capped at 256 output tokens, never retried
   status    what exists: providers, aliases, targets without an alias, keys, budgets, telemetry and both versions
-For what has no flag here (reorder an alias, see what it sends, change a provider): the guided console,
+For what has no flag here (reorder an alias, see what it sends, change a provider or a key): the guided console,
 or the stargaite command: docker compose exec -T stargaite /stargaite help
 `
 
@@ -259,8 +265,8 @@ func plainSession(root context.Context, entry task.Entry, u *ui.UI, px *proxy.Pr
 }
 
 // guidedSession runs the program and, on the session goroutine, the entry
-// only with the flags' answers, or with none the home menu: pick a task, run
-// it, say how it ended, pick again, until Ctrl-C.
+// only with the flags' answers, or with none the home (task.Home): read what
+// exists, pick a task, run it, say how it ended, again, until Ctrl-C.
 func guidedSession(root context.Context, cancel context.CancelFunc, px *proxy.Proxy, h *host.Host,
 	environ []string, answers map[string]string, only *task.Entry, stdin, stdout, stderr *os.File) ending {
 	var (
@@ -281,44 +287,15 @@ func guidedSession(root context.Context, cancel context.CancelFunc, px *proxy.Pr
 			}
 			return code
 		}
-		menu := task.Menu()
-		home := ui.Question{ID: "home", Prompt: "What do you want to do?"}
-		for _, entry := range menu {
-			home.Options = append(home.Options, ui.Option{Value: entry.Label, Label: entry.Label})
+		err := task.Home(root, u, px, h, homeBound)
+		switch {
+		case errors.Is(err, ui.ErrQuit):
+			return exitINT
+		case root.Err() != nil:
+			return exitFail
 		}
-		for {
-			label, err := u.Pick(root, home)
-			switch {
-			case errors.Is(err, ui.ErrQuit):
-				return exitINT
-			case err != nil:
-				if root.Err() == nil {
-					failure = err
-				}
-				return exitFail
-			}
-			for _, entry := range menu {
-				if entry.Label != label {
-					continue
-				}
-				res, err := u.Run(root, entry.Steps, func(ctx context.Context) (string, error) { return entry.Run(ctx, u, px, h) })
-				switch {
-				case errors.Is(err, ui.ErrQuit):
-					return exitINT
-				case root.Err() != nil:
-					return exitFail
-				case errors.Is(err, ui.ErrLeave):
-					err = u.Say(root, "Left "+label+".")
-				case err != nil:
-					err = u.Say(root, label+": "+err.Error())
-				case res != "":
-					err = u.Say(root, res)
-				}
-				if err != nil {
-					return exitFail
-				}
-			}
-		}
+		failure = err
+		return exitFail
 	}
 	done := supervise(session, func() { panicked.Store(true); p.Kill() }, stderr)
 	final, err := p.Run()

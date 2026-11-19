@@ -1108,7 +1108,7 @@ subcommands:
   provider  add providers and their keys; each key is checked for free before it is written
   alias     an alias toward a provider's model, with fallbacks from any provider (--fallback a/m,b/m);
             its new targets are checked first, each paid call counted and announced
-  key       a client key for an alias (--alias, main), then a first answer
+  key       a client key for one or more aliases (--alias a,b; main), shown once, then a first answer
   budget    a spending limit on the instance, an alias or a key; the prices
             of the targets it reaches unpriced are asked first
   telemetry traces to Langfuse or any OTLP endpoint, replacing what was set
@@ -1215,7 +1215,7 @@ main() {
 	install) parse_flags "port $pf model alias max-output-tokens effort key-name rpm-limit" "$bf reverify" "$@"; install ;;
 	provider) console provider "$@" ;;
 	alias) console alias "$@" ;;
-	key) parse_flags "alias key-name rpm-limit" "" "$@"; running; alias_kept || die "alias $alias does not exist: ./setup.sh alias makes it"; if step_key; then step_answer; fi ;;
+	key) console key "$@" ;;
 	budget) parse_flags "on limit-usd reset input-price output-price" "yes" "$@"; running; budget ;;
 	telemetry) parse_flags "backend endpoint langfuse-public-env langfuse-secret-env header-name key-env" "$bf" "$@"; running; telemetry ;;
 	remote) parse_flags "address tls tls-cert tls-key tls-name tls-ca" "yes" "$@"; remote ;;

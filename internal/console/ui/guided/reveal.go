@@ -3,6 +3,7 @@ package guided
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/x/ansi"
@@ -15,12 +16,16 @@ import (
 // in the terminal's scrollback (docs/design/phase-7.md section 3, "The
 // client key"). The root model switches screens while it is the piece.
 type reveal struct {
-	q      ui.Question
-	warned bool // Ctrl-C was pressed once
+	q       ui.Question
+	warned  bool      // Ctrl-C was pressed once
+	created time.Time // when it was made
 }
 
-// Update answers "" on Enter. Esc and paste do nothing; the first Ctrl-C
-// warns that the value will not be shown again, the second quits.
+// Update answers "" on Enter, but an Enter earlier than piece.EnterWait
+// after the reveal was made is ignored, as the paid step's is, so a late
+// Enter meant for the question before cannot dismiss an unseen value. Esc
+// and paste do nothing; the first Ctrl-C warns that the value will not be
+// shown again, the second quits.
 func (r *reveal) Update(msg tea.Msg) (piece.Piece, *piece.Answer) {
 	k, ok := msg.(tea.KeyPressMsg)
 	if !ok {
@@ -28,7 +33,9 @@ func (r *reveal) Update(msg tea.Msg) (piece.Piece, *piece.Answer) {
 	}
 	switch k.String() {
 	case "enter":
-		return r, &piece.Answer{}
+		if time.Since(r.created) >= piece.EnterWait {
+			return r, &piece.Answer{}
+		}
 	case "ctrl+c":
 		if r.warned {
 			return r, &piece.Answer{Err: ui.ErrQuit}

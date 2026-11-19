@@ -111,13 +111,19 @@ func (h *Host) WaitReady(ctx context.Context, say func(string)) error {
 		return fmt.Errorf("waiting for the proxy: %w", ctx.Err())
 	}
 	say("not ready within 120 s; the last 30 log lines:")
-	logs, cancelLogs := context.WithTimeout(ctx, h.bound)
-	defer cancelLogs()
-	_, _ = h.Display(logs, say, "docker", "compose", "logs", "--tail", "30", "stargaite")
+	h.Logs(ctx, say)
 	if o, err := h.ReadOverride(); err == nil && o.Get("tls_name") != "" {
 		say("./setup.sh remote again repairs a remote that did not finish")
 	}
 	return errors.New("the proxy did not become ready")
+}
+
+// Logs hands say the container's last 30 log lines, bounded by h.bound. It is
+// best effort: a failure says nothing more.
+func (h *Host) Logs(ctx context.Context, say func(string)) {
+	bounded, cancel := context.WithTimeout(ctx, h.bound)
+	defer cancel()
+	_, _ = h.Display(bounded, say, "docker", "compose", "logs", "--tail", "30", "stargaite")
 }
 
 // ContainerRuns reports whether the clone's container runs. Compose's

@@ -68,14 +68,7 @@ func SeeWhatExists(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host)
 		{&keys, "keys list", func() []string {
 			var lines []string
 			for _, k := range keys.Keys {
-				calls := strings.Join(k.Models, ", ")
-				switch {
-				case slices.Equal(k.Models, []string{"*"}):
-					calls = "every alias"
-				case len(k.Models) == 0:
-					calls = "no alias"
-				}
-				lines = append(lines, "key "+k.Name+": may call "+calls+budget(k.Budget))
+				lines = append(lines, "key "+k.Name+": may call "+mayCall(k)+budget(k.Budget))
 			}
 			return orNone(lines, "keys: none")
 		}},

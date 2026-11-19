@@ -214,7 +214,7 @@ var c60Words = map[string]string{
 	"unpriced":           "%s has no prices, so no budget counts its spend; a budget that reaches it asks them",
 	"no_fallback_prices": "%s has no prices: its cost is the provider's own report, and a call without one counts nothing",
 	"effort_dropped":     "%s: the alias's effort is not sent toward a target whose reasoning dialect is none",
-	"unknown_alias":      "%s names an alias that does not exist: its calls to that alias get an error",
+	"unknown_alias":      "%s names an alias that does not exist: its calls to that alias get an error: Change a key sets the aliases it may call",
 }
 
 // TestPlain: a row with words says them with the resource's name; any other
@@ -227,6 +227,13 @@ func TestPlain(t *testing.T) {
 		"effort_dropped":     "targets/a: the alias's effort is not sent toward a target whose reasoning dialect is none",
 	} {
 		if got := Plain(code, "targets/a", "x"); got != words {
+			t.Errorf("%s: %q, want %q", code, got, words)
+		}
+	}
+	for code, words := range map[string]string{
+		"unknown_alias": "keys/k names an alias that does not exist: its calls to that alias get an error: Change a key sets the aliases it may call",
+	} {
+		if got := Plain(code, "keys/k", "x"); got != words {
 			t.Errorf("%s: %q, want %q", code, got, words)
 		}
 	}

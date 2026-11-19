@@ -157,7 +157,7 @@ func newPiece(q ui.Question) piece.Piece {
 	case ui.KindConfirm:
 		return piece.Confirm(q)
 	case ui.KindReveal:
-		return &reveal{q: q}
+		return &reveal{q: q, created: time.Now()}
 	case ui.KindPickMany:
 		return piece.PickMany(q)
 	case ui.KindSecret:

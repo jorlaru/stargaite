@@ -457,6 +457,60 @@ func TestPaidFront(t *testing.T) {
 	}
 }
 
+// TestPaidLabels: two given options keep their labels, with Paid's values.
+func TestPaidLabels(t *testing.T) {
+	front := &fakeFront{t: t, answers: []string{"check"}}
+	q := paidQuestion()
+	q.Options = []Option{{Label: "Try it"}, {Label: "Not now"}}
+	b, err := New(front, nil).Paid(context.Background(), q, 1)
+	want := []Option{{Value: "check", Label: "Try it"}, {Value: "not now", Label: "Not now"}}
+	if err != nil || b == nil || !slices.Equal(front.asked[0].Options, want) {
+		t.Fatalf("budget %v, err %v, the front got %+v", b, err, front.asked[0].Options)
+	}
+}
+
+// TestRunWith: presets answer by ID for that run only, in place of the
+// session's answers, which come back on return; a nested Run keeps them.
+func TestRunWith(t *testing.T) {
+	ctx := context.Background()
+	front := &fakeFront{t: t, answers: []string{"typed-a", "typed-b"}}
+	u := New(front, map[string]string{"a": "flag"})
+	steps := []Step{{ID: "s", Title: "s"}}
+	var inside []string
+	_, err := u.RunWith(ctx, steps, map[string]string{"b": "pre"}, func(ctx context.Context) (string, error) {
+		for _, id := range []string{"b", "a"} {
+			v, err := u.Text(ctx, Question{ID: id, Flag: id, Step: "s"})
+			if err != nil {
+				return "", err
+			}
+			inside = append(inside, v)
+		}
+		return u.Run(ctx, steps, func(ctx context.Context) (string, error) {
+			v, err := u.Text(ctx, Question{ID: "b", Flag: "b", Step: "s"})
+			inside = append(inside, v)
+			return "", err
+		})
+	})
+	if err != nil || !slices.Equal(inside, []string{"pre", "typed-a", "pre"}) {
+		t.Fatalf("inside: %q, %v", inside, err)
+	}
+	var after []string
+	for _, id := range []string{"a", "b"} {
+		v, err := u.Text(ctx, Question{ID: id, Flag: id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		after = append(after, v)
+	}
+	asked := make([]string, len(front.asked))
+	for i, q := range front.asked {
+		asked[i] = q.ID
+	}
+	if !slices.Equal(after, []string{"flag", "typed-b"}) || !slices.Equal(asked, []string{"a", "b"}) {
+		t.Fatalf("after: %q, the front was asked %q", after, asked)
+	}
+}
+
 func TestPaidNeverFromFlags(t *testing.T) {
 	front := &fakeFront{t: t, answers: []string{"check"}}
 	b, err := New(front, map[string]string{"check": "not now"}).Paid(context.Background(), paidQuestion(), 1)

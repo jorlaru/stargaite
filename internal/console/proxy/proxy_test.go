@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http/httptest"
 	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -165,6 +166,205 @@ func TestCallRealShapes(t *testing.T) {
 		t.Errorf("settings timeouts = %+v", settings.Timeouts)
 	}
 	changeShapes(t, px)
+	exportShapes(t)
+	keyShapes(t)
+}
+
+// exportShapes: export on an empty store, then validate on a store whose only
+// finding is an unresolved credential, through the real CLI (C61's probes of
+// shapes read from code only).
+func exportShapes(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	env := admintest.Server(t)
+	px := New(cliRunner(env))
+	var export ExportReply
+	if err := px.Call(ctx, &export, "export", nil); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if export.Version != 1 || export.Providers != nil || export.Models != nil || export.Keys != nil || export.Settings.Budget != nil {
+		t.Errorf("export of an empty store = %+v", export)
+	}
+	cliDo(t, env, "providers", "add", "x", "--protocol", "openai", "--base-url", "https://api.x.example/v1", "--api-key-env", "NOPE_KEY",
+		"--billing", "none")
+	var validated Change
+	if err := px.Call(ctx, &validated, "validate", nil); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	want := []Finding{{Severity: "warning", Code: "credential_unresolved", Resource: "providers/x", Message: "NOPE_KEY does not resolve"}}
+	if !slices.Equal(validated.Findings, want) {
+		t.Errorf("validate = %+v, want %+v", validated.Findings, want)
+	}
+}
+
+// keyShapes: the key commands C61 runs, through the real CLI, on a store with
+// one alias and no budget. A secret is never printed.
+func keyShapes(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	env := admintest.Server(t)
+	px := New(cliRunner(env))
+	cliDo(t, env, "providers", "add", "mock", "--protocol", "openai", "--base-url", "http://127.0.0.1:9/v1", "--allow-private-network", "--billing", "none")
+	cliDo(t, env, "targets", "add", "mock/m", "--kind", "chat")
+	cliDo(t, env, "models", "add", "a", "--target", "mock/m")
+	token := regexp.MustCompile(`^sk-stargaite-[a-z2-7]{12}-[a-z2-7]{52}$`)
+	key := func() (Key, bool) {
+		t.Helper()
+		var keys KeysReply
+		if err := px.Call(ctx, &keys, "keys list", nil); err != nil {
+			t.Fatalf("keys list: %v", err)
+		}
+		i := slices.IndexFunc(keys.Keys, func(k Key) bool { return k.Name == "k" })
+		if i < 0 {
+			return Key{}, false
+		}
+		return keys.Keys[i], true
+	}
+
+	first, findings, err := px.NewSecret(ctx, "keys create", []string{"--model", "a", "--rpm-limit", "10"}, "k")
+	if err != nil || !token.MatchString(first) || findings == nil {
+		t.Fatalf("keys create: err %v, findings %+v, the secret has the token's shape: %v", err, findings, token.MatchString(first))
+	}
+	// keys list shows the limits in force: an undeclared max_parallel_requests
+	// is the published default, 5 (internal/config/snapshot.go:251, LIM-7).
+	k, ok := key()
+	if !ok || !slices.Equal(k.Models, []string{"a"}) || k.RPMLimit == nil || *k.RPMLimit != 10 || k.MaxParallel == nil || *k.MaxParallel != 5 ||
+		!slices.Equal(k.Secrets, []Secret{{ValidUntil: 0}}) {
+		t.Errorf("keys list after create = %+v", k)
+	}
+	second, _, err := px.NewSecret(ctx, "keys rotate", []string{"--grace", "1h"}, "k")
+	if err != nil || !token.MatchString(second) || second == first {
+		t.Fatalf("keys rotate: err %v, the token's shape %v, a new secret %v", err, token.MatchString(second), second != first)
+	}
+	k, _ = key()
+	now := time.Now().UnixMilli()
+	if len(k.Secrets) != 2 || !slices.ContainsFunc(k.Secrets, func(s Secret) bool { return s.ValidUntil > now }) {
+		t.Errorf("keys list after rotate = %+v", k.Secrets)
+	}
+	var set Change
+	if err := px.Call(ctx, &set, "keys set", []string{"--rpm-limit=", "--max-parallel-requests", "3"}, "k"); err != nil {
+		t.Fatalf("keys set: %v", err)
+	}
+	if k, _ = key(); k.RPMLimit != nil || k.MaxParallel == nil || *k.MaxParallel != 3 {
+		t.Errorf("keys list after set = %+v", k)
+	}
+	var revoked Change
+	if err := px.Call(ctx, &revoked, "keys revoke", []string{"--yes"}, "k"); err != nil {
+		t.Fatalf("keys revoke: %v", err)
+	}
+	if _, ok := key(); ok {
+		t.Error("keys list holds k after its revoke")
+	}
+	var export ExportReply
+	if err := px.Call(ctx, &export, "export", nil); err != nil {
+		t.Fatalf("export: %v", err)
+	}
+	if len(export.Models) != 1 || len(export.Keys) != 0 || export.Settings.Budget != nil {
+		t.Errorf("export = %+v", export)
+	}
+}
+
+// TestCallRefusableKeyBudget: a key's budget that reaches an unpriced
+// pay-per-use target is refused with unpriced_under_budget, returned as a
+// finding with nothing published; once the target is priced it is accepted.
+func TestCallRefusableKeyBudget(t *testing.T) {
+	env := admintest.Server(t)
+	cliDo(t, env, "providers", "add", "acme", "--protocol", "openai", "--base-url", "https://api.acme.example/v1", "--billing", "pay_per_use")
+	cliDo(t, env, "targets", "add", "acme/m1", "--kind", "chat")
+	cliDo(t, env, "models", "add", "a", "--target", "acme/m1")
+	cliDo(t, env, "keys", "create", "k", "--model", "a")
+	shown := func() *Budget {
+		t.Helper()
+		var k Key
+		if err := json.Unmarshal([]byte(cliDo(t, env, "keys", "show", "k", "--json")), &k); err != nil {
+			t.Fatal(err)
+		}
+		return k.Budget
+	}
+	px := New(cliRunner(env))
+	ctx := context.Background()
+	flags := []string{"--budget", "limit_usd=5,reset_interval=monthly"}
+	findings, err := px.CallRefusable(ctx, &Change{}, "keys set", flags, "k")
+	if err != nil || !hasFinding(findings, "error", "unpriced_under_budget", "targets/acme/m1") {
+		t.Fatalf("unpriced: %+v, %v; want unpriced_under_budget on targets/acme/m1", findings, err)
+	}
+	if b := shown(); b != nil {
+		t.Fatalf("a refused change was published: budget %+v", b)
+	}
+	cliDo(t, env, "targets", "set", "acme/m1", "--pricing", "input_per_million=1,output_per_million=2,as_of="+time.Now().Format(time.DateOnly))
+	var change Change
+	findings, err = px.CallRefusable(ctx, &change, "keys set", flags, "k")
+	if err != nil || findings != nil || change.Findings == nil {
+		t.Fatalf("priced: findings %+v, %v, the change %+v", findings, err, change)
+	}
+	if b := shown(); b == nil || *b != (Budget{LimitUSD: 5, ResetInterval: "monthly"}) {
+		t.Fatalf("budget = %+v", b)
+	}
+}
+
+// TestCallRefusableOther: an exit 1 without findings and an exit 2 follow
+// Call's rule, never quoting the output; the paid command is refused.
+func TestCallRefusableOther(t *testing.T) {
+	for _, tc := range []struct {
+		out  string
+		code int
+		want string
+	}{
+		{`{"error":{"message":"no","findings":[]}}`, 1, "stargaite keys set: no"},
+		{"usage: sk-hand-edited-secret\n", 2, "stargaite keys set: failed with exit 2"},
+	} {
+		findings, err := New(canned(tc.out, tc.code, nil)).CallRefusable(context.Background(), &Change{}, "keys set", nil, "k")
+		if findings != nil || err == nil || err.Error() != tc.want {
+			t.Errorf("%q exit %d: findings %+v, err %v; want %q", tc.out, tc.code, findings, err, tc.want)
+		}
+	}
+	var seen [][]string
+	_, err := New(canned(verified, 0, &seen)).CallRefusable(context.Background(), &VerifyReply{}, "targets verify", nil, "acme/m1")
+	if err == nil || err.Error() != "a paid command goes through Verify" || len(seen) != 0 {
+		t.Fatalf("targets verify: err %v, %d CLI runs", err, len(seen))
+	}
+}
+
+// TestNewSecretNotUnderstood: an answer without the new secret says it is
+// lost and never quotes the answer; a refusal is the CLI's message; a run
+// that may have made the key says so.
+func TestNewSecretNotUnderstood(t *testing.T) {
+	ctx := context.Background()
+	lost := "stargaite keys create: the answer was not understood, so the new secret of key k is lost: Change a key rotates it (" + stale + ")"
+	for _, out := range []string{"not json sk-stargaite-leak", `{"findings":[],"secrets":{}}`, `{"findings":[],"secrets":{"other":"sk-x"}}`} {
+		secret, _, err := New(canned(out, 0, nil)).NewSecret(ctx, "keys create", nil, "k")
+		if secret != "" || err == nil || err.Error() != lost {
+			t.Errorf("%q: secret given %v, err %v; want %q", out, secret != "", err, lost)
+		}
+	}
+	// The admin API's own refusal, as the CLI passes it on: nothing was made.
+	_, _, err := New(canned(`{"error":{"message":"key \"k\" exists","code":"conflict"}}`, 1, nil)).NewSecret(ctx, "keys create", nil, "k")
+	if err == nil || err.Error() != `stargaite keys create: key "k" exists` {
+		t.Errorf("exit 1: err %v", err)
+	}
+	// No answer of the admin API was read: the key may have been made.
+	for _, c := range []struct {
+		out  string
+		code int
+		want string
+	}{
+		{`{"error":{"message":"the admin API was not reached: EOF","type":"api_error","code":"admin_unreachable"}}`, 1,
+			"stargaite keys create: the admin API was not reached: EOF"},
+		{`{"error":{"message":"key \"k\" exists"}}`, 1, `stargaite keys create: key "k" exists`},
+		{"", 137, "stargaite keys create: failed with exit 137"},
+	} {
+		_, _, err := New(canned(c.out, c.code, nil)).NewSecret(ctx, "keys create", nil, "k")
+		if want := c.want + ": key k may have been made (or rotated); if so its secret is lost: Change a key rotates it"; err == nil || err.Error() != want {
+			t.Errorf("exit %d %s: err %v, want %q", c.code, c.out, err, want)
+		}
+	}
+	failing := func(context.Context, []string, io.Reader, io.Writer, io.Writer) (int, error) {
+		return 0, errors.New("no docker")
+	}
+	_, _, err = New(failing).NewSecret(ctx, "keys create", nil, "k")
+	if want := "stargaite keys create: no docker: key k may have been made (or rotated); if so its secret is lost: Change a key rotates it"; err == nil || err.Error() != want {
+		t.Errorf("runner error: err %v, want %q", err, want)
+	}
 }
 
 // changeShapes: the answers of the changes C60 makes, and the members it

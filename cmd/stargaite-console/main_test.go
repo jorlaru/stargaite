@@ -39,11 +39,24 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "the console was not built: %v\n%s", err, out)
 	case os.WriteFile(filepath.Join(dir, "clone", "compose.yaml"), []byte("services: {}\n"), 0o644) != nil:
 		fmt.Fprintln(os.Stderr, "compose.yaml was not written")
+	// The home's readiness check reaches this port, where nothing listens,
+	// never a service of the machine running the tests.
+	case os.WriteFile(filepath.Join(dir, "clone", ".env"), []byte("STARGAITE_PORT="+closedPort()+"\n"), 0o600) != nil:
+		fmt.Fprintln(os.Stderr, ".env was not written")
 	default:
 		code = m.Run()
 	}
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
+}
+
+// closedPort is a loopback port nothing listens on: one that was free a
+// moment ago.
+func closedPort() string {
+	srv := httptest.NewServer(http.NotFoundHandler())
+	u, _ := url.Parse(srv.URL)
+	srv.Close()
+	return u.Port()
 }
 
 // replies are what the fake docker answers for the seven reads, in the
@@ -118,7 +131,7 @@ func TestVersionFirst(t *testing.T) {
 func TestUsage(t *testing.T) {
 	env, log := fake(t, replies)
 	out, _, code := runConsole(t, console, env, "help")
-	if code != 0 || !strings.HasPrefix(out, "usage: stargaite-console [provider | alias | status | help] [flags] [--version]\n") {
+	if code != 0 || !strings.HasPrefix(out, "usage: stargaite-console [provider | alias | key | status | help] [flags] [--version]\n") {
 		t.Fatalf("help: exit %d\n%s", code, out)
 	}
 	for _, c := range []struct {
@@ -141,7 +154,7 @@ func TestUsage(t *testing.T) {
 
 func TestUsageText(t *testing.T) {
 	out, _, _ := runConsole(t, console, nil, "--help")
-	want := "usage: stargaite-console [provider | alias | status | help] [flags] [--version]\n" +
+	want := "usage: stargaite-console [provider | alias | key | status | help] [flags] [--version]\n" +
 		"At a terminal with no subcommand: the guided console.\n" +
 		"  provider  add providers and their keys; each key is checked for free before it is written\n" +
 		"            --provider <a,b>   presets, a provider already added, or one new name\n" +
@@ -153,8 +166,11 @@ func TestUsageText(t *testing.T) {
 		"            --effort <level>   --max-output-tokens <n>   --input-price <usd>   --output-price <usd>   --reverify\n" +
 		"            and, when --provider is not added yet, provider's flags\n" +
 		"            its new targets are checked first: each paid call is announced, capped at 256 output tokens, never retried\n" +
+		"  key       a client key for one or more aliases, shown once, then one test call through the first\n" +
+		"            --alias <a,b> (main)   --key-name <name> (my-app)   --rpm-limit <n> (60)\n" +
+		"            the test call is announced first: up to one paid call per target of that alias, capped at 256 output tokens, never retried\n" +
 		"  status    what exists: providers, aliases, targets without an alias, keys, budgets, telemetry and both versions\n" +
-		"For what has no flag here (reorder an alias, see what it sends, change a provider): the guided console,\n" +
+		"For what has no flag here (reorder an alias, see what it sends, change a provider or a key): the guided console,\n" +
 		"or the stargaite command: docker compose exec -T stargaite /stargaite help\n"
 	if out != want {
 		t.Fatalf("usage:\n%q\nwant:\n%q", out, want)
@@ -606,5 +622,79 @@ func TestProviderKeyEnvPlain(t *testing.T) {
 	}
 	if got := auth(); len(got) != 1 || got[0] != "Bearer "+secret {
 		t.Fatalf("the model list got %q", got)
+	}
+}
+
+// keySecret is the secret the fake CLI's keys create gives, in the shape
+// the proxy makes.
+const keySecret = "sk-stargaite-abcdefghijkl-abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrst"
+
+// keyCLI answers Give an app or agent its key for my-app toward alias main.
+const keyCLI = `case "$*" in
+"compose ps -q") echo c0ffee ;;
+"compose exec -T stargaite /stargaite models list --json") echo '{"models":[{"name":"main","targets":["acme/a"]}]}' ;;
+"compose exec -T stargaite /stargaite keys list --json") echo '{"keys":[]}' ;;
+"compose exec -T stargaite /stargaite keys create --json --model main --rpm-limit 60 -- my-app") ` +
+	`echo '{"findings":[],"secrets":{"my-app":"` + keySecret + `"},"resource":{"name":"my-app"}}' ;;
+*) exit 9 ;;
+esac
+`
+
+// chatBody is the shim's chat completion (tests/setup/shim).
+const chatBody = `{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"fake reply"},"finish_reason":"stop"}]}`
+
+// keyClone is a clone of its own whose data plane answers each chat
+// completion with status and body, and a fake docker with keyCLI. It
+// returns the console, the fake's environment and log, and the
+// Authorization headers the data plane got.
+func keyClone(t *testing.T, status int, body string) (bin string, env []string, log string, auth func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var got []string
+	bin, _, _ = ownClone(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got = append(got, r.Header.Get("Authorization"))
+		mu.Unlock()
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/chat/completions" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("X-Stargaite-Target", "fake/target")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}))
+	env, log = fake(t, keyCLI)
+	return bin, env, log, func() []string { mu.Lock(); defer mu.Unlock(); return slices.Clone(got) }
+}
+
+// key without a terminal prints the new secret once, alone on its line,
+// then tries it with that key: one request; a try the plane refuses exits
+// 1 with its words.
+func TestKeyPlain(t *testing.T) {
+	bin, env, log, auth := keyClone(t, http.StatusOK, chatBody)
+	out, errOut, code := runConsole(t, bin, env, "key")
+	lines := strings.Split(out, "\n")
+	if code != 0 || strings.Count(out, keySecret) != 1 || !slices.Contains(lines, keySecret) || !strings.Contains(out, "answer: fake reply") {
+		t.Fatalf("exit %d, stderr %q, stdout:\n%s", code, errOut, out)
+	}
+	if got := auth(); len(got) != 1 || got[0] != "Bearer "+keySecret {
+		t.Fatalf("the data plane got %q", got)
+	}
+	if strings.Contains(readLog(t, log), keySecret) {
+		t.Fatal("the secret is in the docker log")
+	}
+	for _, c := range []struct {
+		status int
+		body   string
+		want   string
+	}{
+		{http.StatusBadGateway, `{"error":{"message":"the provider failed","code":"provider_error"}}`, "stargaite-console: the test call answered 502: the provider failed"},
+		{http.StatusInternalServerError, "", "stargaite-console: the test call answered 500"},
+	} {
+		bin, env, _, auth := keyClone(t, c.status, c.body)
+		out, errOut, code := runConsole(t, bin, env, "key")
+		if code != 1 || !slices.Contains(strings.Split(errOut, "\n"), c.want) || len(auth()) != 1 {
+			t.Errorf("%d: exit %d, %d requests, stderr %q, stdout:\n%s", c.status, code, len(auth()), errOut, out)
+		}
 	}
 }

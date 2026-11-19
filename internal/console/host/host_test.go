@@ -588,3 +588,34 @@ func TestWaitReadyBadPlane(t *testing.T) {
 		t.Fatalf("err %v, tries %d, said %q, docker %q", err, *tries, said, read(t, log))
 	}
 }
+
+// TestLogsBound: Logs says the container's last 30 lines, and a docker that
+// hangs is cut at h.bound.
+func TestLogsBound(t *testing.T) {
+	logs := t.TempDir()
+	log, pid := filepath.Join(logs, "argv"), filepath.Join(logs, "pid")
+	fakes(t, map[string]string{"docker": `echo "$*" >> ` + log + "\necho 'a line'\necho 'another line'\n"})
+	h := New(t.TempDir())
+	var said []string
+	h.Logs(context.Background(), func(l string) { said = append(said, l) })
+	if !slices.Equal(said, []string{"a line", "another line"}) || read(t, log) != "compose logs --tail 30 stargaite\n" {
+		t.Fatalf("said %q, docker %q", said, read(t, log))
+	}
+
+	fakes(t, map[string]string{"docker": "echo $$ > " + pid + "\nexec /bin/sleep 60\n"})
+	h.bound = 100 * time.Millisecond
+	start := time.Now()
+	h.Logs(context.Background(), func(string) {})
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("Logs returned after %v", time.Since(start))
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(read(t, pid)))
+	if err != nil {
+		t.Fatalf("the hanging docker never started: %v", err)
+	}
+	for deadline := time.Now().Add(2 * time.Second); !gone(n); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the hanging docker %d was not cut", n)
+		}
+	}
+}

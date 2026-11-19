@@ -359,22 +359,49 @@ func (r *run) written() string {
 	return s
 }
 
+// plane is the data plane serveReady serves: each chat request it got.
+type plane struct {
+	mu   sync.Mutex
+	chat []chatRequest
+}
+
+// chatRequest is a chat completion's Authorization header and body.
+type chatRequest struct{ auth, body string }
+
+func (p *plane) requests() []chatRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.chat)
+}
+
 // serveReady answers /health/ready with 200 on 127.0.0.1:port until the test
 // ends: the data plane's readiness, which the console checks over HTTP
-// itself. It is started after install, which checks the port is free.
-func serveReady(t *testing.T, port string) {
+// itself; and a chat completion with the shim's answer, the console's try.
+// It is started after install, which checks the port is free.
+func serveReady(t *testing.T, port string) *plane {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:"+port)
 	if err != nil {
 		t.Fatal(err)
 	}
+	p := &plane{}
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/health/ready" {
+		switch {
+		case r.URL.Path == "/health/ready":
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			p.mu.Lock()
+			p.chat = append(p.chat, chatRequest{r.Header.Get("Authorization"), string(body)})
+			p.mu.Unlock()
+			w.Header().Set("X-Stargaite-Target", "fake/target")
+			_, _ = io.WriteString(w, `{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"fake reply"},"finish_reason":"stop"}]}`)
+		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}), ReadHeaderTimeout: 10 * time.Second}
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
+	return p
 }
 
 // freePort is a loopback port nothing listens on.
@@ -551,7 +578,7 @@ func TestSetupFlags(t *testing.T) {
 		if code, out := r.exec(acme(port)...); code != 0 {
 			t.Fatalf("install: exit %d:\n%s", code, out)
 		}
-		serveReady(t, port)
+		pl := serveReady(t, port)
 		// sub runs a subcommand and returns its CLI calls; all holds every
 		// output, for the leak check.
 		var all string
@@ -588,8 +615,18 @@ func TestSetupFlags(t *testing.T) {
 
 		got, out = sub("key", "--alias", "local", "--key-name", "second", "--rpm-limit", "10")
 		if !slices.Equal(got, []string{"models list", "keys list", "keys create --model local --rpm-limit 10 -- second"}) ||
-			!strings.Contains(out, "answer: fake reply") || r.count("curl", "chat/completions") != 2 || r.count("curl", `"model":"local"`) != 1 {
+			!strings.Contains(out, "answer: fake reply") || r.count("curl", "chat/completions") != 1 {
 			t.Errorf("key: %q:\n%s", got, out)
+		}
+		// The console's try is no curl: the data plane got it, with the new
+		// key, and the key is printed once, alone on its line.
+		const secret = "sk-stargaite-fake-second"
+		if req := pl.requests(); len(req) != 1 || req[0].auth != "Bearer "+secret || !strings.Contains(req[0].body, `"model":"local"`) ||
+			!strings.Contains(req[0].body, `"max_tokens":256`) {
+			t.Errorf("the data plane got %q", req)
+		}
+		if strings.Count(out, secret) != 1 || !slices.Contains(strings.Split(out, "\n"), secret) {
+			t.Errorf("the key is not printed once alone on its line:\n%s", out)
 		}
 		// A key that exists is kept, as anything that exists is: exit 0.
 		got, out = sub("key", "--alias", "local", "--key-name", "second")
@@ -1007,7 +1044,8 @@ func TestSetupNoTTY(t *testing.T) {
 // reaches the first answer.
 func TestSetupPrompts(t *testing.T) {
 	r := newRun(t, nil)
-	code, out := r.pty([]string{"install", "--port", freePort(t)},
+	port := freePort(t)
+	code, out := r.pty([]string{"install", "--port", port},
 		step{"provider: a number or a name: ", "1"},
 		step{"OPENAI_API_KEY (typed hidden): ", "typed-secret-1"},
 		step{"continue? [y/N]: ", "y"},
@@ -1091,8 +1129,10 @@ func TestSetupPrompts(t *testing.T) {
 		}
 	}
 
-	// A key that exists: Enter skips it, said, and is no failure.
-	code, out = r.pty([]string{"key"},
+	// A key that exists: Enter skips it, said, and is no failure. key is
+	// the console's since C61; install still asks this way until C62.
+	code, out = r.pty([]string{"install", "--port", port, "--provider", "openai", "--model", "gpt-b"},
+		step{"OPENAI_API_KEY is in .env: replace it? [y/N]: ", ""},
 		step{"a name for the alias your clients call [main]: ", ""},
 		step{"a name for the client key [my-app]: ", ""},
 		step{"another name, or Enter to skip the first answer: ", ""},
@@ -1385,8 +1425,8 @@ func TestSetupRemote(t *testing.T) {
 		// answer goes over HTTPS.
 		ready(t, r, n, "localhost", port, " --cacert tls/cert.pem ")
 		n = len(r.calls())
-		if code, out := r.exec("key", "--alias", "main", "--key-name", "second"); code != 0 || !strings.Contains(out, "answer: fake reply") {
-			t.Errorf("key: exit %d:\n%s", code, out)
+		if code, out := r.exec(append(without(acme(port), "--key-name"), "--key-name", "second")...); code != 0 || !strings.Contains(out, "answer: fake reply") {
+			t.Errorf("install again, key second: exit %d:\n%s", code, out)
 		}
 		if code, out := r.exec("status"); code != 0 || !strings.Contains(out, "provider acme: credential resolved") {
 			t.Errorf("status: exit %d:\n%s", code, out)
@@ -1590,7 +1630,7 @@ func TestSetupRemote(t *testing.T) {
 			t.Errorf("install again: exit %d:\n%s", code, out)
 		}
 		r.env = append(r.env, "FAKE_READY=never")
-		if code, out := r.exec("key", "--alias", "main", "--key-name", "second"); code != 1 || !strings.Contains(out, "a log line\n./setup.sh remote again repairs a remote that did not finish") {
+		if code, out := r.exec("budget", "--on", "instance", "--limit-usd", "1", "--yes"); code != 1 || !strings.Contains(out, "a log line\n./setup.sh remote again repairs a remote that did not finish") {
 			t.Errorf("never ready: exit %d:\n%s", code, out)
 		}
 	})
@@ -1656,7 +1696,7 @@ func TestSetupRemote(t *testing.T) {
 		if out, err := restart.CombinedOutput(); err != nil {
 			t.Fatalf("restart: %v: %s", err, out)
 		}
-		if code, out := r.exec("key", "--alias", "main", "--key-name", "k2"); code != 1 || !strings.Contains(out, "not ready within 120 s") {
+		if code, out := r.exec("budget", "--on", "instance", "--limit-usd", "1", "--yes"); code != 1 || !strings.Contains(out, "not ready within 120 s") {
 			t.Fatalf("the shim does not refuse the expired certificate: exit %d:\n%s", code, out)
 		}
 		code, out := r.exec("remote", "--tls", "self-signed", "--yes")

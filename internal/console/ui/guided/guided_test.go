@@ -293,12 +293,14 @@ func TestRevealAltScreenOneStep(t *testing.T) {
 	h := start(t)
 	got := h.asked(revealQuestion())
 	f := h.waitShown("FAKE-REVEAL-7f3a")
+	shown := time.Now()
 	if !f.AltScreen || !strings.Contains(f.Content, "\n  FAKE-REVEAL-7f3a\n\nenter: I have stored it\n") {
 		t.Fatalf("reveal frame alt=%v:\n%s", f.AltScreen, f.Content)
 	}
 	h.waitOutput("FAKE-REVEAL-7f3a")
 	h.p.Send(tea.KeyPressMsg{Code: tea.KeyEscape})
 	h.p.Send(tea.PasteMsg{Content: "x"})
+	time.Sleep(time.Until(shown.Add(450 * time.Millisecond))) // past the reveal's guard on Enter
 	h.p.Send(key(tea.KeyEnter))
 	if r := answer(t, got); r.err != nil || r.text != "" {
 		t.Fatalf("answer %+v", r)
@@ -394,6 +396,7 @@ func TestRevealHoldsSay(t *testing.T) {
 	h := start(t)
 	got := h.asked(revealQuestion())
 	h.waitShown("FAKE-REVEAL-7f3a")
+	revealed := time.Now()
 	h.waitOutput("FAKE-REVEAL-7f3a")
 	shown := make(chan error, 1)
 	go func() { shown <- h.front.Show(h.ctx, "later") }()
@@ -401,6 +404,7 @@ func TestRevealHoldsSay(t *testing.T) {
 	if strings.Contains(h.out.String(), "later") {
 		t.Fatal("a line was printed on the alternate screen")
 	}
+	time.Sleep(time.Until(revealed.Add(450 * time.Millisecond))) // past the reveal's guard on Enter
 	h.p.Send(key(tea.KeyEnter))
 	answer(t, got)
 	out := h.waitOutput("later")
@@ -604,6 +608,9 @@ func TestFrameFits(t *testing.T) {
 		}
 		for range 40 {
 			h.p.Send(key(tea.KeyDown))
+		}
+		if q.Kind == ui.KindReveal {
+			time.Sleep(450 * time.Millisecond) // past the reveal's guard on Enter
 		}
 		h.p.Send(key(tea.KeyEnter))
 		if r := answer(t, got); r.err != nil {

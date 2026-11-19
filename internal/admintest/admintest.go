@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -42,13 +43,23 @@ func AnnexBEnv() map[string]string {
 // test. It returns the environment that points the CLI at it.
 func Server(t testing.TB) map[string]string {
 	t.Helper()
+	env, _ := Plane(t)
+	return env
+}
+
+// Plane is Server with the data plane beside it, in process on the same
+// configuration: env points the CLI at the admin listener, and port is the
+// data plane's on 127.0.0.1. Its clients, as verify's, resolve no name, so a
+// provider must be on 127.0.0.1 with allow_private_network.
+func Plane(t testing.TB) (env map[string]string, port string) {
+	t.Helper()
 	annex := AnnexBEnv()
 	st, err := store.Open(context.Background(), t.TempDir(), slog.New(slog.DiscardHandler))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = st.Close() })
-	env := func() config.Env {
+	cfgEnv := func() config.Env {
 		return config.Env{
 			Lookup: func(n string) (string, bool) { v, ok := annex[n]; return v, ok },
 			Resolve: func(context.Context, string) ([]netip.Addr, error) {
@@ -56,7 +67,7 @@ func Server(t testing.TB) map[string]string {
 			},
 		}
 	}
-	cfg, err := config.Open(context.Background(), st, env, time.Now)
+	cfg, err := config.Open(context.Background(), st, cfgEnv, time.Now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,17 +84,23 @@ func Server(t testing.TB) map[string]string {
 		defer cancel()
 		spans.Close(ctx)
 	})
-	// targets verify runs on a data plane of its own whose clients resolve
-	// no name, so no call leaves the host.
+	// targets verify and the data plane run on clients that resolve no name,
+	// so no call leaves the host.
 	limits, writer := admission.New(cfg.Now, records.Seeder(st.Read(), log)), records.NewWriter(st.Write, log)
 	t.Cleanup(func() { writer.Close(context.Background()) }) // before the store closes
 	noDNS := func(context.Context, string) ([]netip.Addr, error) {
 		return nil, errors.New("no name is resolved in tests")
 	}
-	verify := api.Verify(api.Deps{Config: cfg, Log: log, Clients: [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)},
-		Flight: &sync.WaitGroup{}, Usage: writer, Admission: limits, Counters: &records.Counters{}, Spanned: &records.Counters{}, Spans: spans, Version: "test"})
+	deps := api.Deps{Config: cfg, Log: log, Clients: [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)},
+		Flight: &sync.WaitGroup{}, Usage: writer, Admission: limits, Counters: &records.Counters{}, Spanned: &records.Counters{}, Spans: spans, Version: "test"}
 	srv := httptest.NewServer(admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(Key)), Log: log, Usage: st.Read(),
-		Admission: limits, Spans: spans, Backup: st.Backup, Verify: verify}))
+		Admission: limits, Spans: spans, Backup: st.Backup, Verify: api.Verify(deps)}))
 	t.Cleanup(srv.Close)
-	return map[string]string{"STARGAITE_ADMIN_URL": srv.URL, "STARGAITE_ADMIN_KEY": Key}
+	data := httptest.NewServer(api.Handler(deps))
+	t.Cleanup(data.Close)
+	u, err := url.Parse(data.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return map[string]string{"STARGAITE_ADMIN_URL": srv.URL, "STARGAITE_ADMIN_KEY": Key}, u.Port()
 }

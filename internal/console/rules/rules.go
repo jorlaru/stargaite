@@ -1,7 +1,8 @@
-// Package rules holds the console's tables about the proxy's warnings: for
-// each code internal/config can warn with, the step of the running task that
-// resolves it, so the warning is held until then (design section 3,
-// "Warnings"), and the plain words that say it.
+// Package rules holds the console's two tables. Warnings: for each code
+// internal/config can warn with, the step of the running task that resolves
+// it, so the warning is held until then (design section 3, "Warnings"), and
+// the plain words that say it. Suggestions: what the home suggests from what
+// it read (design section 3, "Suggestions"; suggest.go).
 package rules
 
 import "fmt"
@@ -25,7 +26,7 @@ func Warnings() []Warning {
 		{"reasoning_undeclared", "", ""},
 		{"effort_dropped", "", "%s: the alias's effort is not sent toward a target whose reasoning dialect is none"},
 		{"endpoint_unservable", "", ""},
-		{"unknown_alias", "", "%s names an alias that does not exist: its calls to that alias get an error"},
+		{"unknown_alias", "", "%s names an alias that does not exist: its calls to that alias get an error: Change a key sets the aliases it may call"},
 		{"unknown_provider", "", ""},
 		{"quota_beyond_retention", "", ""},
 		{"env_file_unreadable", "", ""},

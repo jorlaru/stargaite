@@ -1,13 +1,16 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jorlaru/stargaite/internal/console/paid"
 	"github.com/jorlaru/stargaite/internal/transport"
 )
 
@@ -287,11 +291,11 @@ func TestReadyPlain(t *testing.T) {
 	code.Store(200)
 	srv, rec := serve(t, func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(int(code.Load())) })
 	h := readyHost(t, srv)
-	if err := h.isReady(context.Background()); err != nil || rec.got()[0].URL.Path != "/health/ready" {
+	if err := h.Ready(context.Background()); err != nil || rec.got()[0].URL.Path != "/health/ready" {
 		t.Fatalf("200: %v", err)
 	}
 	code.Store(503)
-	if err := h.isReady(context.Background()); err == nil {
+	if err := h.Ready(context.Background()); err == nil {
 		t.Fatal("503 was taken as ready")
 	}
 }
@@ -304,7 +308,7 @@ func TestReadyTry(t *testing.T) {
 	h := readyHost(t, srv)
 	h.ready.try = 100 * time.Millisecond
 	start := time.Now()
-	if err := h.isReady(context.Background()); err == nil || time.Since(start) > 2*time.Second {
+	if err := h.Ready(context.Background()); err == nil || time.Since(start) > 2*time.Second {
 		t.Fatalf("err %v after %v", err, time.Since(start))
 	}
 }
@@ -316,11 +320,11 @@ func TestReadyTLS(t *testing.T) {
 	write(t, filepath.Join(h.Dir, "compose.override.yaml"), "# setup: tls_name=example.com\n# setup: tls_ca=cert.pem\nservices: {}\n")
 	cert := filepath.Join(h.Dir, "tls", "cert.pem")
 	write(t, cert, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})))
-	if err := h.isReady(context.Background()); err != nil {
+	if err := h.Ready(context.Background()); err != nil {
 		t.Fatalf("the server's own certificate: %v", err)
 	}
 	write(t, cert, string(otherCert(t)))
-	if err := h.isReady(context.Background()); err == nil {
+	if err := h.Ready(context.Background()); err == nil {
 		t.Fatal("a certificate outside tls/ was trusted")
 	}
 }
@@ -339,4 +343,224 @@ func otherCert(t *testing.T) []byte {
 		t.Fatal(err)
 	}
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+// planeReq is one request a data plane got.
+type planeReq struct{ method, path, auth, ctype, body string }
+
+// planeLog is what a data plane got, and a signal for each request whose
+// context had ended when its answer returned.
+type planeLog struct {
+	mu    sync.Mutex
+	reqs  []planeReq
+	ended chan struct{}
+}
+
+func (l *planeLog) got() []planeReq {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.reqs)
+}
+
+// logged wraps answer so that l records each request.
+func (l *planeLog) logged(answer http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		l.mu.Lock()
+		l.reqs = append(l.reqs, planeReq{r.Method, r.URL.Path, r.Header.Get("Authorization"), r.Header.Get("Content-Type"), string(body)})
+		l.mu.Unlock()
+		answer(w, r)
+		if r.Context().Err() != nil {
+			l.ended <- struct{}{}
+		}
+	}
+}
+
+// servePlane is a clone whose data plane answers with answer.
+func servePlane(t *testing.T, answer http.HandlerFunc) (*Host, *planeLog) {
+	t.Helper()
+	l := &planeLog{ended: make(chan struct{}, 10)}
+	srv, _ := serve(t, l.logged(answer))
+	return readyHost(t, srv), l
+}
+
+// budget opens a paid budget of n calls on a fresh session.
+func budget(t *testing.T, n int) *paid.Budget {
+	t.Helper()
+	b, err := paid.NewSession().Open(n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// clean fails when err holds the key or a Bearer header.
+func clean(t *testing.T, err error, key string) {
+	t.Helper()
+	noKey(t, err, key)
+	if err != nil && strings.Contains(err.Error(), "Bearer") {
+		t.Fatalf("the error holds the header: %v", err)
+	}
+}
+
+const tryBody = `{"model":"a","max_tokens":256,"messages":[{"role":"user","content":"Say hello in one short sentence."}]}`
+
+func TestTryCompletionRequest(t *testing.T) {
+	h, l := servePlane(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Stargaite-Target", "acme/m")
+		_, _ = fmt.Fprint(w, `{"choices":[{"message":{"content":"hi\u001b[2J"},"finish_reason":"stop"}]}`)
+	})
+	key := `k"1\2`
+	got, err := h.TryCompletion(context.Background(), budget(t, 1), 1, key, "a")
+	clean(t, err, key)
+	reqs := l.got()
+	if err != nil || len(reqs) != 1 {
+		t.Fatalf("err %v, %d requests", err, len(reqs))
+	}
+	want := planeReq{"POST", "/v1/chat/completions", "Bearer " + key, "application/json", tryBody}
+	if reqs[0] != want {
+		t.Fatalf("request %+v\nwant    %+v", reqs[0], want)
+	}
+	if got.Status != 200 || got.Content != "hi[2J" || got.FinishReason != "stop" || got.Target != "acme/m" || got.Message != "" || got.Took <= 0 {
+		t.Fatalf("completion %+v", got)
+	}
+}
+
+func TestTryCompletionAnswers(t *testing.T) {
+	h, l := servePlane(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = fmt.Fprint(w, `{"error":{"message":"the provider failed","code":"provider_error"}}`)
+	})
+	got, err := h.TryCompletion(context.Background(), budget(t, 1), 1, "sk-k", "a")
+	if err != nil || got.Status != 502 || got.Message != "the provider failed" || got.Content != "" || len(l.got()) != 1 {
+		t.Fatalf("completion %+v, err %v, %d requests", got, err, len(l.got()))
+	}
+
+	h, l = servePlane(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(bytes.Repeat([]byte("x"), httpLimit+1))
+	})
+	_, err = h.TryCompletion(context.Background(), budget(t, 1), 1, "sk-k", "a")
+	if err == nil || err.Error() != "the test call did not complete: the answer is over 1 MiB" || len(l.got()) != 1 {
+		t.Fatalf("an answer over 1 MiB: err %v, %d requests", err, len(l.got()))
+	}
+}
+
+// TestTryCompletionTakesFirst: no budget, too small a one, or a spent one is
+// refused before anything is sent.
+func TestTryCompletionTakesFirst(t *testing.T) {
+	h, l := servePlane(t, func(http.ResponseWriter, *http.Request) {})
+	spent := budget(t, 1)
+	if err := spent.Take(1); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		b     *paid.Budget
+		calls int
+		want  string
+	}{
+		{nil, 1, "no paid budget: this call was not announced"},
+		{budget(t, 1), 2, "2 paid calls asked, 1 left of what this step stated"},
+		{spent, 1, "1 paid calls asked, 0 left of what this step stated"},
+	} {
+		if _, err := h.TryCompletion(context.Background(), tc.b, tc.calls, "sk-k", "a"); err == nil || err.Error() != tc.want {
+			t.Errorf("err %v, want %q", err, tc.want)
+		}
+	}
+	if n := len(l.got()); n != 0 {
+		t.Fatalf("%d requests without a budget", n)
+	}
+}
+
+// TestTryCompletionBound: the whole request is bounded by httpBound, and the
+// server sees it end.
+func TestTryCompletionBound(t *testing.T) {
+	h, l := servePlane(t, hang)
+	h.httpBound = 50 * time.Millisecond
+	start := time.Now()
+	_, err := h.TryCompletion(context.Background(), budget(t, 1), 1, "sk-hang", "a")
+	if err == nil || err.Error() != "the test call did not complete: no answer within 50ms" || time.Since(start) > 2*time.Second {
+		t.Fatalf("err %v after %v", err, time.Since(start))
+	}
+	select {
+	case <-l.ended:
+	case <-time.After(time.Second):
+		t.Fatal("the server never saw the request end")
+	}
+	if n := len(l.got()); n != 1 {
+		t.Fatalf("%d requests, want 1", n)
+	}
+}
+
+// TestTryCompletionCancel: ctx's end cancels the request at the server.
+func TestTryCompletionCancel(t *testing.T) {
+	h, l := servePlane(t, hang)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.TryCompletion(ctx, budget(t, 1), 1, "sk-k", "a")
+		done <- err
+	}()
+	for deadline := time.Now().Add(2 * time.Second); len(l.got()) == 0; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the request never arrived")
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("TryCompletion did not return")
+	}
+	select {
+	case <-l.ended:
+	case <-time.After(time.Second):
+		t.Fatal("the server's request did not end within 1 s of the cancel")
+	}
+	if n := len(l.got()); n != 1 {
+		t.Fatalf("%d requests, want 1", n)
+	}
+}
+
+// TestTryCompletionTransport: no redirect followed, no proxy from the
+// environment, only tls/<CA> trusted; no error holds the key.
+func TestTryCompletionTransport(t *testing.T) {
+	const key = "sk-transport"
+	ctx := context.Background()
+	second, secondLog := servePlane(t, func(http.ResponseWriter, *http.Request) {})
+	sp, _ := second.Plane()
+	h, _ := servePlane(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, sp.BaseURL+"/chat/completions", http.StatusTemporaryRedirect)
+	})
+	got, err := h.TryCompletion(ctx, budget(t, 1), 1, key, "a")
+	clean(t, err, key)
+	if err != nil || got.Status != http.StatusTemporaryRedirect || len(secondLog.got()) != 0 {
+		t.Fatalf("redirect: completion %+v, err %v, %d requests to the second server", got, err, len(secondLog.got()))
+	}
+
+	// Go never sends a loopback request through an environment proxy, so the
+	// try's own client is looked at instead.
+	if _, c, err := h.planeClient(); err != nil || c.Transport.(*http.Transport).Proxy != nil {
+		t.Fatalf("proxy: the try's client takes a proxy (err %v)", err)
+	}
+
+	l := &planeLog{ended: make(chan struct{}, 10)}
+	srv := httptest.NewTLSServer(l.logged(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(srv.Close)
+	h = readyHost(t, srv)
+	write(t, filepath.Join(h.Dir, "compose.override.yaml"), "# setup: tls_name=example.com\n# setup: tls_ca=ca.pem\nservices: {}\n")
+	ca := filepath.Join(h.Dir, "tls", "ca.pem")
+	write(t, ca, string(otherCert(t)))
+	_, err = h.TryCompletion(ctx, budget(t, 1), 1, key, "a")
+	clean(t, err, key)
+	if err == nil || !strings.HasPrefix(err.Error(), "the test call did not complete: ") || len(l.got()) != 0 {
+		t.Fatalf("a certificate outside tls/: err %v, %d requests", err, len(l.got()))
+	}
+	write(t, ca, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})))
+	if got, err := h.TryCompletion(ctx, budget(t, 1), 1, key, "a"); err != nil || got.Status != 200 || len(l.got()) != 1 {
+		t.Fatalf("tls/ca.pem: completion %+v, err %v, %d requests", got, err, len(l.got()))
+	}
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/jorlaru/stargaite/internal/console/ui"
 )
@@ -45,5 +46,37 @@ func TestPlainShowLines(t *testing.T) {
 	}
 	if out.String() != "one\ntwo\n" {
 		t.Fatalf("stdout = %q", out.String())
+	}
+}
+
+func TestPlainMissingWithPrompt(t *testing.T) {
+	_, err := New(&bytes.Buffer{}).Ask(context.Background(), ui.Question{ID: "yes", Flag: "yes", Prompt: "writing x"})
+	var usage *ui.UsageError
+	if !errors.As(err, &usage) || err.Error() != "missing --yes: writing x" {
+		t.Fatalf("err = %v, want missing --yes: writing x", err)
+	}
+}
+
+func TestPlainWorkWaits(t *testing.T) {
+	var out bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	got := make(chan error, 1)
+	go func() {
+		_, err := New(&out).Ask(ctx, ui.Question{ID: "up", Kind: ui.KindWork, Prompt: "restarting"})
+		got <- err
+	}()
+	select {
+	case err := <-got:
+		t.Fatalf("returned before cancel: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-got:
+		if !errors.Is(err, context.Canceled) || out.Len() != 0 {
+			t.Fatalf("err = %v, stdout %q", err, out.String())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no return after cancel")
 	}
 }

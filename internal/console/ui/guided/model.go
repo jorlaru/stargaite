@@ -156,6 +156,12 @@ func newPiece(q ui.Question) piece.Piece {
 		return piece.Confirm(q)
 	case ui.KindReveal:
 		return &reveal{q: q}
+	case ui.KindPickMany:
+		return piece.PickMany(q)
+	case ui.KindSecret:
+		return piece.Secret(q)
+	case ui.KindWork:
+		return piece.Work(q)
 	}
 	return piece.Pick(q)
 }

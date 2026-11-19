@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -62,12 +63,18 @@ func openPTY(t *testing.T) (master, slave *os.File) {
 // onTerminal starts the console with args on a new pseudo-terminal.
 func onTerminal(t *testing.T, env []string, args ...string) *terminal {
 	t.Helper()
+	return onTerminalAt(t, console, env, args...)
+}
+
+// onTerminalAt is onTerminal with the console at bin.
+func onTerminalAt(t *testing.T, bin string, env []string, args ...string) *terminal {
+	t.Helper()
 	m, s := openPTY(t)
 	before, err := unix.IoctlGetTermios(int(s.Fd()), unix.TCGETS)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(console, args...)
+	cmd := exec.Command(bin, args...)
 	cmd.Env = append(env, "TERM=xterm-256color")
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = s, s, s
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true}
@@ -258,10 +265,14 @@ func TestGuidedTaskError(t *testing.T) {
 }
 
 func TestTeaTraceRefused(t *testing.T) {
-	for _, v := range []string{"TEA_TRACE", "TEA_DEBUG"} {
+	for _, row := range []struct {
+		v    string
+		args []string
+	}{{"TEA_TRACE", nil}, {"TEA_DEBUG", nil}, {"TEA_TRACE", []string{"status"}}} {
+		v := row.v
 		env, log := fake(t, replies)
 		trace := filepath.Join(t.TempDir(), "f")
-		tm := onTerminal(t, append(env, v+"="+trace))
+		tm := onTerminal(t, append(env, v+"="+trace), row.args...)
 		code, _ := tm.exit()
 		want := "stargaite-console: " + v + " is set: the console would write every byte it draws to a file, a client key included; unset it"
 		if code != 1 || !strings.Contains(tm.output(), want) {
@@ -274,6 +285,18 @@ func TestTeaTraceRefused(t *testing.T) {
 			t.Fatalf("%s: docker ran: %q", v, l)
 		}
 	}
+}
+
+// A subcommand at a terminal runs its task in the guided front.
+func TestStatusAtTerminalIsGuided(t *testing.T) {
+	env, _ := fake(t, replies)
+	tm := onTerminal(t, env, "status")
+	tm.waitFor("version: v1.2.3 running", 1)
+	code, after := tm.exit()
+	if code != 0 || !strings.Contains(tm.output(), "\x1b[?2004h") {
+		t.Fatalf("exit %d, or not drawn by the guided front:\n%q", code, tm.output())
+	}
+	tm.restored(after)
 }
 
 func TestChildHasNoTerminal(t *testing.T) {
@@ -289,5 +312,148 @@ esac
 	}
 	if l := readLog(t, log); !strings.Contains(l, "no-tty\n") || strings.Contains(l, "\ntty\n") {
 		t.Fatalf("log %q; want no-tty", l)
+	}
+}
+
+// The secret pasted at the terminal, with the line break a copied line
+// brings, never reaches the screen, an argv, a log or a file but .env.
+func TestProviderSecretNeverOnTerminal(t *testing.T) {
+	const secret = `s3cr3t $HOME #x y\z`
+	bin, dir, env, log, flags, auth := acmeClone(t, secret)
+	tm := onTerminalAt(t, bin, env, flags...)
+	tm.waitFor("typed hidden", 1)
+	tm.write("\x1b[200~" + secret + "\r\x1b[201~")
+	tm.write("\r")
+	code, after := tm.exit()
+	if code != 0 || strings.Contains(tm.output(), "s3cr3t") {
+		t.Fatalf("exit %d, or the secret is on the terminal:\n%q", code, tm.output())
+	}
+	tm.restored(after)
+	dotEnv, err := os.ReadFile(filepath.Join(dir, ".env"))
+	if err != nil || !strings.Contains(string(dotEnv), "\nACME_API_KEY='"+secret+"'\n") || strings.Contains(string(dotEnv), "\r") {
+		t.Fatalf(".env %q, %v", dotEnv, err)
+	}
+	if got := auth(); len(got) != 1 || got[0] != "Bearer "+secret {
+		t.Fatalf("the model list got %q", got)
+	}
+	if strings.Contains(readLog(t, log), "s3cr3t") {
+		t.Fatal("the docker log holds the secret")
+	}
+	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || d.Name() == ".env" {
+			return err
+		}
+		if b, err := os.ReadFile(path); err == nil && bytes.Contains(b, []byte("s3cr3t")) {
+			t.Errorf("%s holds the secret", path)
+		}
+		return nil
+	})
+}
+
+// Ctrl-C while the container is recreated: compose up gets SIGINT, the
+// console exits 130 and restores the terminal, and the terminal still shows
+// how to apply the files written.
+func TestProviderCtrlCDuringRecreate(t *testing.T) {
+	env, log := fake(t, ollama(trapUp))
+	bin, _, _ := ownClone(t, nil)
+	tm := onTerminalAt(t, bin, env, "provider", "--provider", "ollama", "--yes")
+	tm.waitFor("recreating the container", 1)
+	waitLog(t, log, "compose up")
+	sent := time.Now()
+	tm.write("\x03")
+	code, after := tm.exit()
+	if took := time.Since(sent); code != 130 || took > 12*time.Second || !strings.Contains(readLog(t, log), "INT\n") {
+		t.Fatalf("exit %d after %s, log %q", code, took, readLog(t, log))
+	}
+	tm.restored(after)
+	if !strings.Contains(tm.output(), "the files are written: if the recreate stops") {
+		t.Errorf("output:\n%q", tm.output())
+	}
+}
+
+// --key-env names the variable at a terminal too: the key comes from the
+// console's environment, and no hidden question is asked.
+func TestProviderKeyEnvAtTerminal(t *testing.T) {
+	const secret = `s3cr3t $HOME #x y\z`
+	bin, dir, env, _, flags, auth := acmeClone(t, secret)
+	tm := onTerminalAt(t, bin, append(env, "SRC="+secret), append(flags, "--key-env", "SRC")...)
+	code, after := tm.exit()
+	if code != 0 || strings.Contains(tm.output(), "typed hidden") || strings.Contains(tm.output(), "s3cr3t") {
+		t.Fatalf("exit %d:\n%q", code, tm.output())
+	}
+	tm.restored(after)
+	if dotEnv, err := os.ReadFile(filepath.Join(dir, ".env")); err != nil || !strings.Contains(string(dotEnv), "\nACME_API_KEY='"+secret+"'\n") {
+		t.Fatalf(".env %q, %v", dotEnv, err)
+	}
+	if got := auth(); len(got) != 1 || got[0] != "Bearer "+secret {
+		t.Fatalf("the model list got %q", got)
+	}
+}
+
+// Esc at the hidden question leaves the subcommand: it says so, exits 1,
+// and writes nothing.
+func TestProviderEscLeaves(t *testing.T) {
+	bin, dir, env, _, flags, _ := acmeClone(t, "k")
+	before, err := os.ReadFile(filepath.Join(dir, ".env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tm := onTerminalAt(t, bin, env, flags...)
+	tm.waitFor("typed hidden", 1)
+	tm.write("\x1b")
+	code, after := tm.exit()
+	if code != 1 || !strings.Contains(tm.output(), "Left Add providers.") {
+		t.Fatalf("exit %d:\n%q", code, tm.output())
+	}
+	tm.restored(after)
+	if now, err := os.ReadFile(filepath.Join(dir, ".env")); err != nil || !bytes.Equal(now, before) {
+		t.Fatalf(".env %q, %v; was %q", now, err, before)
+	}
+}
+
+// halfTerminal runs status with only standard input, or only standard
+// output, on a pseudo-terminal: the other is a pipe, or /dev/null. It
+// returns the exit code and everything written.
+func halfTerminal(t *testing.T, inOnTTY bool) (int, string) {
+	t.Helper()
+	env, _ := fake(t, replies)
+	m, s := openPTY(t)
+	cmd := exec.Command(console, "status")
+	cmd.Env = append(env, "TERM=xterm-256color")
+	var pipe bytes.Buffer
+	if inOnTTY {
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = s, &pipe, &pipe
+	} else {
+		cmd.Stdout, cmd.Stderr = s, s // standard input /dev/null
+	}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var tty bytes.Buffer
+	read := make(chan struct{})
+	go func() { _, _ = io.Copy(&tty, m); close(read) }()
+	waited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(15 * time.Second):
+		_ = cmd.Process.Kill()
+		<-waited
+		t.Fatal("status did not exit within 15 s")
+	}
+	_ = s.Close() // the master then reads what is left, then EIO
+	<-read
+	return cmd.ProcessState.ExitCode(), pipe.String() + tty.String()
+}
+
+// Only standard input and output both on a terminal make the guided front:
+// a pipe or /dev/null on either side gives the plain lines.
+func TestStatusHalfTerminalIsPlain(t *testing.T) {
+	for _, inOnTTY := range []bool{true, false} {
+		code, out := halfTerminal(t, inOnTTY)
+		if code != 0 || !strings.Contains(out, "version: v1.2.3 running, dev in this clone") || strings.Contains(out, "\x1b[?2004h") {
+			t.Fatalf("standard input on the terminal %v: exit %d\n%q", inOnTTY, code, out)
+		}
 	}
 }

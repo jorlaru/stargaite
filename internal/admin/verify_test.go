@@ -661,6 +661,65 @@ func TestVerifyStop(t *testing.T) {
 	}
 }
 
+// TestVerifyClientGone is TestVerifyStop with the client, not the server,
+// ending the run: once the request's own context is cancelled, the call in
+// flight is cancelled at the mock, the levels left are not attempted, the
+// run leaves one record, is audited failed and Flight is back at zero. It is
+// the server half of targets verify --until-stdin-closes.
+func TestVerifyClientGone(t *testing.T) {
+	f := newVerifyFixture(t)
+	f.setUp(t)
+	f.mock.Script(mockprovider.Step{Hang: true})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.url+"/admin/v1/verify/mock%2Fm", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	done := make(chan error, 1)
+	go func() {
+		resp, err := f.client.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		done <- err
+	}()
+	for deadline := time.Now().Add(5 * time.Second); len(f.mock.Calls()) == 0; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the run never reached the mock")
+		}
+	}
+	cancel()
+	if err := <-done; err == nil {
+		t.Error("the cancelled request returned no error")
+	}
+	f.flight.Wait()
+	// The mock marks its call cancelled when its handler returns, which may
+	// come after the run has let go of Flight: wait for it, bounded.
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		calls := f.mock.Calls()
+		if len(calls) != 1 {
+			t.Fatalf("%d mock calls, want one", len(calls))
+		}
+		if calls[0].Cancelled {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the mock's call was not cancelled within 5 s")
+		}
+	}
+	f.records(t, 1)
+	// The audit row is written after the run lets go of Flight, and no answer
+	// reaches the gone client to say when: wait for it, bounded.
+	want := "targets verify mock/m target mock/m failed"
+	for deadline := time.Now().Add(5 * time.Second); f.lastAudit(t) != want; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("audit %q, want %q", f.lastAudit(t), want)
+		}
+	}
+}
+
 // TestVerifyAlongsideTraffic runs verify runs and chat requests on one data
 // plane at once (run under -race in make ci): every request and every run
 // completes, each record lands under its own key, the client keys' budgets

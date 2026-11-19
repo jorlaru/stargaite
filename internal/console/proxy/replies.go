@@ -22,8 +22,80 @@ func (*ProvidersReply) Required() []string { return []string{"providers"} }
 // Provider is a provider and the state of its credential: resolved,
 // unresolved or none.
 type Provider struct {
-	Name       string `json:"name"`
-	Credential string `json:"credential"`
+	Name                string `json:"name"`
+	Credential          string `json:"credential"`
+	Protocol            string `json:"protocol"`
+	BaseURL             string `json:"base_url"`
+	APIKeyEnv           string `json:"api_key_env"`
+	AllowPrivateNetwork bool   `json:"allow_private_network"`
+}
+
+// ProviderReply is "providers show --json": the provider's members at the
+// top level.
+type ProviderReply struct {
+	Provider
+}
+
+// Required names the members the answer must have.
+func (*ProviderReply) Required() []string { return []string{"name", "credential"} }
+
+// ProviderChange is "providers add --json": the findings of the whole
+// configuration after the change, and the provider as published.
+type ProviderChange struct {
+	Findings []Finding `json:"findings"`
+	Resource Provider  `json:"resource"`
+}
+
+// Required names the members the answer must have.
+func (*ProviderChange) Required() []string { return []string{"findings", "resource"} }
+
+// Finding is one warning of the configuration, or an error of a refusal.
+type Finding struct {
+	Severity string `json:"severity"`
+	Code     string `json:"code"`
+	Resource string `json:"resource"`
+	Message  string `json:"message"`
+}
+
+// PresetsReply is "providers presets --json".
+type PresetsReply struct {
+	Presets []Preset `json:"presets"`
+}
+
+// Required names the members the answer must have.
+func (*PresetsReply) Required() []string { return []string{"presets"} }
+
+// Preset is a provider the proxy knows how to reach; untested ones were
+// never tried against the live service.
+type Preset struct {
+	Name      string `json:"name"`
+	Untested  bool   `json:"untested"`
+	Protocol  string `json:"protocol"`
+	BaseURL   string `json:"base_url"`
+	APIKeyEnv string `json:"api_key_env"`
+}
+
+// VerifyReply is "targets verify --json": whether every call answered 2xx,
+// whether the result was stored, and each call.
+type VerifyReply struct {
+	Target string       `json:"target"`
+	OK     bool         `json:"ok"`
+	Stored bool         `json:"stored"`
+	Calls  []VerifyCall `json:"calls"`
+}
+
+// Required names the members the answer must have.
+func (*VerifyReply) Required() []string { return []string{"target", "ok", "calls"} }
+
+// VerifyCall is one call of a check: the level asked ("" for none), the
+// provider's status and, when it refused, its reason or the proxy's error.
+type VerifyCall struct {
+	Effort          string `json:"effort"`
+	Status          int    `json:"status"`
+	ProviderMessage string `json:"provider_message"`
+	Error           *struct {
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 // ModelsReply is "models list --json".

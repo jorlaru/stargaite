@@ -20,6 +20,7 @@ import (
 	"io/fs"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -358,6 +359,24 @@ func (r *run) written() string {
 	return s
 }
 
+// serveReady answers /health/ready with 200 on 127.0.0.1:port until the test
+// ends: the data plane's readiness, which the console checks over HTTP
+// itself. It is started after install, which checks the port is free.
+func serveReady(t *testing.T, port string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:"+port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/health/ready" {
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}), ReadHeaderTimeout: 10 * time.Second}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+}
+
 // freePort is a loopback port nothing listens on.
 func freePort(t *testing.T) string {
 	t.Helper()
@@ -528,9 +547,11 @@ func TestSetupFlags(t *testing.T) {
 	// every answer a flag, through the CLI only.
 	t.Run("run again", func(t *testing.T) {
 		r := newRun(t, []string{"SRC=v", "PK=pk-lf-public", "SK=sk-lf-secret", "OT=Bearer otlp-secret"})
-		if code, out := r.exec(acme(freePort(t))...); code != 0 {
+		port := freePort(t)
+		if code, out := r.exec(acme(port)...); code != 0 {
 			t.Fatalf("install: exit %d:\n%s", code, out)
 		}
+		serveReady(t, port)
 		// sub runs a subcommand and returns its CLI calls; all holds every
 		// output, for the leak check.
 		var all string
@@ -676,9 +697,11 @@ func TestSetupFlags(t *testing.T) {
 	// recreate, is read by a recreate too.
 	t.Run("resume", func(t *testing.T) {
 		r := newRun(t, []string{"SRC=v", "OT=Bearer otlp-secret"})
-		if code, out := r.exec(acme(freePort(t))...); code != 0 {
+		port := freePort(t)
+		if code, out := r.exec(acme(port)...); code != 0 {
 			t.Fatalf("install: exit %d:\n%s", code, out)
 		}
+		serveReady(t, port)
 		otlp := []string{"telemetry", "--backend", "otlp", "--endpoint", "https://otlp.example", "--header-name", "Authorization", "--key-env", "OT"}
 		for _, args := range [][]string{{"provider", "--provider", "ollama"}, otlp} {
 			up := r.count("docker", "compose up")
@@ -959,9 +982,11 @@ func TestSetupNoTTY(t *testing.T) {
 	} {
 		t.Run(strings.Join(c.args, " "), func(t *testing.T) {
 			r := newRun(t, []string{"SRC=v"})
-			if code, out := r.exec(acme(freePort(t))...); code != 0 {
+			port := freePort(t)
+			if code, out := r.exec(acme(port)...); code != 0 {
 				t.Fatalf("install: exit %d:\n%s", code, out)
 			}
+			serveReady(t, port)
 			before, up, files := len(r.cli()), r.count("docker", "compose up"), r.written()
 			code, out := r.exec(c.args...)
 			if got := r.cli()[before:]; code != 2 || !strings.Contains(out, c.missing) || !slices.Equal(got, c.cli) || r.count("docker", "compose up") != up {

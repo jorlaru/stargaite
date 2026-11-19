@@ -1,5 +1,6 @@
 // Package piece is the guided console's questions as Bubble Tea input: a
-// pick, a line of text and a yes-or-no confirm. A piece takes messages and
+// pick, a multi-pick, a line of text, a hidden secret, a yes-or-no confirm,
+// and the work under way. A piece takes messages and
 // returns its answer, and draws itself in the size it is given. It knows no
 // task, proxy or host (docs/design/phase-7.md section 5).
 package piece
@@ -51,6 +52,13 @@ func footer(q ui.Question, keys string) string {
 		return keys + " · ctrl+c quit"
 	}
 	return keys + " · esc menu · ctrl+c quit"
+}
+
+// hasControl reports whether s holds a rune below U+0020 (a line break among
+// them), DEL or a C1 control, which a terminal could read as the start of a
+// sequence.
+func hasControl(s string) bool {
+	return strings.ContainsFunc(s, func(c rune) bool { return c < 0x20 || (c >= 0x7f && c <= 0x9f) })
 }
 
 // fit cuts lines to width and, when there are more than height, keeps the

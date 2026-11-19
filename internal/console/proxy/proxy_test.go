@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http/httptest"
 	"slices"
 	"strings"
 	"testing"
@@ -12,18 +13,23 @@ import (
 
 	"github.com/jorlaru/stargaite/internal/admintest"
 	"github.com/jorlaru/stargaite/internal/cli"
+	"github.com/jorlaru/stargaite/internal/console/paid"
+	"github.com/jorlaru/stargaite/tests/mockprovider"
 )
 
 // cliRunner runs the CLI in process against env, as the container would.
 func cliRunner(env map[string]string) Runner {
-	return func(_ context.Context, args []string, stdout, stderr io.Writer) (int, error) {
-		return cli.Main(args, func(k string) string { return env[k] }, strings.NewReader(""), stdout, stderr), nil
+	return func(_ context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+		if stdin == nil {
+			stdin = strings.NewReader("")
+		}
+		return cli.Main(args, func(k string) string { return env[k] }, stdin, stdout, stderr), nil
 	}
 }
 
 // canned answers every call with out and code, and records the arguments.
 func canned(out string, code int, seen *[][]string) Runner {
-	return func(_ context.Context, args []string, stdout, _ io.Writer) (int, error) {
+	return func(_ context.Context, args []string, _ io.Reader, stdout, _ io.Writer) (int, error) {
 		if seen != nil {
 			*seen = append(*seen, args)
 		}
@@ -61,7 +67,7 @@ func TestCallArgv(t *testing.T) {
 		t.Fatalf("argv = %q, want %q", seen, want)
 	}
 	// Standard error is not read: what the CLI writes there never reaches the answer.
-	noisy := func(_ context.Context, _ []string, stdout, stderr io.Writer) (int, error) {
+	noisy := func(_ context.Context, _ []string, _ io.Reader, stdout, stderr io.Writer) (int, error) {
 		_, _ = io.WriteString(stderr, "sk-x")
 		_, _ = io.WriteString(stdout, `{"providers":[]}`)
 		return 0, nil
@@ -97,7 +103,8 @@ func TestCallRealShapes(t *testing.T) {
 	if version.Version != "dev" {
 		t.Errorf("version = %q", version.Version)
 	}
-	if !slices.Contains(providers.Providers, Provider{Name: "anthropic", Credential: "resolved"}) {
+	anthropic := Provider{Name: "anthropic", Credential: "resolved", Protocol: "anthropic", BaseURL: "https://api.anthropic.com", APIKeyEnv: "ANTHROPIC_API_KEY"}
+	if !slices.Contains(providers.Providers, anthropic) {
 		t.Errorf("providers = %+v", providers.Providers)
 	}
 	i := slices.IndexFunc(models.Models, func(m Model) bool { return m.Name == "fast" })
@@ -121,6 +128,35 @@ func TestCallRealShapes(t *testing.T) {
 	if telemetry.Telemetry == nil || telemetry.Telemetry.OTLPEndpoint != "https://langfuse.example.com/api/public/otel" ||
 		!slices.Equal(telemetry.Telemetry.BasicAuthEnv, []string{"LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"}) || len(telemetry.Unresolved) != 0 {
 		t.Errorf("telemetry = %+v", telemetry)
+	}
+
+	var presets PresetsReply
+	if err := px.Call(ctx, &presets, "providers presets", nil); err != nil {
+		t.Fatal(err)
+	}
+	i = slices.IndexFunc(presets.Presets, func(p Preset) bool { return p.Name == "ollama" })
+	if len(presets.Presets) != 18 || i < 0 || presets.Presets[i].BaseURL != "http://localhost:11434/v1" {
+		t.Errorf("presets = %+v", presets.Presets)
+	}
+	var shown ProviderReply
+	if err := px.Call(ctx, &shown, "providers show", nil, "anthropic"); err != nil {
+		t.Fatal(err)
+	}
+	if shown.Name != "anthropic" || shown.Credential != "resolved" || shown.Protocol != "anthropic" {
+		t.Errorf("providers show anthropic = %+v", shown)
+	}
+	for _, private := range []bool{false, true} {
+		name, flags := "acme", []string{"--protocol", "openai", "--base-url", "https://api.acme.example/v1", "--billing", "none"}
+		if private {
+			name, flags = "local", []string{"--protocol", "openai", "--base-url", "http://127.0.0.1:8000/v1", "--allow-private-network", "--billing", "none"}
+		}
+		var change ProviderChange
+		if err := px.Call(ctx, &change, "providers add", flags, name); err != nil {
+			t.Fatal(err)
+		}
+		if change.Resource.Name != name || change.Resource.AllowPrivateNetwork != private || change.Findings == nil {
+			t.Errorf("providers add %s = %+v", name, change)
+		}
 	}
 }
 
@@ -172,7 +208,7 @@ func TestCallExitZeroNotJSON(t *testing.T) {
 }
 
 func TestCallHonoursContext(t *testing.T) {
-	block := func(ctx context.Context, _ []string, _, _ io.Writer) (int, error) {
+	block := func(ctx context.Context, _ []string, _ io.Reader, _, _ io.Writer) (int, error) {
 		<-ctx.Done()
 		return 130, nil
 	}
@@ -183,7 +219,9 @@ func TestCallHonoursContext(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > time.Second {
 		t.Fatalf("err = %v after %v", err, time.Since(start))
 	}
-	failing := func(context.Context, []string, io.Writer, io.Writer) (int, error) { return 0, errors.New("no docker") }
+	failing := func(context.Context, []string, io.Reader, io.Writer, io.Writer) (int, error) {
+		return 0, errors.New("no docker")
+	}
 	if err := New(failing).Call(context.Background(), &ProvidersReply{}, "providers list", nil); err == nil || err.Error() != "stargaite providers list: no docker" {
 		t.Fatalf("err = %v", err)
 	}
@@ -192,7 +230,7 @@ func TestCallHonoursContext(t *testing.T) {
 func TestCallBound(t *testing.T) {
 	var left time.Duration
 	var ok bool
-	record := func(ctx context.Context, _ []string, stdout, _ io.Writer) (int, error) {
+	record := func(ctx context.Context, _ []string, _ io.Reader, stdout, _ io.Writer) (int, error) {
 		var deadline time.Time
 		deadline, ok = ctx.Deadline()
 		left = time.Until(deadline)
@@ -208,7 +246,7 @@ func TestCallBound(t *testing.T) {
 }
 
 func TestCallCaptureLimit(t *testing.T) {
-	big := func(_ context.Context, _ []string, stdout, _ io.Writer) (int, error) {
+	big := func(_ context.Context, _ []string, _ io.Reader, stdout, _ io.Writer) (int, error) {
 		chunk := bytes.Repeat([]byte(" "), 1<<20)
 		for range 9 {
 			if _, err := stdout.Write(chunk); err != nil {
@@ -220,5 +258,295 @@ func TestCallCaptureLimit(t *testing.T) {
 	err := New(big).Call(context.Background(), &ProvidersReply{}, "providers list", nil)
 	if err == nil || err.Error() != "stargaite providers list: the answer is larger than 8 MiB" || captureLimit != 8<<20 {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// budget opens a paid budget of n calls on a fresh session.
+func budget(t *testing.T, n int) *paid.Budget {
+	t.Helper()
+	b, err := paid.NewSession().Open(n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// verified is a passing verify answer of one call.
+const verified = `{"target":"acme/m1","ok":true,"stored":true,"calls":[{"effort":"","status":200}]}`
+
+// recording answers every call with out and code, and records the
+// arguments and whether a standard input was given.
+func recording(out string, code int, seen *[][]string, stdins *[]bool) Runner {
+	return func(_ context.Context, args []string, stdin io.Reader, stdout, _ io.Writer) (int, error) {
+		*seen = append(*seen, args)
+		*stdins = append(*stdins, stdin != nil)
+		_, _ = io.WriteString(stdout, out)
+		return code, nil
+	}
+}
+
+// TestVerifyTakesFirst: no budget, or a spent one, is refused before the CLI
+// runs.
+func TestVerifyTakesFirst(t *testing.T) {
+	var seen [][]string
+	var stdins []bool
+	px := New(recording(verified, 0, &seen, &stdins))
+	spent := budget(t, 1)
+	if err := spent.Take(1); err != nil {
+		t.Fatal(err)
+	}
+	for _, b := range []*paid.Budget{nil, spent} {
+		if _, err := px.Verify(context.Background(), b, "acme/m1", 1, time.Minute); err == nil {
+			t.Errorf("budget %+v: no error", b)
+		}
+	}
+	if len(seen) != 0 {
+		t.Fatalf("the CLI ran %d times without a budget", len(seen))
+	}
+}
+
+// TestVerifyArgv: one Verify is one targets verify, with a 256-token cap,
+// watching its standard input, which is given.
+func TestVerifyArgv(t *testing.T) {
+	var seen [][]string
+	var stdins []bool
+	reply, err := New(recording(verified, 0, &seen, &stdins)).Verify(context.Background(), budget(t, 1), "acme/m1", 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{{"targets", "verify", "--json", "--max-output-tokens", "256", "--until-stdin-closes", "--", "acme/m1"}}
+	if !slices.EqualFunc(seen, want, slices.Equal) || !slices.Equal(stdins, []bool{true}) {
+		t.Fatalf("argv = %q, stdin given %v; want %q with a stdin", seen, stdins, want)
+	}
+	if reply.Target != "acme/m1" || !reply.OK || !reply.Stored || len(reply.Calls) != 1 || reply.Calls[0].Status != 200 {
+		t.Errorf("reply = %+v", reply)
+	}
+}
+
+// TestVerifyFails: a failed check is an error naming each call's status and
+// the provider's reason.
+func TestVerifyFails(t *testing.T) {
+	out := `{"target":"acme/m1","ok":false,"stored":false,"calls":[{"effort":"","status":404,"provider_message":"model not found: acme/m1"}]}`
+	var seen [][]string
+	var stdins []bool
+	_, err := New(recording(out, 1, &seen, &stdins)).Verify(context.Background(), budget(t, 1), "acme/m1", 1, time.Minute)
+	if err == nil || !strings.Contains(err.Error(), "call: status 404, model not found: acme/m1") ||
+		!strings.Contains(err.Error(), "target acme/m1 failed its check") {
+		t.Fatalf("err = %v", err)
+	}
+	two := `{"target":"acme/m1","ok":false,"stored":false,"calls":[{"effort":"low","status":200},` +
+		`{"effort":"high","status":500,"error":{"message":"upstream\u001b[2J broke"}},{"effort":"none","status":0}]}`
+	_, err = New(recording(two, 1, &seen, &stdins)).Verify(context.Background(), budget(t, 3), "acme/m1", 3, time.Minute)
+	want := "low: status 200, no answer\nhigh: status 500, upstream[2J broke\nnone: status 0, no answer\ntarget acme/m1 failed its check"
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v, want %q", err, want)
+	}
+}
+
+// TestVerifyMoreCallsThanStated: an answer with more calls than the step
+// stated is a loud error.
+func TestVerifyMoreCallsThanStated(t *testing.T) {
+	out := `{"target":"acme/m1","ok":true,"stored":true,"calls":[{"effort":"low","status":200},{"effort":"high","status":200}]}`
+	var seen [][]string
+	var stdins []bool
+	_, err := New(recording(out, 0, &seen, &stdins)).Verify(context.Background(), budget(t, 1), "acme/m1", 1, time.Minute)
+	want := "stargaite targets verify acme/m1: the answer has 2 calls, 1 were stated: stop and report this"
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v, want %q", err, want)
+	}
+}
+
+// TestVerifyOtherOutcomes: an error envelope, an exit 2 and an exit 0 that
+// is not an answer follow Call's rule, never quoting the output.
+func TestVerifyOtherOutcomes(t *testing.T) {
+	for _, tc := range []struct {
+		out  string
+		code int
+		want string
+	}{
+		{`{"error":{"message":"target \"acme/m1\" does not exist"}}`, 1, `stargaite targets verify: target "acme/m1" does not exist`},
+		{"usage: sk-hand-edited-secret\n", 2, "stargaite targets verify: failed with exit 2"},
+		{`{"ok":true}`, 0, `stargaite targets verify: the answer has no "target": this console and the running proxy are different versions; rebuild the proxy from this clone`},
+	} {
+		var seen [][]string
+		var stdins []bool
+		_, err := New(recording(tc.out, tc.code, &seen, &stdins)).Verify(context.Background(), budget(t, 1), "acme/m1", 1, time.Minute)
+		if err == nil || err.Error() != tc.want {
+			t.Errorf("%q exit %d: err = %v, want %q", tc.out, tc.code, err, tc.want)
+		}
+	}
+}
+
+// mockTarget is the admin API in process with provider mock on the mock
+// provider and target mock/m, whose check is 3 calls (low, high, none).
+func mockTarget(t *testing.T) (map[string]string, *mockprovider.Server) {
+	t.Helper()
+	env := admintest.Server(t)
+	mock := mockprovider.New()
+	srv := httptest.NewServer(mock)
+	t.Cleanup(srv.Close)
+	for _, args := range [][]string{
+		{"providers", "add", "mock", "--protocol", "openai", "--base-url", srv.URL, "--allow-private-network", "--billing", "none"},
+		{"targets", "add", "mock/m", "--kind", "chat", "--level", "low", "--level", "high", "--can-disable"},
+	} {
+		var out, errOut bytes.Buffer
+		if code := cli.Main(args, func(k string) string { return env[k] }, strings.NewReader(""), &out, &errOut); code != 0 {
+			t.Fatalf("%q: exit %d: %s%s", args, code, out.String(), errOut.String())
+		}
+	}
+	return env, mock
+}
+
+// TestVerifyCancelAtServer: cancelling Verify closes the CLI's standard
+// input, and the server, through the real CLI in process, cancels the call
+// in flight and starts no other.
+func TestVerifyCancelAtServer(t *testing.T) {
+	env, mock := mockTarget(t)
+	mock.Script(mockprovider.Step{Hang: true})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := New(cliRunner(env)).Verify(ctx, budget(t, 3), "mock/m", 3, time.Minute)
+		done <- err
+	}()
+	for deadline := time.Now().Add(5 * time.Second); len(mock.Calls()) != 1; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the check never reached the mock")
+		}
+	}
+	cancel()
+	select {
+	case err := <-done:
+		want := "the check of mock/m was stopped: the call in flight may still be billed"
+		if err == nil || !strings.HasPrefix(err.Error(), want) || !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v, want %q wrapping context.Canceled", err, want)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Verify did not return within 5 s of the cancel")
+	}
+	for deadline := time.Now().Add(5 * time.Second); !mock.Calls()[0].Cancelled; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the call in flight was not cancelled at the mock")
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+	if n := len(mock.Calls()); n != 1 {
+		t.Errorf("%d mock calls after the cancel, want 1", n)
+	}
+}
+
+// TestVerifyEscBeforeEnterMakesNoCall: a check whose budget was never opened
+// reaches no provider (design section 10, layer 2; the piece's half lands
+// with the paid piece).
+func TestVerifyEscBeforeEnterMakesNoCall(t *testing.T) {
+	env, mock := mockTarget(t)
+	if _, err := New(cliRunner(env)).Verify(context.Background(), nil, "mock/m", 3, time.Minute); err == nil {
+		t.Fatal("a check without a budget ran")
+	}
+	if n := len(mock.Calls()); n != 0 {
+		t.Fatalf("%d mock calls, want 0", n)
+	}
+}
+
+// TestVerifyStopGrace: after a cancel, a CLI that does not stop on its
+// closed standard input keeps its context for the grace, and no longer.
+func TestVerifyStopGrace(t *testing.T) {
+	if stopGrace != 10*time.Second || New(nil).grace != stopGrace {
+		t.Fatalf("stopGrace %v, New's grace %v; want 10 s", stopGrace, New(nil).grace)
+	}
+	cancelled := make(chan time.Time, 1)
+	deaf := func(ctx context.Context, _ []string, _ io.Reader, _, _ io.Writer) (int, error) {
+		<-ctx.Done()
+		cancelled <- time.Now()
+		return 130, nil
+	}
+	px := New(deaf)
+	px.grace = 200 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := px.Verify(ctx, budget(t, 1), "acme/m1", 1, time.Minute)
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Verify did not return within 2 s")
+	}
+	if waited := (<-cancelled).Sub(start); waited < 200*time.Millisecond || waited > 2*time.Second {
+		t.Fatalf("the CLI's context was cancelled %v after the cancel, want the 200 ms grace", waited)
+	}
+}
+
+// TestVerifyBound: at its bound a check is stopped as a cancel is: its
+// standard input is closed first, before its context.
+func TestVerifyBound(t *testing.T) {
+	first := make(chan string, 2)
+	listening := func(ctx context.Context, _ []string, stdin io.Reader, _, _ io.Writer) (int, error) {
+		eof := make(chan struct{})
+		go func() { _, _ = io.Copy(io.Discard, stdin); close(eof) }()
+		select {
+		case <-eof:
+			first <- "eof"
+		case <-ctx.Done():
+			first <- "ctx"
+		}
+		return 1, nil
+	}
+	px := New(listening)
+	px.grace = 200 * time.Millisecond
+	start := time.Now()
+	_, err := px.Verify(context.Background(), budget(t, 1), "acme/m1", 1, 100*time.Millisecond)
+	if err == nil || !strings.HasPrefix(err.Error(), "the check of acme/m1 did not end within 100ms: the call in flight may still be billed") {
+		t.Fatalf("err = %v", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("Verify returned after %v", time.Since(start))
+	}
+	if got := <-first; got != "eof" {
+		t.Fatalf("the CLI saw %s first, want its standard input's end", got)
+	}
+}
+
+// TestCallRefusesVerify: a paid command never goes through Call.
+func TestCallRefusesVerify(t *testing.T) {
+	var seen [][]string
+	var stdins []bool
+	var r VerifyReply
+	err := New(recording(verified, 0, &seen, &stdins)).Call(context.Background(), &r, "targets verify", nil, "acme/m1")
+	if err == nil || err.Error() != "a paid command goes through Verify" || len(seen) != 0 {
+		t.Fatalf("err = %v, %d CLI runs", err, len(seen))
+	}
+	// The CLI matches a command by its leading words: anything after them
+	// still runs the paid command.
+	for _, words := range []string{"targets verify acme/m1", "targets verify --max-output-tokens=256 acme/m1", " targets  verify"} {
+		err := New(recording(verified, 0, &seen, &stdins)).Call(context.Background(), &r, words, nil)
+		if err == nil || err.Error() != "a paid command goes through Verify" || len(seen) != 0 {
+			t.Fatalf("%q: err = %v, CLI runs %q", words, err, seen)
+		}
+	}
+}
+
+// TestVerifyEndedContext: a check whose context has already ended is not
+// started, and its budget is left unspent.
+func TestVerifyEndedContext(t *testing.T) {
+	var seen [][]string
+	var stdins []bool
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	b := budget(t, 1)
+	_, err := New(recording(verified, 0, &seen, &stdins)).Verify(ctx, b, "acme/m1", 1, time.Minute)
+	if err == nil || err.Error() != "the check of acme/m1 was not started: context canceled" || !errors.Is(err, context.Canceled) || len(seen) != 0 {
+		t.Fatalf("err = %v, CLI runs %q", err, seen)
+	}
+	if err := b.Take(1); err != nil {
+		t.Fatalf("the budget was spent: %v", err)
 	}
 }

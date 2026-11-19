@@ -47,16 +47,13 @@ func (t *text) Update(msg tea.Msg) (Piece, *Answer) {
 	return t, nil
 }
 
-// insert adds s at the insertion point, unless it holds a control: a rune
-// below U+0020 (a paste of several lines among them), DEL or a C1 control,
-// which a terminal could read as the start of a sequence.
+// insert adds s at the insertion point, unless it holds a control (a paste
+// of several lines among them).
 func (t *text) insert(s string) {
-	r := []rune(s)
-	for _, c := range r {
-		if c < 0x20 || (c >= 0x7f && c <= 0x9f) {
-			return
-		}
+	if hasControl(s) {
+		return
 	}
+	r := []rune(s)
 	t.value = append(t.value[:t.pos], append(r, t.value[t.pos:]...)...)
 	t.pos += len(r)
 }

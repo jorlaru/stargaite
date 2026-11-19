@@ -62,6 +62,12 @@ func (p pick) Update(msg tea.Msg) (Piece, *Answer) {
 }
 
 func (p pick) View(width, height int) string {
+	return p.view(width, height, func(o ui.Option) string { return o.Label }, "↑↓ move · type to filter · enter pick")
+}
+
+// view draws the prompt, the filter, the window of matches, each as row
+// draws it, and the footer with keys.
+func (p pick) view(width, height int, row func(ui.Option) string, keys string) string {
 	f := p.filter
 	if f == "" {
 		f = "type to filter"
@@ -79,11 +85,11 @@ func (p pick) View(width, height int) string {
 		if i == p.cursor {
 			mark, keep = "> ", len(lines)
 		}
-		lines = append(lines, mark+ms[i].Label)
+		lines = append(lines, mark+row(ms[i]))
 	}
 	if hidden := len(ms) - min(rows, len(ms)); hidden > 0 {
 		lines = append(lines, fmt.Sprintf("(%d more)", hidden))
 	}
-	lines = append(lines, footer(p.q, "↑↓ move · type to filter · enter pick"))
+	lines = append(lines, footer(p.q, keys))
 	return fit(lines, width, height, keep)
 }

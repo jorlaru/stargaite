@@ -4,14 +4,23 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"maps"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/jorlaru/stargaite/internal/console/task"
 )
 
 // console is the binary TestMain builds, in a clone: <tmp>/clone/bin/.
@@ -109,7 +118,7 @@ func TestVersionFirst(t *testing.T) {
 func TestUsage(t *testing.T) {
 	env, log := fake(t, replies)
 	out, _, code := runConsole(t, console, env, "help")
-	if code != 0 || !strings.HasPrefix(out, "usage: stargaite-console [status | help] [--version]\n") {
+	if code != 0 || !strings.HasPrefix(out, "usage: stargaite-console [provider | status | help] [flags] [--version]\n") {
 		t.Fatalf("help: exit %d\n%s", code, out)
 	}
 	for _, c := range []struct {
@@ -132,11 +141,68 @@ func TestUsage(t *testing.T) {
 
 func TestUsageText(t *testing.T) {
 	out, _, _ := runConsole(t, console, nil, "--help")
-	want := "usage: stargaite-console [status | help] [--version]\n" +
+	want := "usage: stargaite-console [provider | status | help] [flags] [--version]\n" +
 		"At a terminal with no subcommand: the guided console.\n" +
-		"  status   what exists: providers, aliases, targets without an alias, keys, budgets, telemetry and both versions\n"
+		"  provider  add providers and their keys; each key is checked for free before it is written\n" +
+		"            --provider <a,b>   presets, a provider already added, or one new name\n" +
+		"            --base-url <url>   --protocol <openai|anthropic>   --api-key-env <VAR|none>\n" +
+		"            --key-env <VAR> or <name=VAR,…>   names the variable that holds a key\n" +
+		"            --replace   --allow-private-network   --yes\n" +
+		"  status    what exists: providers, aliases, targets without an alias, keys, budgets, telemetry and both versions\n"
 	if out != want {
 		t.Fatalf("usage:\n%q\nwant:\n%q", out, want)
+	}
+}
+
+func TestParseFlags(t *testing.T) {
+	e := task.Entry{Flags: []string{"provider", "base-url"}, Bools: []string{"yes"}}
+	for _, c := range []struct {
+		args []string
+		want map[string]string
+		err  string
+	}{
+		{[]string{"--provider", "a,b", "--yes"}, map[string]string{"provider": "a,b", "yes": "yes"}, ""},
+		{[]string{"--base-url=http://x/v1?a=b"}, map[string]string{"base-url": "http://x/v1?a=b"}, ""},
+		{[]string{"--provider", "a", "--provider=b"}, map[string]string{"provider": "b"}, ""},
+		{nil, map[string]string{}, ""},
+		{[]string{"--yes", "--provider"}, nil, "--provider needs a value"},
+		{[]string{"--provider", "--yes"}, nil, "--provider needs a value"},
+		{[]string{"--yes=no"}, nil, "--yes takes no value"},
+		{[]string{"--nope"}, nil, "unknown flag --nope"},
+		{[]string{"--nope=\x1b[2J"}, nil, "unknown flag --nope"},
+		{[]string{"x"}, nil, "unexpected argument: x"},
+		{[]string{"-y"}, nil, "unexpected argument: -y"},
+	} {
+		got, err := parseFlags(e, c.args)
+		if c.err != "" {
+			if err == nil || err.Error() != c.err || got != nil {
+				t.Errorf("%q: got %v, %v; want %q", c.args, got, err, c.err)
+			}
+			continue
+		}
+		if err != nil || !maps.Equal(got, c.want) {
+			t.Errorf("%q: got %v, %v; want %v", c.args, got, err, c.want)
+		}
+	}
+}
+
+func TestProviderUsageErrorsRunNothing(t *testing.T) {
+	env, log := fake(t, replies)
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"provider", "--nope"}, "stargaite-console: unknown flag --nope\n"},
+		{[]string{"provider", "--yes=no"}, "stargaite-console: --yes takes no value\n"},
+		{[]string{"provider", "--provider"}, "stargaite-console: --provider needs a value\n"},
+		{[]string{"provider", "--nope\x1b[2J"}, "stargaite-console: unknown flag --nope[2J\n"},
+	} {
+		if out, errOut, code := runConsole(t, console, env, c.args...); code != 2 || errOut != c.want || out != "" {
+			t.Fatalf("%q: exit %d, stdout %q, stderr %q; want 2, %q", c.args, code, out, errOut, c.want)
+		}
+	}
+	if l := readLog(t, log); l != "" {
+		t.Fatalf("docker ran on a usage error: %q", l)
 	}
 }
 
@@ -355,5 +421,168 @@ func TestExitCode(t *testing.T) {
 		if got := c.e.code(); got != c.want {
 			t.Errorf("%s: %d; want %d", c.name, got, c.want)
 		}
+	}
+}
+
+// ownClone copies the console into a clone of its own, so a test that
+// writes .env or the override sees no other test's files. Its .env names the
+// port of a server that answers readiness and, under /v1/, models when set.
+// It returns the console, the clone and the port.
+func ownClone(t *testing.T, models http.Handler) (bin, dir, port string) {
+	t.Helper()
+	dir = t.TempDir()
+	bin = filepath.Join(dir, "bin", "stargaite-console")
+	b, err := os.ReadFile(console)
+	if err == nil {
+		err = os.MkdirAll(filepath.Dir(bin), 0o755)
+	}
+	if err == nil {
+		err = errors.Join(os.WriteFile(bin, b, 0o755), os.WriteFile(filepath.Join(dir, "compose.yaml"), []byte("services: {}\n"), 0o644))
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health/ready", func(http.ResponseWriter, *http.Request) {})
+	if models != nil {
+		mux.Handle("/v1/", models)
+	}
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	u, _ := url.Parse(srv.URL)
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("STARGAITE_PORT="+u.Port()+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return bin, dir, u.Port()
+}
+
+// acmeClone is a clone of its own whose model list accepts secret, and a
+// fake docker that answers Add providers for acme there. It returns the
+// console, the clone, the fake's environment and log, the flags that add
+// acme, and the Authorization headers the model list got.
+func acmeClone(t *testing.T, secret string) (bin, dir string, env []string, log string, flags []string, auth func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var got []string
+	bin, dir, port := ownClone(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got = append(got, r.Header.Get("Authorization"))
+		mu.Unlock()
+		if r.URL.Path != "/v1/models" || r.Header.Get("Authorization") != "Bearer "+secret {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":[{"id":"m1"}]}`)
+	}))
+	url := "http://host.docker.internal:" + port + "/v1"
+	env, log = fake(t, "case \"$*\" in\n"+presetsAndList+
+		`"compose exec -T stargaite /stargaite providers add --json --base-url `+url+` --api-key-env ACME_API_KEY --protocol openai --billing pay_per_use --allow-private-network -- acme") `+
+		`echo '{"findings":[],"resource":{"name":"acme","credential":"unresolved","protocol":"openai","base_url":"`+url+`","api_key_env":"ACME_API_KEY","allow_private_network":true}}' ;;
+"compose exec -T stargaite /stargaite providers show --json -- acme") echo '{"name":"acme","credential":"resolved"}' ;;
+"compose up -d --no-build") ;;
+*) exit 9 ;;
+esac
+`)
+	flags = []string{"provider", "--provider", "acme", "--protocol", "openai", "--base-url", "http://127.0.0.1:" + port + "/v1",
+		"--api-key-env", "ACME_API_KEY", "--yes"}
+	return bin, dir, env, log, flags, func() []string { mu.Lock(); defer mu.Unlock(); return slices.Clone(got) }
+}
+
+// presetsAndList are the fake docker's answers to compose ps and the first
+// two reads of Add providers.
+const presetsAndList = `"compose ps -q") echo c0ffee ;;
+"compose exec -T stargaite /stargaite providers presets --json") echo '{"presets":[{"name":"ollama","protocol":"openai","base_url":"http://localhost:11434/v1"}]}' ;;
+"compose exec -T stargaite /stargaite providers list --json") echo '{"providers":[]}' ;;
+`
+
+// ollama answers the CLI calls of Add providers for ollama; up is the shell
+// of its compose up.
+func ollama(up string) string {
+	return "case \"$*\" in\n" + presetsAndList +
+		`"compose exec -T stargaite /stargaite providers add --json --base-url http://host.docker.internal:11434/v1 --allow-private-network -- ollama") ` +
+		`echo '{"findings":[],"resource":{"name":"ollama","credential":"none","protocol":"openai","base_url":"http://host.docker.internal:11434/v1","allow_private_network":true}}' ;;
+"compose exec -T stargaite /stargaite providers show --json -- ollama") echo '{"name":"ollama","credential":"none"}' ;;
+"compose up -d --no-build") ` + up + ` ;;
+*) exit 9 ;;
+esac
+`
+}
+
+// trapUp is a compose up that logs INT on SIGINT and waits on a child that
+// holds no pipe.
+const trapUp = `trap 'echo INT >> "$FAKE_LOG"; exit 130' INT; /bin/sleep 60 >/dev/null 2>&1 & wait`
+
+func TestProviderPlainMissing(t *testing.T) {
+	env, log := fake(t, "case \"$*\" in\n"+presetsAndList+"*) exit 9 ;;\nesac\n")
+	bin, _, _ := ownClone(t, nil)
+	out, errOut, code := runConsole(t, bin, env, "provider")
+	if code != 2 || errOut != "stargaite-console: missing --provider: Which providers do you want to add?\n" || out != "" {
+		t.Fatalf("exit %d, stdout %q, stderr %q", code, out, errOut)
+	}
+	want := "compose ps -q\ncompose exec -T stargaite /stargaite providers presets --json\ncompose exec -T stargaite /stargaite providers list --json\n"
+	if l := readLog(t, log); l != want {
+		t.Fatalf("docker log %q", l)
+	}
+}
+
+// waitLog waits until the fake's log holds s.
+func waitLog(t *testing.T, log, s string) {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); !strings.Contains(readLog(t, log), s); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the log never held %q: %q", s, readLog(t, log))
+		}
+	}
+	time.Sleep(100 * time.Millisecond) // the fake has installed its trap
+}
+
+// temporaries are the temporary files of .env and the override left in dir.
+func temporaries(t *testing.T, dir string) []string {
+	t.Helper()
+	env, _ := filepath.Glob(filepath.Join(dir, ".env.*"))
+	override, _ := filepath.Glob(filepath.Join(dir, "compose.override.*"))
+	return slices.DeleteFunc(append(env, override...), func(p string) bool { return filepath.Base(p) == "compose.override.yaml" })
+}
+
+func TestProviderSIGINTDuringUp(t *testing.T) {
+	env, log := fake(t, ollama(trapUp))
+	bin, dir, _ := ownClone(t, nil)
+	cmd := exec.Command(bin, "provider", "--provider", "ollama", "--yes")
+	cmd.Env = env
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waitLog(t, log, "compose up")
+	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	waited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-time.After(12 * time.Second):
+		_ = cmd.Process.Kill()
+		<-waited
+		t.Fatal("the console did not exit within 12 s")
+	}
+	if code := cmd.ProcessState.ExitCode(); code != 130 || !strings.Contains(readLog(t, log), "INT\n") || len(temporaries(t, dir)) > 0 {
+		t.Fatalf("exit %d, log %q, left %q", code, readLog(t, log), temporaries(t, dir))
+	}
+}
+
+// --key-env names the variable that holds the key, in the console's
+// environment: it is checked once and written to .env.
+func TestProviderKeyEnvPlain(t *testing.T) {
+	const secret = `s3cr3t $HOME #x y\z`
+	bin, dir, env, _, flags, auth := acmeClone(t, secret)
+	out, errOut, code := runConsole(t, bin, append(env, "SRC="+secret), append(flags, "--key-env", "SRC")...)
+	if code != 0 || !strings.HasSuffix(out, "Done: acme added, key checked.\n") || errOut != "" || strings.Contains(out, "s3cr3t") {
+		t.Fatalf("exit %d, stderr %q, stdout:\n%s", code, errOut, out)
+	}
+	if dotEnv, err := os.ReadFile(filepath.Join(dir, ".env")); err != nil || !strings.Contains(string(dotEnv), "\nACME_API_KEY='"+secret+"'\n") {
+		t.Fatalf(".env %q, %v", dotEnv, err)
+	}
+	if got := auth(); len(got) != 1 || got[0] != "Bearer "+secret {
+		t.Fatalf("the model list got %q", got)
 	}
 }

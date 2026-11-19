@@ -1,7 +1,8 @@
 // Package cli is the command line: a command table, one flag set per command
 // and deterministic exit codes. Every command but version, validate -f and
 // restore is one call to the admin API. No command ever prompts (PRI-8):
-// standard input is read only where a file argument is "-" (OPS-3).
+// standard input is read only where a file argument is "-" (OPS-3), or, under
+// targets verify --until-stdin-closes, to see it end.
 package cli
 
 import (
@@ -243,6 +244,7 @@ var commands = []command{
 	{words: []string{"targets", "set"}, args: []string{"id"}, flags: targetFlags, request: named(http.MethodPatch, "/targets")},
 	{words: []string{"targets", "verify"}, args: []string{"id"}, flags: []flagSpec{
 		{"max-output-tokens", kindNumber, "max_output_tokens", "the only output cap sent; required for an anthropic target (PAR-7)"},
+		{"until-stdin-closes", kindBool, "", "end the request, and the run at the server, when standard input closes; standard input must be a pipe"},
 	}, request: func(in input) (string, string, any) {
 		return http.MethodPost, "/verify/" + url.PathEscape(in.args[0]), in.body
 	}, render: verified, long: true},
@@ -411,6 +413,16 @@ func Main(args []string, getenv func(string) string, stdin io.Reader, stdout, st
 	}
 
 	ctx := context.Background()
+	if b := in.bools["until-stdin-closes"]; b != nil && *b {
+		if in.stdin == nil || device(in.stdin) {
+			say(stderr, "%s: --until-stdin-closes needs standard input to be a pipe that stays open\n", name)
+			return exitUsage
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		go func() { _, _ = io.Copy(io.Discard, in.stdin); cancel() }() // EOF or a read error ends the request
+	}
 	if cmd.local != nil {
 		err := cmd.local(ctx, in, stdout)
 		switch {

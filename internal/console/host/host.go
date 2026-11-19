@@ -6,28 +6,49 @@
 package host
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
-// localBound bounds each local read: docker compose ps and git describe.
-const localBound = 20 * time.Second
+const (
+	// localBound bounds each local read: docker compose ps and git describe.
+	localBound = 20 * time.Second
+	// upBound bounds docker compose up, which may pull and build.
+	upBound = 20 * time.Minute
+)
 
 // Host is the clone. Every command runs with its directory as the working
-// directory.
+// directory. Its bounds are fields that tests shorten, never the constants.
 type Host struct {
-	Dir   string
-	bound time.Duration // localBound; tests shorten the field, never the constant
+	Dir       string
+	bound     time.Duration // localBound
+	upBound   time.Duration // upBound
+	httpBound time.Duration // httpBound
+	ready     struct {      // readiness: at most tries checks, pause apart, each try long, all within bound
+		tries             int
+		pause, try, bound time.Duration
+	}
+	readyCheck func(context.Context) error // one readiness check: isReady; tests replace it
 }
 
 // New returns the clone at dir.
-func New(dir string) *Host { return &Host{Dir: dir, bound: localBound} }
+func New(dir string) *Host {
+	h := &Host{Dir: dir, bound: localBound, upBound: upBound, httpBound: httpBound}
+	h.ready.tries, h.ready.pause, h.ready.try, h.ready.bound = 120, time.Second, 2*time.Second, 120*time.Second
+	h.readyCheck = h.isReady
+	return h
+}
 
 // Find returns the clone the console was exported into: the parent of the
-// executable's directory, bin/, which must hold compose.yaml.
-func Find(executable string) (*Host, error) {
+// executable's directory, bin/, which must hold compose.yaml. It applies the
+// root rule for uid, then changes to the clone, so a Host from Find has
+// passed both.
+func Find(executable string, uid int) (*Host, error) {
 	exe, err := filepath.EvalSymlinks(executable)
 	if err != nil {
 		return nil, fmt.Errorf("the console's own path: %w", err)
@@ -36,5 +57,34 @@ func Find(executable string) (*Host, error) {
 	if _, err := os.Stat(filepath.Join(dir, "compose.yaml")); err != nil {
 		return nil, fmt.Errorf("compose.yaml is not in %s, the parent of bin/: run ./setup.sh from the clone of stargaite", dir)
 	}
-	return New(dir), nil
+	h := New(dir)
+	if err := h.RootRule(uid); err != nil {
+		return nil, err
+	}
+	if err := os.Chdir(dir); err != nil {
+		return nil, fmt.Errorf("the clone: %w", err)
+	}
+	return h, nil
+}
+
+// RootRule refuses root in a clone that belongs to another user, before
+// anything is written, as setup.sh's root_rule does.
+func (h *Host) RootRule(uid int) error {
+	info, err := os.Stat(h.Dir)
+	if err != nil {
+		return fmt.Errorf("the clone: %w", err)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("the clone's owner is not known on this system")
+	}
+	return rootRule(uid, int(st.Uid))
+}
+
+func rootRule(uid, owner int) error {
+	if uid == 0 && owner != 0 {
+		return errors.New("run as root in a clone that belongs to another user, the console would leave root-owned files " +
+			"(.env, tls/, backups/, git objects) that break its next run and that user's git: run it as the clone's owner")
+	}
+	return nil
 }

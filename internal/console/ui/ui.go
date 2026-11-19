@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 )
@@ -37,6 +38,9 @@ const (
 	KindText
 	KindConfirm
 	KindReveal
+	KindPickMany
+	KindSecret
+	KindWork
 )
 
 // Option is one choice of a pick: Value is the answer, Label what is shown.
@@ -53,15 +57,18 @@ type Bar struct {
 }
 
 // Question is what a task asks. ID keys the answer given as a flag; Flag is
-// that flag's name, without the dashes.
+// that flag's name, without the dashes. A question asked once per item (a
+// key per provider) names it in Item: its flag then takes item=value pairs.
 type Question struct {
 	ID, Step, Prompt, Flag string
 	Kind                   Kind
-	Options                []Option // pick, confirm
+	Options                []Option // pick, confirm, multi-pick
 	Default                string
 	HasDefault             bool
 	Value                  string             // reveal: what is shown
-	Check                  func(string) error // optional
+	Check                  func(string) error // optional; never applied to a secret
+	Item                   string             // the item a per-item flag answers
+	Other                  string             // multi-pick: from the flags, an item that is no option is taken as typed
 	Bar                    Bar                // set by UI before Front.Ask
 }
 
@@ -75,13 +82,32 @@ type Front interface {
 type UI struct {
 	front   Front
 	answers map[string]string
-	steps   []Step // the running task's table; nil outside a task
+	environ []string           // where a secret's flag finds its variable
+	bare    map[string]bareUse // per ID: the first item a bare per-item value answered
+	steps   []Step             // the running task's table; nil outside a task
 	inTask  bool
 }
 
+// bareUse is the item, and the prompt it asked, that a per-item flag given
+// without pairs answered first.
+type bareUse struct{ item, prompt string }
+
 // New returns a UI that takes answers from the flags first, then from front.
 func New(front Front, answers map[string]string) *UI {
-	return &UI{front: front, answers: answers}
+	return &UI{front: front, answers: answers, bare: map[string]bareUse{}}
+}
+
+// WithEnv sets the environment a secret's flag names its variable in, and
+// returns u.
+func (u *UI) WithEnv(environ []string) *UI {
+	u.environ = environ
+	return u
+}
+
+// Given reports whether the flags answer q.
+func (u *UI) Given(q Question) bool {
+	_, ok := u.answer(q)
+	return ok
 }
 
 // Run runs a task with its step table and restores the previous table on
@@ -112,6 +138,89 @@ func (u *UI) Confirm(ctx context.Context, q Question) (bool, error) {
 	a, err := u.ask(ctx, q)
 	return a == "yes", err
 }
+
+// PickMany asks for one or more of q.Options. From the flags, with q.Other
+// set, an item that is no option is taken as typed.
+func (u *UI) PickMany(ctx context.Context, q Question) ([]string, error) {
+	q.Kind = KindPickMany
+	a, err := u.ask(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	return strings.Split(a, ","), nil
+}
+
+// Secret asks for a value that is never shown, named by q.Prompt. From the
+// flags, the answer is the name of a variable in the environment WithEnv
+// gave. The value must be one .env can hold.
+func (u *UI) Secret(ctx context.Context, q Question) (string, error) {
+	q.Kind, q.Check = KindSecret, nil
+	q, err := u.prepare(q)
+	if err != nil {
+		return "", err
+	}
+	name, given, err := u.fromFlags(q)
+	var v string
+	switch {
+	case err != nil:
+		return "", err
+	case given:
+		v, err = u.variable(q.Flag, name)
+	default:
+		v, err = u.front.Ask(ctx, q)
+	}
+	if err == nil {
+		err = Storable(q.Prompt, v)
+	}
+	if err != nil {
+		return "", err
+	}
+	return v, nil
+}
+
+// variable is the value of the environment variable name, which a flag gave.
+// The error never holds what was given.
+func (u *UI) variable(flag, name string) (string, error) {
+	if regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`).MatchString(name) {
+		for _, kv := range u.environ {
+			if k, v, _ := strings.Cut(kv, "="); k == name {
+				return v, nil
+			}
+		}
+	}
+	return "", &UsageError{Msg: "--" + flag + " takes the name of a variable exported to the console"}
+}
+
+// Work runs fn while the front shows q, and stops it when the reader leaves
+// or quits there: fn's context then ends, and Work returns ErrLeave or
+// ErrQuit once fn has returned. Otherwise it returns fn's error. fn may say
+// lines: the ask runs on its own goroutine and touches no field of u.
+func (u *UI) Work(ctx context.Context, q Question, fn func(context.Context) error) error {
+	q.Kind = KindWork
+	q, err := u.prepare(q)
+	if err != nil {
+		return err
+	}
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	front, asked := u.front, make(chan error, 1)
+	Go(func() {
+		_, err := front.Ask(wctx, q)
+		if pressed(err) {
+			cancel()
+		}
+		asked <- err
+	}, func(any) { cancel(); asked <- nil }) // fn then reports the ended context
+	err = fn(wctx)
+	cancel()
+	if a := <-asked; pressed(a) {
+		return a
+	}
+	return err
+}
+
+// pressed reports whether err is the reader leaving or quitting.
+func pressed(err error) bool { return errors.Is(err, ErrLeave) || errors.Is(err, ErrQuit) }
 
 // Reveal shows q.Value until the reader confirms storing it. It never takes
 // an answer from the flags: showing is the point.
@@ -164,9 +273,13 @@ func (u *UI) ask(ctx context.Context, q Question) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if a, ok := u.answers[q.ID]; ok {
+	a, given, err := u.fromFlags(q)
+	if err != nil {
+		return "", err
+	}
+	if given {
 		a = orDefault(q, a)
-		err := isOption(q, a)
+		err := isOption(q, a, true)
 		if err == nil && q.Check != nil {
 			err = q.Check(a)
 		}
@@ -181,7 +294,7 @@ func (u *UI) ask(ctx context.Context, q Question) (string, error) {
 			return "", err
 		}
 		a = orDefault(q, a)
-		if err := isOption(q, a); err != nil {
+		if err := isOption(q, a, false); err != nil {
 			return "", fmt.Errorf("ui: question %s: %w", q.ID, err)
 		}
 		if q.Check == nil {
@@ -200,6 +313,41 @@ func (u *UI) ask(ctx context.Context, q Question) (string, error) {
 	}
 }
 
+// answer is the flags' answer to q. For a per-item question, a value that
+// holds "=" is item=value pairs, and only q.Item's pair answers it.
+func (u *UI) answer(q Question) (string, bool) {
+	a, ok := u.answers[q.ID]
+	if !ok || q.Item == "" || !strings.Contains(a, "=") {
+		return a, ok
+	}
+	for _, pair := range strings.Split(a, ",") {
+		if item, v, _ := strings.Cut(pair, "="); item == q.Item {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+// fromFlags is answer, with the rule for a per-item flag given without
+// pairs: it answers every item that asks what the first one asked, and a
+// second item asking something else is a usage error, so one item's value
+// never answers another's question.
+func (u *UI) fromFlags(q Question) (string, bool, error) {
+	a, ok := u.answer(q)
+	if !ok || q.Item == "" || strings.Contains(u.answers[q.ID], "=") {
+		return a, ok, nil
+	}
+	first, seen := u.bare[q.ID]
+	switch {
+	case !seen:
+		u.bare[q.ID] = bareUse{item: q.Item, prompt: q.Prompt}
+	case first.item != q.Item && first.prompt != q.Prompt:
+		return "", false, &UsageError{Msg: fmt.Sprintf("--%s: several providers need a key each: give %s=VAR,%s=VAR",
+			q.Flag, first.item, q.Item)}
+	}
+	return a, true, nil
+}
+
 // orDefault is a, or q's default when a is empty and q has one.
 func orDefault(q Question, a string) string {
 	if a == "" && q.HasDefault {
@@ -208,17 +356,25 @@ func orDefault(q Question, a string) string {
 	return a
 }
 
-// isOption refuses a pick or confirm answer that is not one of q.Options.
-func isOption(q Question, a string) error {
-	if q.Kind != KindPick && q.Kind != KindConfirm {
+// isOption refuses a pick or confirm answer that is not one of q.Options,
+// and a multi-pick answer, items joined by ",", with an item that is not.
+// From the flags, a multi-pick with q.Other takes any non-empty item.
+func isOption(q Question, a string, fromFlags bool) error {
+	items := []string{a}
+	switch {
+	case q.Kind == KindPickMany:
+		items = strings.Split(a, ",")
+	case q.Kind != KindPick && q.Kind != KindConfirm:
 		return nil
 	}
 	values := make([]string, len(q.Options))
 	for i, o := range q.Options {
 		values[i] = o.Value
 	}
-	if slices.Contains(values, a) {
-		return nil
+	for _, it := range items {
+		if !slices.Contains(values, it) && (!fromFlags || q.Other == "" || it == "") {
+			return fmt.Errorf("%s is not one of %s", it, strings.Join(values, ", "))
+		}
 	}
-	return fmt.Errorf("%s is not one of %s", a, strings.Join(values, ", "))
+	return nil
 }

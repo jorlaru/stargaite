@@ -146,7 +146,7 @@ Run again on an installation, it offers a menu, or takes a subcommand; `./setup.
 | Subcommand | What it does |
 |---|---|
 | `install` | The steps above; the default at a terminal before the container exists |
-| `provider` | Add a provider and its credential, or replace a credential in `.env` |
+| `provider` | Add providers and their keys in one go; each key is checked for free (its model list) before it is written to `.env`, and the container is recreated once |
 | `alias` | An alias toward a provider's model, the target verified first |
 | `key` | A client key for an alias, then a first answer with it |
 | `budget` | A spending limit on the instance, an alias or a key; the prices of the targets it reaches unpriced are asked first |
@@ -311,10 +311,10 @@ names what to fix (for example, a key with a budget needs prices on every target
   A TLS reverse proxy (Caddy, nginx, Traefik) on the same host needs no change here: point it at the upstream
   `http://127.0.0.1:4000`, which `compose.yaml` publishes with `--behind-tls-proxy` as shipped.
 - **Change a credential.** `./setup.sh provider`, naming the provider, asks whether to replace the credential in
-  `.env` (`--replace` without a terminal), reads the new one hidden and recreates the container. By hand: remove its
-  line (`sed -i '/^OPENAI_API_KEY=/d' .env`, which keeps the mode `0600`), run the last line of step 1 again, then
-  `docker compose up -d`. Either way requests in flight are given time to finish (`stop_grace_period`); configuration
-  and usage live in the volume and survive it.
+  `.env` (`--replace` without a terminal), reads the new one hidden, checks it for free and recreates the container.
+  By hand: remove its line (`sed -i '/^OPENAI_API_KEY=/d' .env`, which keeps the mode `0600`), run the last line of
+  step 1 again, then `docker compose up -d`. Either way requests in flight are given time to finish
+  (`stop_grace_period`); configuration and usage live in the volume and survive it.
 - **Upgrade.** `./setup.sh upgrade` refuses a clone with local changes to tracked files, a detached `HEAD`, a branch
   without upstream and one that cannot fast-forward, naming which. It fetches (within 20 s, never asking for a
   password), lists the new commits and says whether a migration of the store changed, then, once confirmed (`--yes`
@@ -836,7 +836,7 @@ provider `cost_report` wins over the table. Search units are not recorded: a tar
 
 ### Targets verify
 
-`./stargaite targets verify <target> [--max-output-tokens n]` checks a chat target against its live provider, with
+`./stargaite targets verify <target> [--max-output-tokens n] [--until-stdin-closes]` checks a chat target against its live provider, with
 the provider's own credential: one call per level the target declares (`--level`, in order), then one at `none` when
 it declares `--can-disable=true`, or a single call with no reasoning control when it declares neither; an `on` level
 is sent as `medium`. Each call sends the fixed prompt "What is 17 × 23? Answer with the number only." through the same
@@ -855,6 +855,8 @@ milliseconds) and `verified_version`, and `validate` warns about every chat targ
 store, does not); any change of the target or of its provider clears it. Every run is audited, `verified`, `failed`, or
 `stale` when the target changed while it ran, and none writes a revision. The server bounds the run by its own write
 deadline, the number of calls times the provider's `total_ms` plus 5 s, so the CLI waits without its 90 s timeout.
+With `--until-stdin-closes`, which needs standard input to be a pipe, the CLI ends its request when its standard input
+closes, and the server starts no further call of the run; a call already sent may still be billed.
 
 ### Resilience
 

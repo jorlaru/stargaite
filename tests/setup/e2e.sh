@@ -141,6 +141,17 @@ main() {
 	cert=$(<"$tree/tls/cert.pem")
 	again remote --tls self-signed --yes
 	[[ $(<"$tree/tls/cert.pem") != "$cert" && $out == *"https on $gw:$port: ready"* ]] || fail "remote again did not renew the certificate on $gw:$port"
+	# Add providers through the console, under TLS: the key checked for free
+	# against the mock's model list, which it does not serve, so not
+	# checked, then written, and the container recreated once.
+	E2E_KEY=$key again provider --provider mock2 --protocol openai --base-url "http://$gw:$mport" --api-key-env MOCK2_API_KEY \
+		--key-env E2E_KEY --allow-private-network --yes
+	[[ $out == *"mock2: key not checked: http://$gw:$mport/models answered 404"* && $out == *"Done: mock2 added, key not checked."* ]] ||
+		fail "Add providers did not check the key and finish"
+	[[ $out != *"$key"* ]] || fail "the credential was printed"
+	[[ $(curl -fsS --max-time 10 "http://$gw:$mport/mock/calls" | jq --arg a "Bearer $key" \
+		'[.[] | select(.Path == "/models" and .Header.Authorization == [$a])] | length') == 1 ]] ||
+		fail "the free check did not reach the mock with the key byte for byte"
 	again key --alias main --key-name e2e-3
 	[[ $out == *"answer: mock reply"* ]] || fail "no first answer over HTTPS"
 	again status

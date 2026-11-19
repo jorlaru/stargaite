@@ -47,9 +47,14 @@ const (
 // ended or a signal came: a command's process group gets 10 s to stop.
 const sessionBound = 12 * time.Second
 
-const usage = `usage: stargaite-console [status | help] [--version]
+const usage = `usage: stargaite-console [provider | status | help] [flags] [--version]
 At a terminal with no subcommand: the guided console.
-  status   what exists: providers, aliases, targets without an alias, keys, budgets, telemetry and both versions
+  provider  add providers and their keys; each key is checked for free before it is written
+            --provider <a,b>   presets, a provider already added, or one new name
+            --base-url <url>   --protocol <openai|anthropic>   --api-key-env <VAR|none>
+            --key-env <VAR> or <name=VAR,…>   names the variable that holds a key
+            --replace   --allow-private-network   --yes
+  status    what exists: providers, aliases, targets without an alias, keys, budgets, telemetry and both versions
 `
 
 func main() {
@@ -57,7 +62,8 @@ func main() {
 }
 
 // run is the console: the arguments, the clone, the signals, then the
-// session on its own goroutine, in plain mode or under the guided program.
+// session on its own goroutine, under the guided program when standard input
+// and output are a terminal, and in plain mode otherwise.
 func run(args, environ []string, stdin, stdout, stderr *os.File) int {
 	if len(args) == 1 && args[0] == "--version" {
 		_, _ = fmt.Fprintln(stdout, version)
@@ -71,30 +77,38 @@ func run(args, environ []string, stdin, stdout, stderr *os.File) int {
 	if len(args) > 0 {
 		sub = args[0]
 	}
-	// A subcommand is one the menu declares; no task takes arguments yet.
-	known := sub != "" && slices.ContainsFunc(task.Menu(), func(e task.Entry) bool { return e.Sub == sub })
+	// A subcommand is one the menu declares.
+	menu := task.Menu()
+	i := slices.IndexFunc(menu, func(e task.Entry) bool { return e.Sub == sub })
+	known := sub != "" && i >= 0
+	guided := term.IsTerminal(stdin.Fd()) && term.IsTerminal(stdout.Fd())
 	switch {
 	case sub == "help" || sub == "-h" || sub == "--help":
 		_, _ = io.WriteString(stdout, usage)
 		return exitOK
-	case known && len(args) > 1 && strings.HasPrefix(args[1], "--"):
-		return fail(exitUsage, "unknown flag %s", ui.OneLine(args[1]))
-	case known && len(args) > 1:
-		return fail(exitUsage, "unexpected argument: %s", ui.OneLine(args[1]))
-	case sub == "" && (!term.IsTerminal(stdin.Fd()) || !term.IsTerminal(stdout.Fd())):
+	case sub == "" && !guided:
 		return fail(exitUsage, "no subcommand; stargaite-console help lists them")
 	case sub != "" && !known:
 		return fail(exitUsage, "unknown subcommand %q; stargaite-console help lists them", ui.OneLine(sub))
+	}
+	var only *task.Entry // the subcommand's entry; nil runs the home menu
+	var answers map[string]string
+	if known {
+		only = &menu[i]
+		var err error
+		if answers, err = parseFlags(*only, args[1:]); err != nil {
+			return fail(exitUsage, "%s", ui.OneLine(err.Error()))
+		}
 	}
 	exe, err := os.Executable()
 	if err != nil {
 		return fail(exitFail, "the console's own path: %s", ui.OneLine(err.Error()))
 	}
-	h, err := host.Find(exe)
+	h, err := host.Find(exe, os.Getuid())
 	if err != nil {
 		return fail(exitFail, "%s", ui.OneLine(err.Error()))
 	}
-	if sub == "" {
+	if guided {
 		for _, v := range []string{"TEA_TRACE", "TEA_DEBUG"} {
 			if set(environ, v) {
 				return fail(exitFail, "%s is set: the console would write every byte it draws to a file, a client key included; unset it", v)
@@ -120,10 +134,10 @@ func run(args, environ []string, stdin, stdout, stderr *os.File) int {
 
 	var e ending
 	px := proxy.New(h.CLI)
-	if sub != "" {
-		e = plainSession(root, sub, px, h, stdout, stderr)
-	} else {
-		e = guidedSession(root, cancel, px, h, environ, stdin, stdout, stderr)
+	if guided {
+		e = guidedSession(root, cancel, px, h, environ, answers, only, stdin, stdout, stderr)
+	} else { // without a terminal there is a subcommand: checked above
+		e = plainSession(root, *only, ui.New(plain.New(stdout), answers).WithEnv(environ), px, h, stderr)
 	}
 	if s, ok := got.Load().(os.Signal); ok {
 		e.signal = s
@@ -160,35 +174,71 @@ func (e ending) code() int {
 	return e.session
 }
 
-// plainSession runs the menu entry whose subcommand is sub, with answers
-// from flags or defaults, and waits for it, bounded once a signal came.
-func plainSession(root context.Context, sub string, px *proxy.Proxy, h *host.Host, stdout, stderr io.Writer) ending {
+// parseFlags reads a subcommand's flags into answers keyed by flag name:
+// --name value or --name=value for one of e.Flags, --name for one of
+// e.Bools, whose answer is "yes". The last one given wins.
+func parseFlags(e task.Entry, args []string) (map[string]string, error) {
+	answers := map[string]string{}
+	for i := 0; i < len(args); i++ {
+		name, value, hasValue := strings.Cut(strings.TrimPrefix(args[i], "--"), "=")
+		switch {
+		case !strings.HasPrefix(args[i], "--"):
+			return nil, fmt.Errorf("unexpected argument: %s", args[i])
+		case slices.Contains(e.Bools, name) && hasValue:
+			return nil, fmt.Errorf("--%s takes no value", name)
+		case slices.Contains(e.Bools, name):
+			answers[name] = "yes"
+		case !slices.Contains(e.Flags, name):
+			return nil, fmt.Errorf("unknown flag --%s", name)
+		case hasValue:
+			answers[name] = value
+		case i+1 < len(args) && !strings.HasPrefix(args[i+1], "--"):
+			i++
+			answers[name] = args[i]
+		default:
+			return nil, fmt.Errorf("--%s needs a value", name)
+		}
+	}
+	return answers, nil
+}
+
+// runOne runs entry as a subcommand and says its result. It returns the
+// exit code and the error to print on standard error, if any. Leaving the
+// task says so and is a failure.
+func runOne(root context.Context, u *ui.UI, entry task.Entry, px *proxy.Proxy, h *host.Host) (int, error) {
+	res, err := u.Run(root, entry.Steps, func(ctx context.Context) (string, error) { return entry.Run(ctx, u, px, h) })
+	var usageErr *ui.UsageError
+	switch {
+	case err == nil && res == "":
+		return exitOK, nil
+	case err == nil:
+		if err := u.Say(root, res); err != nil {
+			return exitFail, err
+		}
+		return exitOK, nil
+	case errors.As(err, &usageErr):
+		return exitUsage, err
+	case errors.Is(err, ui.ErrQuit):
+		return exitINT, nil
+	case errors.Is(err, ui.ErrLeave):
+		return exitFail, u.Say(root, "Left "+entry.Label+".")
+	}
+	return exitFail, err
+}
+
+// plainSession runs entry with answers from flags or defaults, and waits for
+// it, bounded once a signal came.
+func plainSession(root context.Context, entry task.Entry, u *ui.UI, px *proxy.Proxy, h *host.Host, stderr io.Writer) ending {
 	var (
 		e        ending
 		panicked atomic.Bool
 	)
-	u := ui.New(plain.New(stdout), nil)
 	session := func() int {
-		for _, entry := range task.Menu() {
-			if entry.Sub != sub {
-				continue
-			}
-			res, err := u.Run(root, entry.Steps, func(ctx context.Context) (string, error) { return entry.Run(ctx, u, px, h) })
-			if err == nil && res != "" {
-				err = u.Say(root, res)
-			}
-			var usageErr *ui.UsageError
-			switch {
-			case errors.As(err, &usageErr):
-				_, _ = fmt.Fprintf(stderr, "stargaite-console: %s\n", ui.OneLine(err.Error()))
-				return exitUsage
-			case err != nil:
-				_, _ = fmt.Fprintf(stderr, "stargaite-console: %s\n", ui.OneLine(err.Error()))
-				return exitFail
-			}
-			return exitOK
+		code, err := runOne(root, u, entry, px, h)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "stargaite-console: %s\n", ui.OneLine(err.Error()))
 		}
-		return exitUsage // run checked sub against the menu's subcommands
+		return code
 	}
 	done := supervise(session, func() { panicked.Store(true) }, stderr)
 	select {
@@ -201,10 +251,11 @@ func plainSession(root context.Context, sub string, px *proxy.Proxy, h *host.Hos
 	return e
 }
 
-// guidedSession runs the program and, on the session goroutine, the home
-// menu: pick a task, run it, say how it ended, pick again, until Ctrl-C.
+// guidedSession runs the program and, on the session goroutine, the entry
+// only with the flags' answers, or with none the home menu: pick a task, run
+// it, say how it ended, pick again, until Ctrl-C.
 func guidedSession(root context.Context, cancel context.CancelFunc, px *proxy.Proxy, h *host.Host,
-	environ []string, stdin, stdout, stderr *os.File) ending {
+	environ []string, answers map[string]string, only *task.Entry, stdin, stdout, stderr *os.File) ending {
 	var (
 		e        ending
 		panicked atomic.Bool
@@ -213,9 +264,16 @@ func guidedSession(root context.Context, cancel context.CancelFunc, px *proxy.Pr
 	opts := append(guided.Options(root, environ), tea.WithInput(stdin), tea.WithOutput(stdout))
 	p := tea.NewProgram(guided.NewModel(version), opts...)
 	front := guided.NewFront(p)
-	u := ui.New(front, nil)
+	u := ui.New(front, answers).WithEnv(environ)
 	session := func() int {
 		defer front.Done()
+		if only != nil {
+			code, err := runOne(root, u, *only, px, h)
+			if err != nil && root.Err() == nil {
+				failure = err
+			}
+			return code
+		}
 		menu := task.Menu()
 		home := ui.Question{ID: "home", Prompt: "What do you want to do?"}
 		for _, entry := range menu {

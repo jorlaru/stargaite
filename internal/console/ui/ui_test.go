@@ -3,7 +3,11 @@ package ui
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 )
 
 // fakeFront answers from a list, records every question and every Show.
@@ -253,5 +257,209 @@ func TestGoRecovers(t *testing.T) {
 	Go(func() { panic("x") }, func(v any) { got <- v })
 	if v := <-got; v != "x" {
 		t.Fatalf("onPanic got %v", v)
+	}
+}
+
+func TestStorable(t *testing.T) {
+	const cannot = "ACME_API_KEY holds ' or a newline, or ends in \\: .env cannot hold it, so nothing was written"
+	for _, tc := range []struct{ v, want string }{
+		{"", "ACME_API_KEY is empty"},
+		{"it's", cannot},
+		{"two\nlines", cannot},
+		{"ends\\", cannot},
+		{"$ #\\", cannot},
+		{"s3cr3t $HOME #x y\\z", ""},
+		{"$ #\\x", ""},
+	} {
+		err := Storable("ACME_API_KEY", tc.v)
+		if (err == nil) != (tc.want == "") || (err != nil && err.Error() != tc.want) {
+			t.Fatalf("Storable(%q) = %v, want %q", tc.v, err, tc.want)
+		}
+	}
+}
+
+func keyEnvQuestion(item, prompt string) Question {
+	return Question{ID: "key-env", Flag: "key-env", Item: item, Prompt: prompt}
+}
+
+func TestItemPairs(t *testing.T) {
+	ctx := context.Background()
+	u := New(refusingFront{t}, map[string]string{"key-env": "openai=A,anthropic=B"})
+	if got, err := u.Text(ctx, keyEnvQuestion("anthropic", "V")); err != nil || got != "B" {
+		t.Fatalf("anthropic: got %q, %v; want B", got, err)
+	}
+	front := &fakeFront{t: t, answers: []string{"asked"}}
+	u = New(front, map[string]string{"key-env": "openai=A,anthropic=B"})
+	if got, err := u.Text(ctx, keyEnvQuestion("gemini", "V")); err != nil || got != "asked" || len(front.asked) != 1 {
+		t.Fatalf("gemini: got %q, %v, asked %d; want the front asked", got, err, len(front.asked))
+	}
+	if u.Given(keyEnvQuestion("gemini", "V")) || !u.Given(keyEnvQuestion("openai", "V")) {
+		t.Fatal("Given does not follow the item's pair")
+	}
+
+	u = New(refusingFront{t}, map[string]string{"key-env": "A"})
+	for _, item := range []string{"x", "y"} {
+		if got, err := u.Text(ctx, keyEnvQuestion(item, "V")); err != nil || got != "A" {
+			t.Fatalf("bare value, item %s asking V: got %q, %v; want A", item, got, err)
+		}
+	}
+
+	u = New(refusingFront{t}, map[string]string{"key-env": "A"}).WithEnv([]string{"A=s3cr3t"})
+	if got, err := u.Secret(ctx, keyEnvQuestion("x", "V")); err != nil || got != "s3cr3t" {
+		t.Fatalf("x asking V: got %q, %v", got, err)
+	}
+	if got, err := u.Secret(ctx, keyEnvQuestion("x", "V")); err != nil || got != "s3cr3t" {
+		t.Fatalf("x asking V again: got %q, %v", got, err)
+	}
+	got, err := u.Secret(ctx, keyEnvQuestion("y", "W"))
+	var usage *UsageError
+	if !errors.As(err, &usage) || err.Error() != "--key-env: several providers need a key each: give x=VAR,y=VAR" || got != "" {
+		t.Fatalf("y asking W: got %q, %v; want the usage error and no value", got, err)
+	}
+}
+
+func TestGiven(t *testing.T) {
+	u := New(refusingFront{t}, map[string]string{"yes": "yes"})
+	if !u.Given(Question{ID: "yes"}) || u.Given(Question{ID: "replace"}) {
+		t.Fatal("Given is wrong")
+	}
+}
+
+func providerQuestion(other string) Question {
+	return Question{ID: "provider", Flag: "provider", Prompt: "Which providers?", Other: other,
+		Options: []Option{{Value: "a", Label: "a"}, {Value: "b", Label: "b"}, {Value: "+another", Label: "another"}}}
+}
+
+func TestPickManyFlags(t *testing.T) {
+	ctx := context.Background()
+	got, err := New(refusingFront{t}, map[string]string{"provider": "a,b"}).PickMany(ctx, providerQuestion(""))
+	if err != nil || !slices.Equal(got, []string{"a", "b"}) {
+		t.Fatalf("got %q, %v; want [a b]", got, err)
+	}
+	_, err = New(refusingFront{t}, map[string]string{"provider": "a,zz"}).PickMany(ctx, providerQuestion(""))
+	var usage *UsageError
+	if !errors.As(err, &usage) || err.Error() != "--provider: zz is not one of a, b, +another" {
+		t.Fatalf("err = %v", err)
+	}
+	got, err = New(refusingFront{t}, map[string]string{"provider": "zz"}).PickMany(ctx, providerQuestion("+another"))
+	if err != nil || !slices.Equal(got, []string{"zz"}) {
+		t.Fatalf("with Other: got %q, %v; want [zz]", got, err)
+	}
+	_, err = New(refusingFront{t}, map[string]string{"provider": "a,"}).PickMany(ctx, providerQuestion("+another"))
+	if !errors.As(err, &usage) {
+		t.Fatalf("an empty item: err = %v, want a usage error", err)
+	}
+}
+
+func TestPickManyFront(t *testing.T) {
+	ctx := context.Background()
+	front := &fakeFront{t: t, answers: []string{"b,a"}}
+	got, err := New(front, nil).PickMany(ctx, providerQuestion("+another"))
+	if err != nil || !slices.Equal(got, []string{"b", "a"}) || front.asked[0].Kind != KindPickMany {
+		t.Fatalf("got %q, %v; want [b a] from a multi-pick", got, err)
+	}
+	_, err = New(&fakeFront{t: t, answers: []string{"x"}}, nil).PickMany(ctx, providerQuestion("+another"))
+	var usage *UsageError
+	if err == nil || errors.As(err, &usage) || !strings.HasPrefix(err.Error(), "ui: question provider: ") {
+		t.Fatalf("err = %v, want an internal error", err)
+	}
+}
+
+func TestSecretFromEnv(t *testing.T) {
+	const v = "s3cr3t $HOME #x y\\z"
+	u := New(refusingFront{t}, map[string]string{"key-env": "SRC"}).WithEnv([]string{"OTHER=1", "SRC=" + v})
+	got, err := u.Secret(context.Background(), Question{ID: "key-env", Flag: "key-env", Prompt: "ACME_API_KEY",
+		Check: func(string) error { return errBad }})
+	if err != nil || got != v {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}
+
+func TestSecretFromFront(t *testing.T) {
+	front := &fakeFront{t: t, answers: []string{"typed"}}
+	got, err := New(front, nil).Secret(context.Background(), Question{ID: "key-env", Flag: "key-env", Prompt: "ACME_API_KEY"})
+	if err != nil || got != "typed" || front.asked[0].Kind != KindSecret {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}
+
+func TestSecretFlagNamesNoVariable(t *testing.T) {
+	for _, given := range []string{"gsk_PastedValue123", "sk-pasted-value"} {
+		u := New(refusingFront{t}, map[string]string{"key-env": given}).WithEnv([]string{"SRC=x"})
+		got, err := u.Secret(context.Background(), Question{ID: "key-env", Flag: "key-env", Prompt: "ACME_API_KEY"})
+		var usage *UsageError
+		if !errors.As(err, &usage) || err.Error() != "--key-env takes the name of a variable exported to the console" || got != "" {
+			t.Fatalf("%s: got %q, %v", given, got, err)
+		}
+		if strings.Contains(err.Error(), given) {
+			t.Fatalf("the error holds what was given: %v", err)
+		}
+	}
+}
+
+func TestSecretRefusedValue(t *testing.T) {
+	u := New(refusingFront{t}, map[string]string{"key-env": "SRC"}).WithEnv([]string{"SRC=it's"})
+	got, err := u.Secret(context.Background(), Question{ID: "key-env", Flag: "key-env", Prompt: "ACME_API_KEY"})
+	var usage *UsageError
+	if err == nil || errors.As(err, &usage) || !strings.Contains(err.Error(), ".env cannot hold it") || got != "" {
+		t.Fatalf("got %q, %v; want a plain error", got, err)
+	}
+	if strings.Contains(err.Error(), "it's") {
+		t.Fatalf("the error holds the value: %v", err)
+	}
+}
+
+// workFront answers a work question with err once its context ends, or at
+// once when now is set, and records the kind and whether its context ended.
+type workFront struct {
+	err   error
+	now   bool
+	kind  chan Kind
+	ended chan struct{}
+}
+
+func (f *workFront) Ask(ctx context.Context, q Question) (string, error) {
+	f.kind <- q.Kind
+	if f.now {
+		return "", f.err
+	}
+	<-ctx.Done()
+	close(f.ended)
+	return "", ctx.Err()
+}
+
+func (f *workFront) Show(context.Context, string) error { return nil }
+
+func TestWorkReturnsFnError(t *testing.T) {
+	front := &workFront{kind: make(chan Kind, 1), ended: make(chan struct{})}
+	err := New(front, nil).Work(context.Background(), Question{ID: "up", Prompt: "restarting"}, func(context.Context) error {
+		if k := <-front.kind; k != KindWork {
+			return fmt.Errorf("kind %v", k)
+		}
+		return errBad
+	})
+	if !errors.Is(err, errBad) {
+		t.Fatalf("err = %v, want errBad", err)
+	}
+	select {
+	case <-front.ended:
+	default:
+		t.Fatal("the front's context did not end before Work returned")
+	}
+}
+
+func TestWorkLeave(t *testing.T) {
+	front := &workFront{err: ErrLeave, now: true, kind: make(chan Kind, 1)}
+	start := time.Now()
+	err := New(front, nil).Work(context.Background(), Question{ID: "up", Prompt: "restarting"}, func(ctx context.Context) error {
+		select { // bounded, so a Work that never cancels fails instead of hanging
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+			return errBad
+		}
+	})
+	if !errors.Is(err, ErrLeave) || time.Since(start) > time.Second {
+		t.Fatalf("err = %v after %s, want ErrLeave within 1s", err, time.Since(start))
 	}
 }

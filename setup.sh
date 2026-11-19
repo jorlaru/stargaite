@@ -1105,7 +1105,7 @@ subcommands:
             to a key and a first answer; run again, it resumes and keeps
             what exists (the default at a terminal before it exists; a menu
             of the others after)
-  provider  add a provider and its credential to a running installation
+  provider  add providers and their keys; each key is checked for free before it is written
   alias     an alias toward a provider's model, the target verified first;
             one that exists (--alias, main) is kept, with no paid call
   key       a client key for an alias (--alias, main), then a first answer
@@ -1133,6 +1133,9 @@ install flags, which provider, alias and key take for their steps:
                             holds the credential; typed hidden otherwise
   --replace                 replace the credential already in .env
   --allow-private-network   allow a plain-HTTP or private provider URL
+  provider also takes several: --provider a,b with --key-env a=VAR,b=VAR;
+  then --base-url, --protocol, --api-key-env and --allow-private-network
+  are refused
   --model <id>              the model id at the provider
   --reverify                verify the target again although it is verified
   --alias <name>            the alias clients call (main)
@@ -1208,7 +1211,7 @@ main() {
 	fi
 	case $sub in
 	install) parse_flags "port $pf model alias max-output-tokens effort key-name rpm-limit" "$bf reverify" "$@"; install ;;
-	provider) parse_flags "$pf" "$bf" "$@"; running; step_provider ;;
+	provider) console provider "$@" ;;
 	alias) parse_flags "$pf model alias max-output-tokens effort" "$bf reverify" "$@"; running; alias_kept || { step_provider; step_model; step_target; step_alias; } ;;
 	key) parse_flags "alias key-name rpm-limit" "" "$@"; running; alias_kept || die "alias $alias does not exist: ./setup.sh alias makes it"; if step_key; then step_answer; fi ;;
 	budget) parse_flags "on limit-usd reset input-price output-price" "yes" "$@"; running; budget ;;

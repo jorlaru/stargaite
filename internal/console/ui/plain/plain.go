@@ -17,15 +17,21 @@ type Front struct{ out io.Writer }
 func New(stdout io.Writer) *Front { return &Front{out: stdout} }
 
 // Ask answers a question without asking. A reveal writes its value alone on
-// a line, so a script can capture it; any other question takes its default,
-// or is a usage error naming the flag that answers it.
-func (f *Front) Ask(_ context.Context, q ui.Question) (string, error) {
+// a line, so a script can capture it; a work question waits for its work to
+// end; any other question takes its default, or is a usage error naming the
+// flag that answers it, and its prompt.
+func (f *Front) Ask(ctx context.Context, q ui.Question) (string, error) {
 	switch {
 	case q.Kind == ui.KindReveal:
 		_, err := io.WriteString(f.out, q.Value+"\n")
 		return "", err
+	case q.Kind == ui.KindWork:
+		<-ctx.Done()
+		return "", ctx.Err()
 	case q.HasDefault:
 		return q.Default, nil
+	case q.Prompt != "":
+		return "", &ui.UsageError{Msg: "missing --" + q.Flag + ": " + q.Prompt}
 	}
 	return "", &ui.UsageError{Msg: "missing --" + q.Flag}
 }

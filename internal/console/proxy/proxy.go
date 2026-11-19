@@ -8,15 +8,19 @@ package proxy
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/jorlaru/stargaite/internal/console/paid"
 	"github.com/jorlaru/stargaite/internal/console/ui"
 )
 
@@ -25,25 +29,38 @@ const (
 	cliBound = 90 * time.Second
 	// captureLimit caps the answer of one call.
 	captureLimit = 8 << 20
+	// stopGrace is how long a stopped check has, once its standard input is
+	// closed, before its command is cancelled.
+	stopGrace = 10 * time.Second
+	// stale ends every error that says the answer was not understood.
+	stale = "this console and the running proxy are different versions; rebuild the proxy from this clone"
 )
 
-// Runner runs the CLI with args and returns its exit code. In production it
-// is host.CLI; in tests the CLI in process.
-type Runner func(ctx context.Context, args []string, stdout, stderr io.Writer) (int, error)
+// Runner runs the CLI with args and returns its exit code. A nil stdin is
+// none. In production it is host.CLI; in tests the CLI in process.
+type Runner func(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error)
 
 // Reply is a decoded answer. Required names the top-level members the
 // answer must have, so a proxy of another version is caught by name.
 type Reply interface{ Required() []string }
 
 // Proxy calls the CLI through a Runner.
-type Proxy struct{ run Runner }
+type Proxy struct {
+	run   Runner
+	grace time.Duration // stopGrace; tests shorten the field, never the constant
+}
 
 // New returns a Proxy that calls the CLI through run.
-func New(run Runner) *Proxy { return &Proxy{run: run} }
+func New(run Runner) *Proxy { return &Proxy{run: run, grace: stopGrace} }
 
 // Call runs "stargaite <words> --json <flags> [-- <positionals>]" and decodes
-// its answer into reply.
+// its answer into reply. It refuses targets verify, the paid command, which
+// only Verify runs: the CLI matches a command by its leading words, so any
+// words that start with those two.
 func (p *Proxy) Call(ctx context.Context, reply Reply, words string, flags []string, positionals ...string) error {
+	if f := strings.Fields(words); len(f) >= 2 && f[0] == "targets" && f[1] == "verify" {
+		return errors.New("a paid command goes through Verify")
+	}
 	ctx, cancel := context.WithTimeout(ctx, cliBound)
 	defer cancel()
 	args := append(strings.Fields(words), "--json")
@@ -51,31 +68,151 @@ func (p *Proxy) Call(ctx context.Context, reply Reply, words string, flags []str
 	if len(positionals) > 0 {
 		args = append(append(args, "--"), positionals...)
 	}
-	var out capped
-	code, err := p.run(ctx, args, &out, io.Discard)
-	if err == nil {
-		err = ctx.Err()
-	}
+	out, code, err := p.exec(ctx, args, nil)
 	switch {
 	case err != nil:
 		return fmt.Errorf("stargaite %s: %w", words, err)
-	case out.over:
-		return fmt.Errorf("stargaite %s: the answer is larger than 8 MiB", words)
 	case code != 0:
-		var envelope struct {
-			Error *struct {
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		if json.Unmarshal(out.buf.Bytes(), &envelope) == nil && envelope.Error != nil && envelope.Error.Message != "" {
-			return fmt.Errorf("stargaite %s: %s", words, ui.OneLine(envelope.Error.Message))
-		}
-		return fmt.Errorf("stargaite %s: failed with exit %d", words, code)
+		return failure(words, out, code)
 	}
-	// The decoder's errors are dropped, not wrapped: they can quote the output.
-	stale := "this console and the running proxy are different versions; rebuild the proxy from this clone"
+	return decode(words, out, reply)
+}
+
+// Verify runs one paid check of target, which states calls calls, after
+// taking them from b. Its standard input is a pipe: when ctx ends or bound
+// passes, the pipe is closed first, so the CLI ends its request and the
+// server starts no further call; the command is cancelled only if it has not
+// returned grace later. A ctx that has already ended starts nothing and
+// takes nothing.
+func (p *Proxy) Verify(ctx context.Context, b *paid.Budget, target string, calls int, bound time.Duration) (*VerifyReply, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("the check of %s was not started: %w", target, err)
+	}
+	if err := b.Take(calls); err != nil {
+		return nil, err
+	}
+	const words = "targets verify"
+	r, w, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("stargaite %s: %w", words, err)
+	}
+	defer func() { _ = r.Close(); _ = w.Close() }()
+	run, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancel()
+	returned, stopped := make(chan struct{}), make(chan error, 1)
+	ui.Go(func() { stopped <- p.watch(ctx, target, bound, w, returned, cancel) },
+		func(v any) { cancel(); stopped <- fmt.Errorf("the check of %s lost its watch: %v", target, v) })
+	args := []string{"targets", "verify", "--json", "--max-output-tokens", "256", "--until-stdin-closes", "--", target}
+	out, code, err := p.exec(run, args, r)
+	close(returned)
+	if why := <-stopped; why != nil {
+		return nil, why
+	}
+	if err != nil {
+		return nil, fmt.Errorf("stargaite %s: %w", words, err)
+	}
+	return verdict(words, target, calls, out, code)
+}
+
+// watch waits for the run to return, ctx to end or bound to pass. On either
+// of the last two it closes w, the run's standard input, gives the run grace
+// to return, then cancels it, and says why the check was stopped.
+func (p *Proxy) watch(ctx context.Context, target string, bound time.Duration, w *os.File, returned <-chan struct{}, cancel context.CancelFunc) error {
+	expiry := time.NewTimer(bound)
+	defer expiry.Stop()
+	var why error
+	select {
+	case <-returned:
+		return nil
+	case <-ctx.Done():
+		why = fmt.Errorf("the check of %s was stopped: the call in flight may still be billed: %w", target, ctx.Err())
+	case <-expiry.C:
+		why = fmt.Errorf("the check of %s did not end within %s: the call in flight may still be billed", target, bound)
+	}
+	_ = w.Close()
+	grace := time.NewTimer(p.grace)
+	defer grace.Stop()
+	select {
+	case <-returned:
+	case <-grace.C:
+		cancel()
+	}
+	return why
+}
+
+// verdict reads a check's answer. An answer of exit 0 or 1 is a VerifyReply;
+// more calls than stated, or a failed check, is an error; anything else
+// follows Call's rule.
+func verdict(words, target string, calls int, out []byte, code int) (*VerifyReply, error) {
+	var reply VerifyReply
+	if code > 1 {
+		return nil, failure(words, out, code)
+	}
+	if err := decode(words, out, &reply); err != nil {
+		if code != 0 {
+			return nil, failure(words, out, code)
+		}
+		return nil, err
+	}
+	if len(reply.Calls) > calls {
+		return nil, fmt.Errorf("stargaite %s %s: the answer has %d calls, %d were stated: stop and report this", words, target, len(reply.Calls), calls)
+	}
+	if !reply.OK {
+		var lines []string
+		for _, c := range reply.Calls {
+			lines = append(lines, c.line())
+		}
+		return nil, errors.New(strings.Join(append(lines, "target "+target+" failed its check"), "\n"))
+	}
+	return &reply, nil
+}
+
+// line is one call of a failed check: its level, status and reason.
+func (c VerifyCall) line() string {
+	effort, reason := cmp.Or(c.Effort, "call"), c.ProviderMessage
+	if reason == "" && c.Error != nil {
+		reason = c.Error.Message
+	}
+	return ui.OneLine(effort) + ": status " + strconv.Itoa(c.Status) + ", " + ui.OneLine(cmp.Or(reason, "no answer"))
+}
+
+// exec runs the CLI with args and stdin, and returns its answer and exit
+// code. A runner error, the context ending or an answer over 8 MiB is an
+// error, whatever the exit code.
+func (p *Proxy) exec(ctx context.Context, args []string, stdin io.Reader) ([]byte, int, error) {
+	var out capped
+	code, err := p.run(ctx, args, stdin, &out, io.Discard)
+	switch {
+	case err != nil:
+		return nil, 0, err
+	case ctx.Err() != nil:
+		return nil, 0, ctx.Err()
+	case out.over:
+		return nil, 0, errors.New("the answer is larger than 8 MiB")
+	}
+	return out.buf.Bytes(), code, nil
+}
+
+// failure is the error of a non-zero exit: the CLI's own error message,
+// cleaned, never the raw output.
+func failure(words string, out []byte, code int) error {
+	var envelope struct {
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(out, &envelope) == nil && envelope.Error != nil && envelope.Error.Message != "" {
+		return fmt.Errorf("stargaite %s: %s", words, ui.OneLine(envelope.Error.Message))
+	}
+	return fmt.Errorf("stargaite %s: failed with exit %d", words, code)
+}
+
+// decode decodes an answer into reply, which must have every member reply
+// requires. The decoder's errors are dropped, not wrapped: they can quote
+// the output.
+func decode(words string, out []byte, reply Reply) error {
 	var members map[string]jsontext.Value
-	if json.Unmarshal(out.buf.Bytes(), &members) != nil {
+	if json.Unmarshal(out, &members) != nil {
 		return fmt.Errorf("stargaite %s: the answer was not understood: %s", words, stale)
 	}
 	for _, key := range reply.Required() {
@@ -83,7 +220,7 @@ func (p *Proxy) Call(ctx context.Context, reply Reply, words string, flags []str
 			return fmt.Errorf("stargaite %s: the answer has no %q: %s", words, key, stale)
 		}
 	}
-	if json.Unmarshal(out.buf.Bytes(), reply) != nil {
+	if json.Unmarshal(out, reply) != nil {
 		return fmt.Errorf("stargaite %s: the answer was not understood: %s", words, stale)
 	}
 	return nil

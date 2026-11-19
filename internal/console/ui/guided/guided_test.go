@@ -632,3 +632,144 @@ func TestFrameFits(t *testing.T) {
 		}
 	}
 }
+
+func TestGuidedSecretPaste(t *testing.T) {
+	h := start(t)
+	q := ui.Question{ID: "key-env", Step: "key", Prompt: "ACME_API_KEY", Kind: ui.KindSecret, Bar: ui.Bar{Titles: []string{"key"}}}
+	got := h.asked(q)
+	h.waitShown("typed hidden")
+	h.p.Send(tea.PasteMsg{Content: "sk-pasted-9"})
+	h.p.Send(key(tea.KeyEnter))
+	if r := answer(t, got); r.err != nil || r.text != "sk-pasted-9" {
+		t.Fatalf("answer %+v", r)
+	}
+	h.front.Done()
+	h.ended()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, f := range h.frames {
+		if strings.Contains(f.Content, "sk-pasted-9") {
+			t.Fatalf("a frame holds the secret:\n%s", f.Content)
+		}
+	}
+	if strings.Contains(h.out.String(), "sk-pasted-9") {
+		t.Fatal("the output holds the secret")
+	}
+}
+
+// work runs u.Work with a question of prompt "restarting" in a one-step task
+// on its own goroutine, with fn, and sends Work's error.
+func (h *harness) work(fn func(context.Context) error) <-chan error {
+	u := ui.New(h.front, nil)
+	done := make(chan error, 1)
+	go func() {
+		_, err := u.Run(h.ctx, []ui.Step{{ID: "recreate", Title: "recreate"}}, func(ctx context.Context) (string, error) {
+			return "", u.Work(ctx, ui.Question{ID: "up", Step: "recreate", Prompt: "restarting"}, fn)
+		})
+		done <- err
+	}()
+	return done
+}
+
+// workGone waits until the last frame shows no work piece.
+func (h *harness) workGone() {
+	h.t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		h.mu.Lock()
+		last := h.frames[len(h.frames)-1].Content
+		h.mu.Unlock()
+		if strings.Contains(last, "working…") && !strings.Contains(last, "restarting…") {
+			return
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("the work piece is still shown:\n%s", last)
+		}
+	}
+}
+
+func TestGuidedWorkEsc(t *testing.T) {
+	h := start(t)
+	stopped := make(chan struct{})
+	done := h.work(func(ctx context.Context) error {
+		<-ctx.Done()
+		close(stopped)
+		return ctx.Err()
+	})
+	f := h.waitShown("restarting…")
+	if !strings.Contains(f.Content, "● recreate") || !strings.Contains(f.Content, "esc stop · ctrl+c quit") {
+		t.Fatalf("work frame:\n%s", f.Content)
+	}
+	h.p.Send(key(tea.KeyEscape))
+	select {
+	case err := <-done:
+		if !errors.Is(err, ui.ErrLeave) {
+			t.Fatalf("Work: %v; want ErrLeave", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Work did not return within 2s")
+	}
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("fn's context was not cancelled")
+	}
+	h.workGone()
+}
+
+func TestGuidedWorkDone(t *testing.T) {
+	h := start(t)
+	done := h.work(func(ctx context.Context) error {
+		select {
+		case <-time.After(50 * time.Millisecond):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+	h.waitShown("restarting…")
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Work: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Work did not return")
+	}
+	h.workGone()
+}
+
+func TestGuidedPickManyFrame(t *testing.T) {
+	h := start(t)
+	q := ui.Question{ID: "provider", Step: "which", Prompt: "Which providers do you want to add?", Kind: ui.KindPickMany,
+		Bar: ui.Bar{Titles: []string{"which", "add", "key", "write", "recreate"}}}
+	for i := range 19 {
+		name := fmt.Sprintf("provider-%02d", i)
+		q.Options = append(q.Options, ui.Option{Value: name, Label: name + ", untested, asks for its URL  ✓ added"})
+	}
+	got := h.asked(q)
+	h.waitShown("[ ] provider-00")
+	for range 30 {
+		h.p.Send(key(tea.KeyDown))
+	}
+	h.p.Send(tea.KeyPressMsg{Code: tea.KeySpace, Text: " "})
+	h.waitShown("> [x] provider-18")
+	h.p.Send(key(tea.KeyEnter))
+	if r := answer(t, got); r.err != nil || r.text != "provider-18" {
+		t.Fatalf("answer %+v", r)
+	}
+	h.front.Done()
+	h.ended()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, f := range h.frames {
+		lines := strings.Split(f.Content, "\n")
+		if len(lines) > 24 {
+			t.Fatalf("%d lines:\n%s", len(lines), f.Content)
+		}
+		for _, l := range lines {
+			if ansi.StringWidth(l) > 80 {
+				t.Fatalf("line %q is %d wide", l, ansi.StringWidth(l))
+			}
+		}
+	}
+}

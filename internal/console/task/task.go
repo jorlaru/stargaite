@@ -16,9 +16,11 @@ import (
 type Func func(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host) (string, error)
 
 // Entry is a task in the menu: its group, its label, the subcommand that runs
-// it without a terminal, and its step table.
+// it on its own, the value flags and the boolean flags that subcommand takes,
+// and its step table. A flag's name is the ID of the question it answers.
 type Entry struct {
 	Group, Label, Sub string
+	Flags, Bools      []string
 	Steps             []ui.Step
 	Run               Func
 }
@@ -28,5 +30,9 @@ func Menu() []Entry {
 	return []Entry{
 		{Group: "This machine", Label: "See what exists", Sub: "status",
 			Steps: []ui.Step{{ID: "show", Title: "what exists"}}, Run: SeeWhatExists},
+		{Group: "Providers", Label: "Add providers", Sub: "provider",
+			Flags: []string{"provider", "base-url", "protocol", "api-key-env", "key-env"},
+			Bools: []string{"replace", "allow-private-network", "yes"},
+			Steps: addSteps(), Run: AddProviders},
 	}
 }

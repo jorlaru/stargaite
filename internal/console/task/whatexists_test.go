@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -19,8 +20,11 @@ import (
 
 // cliRunner runs the CLI in process against env, as the container would.
 func cliRunner(env map[string]string) proxy.Runner {
-	return func(_ context.Context, args []string, stdout, stderr io.Writer) (int, error) {
-		return cli.Main(args, func(k string) string { return env[k] }, strings.NewReader(""), stdout, stderr), nil
+	return func(_ context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+		if stdin == nil {
+			stdin = strings.NewReader("")
+		}
+		return cli.Main(args, func(k string) string { return env[k] }, stdin, stdout, stderr), nil
 	}
 }
 
@@ -33,7 +37,7 @@ type reply struct {
 // cannedRunner answers by the joined arguments and records each call; a call
 // it has no answer for fails the test.
 func cannedRunner(t *testing.T, answers map[string]reply, calls *[]string) proxy.Runner {
-	return func(_ context.Context, args []string, stdout, _ io.Writer) (int, error) {
+	return func(_ context.Context, args []string, _ io.Reader, stdout, _ io.Writer) (int, error) {
 		key := strings.Join(args, " ")
 		*calls = append(*calls, key)
 		r, ok := answers[key]
@@ -235,9 +239,26 @@ func TestSeeWhatExistsDockerFails(t *testing.T) {
 
 func TestMenuFresh(t *testing.T) {
 	m := Menu()
-	if len(m) != 1 || m[0].Group != "This machine" || m[0].Label != "See what exists" || m[0].Sub != "status" ||
+	if len(m) != 2 || m[0].Group != "This machine" || m[0].Label != "See what exists" || m[0].Sub != "status" ||
 		len(m[0].Steps) != 1 || m[0].Steps[0] != (ui.Step{ID: "show", Title: "what exists"}) || m[0].Run == nil {
 		t.Fatalf("Menu() = %+v", m)
+	}
+	add := m[1]
+	if add.Group != "Providers" || add.Label != "Add providers" || add.Sub != "provider" ||
+		!slices.Equal(add.Flags, []string{"provider", "base-url", "protocol", "api-key-env", "key-env"}) ||
+		!slices.Equal(add.Bools, []string{"replace", "allow-private-network", "yes"}) ||
+		!slices.Equal(add.Steps, addSteps()) || add.Run == nil {
+		t.Fatalf("Menu()[1] = %+v", add)
+	}
+	var titles []string
+	for _, s := range addSteps() {
+		if s.ID != s.Title {
+			t.Fatalf("addSteps() = %+v", addSteps())
+		}
+		titles = append(titles, s.Title)
+	}
+	if !slices.Equal(titles, []string{"which", "add", "key", "write", "recreate"}) {
+		t.Fatalf("addSteps() = %+v", addSteps())
 	}
 	m[0].Label = "changed"
 	m[0].Steps[0].Title = "changed"

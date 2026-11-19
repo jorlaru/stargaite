@@ -65,7 +65,7 @@ func noCharm(deps []string) error {
 
 func TestNoCharmBelowFronts(t *testing.T) {
 	deps := goList(t, "-deps", "./internal/console/ui", "./internal/console/ui/plain", "./internal/console/task",
-		"./internal/console/proxy", "./internal/console/host")
+		"./internal/console/proxy", "./internal/console/host", "./internal/console/paid", "./internal/console/rules")
 	expect(t, noCharm, deps, append(deps, "charm.land/bubbletea/v2"))
 	expect(t, noCharm, deps, append(deps, "github.com/charmbracelet/colorprofile"))
 }
@@ -93,22 +93,30 @@ func importLines(t *testing.T, patterns ...string) []string {
 	return goList(t, append([]string{"-f", `{{.ImportPath}} {{join .Imports " "}}`}, patterns...)...)
 }
 
-// onlyHostExecs: host is the one package that runs a command.
-func onlyHostExecs(lines []string) error {
-	for _, l := range lines {
-		f := strings.Fields(l)
-		for _, i := range f[1:] {
-			if i == "os/exec" && f[0] != module+"internal/console/host" {
-				return fmt.Errorf("%s imports os/exec", f[0])
+// onlyHost is the check that host is the one package importing path: the
+// one that runs a command (os/exec) or speaks HTTP (net/http).
+func onlyHost(path string) func(lines []string) error {
+	return func(lines []string) error {
+		for _, l := range lines {
+			f := strings.Fields(l)
+			for _, i := range f[1:] {
+				if i == path && f[0] != module+"internal/console/host" {
+					return fmt.Errorf("%s imports %s", f[0], path)
+				}
 			}
 		}
+		return nil
 	}
-	return nil
 }
 
 func TestOnlyHostExecs(t *testing.T) {
 	lines := importLines(t, "./internal/console/...", "./cmd/stargaite-console")
-	expect(t, onlyHostExecs, lines, append(lines, module+"internal/console/task os/exec"))
+	expect(t, onlyHost("os/exec"), lines, append(lines, module+"internal/console/task os/exec"))
+}
+
+func TestOnlyHostHTTP(t *testing.T) {
+	lines := importLines(t, "./internal/console/...", "./cmd/stargaite-console")
+	expect(t, onlyHost("net/http"), lines, append(lines, module+"internal/console/task net/http"))
 }
 
 // noProxyPackages: the console reaches the proxy only through its CLI.
@@ -295,5 +303,73 @@ func TestNoPackageState(t *testing.T) {
 	ok := source(t, "internal/console/task/x.go", "package task\nimport \"errors\"\nvar ErrX = errors.New(\"x\")\n")
 	if err := noPackageState(ok); err != nil {
 		t.Errorf("a sentinel error: %v", err)
+	}
+}
+
+// paidSessionPlace: only ui and main name paid.Session or paid.NewSession,
+// so only they can open a paid step, whatever name paid is imported as; and
+// only main names the host's CLI, so every other package runs the CLI
+// through proxy, whose one door refuses the paid command.
+func paidSessionPlace(files map[string]*ast.File) error {
+	for path, f := range files {
+		dir := filepath.Dir(path)
+		names := map[string]bool{"paid": true}
+		for _, spec := range f.Imports {
+			if strings.HasSuffix(strings.Trim(spec.Path.Value, `"`), "/internal/console/paid") && spec.Name != nil {
+				if spec.Name.Name == "." {
+					return fmt.Errorf("%s dot-imports paid", path)
+				}
+				names[spec.Name.Name] = true
+			}
+		}
+		var found error
+		ast.Inspect(f, func(n ast.Node) bool {
+			sel, ok := n.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			pkg, ok := sel.X.(*ast.Ident)
+			switch {
+			case dir == "cmd/stargaite-console":
+			case sel.Sel.Name == "CLI":
+				found = fmt.Errorf("%s names .CLI: only main hands the host's CLI to proxy", path)
+			case dir == "internal/console/ui":
+			case ok && names[pkg.Name] && (sel.Sel.Name == "Session" || sel.Sel.Name == "NewSession"):
+				found = fmt.Errorf("%s names paid.%s", path, sel.Sel.Name)
+			}
+			return found == nil
+		})
+		if found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
+func TestPaidSessionPlace(t *testing.T) {
+	if err := paidSessionPlace(parsed(t)); err != nil {
+		t.Error(err)
+	}
+	for _, src := range []string{
+		"package task\nfunc f() { _ = paid.NewSession() }\n",
+		"package task\nfunc f(s *paid.Session) {}\n",
+		"package task\nimport budget \"github.com/jorlaru/stargaite/internal/console/paid\"\nfunc f() { s := budget.NewSession(); s.Open(12) }\n",
+		"package task\nimport . \"github.com/jorlaru/stargaite/internal/console/paid\"\nfunc f() {}\n",
+		"package task\nfunc f(h *host.Host) { h.CLI(nil, []string{\"targets\", \"verify\", \"a/m\"}, nil, nil, nil) }\n",
+	} {
+		if paidSessionPlace(source(t, "internal/console/task/x.go", src)) == nil {
+			t.Errorf("passed: %q", src)
+		}
+	}
+	for _, path := range []string{"internal/console/ui/x.go", "cmd/stargaite-console/x.go"} {
+		if err := paidSessionPlace(source(t, path, "package x\nfunc f() { _ = paid.NewSession() }\n")); err != nil {
+			t.Errorf("%s: %v", path, err)
+		}
+	}
+	if err := paidSessionPlace(source(t, "cmd/stargaite-console/x.go", "package x\nfunc f() { _ = proxy.New(h.CLI) }\n")); err != nil {
+		t.Errorf("main naming h.CLI: %v", err)
+	}
+	if paidSessionPlace(source(t, "internal/console/ui/x.go", "package x\nfunc f() { _ = proxy.New(h.CLI) }\n")) == nil {
+		t.Error("ui naming h.CLI passed")
 	}
 }

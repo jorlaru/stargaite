@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jorlaru/stargaite/internal/admintest"
 	"github.com/jorlaru/stargaite/internal/config"
 	"github.com/jorlaru/stargaite/internal/domain"
 )
@@ -40,10 +41,7 @@ func writeFile(t *testing.T, content string) string {
 }
 
 // annexBEnv sets every credential config.example.yaml references.
-var annexBEnv = map[string]string{
-	"OPENROUTER_API_KEY": "x", "ANTHROPIC_API_KEY": "x", "MINIMAX_PLAN_API_KEY": "x",
-	"LANGFUSE_PUBLIC_KEY": "x", "LANGFUSE_SECRET_KEY": "x",
-}
+var annexBEnv = admintest.AnnexBEnv()
 
 const internalProvider = `version: 1
 providers:

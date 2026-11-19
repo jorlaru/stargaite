@@ -2,36 +2,23 @@ package cli
 
 import (
 	"bytes"
-	"context"
-	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/jorlaru/stargaite/internal/admin"
-	"github.com/jorlaru/stargaite/internal/admission"
-	"github.com/jorlaru/stargaite/internal/api"
-	"github.com/jorlaru/stargaite/internal/config"
-	"github.com/jorlaru/stargaite/internal/store"
-	"github.com/jorlaru/stargaite/internal/telemetry"
-	"github.com/jorlaru/stargaite/internal/transport"
-	records "github.com/jorlaru/stargaite/internal/usage"
+	"github.com/jorlaru/stargaite/internal/admintest"
 )
 
-const testKey = "test-admin-key-of-at-least-32-characters"
+const testKey = admintest.Key
 
 func getenv(vars map[string]string) func(string) string {
 	return func(name string) string { return vars[name] }
@@ -43,54 +30,10 @@ func runMain(vars map[string]string, args ...string) run {
 	return run{code, stdout.String(), stderr.String()}
 }
 
-// adminServer is the admin listener in process, on an empty store, with
-// every credential of config.example.yaml resolving and no name lookup
-// leaving the test. It returns the environment that points the CLI at it.
+// adminServer is the admin listener in process (internal/admintest).
 func adminServer(t *testing.T) map[string]string {
 	t.Helper()
-	st, err := store.Open(context.Background(), t.TempDir(), slog.New(slog.DiscardHandler))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = st.Close() })
-	env := func() config.Env {
-		return config.Env{
-			Lookup: func(n string) (string, bool) { v, ok := annexBEnv[n]; return v, ok },
-			Resolve: func(context.Context, string) ([]netip.Addr, error) {
-				return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
-			},
-		}
-	}
-	cfg, err := config.Open(context.Background(), st, env, time.Now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
-	// The exporter dials loopback for every name, which SEC-4 refuses without
-	// allow_private_network: telemetry test never leaves the host.
-	loopback := func(context.Context, string) ([]netip.Addr, error) {
-		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
-	}
-	spans := telemetry.NewExporter(func() *config.Exporter { return cfg.Snapshot().Exporter },
-		[2]*http.Client{transport.NewClient(false, loopback), transport.NewClient(true, loopback)}, "test", log)
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		spans.Close(ctx)
-	})
-	// targets verify runs on a data plane of its own whose clients resolve
-	// no name, so no call leaves the host.
-	limits, writer := admission.New(cfg.Now, records.Seeder(st.Read(), log)), records.NewWriter(st.Write, log)
-	t.Cleanup(func() { writer.Close(context.Background()) }) // before the store closes
-	noDNS := func(context.Context, string) ([]netip.Addr, error) {
-		return nil, errors.New("no name is resolved in tests")
-	}
-	verify := api.Verify(api.Deps{Config: cfg, Log: log, Clients: [2]*http.Client{transport.NewClient(false, noDNS), transport.NewClient(true, noDNS)},
-		Flight: &sync.WaitGroup{}, Usage: writer, Admission: limits, Counters: &records.Counters{}, Spanned: &records.Counters{}, Spans: spans, Version: "test"})
-	srv := httptest.NewServer(admin.Handler(admin.Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(testKey)), Log: log, Usage: st.Read(),
-		Admission: limits, Spans: spans, Backup: st.Backup, Verify: verify}))
-	t.Cleanup(srv.Close)
-	return map[string]string{"STARGAITE_ADMIN_URL": srv.URL, "STARGAITE_ADMIN_KEY": testKey}
+	return admintest.Server(t)
 }
 
 // oneJSONValue reports whether out is exactly one JSON value.

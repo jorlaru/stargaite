@@ -349,14 +349,10 @@ root_rule() {
 	fi
 }
 
-# check_machine: the root rule, then everything install needs, all reported
-# at once with where to get it (nothing is ever installed here), then exit 1.
-# The host port must be free on loopback unless it is the one .env names and
-# the container runs already.
-check_machine() {
-	local -a missing=()
+# check_docker: Docker, its daemon, Compose and a .env Compose reads, or what
+# is missing appended to the caller's missing.
+check_docker() {
 	local v
-	root_rule
 	if ! command -v docker >/dev/null; then
 		missing+=("Docker: see https://docs.docker.com/engine/install/")
 	elif ! v=$(docker info --format '{{.ServerVersion}}' 2>&1); then
@@ -374,15 +370,31 @@ check_machine() {
 		[[ $v =~ ^(.*line\ [0-9]+) ]] && v=${BASH_REMATCH[1]}
 		missing+=("a .env and compose.override.yaml that Compose reads (docker compose ps: ${v%%$'\n'*})")
 	fi
+}
+
+# report_missing: nothing missing, or all of it with where to get it (nothing
+# is ever installed here), then exit 1.
+report_missing() {
+	((${#missing[@]} == 0)) && return 0
+	say "setup.sh needs, before anything else:"
+	printf '  - %s\n' "${missing[@]}"
+	exit 1
+}
+
+# check_machine: the root rule, then everything install needs, all reported
+# at once. The host port must be free on loopback unless it is the one .env
+# names and the container runs already.
+check_machine() {
+	local -a missing=()
+	local v
+	root_rule
+	check_docker
 	command -v curl >/dev/null || missing+=("curl: see https://curl.se/download.html")
 	command -v jq >/dev/null || missing+=("jq: see https://jqlang.org/download/")
 	if v=$(docker compose ps -q 2>/dev/null) && [[ $port != "$env_port" || -z $v ]] && (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
 		missing+=("a free host port: 127.0.0.1:$port is taken; give another with --port <n>")
 	fi
-	((${#missing[@]} == 0)) && return 0
-	say "setup.sh needs, before anything else:"
-	printf '  - %s\n' "${missing[@]}"
-	exit 1
+	report_missing
 }
 
 # wait_ready: /health/ready within 120 s, else the last 30 log lines, exit 1.
@@ -819,13 +831,35 @@ telemetry() {
 	ctl telemetry test
 }
 
-# status: the running version and the clone's, and the state of each
-# credential, of the providers and of telemetry; no more (cut 1 of the
-# design's section 6). With --check, first whether the upstream has an
-# upgrade, from one bounded git fetch.
-status() {
-	local v id
+# console ARGS...: this script becomes the console, bin/stargaite-console
+# (docs/design/phase-7.md section 3), run with ARGS. It is exported first from
+# the Dockerfile's console stage when it is missing, reports another version
+# than the clone's, or either is dev or dirty. The export needs Docker's
+# buildx component and is bounded as compose_up is.
+console() {
+	local -a missing=()
+	local have=""
+	root_rule
+	check_docker
+	((${#missing[@]})) || docker buildx version >/dev/null 2>&1 ||
+		missing+=("Docker's buildx component, which builds the console: docker-buildx-plugin from Docker's packages, or docker-buildx on Debian")
+	report_missing
 	clone_version
+	[[ -x bin/stargaite-console ]] && have=$(timeout 10 bin/stargaite-console --version 2>/dev/null)
+	if [[ $have != "$STARGAITE_VERSION" || $have == dev || $have == *-dirty ]]; then
+		say "building the console, version $STARGAITE_VERSION, into bin/"
+		# --quiet: only a failure prints, on standard error.
+		VERSION=$STARGAITE_VERSION DOCKER_BUILDKIT=1 timeout --foreground -k 10 1200 \
+			docker build --quiet --build-arg VERSION --target console --output type=local,dest=bin . >/dev/null ||
+			die "the console was not built within 20 minutes or failed; Docker's output is above"
+	fi
+	exec bin/stargaite-console "$@"
+}
+
+# status: with --check, first whether the upstream has an upgrade, from one
+# bounded git fetch; then the console's status: what exists, and the running
+# version and the clone's.
+status() {
 	if [[ -v opt[check] ]]; then
 		fetch
 		if ((ahead)); then
@@ -834,19 +868,7 @@ status() {
 			say "upgrade: none, up to date with $upstream"
 		fi
 	fi
-	if id=$(docker compose ps -q 2>/dev/null) && [[ -z $id ]]; then
-		say "version: $STARGAITE_VERSION in this clone; no container runs (./setup.sh install starts it)"
-		return
-	fi
-	machine
-	v=$(ctl version --json) || die "the running version was not read"
-	say "version: $(field "$v" .version) running, $STARGAITE_VERSION in this clone"
-	cli providers list || exit 1
-	field "$reply" '.providers[] | "provider \(.name): credential \(.credential)"'
-	cli telemetry status || exit 1
-	field "$reply" 'if .telemetry.otlp_endpoint == null then "telemetry: not set" else "telemetry \(.telemetry.otlp_endpoint): " +
-		(if .unresolved then "credentials unresolved: \(.unresolved | join(", "))" elif .telemetry.basic_auth_env // .telemetry.header_env
-		then "credentials resolved" else "no credential" end) end'
+	console status
 }
 
 # remote: the data plane published on loopback and the addresses given,
@@ -1093,8 +1115,9 @@ subcommands:
             whole, then telemetry test
   remote    publish the data plane beyond loopback, always with TLS: your
             certificate or a self-signed one; run again, it renews it
-  status    the running and the clone's versions, each credential's state;
-            with --check, whether the clone's upstream has an upgrade
+  status    what exists: providers, aliases, keys, budgets, telemetry and both
+            versions; with --check, first whether the clone's upstream has
+            an upgrade
   upgrade   fast-forward this clone to its upstream and rebuild, keeping the
             previous image and taking a backup just before the new version
             starts, then checking it; it prints the way back

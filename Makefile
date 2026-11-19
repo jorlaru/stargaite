@@ -47,6 +47,9 @@ check:
 	@test -z "$$(gofmt -l .)" || { echo "gofmt needed:"; gofmt -l .; exit 1; }
 	go vet ./...
 	go mod tidy -diff
+	@for p in $(PLATFORMS); do \
+		GOOS=$${p%/*} GOARCH=$${p#*/} CGO_ENABLED=0 go list -deps -f '{{with .Module}}{{if not .Main}}{{.Path}}{{end}}{{end}}' ./cmd/stargaite || echo "go list failed for $$p"; \
+	done | sort -u | diff -u cmd/stargaite/modules.txt - || { echo "the proxy's module set changed (docs/design/phase-7.md section 5): - listed, + built"; exit 1; }
 	$(BIN)/golangci-lint run
 	$(BIN)/govulncheck ./...
 	$(BIN)/shellcheck --shell=bash setup.sh tests/setup/e2e.sh

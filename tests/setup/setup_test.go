@@ -40,8 +40,10 @@ import (
 var shimNames = []string{"docker", "curl", "jq", "git", "id", "stat", "mktemp", "mv", "rm", "timeout", "sleep", "stty",
 	"openssl", "mkdir", "cp", "chmod", "chown", "hostname", "getent"}
 
-// shimBin is the shim, built once for every run.
-var shimBin string
+// shimBin is the shim, built once for every run; consoleBin is the console,
+// version v0.0.0-shim, which the fake docker build exports; consoleDirtyBin
+// and consoleDevBin report v0.0.0-shim-dirty and dev.
+var shimBin, consoleBin, consoleDirtyBin, consoleDevBin string
 
 // record is one shim call, as the shim logs it.
 type record struct {
@@ -58,9 +60,21 @@ func TestMain(m *testing.M) {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		shimBin = filepath.Join(dir, "shim")
+		shimBin, consoleBin = filepath.Join(dir, "shim"), filepath.Join(dir, "stargaite-console")
+		consoleDirtyBin, consoleDevBin = filepath.Join(dir, "dirty", "stargaite-console"), filepath.Join(dir, "dev", "stargaite-console")
+		build := func(out string, ldflags ...string) error {
+			b, err := exec.Command("go", append(append([]string{"build", "-o", out}, ldflags...), "../../cmd/stargaite-console")...).CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("%w\n%s", err, b)
+			}
+			return nil
+		}
 		if out, err := exec.Command("go", "build", "-o", shimBin, "./shim").CombinedOutput(); err != nil {
 			fmt.Fprintf(os.Stderr, "the shim was not built: %v\n%s", err, out)
+			code = 1
+		} else if err := errors.Join(build(consoleBin, "-ldflags", "-X main.version=v0.0.0-shim"),
+			build(consoleDirtyBin, "-ldflags", "-X main.version=v0.0.0-shim-dirty"), build(consoleDevBin)); err != nil {
+			fmt.Fprintf(os.Stderr, "the console was not built: %v\n", err)
 			code = 1
 		} else {
 			code = m.Run()
@@ -112,7 +126,7 @@ func newRun(t *testing.T, env []string, without ...string) *run {
 	}
 	r.realPath = toolsDir(t) + string(os.PathListSeparator) + os.Getenv("PATH")
 	r.env = append([]string{"PATH=" + r.shims, "HOME=" + tmp, "LANG=C", "SETUP_LOG=" + r.log,
-		"SETUP_STATE=" + filepath.Join(tmp, "state"), "SETUP_REAL_PATH=" + r.realPath}, env...)
+		"SETUP_STATE=" + filepath.Join(tmp, "state"), "SETUP_REAL_PATH=" + r.realPath, "SETUP_CONSOLE=" + consoleBin}, env...)
 	return r
 }
 
@@ -630,11 +644,11 @@ func TestSetupFlags(t *testing.T) {
 		}
 
 		got, out = sub("status")
-		if !slices.Equal(got, []string{"version", "providers list", "telemetry status"}) {
+		if !slices.Equal(got, []string{"version", "providers list", "models list", "targets list", "keys list", "settings show", "telemetry status"}) {
 			t.Errorf("status: %q", got)
 		}
 		for _, s := range []string{"version: v0.6.0-fake running, dev in this clone", "provider acme: credential resolved", "provider ollama: credential none",
-			"telemetry http://host.docker.internal:4318: credentials resolved"} {
+			"telemetry http://host.docker.internal:4318: credentials resolved", "spend: capped at 20 USD, resets daily"} {
 			if !strings.Contains(out, s) {
 				t.Errorf("status: no %q in:\n%s", s, out)
 			}
@@ -777,6 +791,82 @@ func TestSetupFlags(t *testing.T) {
 		code, out := r.exec(acme(freePort(t), "--key-env", "from")...)
 		if code != 2 || !strings.Contains(out, "exported to this script") || strings.Contains(r.file(".env"), "ACME_API_KEY") {
 			t.Errorf("exit %d:\n%s", code, out)
+		}
+	})
+
+	// status runs the console, exported to bin/ from the Dockerfile's
+	// console stage when it is missing, of another version, or of a dev or
+	// dirty clone; the export needs buildx and is bounded to 20 minutes.
+	t.Run("console export", func(t *testing.T) {
+		const export = "docker build --quiet --build-arg VERSION --target console --output type=local,dest=bin ."
+		for _, c := range []struct{ name, env, want string }{
+			{"no buildx", "FAKE_BUILDX=missing", "Docker's buildx component, which builds the console: docker-buildx-plugin from Docker's packages, or docker-buildx on Debian"},
+			{"export fails", "FAKE_EXPORT=fails", "the console was not built"},
+		} {
+			r := newRun(t, []string{c.env})
+			code, out := r.exec("status")
+			if code != 1 || !strings.Contains(out, c.want) || len(r.cli()) != 0 || (c.env == "FAKE_BUILDX=missing") != (r.count("docker", export) == 0) {
+				t.Errorf("%s: exit %d, %d exports:\n%s", c.name, code, r.count("docker", export), out)
+			}
+		}
+
+		r := newRun(t, nil)
+		gitIn(t, r.dir, "init", "-q")
+		gitIn(t, r.dir, "add", "setup.sh", "compose.yaml")
+		gitIn(t, r.dir, "commit", "-q", "-m", "first")
+		gitIn(t, r.dir, "tag", "v0.0.0-shim")
+		code, out := r.exec("status")
+		if code != 0 || !strings.Contains(out, "version: v0.0.0-shim in this clone; no container runs") ||
+			r.count("timeout", "timeout --foreground -k 10 1200 "+export) != 1 || r.count("docker", export) != 1 {
+			t.Errorf("first status: exit %d, %d exports:\n%s", code, r.count("docker", export), out)
+		}
+		if fi, err := os.Stat(filepath.Join(r.dir, "bin", "stargaite-console")); err != nil || fi.Mode().Perm() != 0o755 {
+			t.Errorf("bin/stargaite-console: %v", err)
+		}
+		if code, out := r.exec("status"); code != 0 || !strings.Contains(out, "version: v0.0.0-shim in this clone") || r.count("docker", export) != 1 {
+			t.Errorf("second status: exit %d, %d exports, want 1:\n%s", code, r.count("docker", export), out)
+		}
+		// A dirty clone exports every time.
+		if err := os.WriteFile(filepath.Join(r.dir, "compose.yaml"), []byte(r.file("compose.yaml")+"# changed\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for i := 2; i <= 3; i++ {
+			if code, out := r.exec("status"); code != 0 || !strings.Contains(out, "version: v0.0.0-shim-dirty in this clone") || r.count("docker", export) != i {
+				t.Errorf("dirty status: exit %d, %d exports, want %d:\n%s", code, r.count("docker", export), i, out)
+			}
+		}
+
+		// The console's own version decides too: one that reports a dirty or
+		// a dev version is exported again although it equals the clone's.
+		for _, c := range []struct {
+			name, bin, want string
+			git             bool
+		}{
+			{"dirty console", consoleDirtyBin, "version: v0.0.0-shim-dirty in this clone", true},
+			{"dev console", consoleDevBin, "version: dev in this clone", false},
+		} {
+			r := newRun(t, []string{"SETUP_CONSOLE=" + c.bin})
+			if c.git {
+				gitIn(t, r.dir, "init", "-q")
+				gitIn(t, r.dir, "add", "setup.sh", "compose.yaml")
+				gitIn(t, r.dir, "commit", "-q", "-m", "first")
+				gitIn(t, r.dir, "tag", "v0.0.0-shim")
+				if err := os.WriteFile(filepath.Join(r.dir, "compose.yaml"), []byte(r.file("compose.yaml")+"# changed\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for i := 1; i <= 2; i++ {
+				if code, out := r.exec("status"); code != 0 || !strings.Contains(out, c.want) || r.count("docker", export) != i {
+					t.Errorf("%s, status %d: exit %d, %d exports, want %d:\n%s", c.name, i, code, r.count("docker", export), i, out)
+				}
+			}
+		}
+
+		r = newRun(t, []string{"FAKE_EXPORT=hang", "FAKE_TIMEOUT=1"})
+		start := time.Now()
+		code, out = r.exec("status")
+		if took := time.Since(start); code != 1 || took > 15*time.Second || !strings.Contains(out, "the console was not built within 20 minutes") || len(r.cli()) != 0 {
+			t.Errorf("export outlives its bound: exit %d after %s:\n%s", code, took, out)
 		}
 	})
 }

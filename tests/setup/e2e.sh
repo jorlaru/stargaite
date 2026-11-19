@@ -146,6 +146,7 @@ main() {
 	again status
 	[[ $out == *"version: $want running, $want in this clone"* && $out == *"provider mock: credential resolved"* &&
 		$out == *"credentials resolved"* ]] || fail "status does not show the versions and the credentials"
+	[[ $("$tree/bin/stargaite-console" --version) == "$want" ]] || fail "the console exported is not this clone's version"
 	# Upgrade: the copy's upstream, a bare repository, holds one commit more.
 	# upgrade keeps the previous image, builds, backs up, starts and checks
 	# the new version; then the way back it printed is run as printed, and

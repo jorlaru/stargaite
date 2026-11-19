@@ -89,7 +89,7 @@ The `stargaite` binary is both the server (`stargaite serve`) and its CLI, which
 `./setup.sh` installs StargAIte on Linux with Docker by asking questions: it checks the machine, builds and starts the
 container, and goes from a provider to a client key and a first answer. You need:
 
-- Docker Engine with Docker Compose 2.24.4 or later, which your user may run;
+- Docker Engine with Docker Compose 2.24.4 or later and Docker's buildx component, which your user may run;
 - `curl` and `jq`;
 - `git`, to clone this repository and, later, to upgrade;
 - bash 4.4 or later, which every current Linux distribution has. macOS and native Windows are not supported yet; WSL
@@ -107,8 +107,10 @@ As root, where `sudo` may not be installed, leave out `sudo` and the third line.
 script, which adds Docker's package repository and installs Docker Engine and Compose; read it first if you like, and
 for a production machine follow Docker's step-by-step instructions for
 [Debian](https://docs.docker.com/engine/install/debian/) or [Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
-instead. The distributions' own packages may lack Compose or ship one older than 2.24.4. The third line lets your user
-run Docker once you log in again; membership of the `docker` group is equivalent to root. On another distribution,
+instead. The distributions' own packages may lack Compose or ship one older than 2.24.4. Docker's packages install
+the buildx component with Compose (`docker-buildx-plugin`); among Debian's own it is `docker-buildx`, which
+`./setup.sh status` needs to build the console. The third line lets your user run Docker once you log in again;
+membership of the `docker` group is equivalent to root. On another distribution,
 install [Docker](https://docs.docker.com/engine/install/), [curl](https://curl.se/download.html),
 [jq](https://jqlang.org/download/) and [git](https://git-scm.com/downloads) from their pages. Then, as the user
 who owns the clone (not with `sudo`):
@@ -150,7 +152,7 @@ Run again on an installation, it offers a menu, or takes a subcommand; `./setup.
 | `budget` | A spending limit on the instance, an alias or a key; the prices of the targets it reaches unpriced are asked first |
 | `telemetry` | Traces to Langfuse or any OTLP endpoint, then `telemetry test` |
 | `remote` | Publish the data plane beyond loopback, always with TLS: your certificate or a self-signed one ([Install with Docker by hand](#install-with-docker-by-hand), day two) |
-| `status` | The running and the clone's versions and each credential's state; `--check` also says whether an upgrade is available |
+| `status` | What exists: providers and their credentials, aliases with their models in order, models in no alias, keys, budgets, telemetry, and the running and the clone's versions; `--check` first says whether an upgrade is available |
 | `upgrade` | Fast-forward the clone and rebuild, keeping the previous image and taking a backup first, then print the way back |
 
 It asks only when its standard input and output are both a terminal. Every answer is also a flag, so a script, CI or an

@@ -185,7 +185,9 @@ func envNames() []string {
 // container runs from its next up; FAKE_UPGRADE=build-fails fails the build,
 // start-fails the up after it, invalid makes validate fail on the new
 // version, backup-short cuts backup - short, and legacy is a CLI from before
-// restore. FAKE_VERSION is the version before any build.
+// restore. FAKE_VERSION is the version before any build. FAKE_BUILDX=missing
+// is a Docker without its buildx component; the console's export is
+// fakeExport.
 func fakeDocker(args []string) int {
 	st := loadState()
 	defer st.save()
@@ -208,6 +210,14 @@ func fakeDocker(args []string) int {
 			return 0
 		}
 		fmt.Println("28.5.1")
+	case slices.Equal(args, []string{"buildx", "version"}):
+		if os.Getenv("FAKE_BUILDX") == "missing" {
+			fmt.Fprintln(os.Stderr, "docker: unknown command: docker buildx")
+			return 1
+		}
+		fmt.Println("github.com/docker/buildx v0.39.0-fake")
+	case len(args) > 0 && args[0] == "build" && slices.Contains(args, "console"):
+		return fakeExport(args)
 	case len(args) < 2 || args[0] != "compose":
 		fmt.Fprintln(os.Stderr, "fake docker: not handled:", args)
 		return 1
@@ -296,6 +306,44 @@ func fakeDocker(args []string) int {
 		return code
 	default:
 		fmt.Fprintln(os.Stderr, "fake docker: not handled:", args)
+		return 1
+	}
+	return 0
+}
+
+// fakeExport answers docker build --build-arg VERSION --target console
+// --output type=local,dest=<d> ., with VERSION in the environment: it copies
+// $SETUP_CONSOLE to <d>/stargaite-console through a rename, a new inode as
+// BuildKit's local exporter gives. FAKE_EXPORT=fails fails the build, and
+// FAKE_EXPORT=hang makes it last 30 s.
+func fakeExport(args []string) int {
+	i := slices.Index(args, "--output")
+	if i < 0 || i+1 == len(args) || !strings.HasPrefix(args[i+1], "type=local,dest=") || !slices.Contains(args, "--target") ||
+		!slices.Contains(args, "--build-arg") || os.Getenv("VERSION") == "" {
+		fmt.Fprintln(os.Stderr, "fake docker: not handled:", args)
+		return 1
+	}
+	switch os.Getenv("FAKE_EXPORT") {
+	case "fails":
+		fmt.Fprintln(os.Stderr, "ERROR: failed to solve: fake")
+		return 1
+	case "hang":
+		time.Sleep(30 * time.Second)
+	}
+	dest := strings.TrimPrefix(args[i+1], "type=local,dest=")
+	data, err := os.ReadFile(os.Getenv("SETUP_CONSOLE"))
+	if err == nil {
+		err = os.MkdirAll(dest, 0o755)
+	}
+	tmp := filepath.Join(dest, ".stargaite-console.tmp")
+	if err == nil {
+		err = os.WriteFile(tmp, data, 0o755)
+	}
+	if err == nil {
+		err = os.Rename(tmp, filepath.Join(dest, "stargaite-console"))
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "fake docker build:", err)
 		return 1
 	}
 	return 0

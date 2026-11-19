@@ -49,8 +49,8 @@ shape of a declaration, not the behaviour of a named product. Performance figure
 | Problem | Agents and automations that consume LLMs end up coupled to a provider, an endpoint and an upstream model: changing any of the three means touching every consumer. General-purpose gateways remove that coupling, but they usually bring a UI, an external database and features many deployments never use, and they can make it hard to see what is actually sent to the provider (§3) |
 | Goal and audience | Give technical consumers (agents in code, workflow tools, microservices) a stable inference contract, so that the provider, the endpoint, the model or the proxy itself can be replaced without modifying them. Give the operator certainty about what each request sent and what it cost |
 | The usual alternative | Consumers call a general-purpose gateway by alias, or call each provider directly |
-| What changes | One binary with no UI and no external database that only authenticates, routes, translates parameters, limits and measures. Every change it makes to a request is visible. Configuration lives in one place and changes without a restart |
-| Vision | Replacing a provider, a model or the whole proxy needs no change in agent logic, and running it costs little: at most 20,000 lines of production code and 0.2 FTE once stable (§23) |
+| What changes | One proxy binary with no UI and no external database that only authenticates, routes, translates parameters, limits and measures; a separate console on the host configures it through the CLI. Every change it makes to a request is visible. Configuration lives in one place and changes without a restart |
+| Vision | Replacing a provider, a model or the whole proxy needs no change in agent logic, and running it costs little: at most 20,000 lines of production code in the proxy (the console has its own ceiling, docs/design/phase-7.md §9) and 0.2 FTE once stable (§23) |
 | Neighbours | Consumers (OpenAI and Anthropic SDK clients, HTTP calls from workflow tools), inference providers, observability backends that ingest OTLP (Langfuse, LangSmith, an OpenTelemetry Collector) and existing gateways (LiteLLM, Bifrost), whose code may be studied for ideas. This project is built from scratch |
 
 The chain the product preserves: `agent → inference client → proxy → provider`. The agent only sees "inference";
@@ -146,7 +146,7 @@ All `decided`.
 | Id | Principle |
 |---|---|
 | PRI-1 | Minimal: whatever is not needed is left out |
-| PRI-2 | LLM proxy only: no MCP, no agents, no guardrails, no UI, no external database |
+| PRI-2 | LLM proxy only: no MCP, no agents, no guardrails, no external database; the proxy has no UI, and the console is a separate host binary that configures it through the CLI |
 | PRI-3 | Drop-in: an OpenAI or Anthropic client works by changing only the base URL, the key and the model name |
 | PRI-4 | The alias is a contract: clients call a model alias, and what the alias guarantees does not change when its targets do |
 | PRI-5 | No silent changes: every change the proxy makes to a request is listed where the operator and the client can see it |
@@ -510,7 +510,7 @@ validation package in process.
 | `stargaite secrets reload` | Resolve credential references again |
 | `stargaite backup <file\|->`, `stargaite restore <file\|-> --yes`, `stargaite version` | Copy the store, to a file or to standard output; put a copy back while `serve` is stopped; print the version |
 
-`setup.sh` (OPS-11) asks the questions and runs these commands for a person; it adds no command.
+`setup.sh` (OPS-11) and the console it starts, `stargaite-console`, ask the questions and run these commands for a person; they add no command.
 
 Flags follow one convention. Every scalar field of §6 is a flag of `add` (`create` for keys) and `set`, named after
 the field with dashes (`--rpm-limit`, `--trace-sample-rate`); the alias's `reasoning.effort`, `reasoning.mode` and
@@ -549,7 +549,7 @@ at least one `--model <alias>` or an explicit `--all-models`: a key never gets a
 | Id | Rule |
 |---|---|
 | OPS-1 | All configuration lives in the embedded store and changes only through the admin API. There is no configuration file to edit and no second store. `config.example.yaml` in the repository is an input for `apply`, not something the proxy reads |
-| OPS-2 | Nothing ever prompts, except `setup.sh`, the guided assistant at the root of the repository, under OPS-11. Every `stargaite` command accepts `--json`, and every command, `setup.sh` included, returns `0` on success, `1` on failure and `2` on wrong usage. A command that deletes or revokes (`remove`, `keys revoke`, `telemetry unset`, `restore`, and `apply --prune` unless it is a `--dry-run`) fails with `2` unless `--yes` is given. `apply` accepts `--dry-run`: it validates and shows the difference without publishing |
+| OPS-2 | Nothing ever prompts, except `setup.sh`, the guided assistant at the root of the repository, and the console it starts, `stargaite-console`, under OPS-11. Every `stargaite` command accepts `--json`, and every command, `setup.sh` and the console included, returns `0` on success, `1` on failure and `2` on wrong usage. A command that deletes or revokes (`remove`, `keys revoke`, `telemetry unset`, `restore`, and `apply --prune` unless it is a `--dry-run`) fails with `2` unless `--yes` is given. `apply` accepts `--dry-run`: it validates and shows the difference without publishing |
 | OPS-3 | `export` writes the whole configuration as YAML, without secrets. `apply -f` validates the file, shows the difference and publishes it in one step; it creates and updates: a resource named in the file is replaced by the file's declaration as a whole, so a field the file omits returns to its default. What is absent from the file is left untouched unless `--prune` is given: then absent providers, targets and aliases are removed, absent keys are revoked (not deleted) and absent settings return to their defaults. An invalid file leaves the active configuration untouched. A key in the file that does not exist yet is created with a new secret, which `apply` prints once; a key that exists keeps its secret. `export` omits revoked keys, and a file that names a revoked key makes `apply` fail with `409 conflict`: a revoked name is never reused. Exporting from one instance and applying to an empty one therefore reproduces the configuration with new key secrets; cloning an instance with its secrets is what `backup` is for. A resource created by `apply` takes only what the file declares: it does not inherit a provider's `target_defaults`. Where a command reads a file (`apply -f`, `validate -f`, `models explain --body`, `restore`), `-` reads standard input, never a terminal; `backup -` writes the copy to standard output, never a terminal, and its summary to standard error. A pipe cut short is still valid YAML and `apply` replaces each resource it names whole, so `export` ends its YAML with the document end marker `...` and `apply -f -` publishes only a document whose last line is that marker, or one JSON document, which a cut leaves unclosed; `apply -f - --dry-run` needs no marker, and `apply -f - --prune` needs `--dry-run` |
 | OPS-4 | Every change publishes a new immutable snapshot atomically and increments the configuration revision. Requests in flight finish with the snapshot they started with. Nothing needs a restart. A change with an empty difference, and the publication at start, keep the revision: only a real difference increments it |
 | OPS-5 | Every change, from a single command or from `apply`, is validated against the whole resulting configuration before it is published. A failed check refuses the change with exit code `1`: unknown providers and targets, aliases without targets, `requires` not met (PAR-5), missing or excessive output caps (PAR-6, PAR-7), `forward` rules, on an alias, a target or a provider, that collide with a parameter the proxy writes, a target's `forward` for a parameter it lists in `unsupported_params`, and a provider's or a target's `drop` for a parameter that carries a contractual feature (PAR-2, PAR-4), reasoning rules (RSN-3, RSN-7), unpriced targets under a budget (USE-12), outbound URLs (SEC-4). Warnings never block: chat targets never verified (RSN-9) or with undeclared reasoning fields (RSN-3), credentials that do not resolve, an effort toward a `none` dialect (RSN-5), targets without prices to fall back on (USE-12), aliases that cannot serve an endpoint, a key that names an unknown alias, a quota window longer than the usage retention (LIM-8). `validate` runs the same checks on the active configuration, or on a file with no server running, except the checks that need the store (chat targets never verified) |
@@ -558,7 +558,7 @@ at least one `--model <alias>` or an explicit `--all-models`: a key never gets a
 | OPS-8 | The metrics endpoint exposes, by key and model alias: requests by status, tokens by type, cost, spans emitted, responses with `finish_reason=length`, responses with empty visible content, model mismatches, parameter changes by action and unpriced requests; and for the instance: budget and quota usage and the exporter's counters. The counters exist from the feature that produces them; the `metrics` feature adds the endpoint |
 | OPS-9 | Logs are structured JSON. Each request line carries the request id, the trace id, the key name and, when the body named one, the alias and, for a refused request, the parameter at fault. Logs never contain bearer tokens, provider credentials, sensitive headers, prompts or responses. Repeated errors are rate-limited, except the usage records of USE-10 |
 | OPS-10 | `serve` takes an exclusive lock on the data directory before opening the store and exits with an error when another process holds it |
-| OPS-11 | `setup.sh`, at the root of the repository, guides a person from a clean machine to a first answer and through later changes. It asks only when its standard input and standard output are both a terminal and an answer was not given as a flag; otherwise it takes the answer's stated default, and fails with `2`, naming the flag, when the answer has none. It changes the proxy's configuration only through the CLI. It never installs packages, never uses `sudo`, never edits `compose.yaml`, never removes a volume, and never rewrites git history. A credential is typed without echo or taken from the script's own environment, and written only to `.env`, with mode `0600`; it never appears on screen or in the arguments of a command. It states each change before making it, and each change that replaces something or interrupts traffic needs a confirmation, or `--yes` without a terminal. Every wait is bounded. It states the number of paid calls before making them and never retries one. An upgrade keeps the previous image and takes a backup before it starts the new version. It publishes the data plane beyond loopback only with TLS (SEC-6) |
+| OPS-11 | The assistant, `setup.sh` at the root of the repository and the console it starts, guides a person from a clean machine to a first answer and through later changes. It asks only when its standard input and standard output are both a terminal and an answer was not given as a flag; otherwise it takes the answer's stated default, and fails with `2`, naming the flag, when the answer has none. It changes the proxy's configuration only through the CLI. It never installs packages, never uses `sudo`, never edits `compose.yaml`, never removes a volume, and never rewrites git history. A credential is typed without echo or taken from the script's own environment, and written only to `.env`, with mode `0600`; it never appears on screen or in the arguments of a command. It states each change before making it, and each change that replaces something or interrupts traffic needs a confirmation, or `--yes` without a terminal. Every wait is bounded. It states the number of paid calls before making them and never retries one. An upgrade keeps the previous image and takes a backup before it starts the new version. It publishes the data plane beyond loopback only with TLS (SEC-6). The console never reads or writes the clipboard, never publishes the admin listener, shows a client key only until the reader confirms storing it, and follows logs only while the reader watches. |
 
 ## 14. Request flow and resilience
 
@@ -671,7 +671,7 @@ All `proposed`.
 
 | ADR | Decision | Chosen | Discarded |
 |---|---|---|---|
-| ADR-001 | Language | Go 1.27.4 or later, one static binary for Linux and macOS; `govulncheck` runs in `make ci` (PUB-5). `decided` | Rust, C++; Windows in v1 |
+| ADR-001 | Language | Go 1.27.4 or later, one static binary for Linux and macOS, and a second static binary, the console, which runs on Linux hosts; `govulncheck` runs in `make ci` (PUB-5). `decided` | Rust, C++; Windows in v1 |
 | ADR-002 | HTTP and JSON | Standard `net/http`. Bodies are read and edited in place by a single-pass scanner that rejects duplicate keys (PAR-1), built on the JSON tokenizer of the standard library (`encoding/json/jsontext`); message content stays raw JSON whenever the format does not change. `decided` | Web frameworks; decoding every body into structs; `gjson` and `sjson`, which do not detect duplicate keys |
 | ADR-003 | Storage | Embedded SQLite through `modernc.org/sqlite` (no CGO), a single writer goroutine fed by a bounded channel and a separate read pool. Every connection is opened with `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON` and `busy_timeout=5000`; none of these is part of a migration | A CGO driver; an external PostgreSQL; a key-value store |
 | ADR-004 | Single source of truth | The embedded store, changed only through the admin API, published as immutable in-memory snapshots, with `export` and `apply` as YAML. `decided` | A hand-edited file plus database overrides; two stores |
@@ -692,8 +692,10 @@ All `proposed`.
 | ADR-019 | Provider presets | A built-in catalog of providers, copied into the configuration when used | Looking presets up at run time; a model catalog; a catalog synchronised from the internet |
 | ADR-020 | Reasoning text | Relayed unchanged on native paths; inline `<think>` blocks removed only for targets that declare them | Parsing and moving every provider's reasoning field |
 | ADR-021 | Topology | One writer instance with a persistent data directory and an exclusive lock on it, one instance per environment, and a separate admin listener | Active-active; environments inside one instance |
+| ADR-022 | Console | Bubble Tea v2 (`charm.land/bubbletea/v2` v2.1.2) pinned, its one library; the pick and the single-line input written here, no Lip Gloss or Bubbles (Lip Gloss detects the terminal at package init); `cmd/stargaite-console` in the same module, never imported by the proxy, which `make check` holds to a committed module list. `decided` | Hand-written terminal I/O throughout; Lip Gloss and Bubbles; a command inside the proxy binary; a web UI |
 
-Distribution: a static binary and an OCI image on a minimal base. The image runs plain `serve`, on loopback like the
+Distribution: a static binary and an OCI image on a minimal base, and the console, exported by `setup.sh` from its own
+Dockerfile stage to `bin/`. The image runs plain `serve`, on loopback like the
 binary; the guide shows the explicit flags that open it (SEC-6). Indicative container resources, to be adjusted with
 the benchmark: request 50m CPU and 64 Mi, limit 1000m CPU and 256 Mi. The proposed package layout is in annex C.
 
@@ -899,7 +901,7 @@ Success and abandonment thresholds with a deadline are `open` (OQ-3).
 | visibility | recording requested, alias and sent values, read from the outgoing body, ends the misdiagnosis of reasoning effort | answering "what did this request send, and did it matter?" with one command | Whether `models explain` and `usage show` answer it without reading code or provider logs |
 | telemetry | one OTLP exporter with one fixed schema survives upgrades of the proxy and of the backend | no reconfiguration and no lost attribution after an upgrade | The golden test and the integration job across versions |
 | data | a local SQLite store is enough as the official record of usage | reliable budgets without an external database | Committed records lost: 0 |
-| operation | the core stays small | a low maintenance cost | Lines of production code and effort once stable: at most 20,000 lines and 0.2 FTE |
+| operation | the core stays small | a low maintenance cost | Lines of production code and effort once stable: at most 20,000 lines of production code in the proxy (the console has its own ceiling, docs/design/phase-7.md §9) and 0.2 FTE |
 | adoption | anyone can clone it and run it | usefulness without adapting the code | PUB-3 and PUB-5 on a clean machine and on a fork |
 
 ## 24. Out of scope
@@ -1334,8 +1336,9 @@ keys:
 ```text
 stargaite/
 ├── cmd/
-│   └── stargaite/
-│       └── main.go          # single entry point: `serve` and the CLI
+│   ├── stargaite/
+│   │   └── main.go          # the proxy: `serve` and the CLI
+│   └── stargaite-console/   # the console: a host binary that configures the proxy through the CLI
 ├── internal/
 │   ├── domain/              # Provider, Target, Model, Key, Usage; the catalog of error codes
 │   ├── store/               # SQLite (modernc), embedded migrations, single writer, backup
@@ -1355,16 +1358,18 @@ stargaite/
 │   ├── telemetry/           # span schema, OTLP/HTTP JSON exporter, queue
 │   ├── api/                 # data plane handlers
 │   ├── admin/               # admin API and audit
-│   └── cli/                 # the CLI, a client of the admin API
+│   ├── cli/                 # the CLI, a client of the admin API
+│   ├── console/             # the console's packages: ui, pieces, tasks, proxy calls, host
+│   └── admintest/           # the admin API in process, for tests only
 ├── tests/
 │   ├── mockprovider/        # local provider for CI: both protocols, scripted failures
 │   ├── contract/            # per-target suite
 │   ├── adversarial/
 │   ├── benchmark/
 │   └── setup/               # setup.sh against shims and, end to end, the mock provider
-├── Dockerfile               # multi-stage build to a minimal non-root image
+├── Dockerfile               # multi-stage build to a minimal non-root image; a stage exports the console
 ├── Makefile                 # `make ci` runs every check
-├── setup.sh                 # the guided assistant (OPS-11)
+├── setup.sh                 # the bootstrap of the console and the guided assistant (OPS-11)
 ├── config.example.yaml
 └── go.mod
 ```

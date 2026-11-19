@@ -1,0 +1,11 @@
+github.com/dustin/go-humanize
+github.com/google/uuid
+github.com/mattn/go-isatty
+github.com/ncruces/go-strftime
+github.com/remyoudompheng/bigfft
+go.yaml.in/yaml/v3
+golang.org/x/sys
+modernc.org/libc
+modernc.org/mathutil
+modernc.org/memory
+modernc.org/sqlite

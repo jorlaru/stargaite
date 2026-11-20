@@ -3,6 +3,7 @@ package task
 import (
 	"context"
 	"errors"
+	"maps"
 	"slices"
 	"strings"
 
@@ -126,8 +127,48 @@ func facts(export proxy.ExportReply, validate proxy.Change) rules.Facts {
 	for n, m := range export.Models {
 		aliases[n] = len(m.Targets)
 	}
-	return rules.Facts{Providers: len(export.Providers), Keys: len(export.Keys), Aliases: aliases,
+	f := rules.Facts{Providers: len(export.Providers), Keys: len(export.Keys), Aliases: aliases,
 		Unresolved: unresolved(validate.Findings), Uncapped: export.Settings.Budget == nil}
+	f.Unverified = unverified(export, validate.Findings, f.Unresolved)
+	return f
+}
+
+// unverified is, per provider whose credential resolves and none of whose
+// chat targets is checked (each one validate's target_unverified), the
+// first alias by name that holds the first of them an alias holds, "" none.
+func unverified(export proxy.ExportReply, findings []proxy.Finding, unresolved map[string]string) map[string]string {
+	never := map[string]bool{}
+	for _, f := range findings {
+		if id, ok := strings.CutPrefix(f.Resource, "targets/"); ok && f.Code == "target_unverified" {
+			never[id] = true
+		}
+	}
+	out, checked := map[string]string{}, map[string]bool{}
+	for _, id := range slices.Sorted(maps.Keys(export.Targets)) {
+		p, _, _ := strings.Cut(id, "/")
+		_, bad := unresolved[p]
+		switch {
+		case export.Targets[id].Kind != "chat" || bad:
+		case !never[id]:
+			checked[p] = true
+		case out[p] == "":
+			out[p] = holder(export, id)
+		}
+	}
+	for p := range checked {
+		delete(out, p)
+	}
+	return out
+}
+
+// holder is the first alias by name whose targets hold target, "" none.
+func holder(export proxy.ExportReply, target string) string {
+	for _, a := range slices.Sorted(maps.Keys(export.Models)) {
+		if slices.Contains(export.Models[a].Targets, target) {
+			return a
+		}
+	}
+	return ""
 }
 
 // readFacts reads export and validate, concurrently, and judges them.

@@ -147,7 +147,10 @@ func (p *plane) probes() int {
 
 // serveOnUp serves readiness on port once compose up is logged, as a
 // container would: the port must be free before.
-func (m *machineWorld) serveOnUp(port string) {
+func (m *machineWorld) serveOnUp(port string) { m.serveOn(port, "compose up", 0) }
+
+// serveOn serves readiness on port after a pause once argv is logged.
+func (m *machineWorld) serveOn(port, argv string, pause time.Duration) {
 	var mu sync.Mutex
 	var p *plane
 	stop := make(chan struct{})
@@ -160,12 +163,17 @@ func (m *machineWorld) serveOnUp(port string) {
 		}
 	})
 	go func() {
-		for !strings.Contains(m.dockerLog(), "compose up") {
+		for !strings.Contains(m.dockerLog(), argv) {
 			select {
 			case <-stop:
 				return
 			case <-time.After(10 * time.Millisecond):
 			}
+		}
+		select {
+		case <-stop:
+			return
+		case <-time.After(pause):
 		}
 		mu.Lock()
 		defer mu.Unlock()

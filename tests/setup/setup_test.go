@@ -1168,6 +1168,62 @@ func TestSetupNoTTY(t *testing.T) {
 	}
 }
 
+// TestSetupMachineTasks: stop, start, logs, backup, restore and uninstall
+// run the console's machine tasks in flags mode (C64a): what interrupts or
+// removes needs --yes, logs --follow needs a terminal, and a refusal runs
+// nothing.
+func TestSetupMachineTasks(t *testing.T) {
+	r := newRun(t, []string{"SRC=v"})
+	if code, out := r.exec(acme(freePort(t))...); code != 0 {
+		t.Fatalf("install: exit %d:\n%s", code, out)
+	}
+	if code, out := r.exec("stop"); code != 2 || !strings.Contains(out, "missing --yes: the container is stopped") || r.count("docker", "compose stop") != 0 {
+		t.Errorf("stop: exit %d, %d stops:\n%s", code, r.count("docker", "compose stop"), out)
+	}
+	if code, out := r.exec("stop", "--yes"); code != 0 || !strings.Contains(out, "Done: the container is stopped.") || r.count("docker", "compose stop") != 1 {
+		t.Errorf("stop --yes: exit %d, %d stops:\n%s", code, r.count("docker", "compose stop"), out)
+	}
+	ups := r.count("docker", "compose up -d --no-build")
+	if code, out := r.exec("start"); code != 0 || !strings.Contains(out, "Done: the container is started and ready.") ||
+		r.count("docker", "compose up -d --no-build") != ups+1 {
+		t.Errorf("start: exit %d:\n%s", code, out)
+	}
+	if code, out := r.exec("logs", "--follow"); code != 2 ||
+		!strings.Contains(out, "--follow needs a terminal: the console follows logs only while someone watches") || r.count("docker", "compose logs") != 0 {
+		t.Errorf("logs --follow: exit %d:\n%s", code, out)
+	}
+	if code, out := r.exec("logs"); code != 0 || !strings.Contains(out, "a log line") || !strings.Contains(out, "Done: the last 100 log lines are above.") ||
+		r.count("docker", "compose logs --no-log-prefix --tail 100 stargaite") != 1 || r.count("docker", "compose logs") != 1 {
+		t.Errorf("logs: exit %d:\n%s", code, out)
+	}
+	code, out := r.exec("backup")
+	copies, _ := filepath.Glob(filepath.Join(r.dir, "backups", "v0.6.0-fake-*Z.db"))
+	if code != 0 || len(copies) != 1 {
+		t.Fatalf("backup: exit %d, copies %q:\n%s", code, copies, out)
+	}
+	info, err := os.Stat(copies[0])
+	name := "backups/" + filepath.Base(copies[0])
+	if err != nil || info.Mode().Perm() != 0o600 || r.file(name) != "SQLite format 3\x00 the store" || !strings.Contains(out, "Done: "+name+", 26 bytes.") {
+		t.Errorf("backup: %v, %v:\n%s", info, err, out)
+	}
+	if code, out := r.exec("restore", "--from", "nope.db", "--yes"); code != 1 ||
+		!strings.Contains(out, "nope.db is not a file with a copy in it; nothing was changed") || r.count("docker", "compose stop") != 1 {
+		t.Errorf("restore --from nope.db: exit %d:\n%s", code, out)
+	}
+	if code, out := r.exec("uninstall"); code != 2 || !strings.Contains(out, "missing --yes: uninstall stops and removes the container") ||
+		r.count("docker", "compose down") != 0 || strings.Contains(out, "sk-SHIM-SECRET") {
+		t.Errorf("uninstall: exit %d:\n%s", code, out)
+	}
+	code, out = r.exec("help")
+	for _, s := range []string{"\n  logs      the container's last log lines; at a terminal it then follows them until Esc\n",
+		"\n  restore   put a copy back (--from <file>, --yes): keys revoked since come back,\n",
+		"\n  uninstall the container, its images and the console; the volume, .env, the\n"} {
+		if code != 0 || !strings.Contains(out, s) {
+			t.Errorf("help: exit %d, lacks %q:\n%s", code, s, out)
+		}
+	}
+}
+
 // TestSetupPrompts: at a terminal, ./setup.sh with no subcommand opens the
 // console's home on an installation, and remote asks its questions. The
 // prompts of the first run, budget and telemetry are the console's

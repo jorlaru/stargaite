@@ -860,6 +860,91 @@ func TestFramesNotInHistory(t *testing.T) {
 	}
 }
 
+// logsFake answers See logs: the container runs, its last lines, and a
+// follow that prints a line, then waits, logging the SIGINT that ends it.
+const logsFake = `case "$*" in
+"compose ps -q"|"compose ps -a -q") echo c0ffee ;;
+"compose logs --no-log-prefix --tail 100 stargaite") echo 'a last line' ;;
+"compose logs --no-log-prefix --follow --tail 0 stargaite") trap 'echo INT >> "$FAKE_LOG"; exit 130' INT; echo 'a followed line'; /bin/sleep 60 >/dev/null 2>&1 & wait ;;
+*) exit 9 ;;
+esac
+`
+
+// logs at a terminal follows until Esc, which stops the follow and exits 0,
+// or Ctrl-C, which exits 130; either way the follow gets SIGINT.
+func TestLogsEscAtTerminal(t *testing.T) {
+	for _, c := range []struct {
+		name, key, said string
+		want            int
+	}{{"Esc", "\x1b", "Stopped following the logs.", 0}, {"Ctrl-C", "\x03", "a followed line", 130}} {
+		t.Run(c.name, func(t *testing.T) {
+			env, log := fake(t, logsFake)
+			tm := onTerminal(t, env, "logs")
+			tm.waitFor("a followed line", 1)
+			tm.write(c.key)
+			code, after := tm.exit()
+			if out := tm.output(); code != c.want || !strings.Contains(out, "a last line") || !strings.Contains(out, c.said) {
+				t.Fatalf("exit %d, want %d:\n%q", code, c.want, out)
+			}
+			tm.restored(after)
+			if l := readLog(t, log); !strings.Contains(l, "INT\n") {
+				t.Fatalf("the follow got no SIGINT: %q", l)
+			}
+		})
+	}
+}
+
+// uninstallFake answers Uninstall over a stopped container (the home then
+// reads nothing from the proxy).
+const uninstallFake = `case "$*" in
+"compose ps -q") ;;
+"compose ps -a -q") echo c0ffee ;;
+"compose config --format json") echo '{"name":"proj","services":{"stargaite":{"image":"stargaite:local"}},"volumes":{"stargaite-data":{"name":"proj_stargaite-data"}}}' ;;
+"compose down") ;;
+"image inspect --format {{.Id}} stargaite:local"|"image inspect --format {{.Id}} stargaite:local-previous") echo sha256:feed ;;
+"rmi stargaite:local"|"rmi stargaite:local-previous") echo "Untagged: $2" ;;
+*) exit 9 ;;
+esac
+`
+
+// uninstall at a terminal, as a subcommand and from the home, each on a
+// clone of its own (it removes the console it runs): confirmed, it removes
+// the console and exits 0, the session ended, never back at the home.
+func TestUninstallAtTerminal(t *testing.T) {
+	if os.Getenv("STARGAITE_E2E_TREE") != "" {
+		t.Skip("STARGAITE_E2E_TREE is set: uninstall would remove the tree's own console")
+	}
+	for _, args := range [][]string{{"uninstall"}, nil} {
+		env, log := fake(t, uninstallFake)
+		bin, _, _ := ownClone(t, nil)
+		tm := onTerminalAt(t, bin, env, args...)
+		if args == nil {
+			tm.waitFor(home, 1)
+			tm.write("Uninstall\r")
+		}
+		tm.waitFor("continue?", 1)
+		tm.write("\x1b[A") // the cursor goes from No to Yes
+		time.Sleep(200 * time.Millisecond)
+		tm.write("\r")
+		code, after := tm.exit()
+		out := tm.output()
+		if code != 0 || !strings.Contains(out, "Done: uninstalled; ./setup.sh installs again on the kept volume.") ||
+			strings.Contains(out, "\nstargaite-console: ") || strings.Count(out, home) > 1 {
+			t.Fatalf("%q: exit %d:\n%q", args, code, out)
+		}
+		tm.restored(after)
+		if _, err := os.Stat(bin); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%q: the clone's console is still there: %v", args, err)
+		}
+		if _, err := os.Stat(console); err != nil {
+			t.Errorf("%q: the shared console is gone: %v", args, err)
+		}
+		if l := readLog(t, log); !strings.Contains(l, "compose down\n") || strings.Contains(l, "compose exec") {
+			t.Errorf("%q: docker log %q", args, l)
+		}
+	}
+}
+
 // mockCall is a call the e2e mock provider lists.
 type mockCall struct {
 	Path      string
@@ -965,5 +1050,73 @@ func TestRealEscDuringCheck(t *testing.T) {
 		if err != nil || json.Unmarshal(b, &target) != nil || target.VerifiedAt != 0 {
 			t.Errorf("target %s: %s, %v", id, b, err)
 		}
+	}
+}
+
+// putBackFake answers a restore whose put-back takes 2 s.
+const putBackFake = `case "$*" in
+"compose ps -q"|"compose ps -a -q") echo c0ffee ;;
+"compose stop") echo stopping ;;
+"compose run --rm --no-deps -T stargaite restore --yes -") /bin/cat >/dev/null; /bin/sleep 2; echo restored ;;
+"compose up -d --no-build") echo started ;;
+*) exit 9 ;;
+esac
+`
+
+// Ctrl-C or SIGTERM while the copy is put back, as a subcommand and from
+// the home: the put-back and the start run to their end, and how they ended
+// is printed on standard error once the terminal is restored.
+func TestRestoreOutcomeAfterQuit(t *testing.T) {
+	ctrlC := func(tm *terminal) { tm.write("\x03") }
+	sigterm := func(tm *terminal) { _ = tm.cmd.Process.Signal(syscall.SIGTERM) }
+	for _, c := range []struct {
+		name     string
+		viaHome  bool
+		end      func(*terminal)
+		wantCode int
+	}{{"Ctrl-C", false, ctrlC, 130}, {"Ctrl-C from the home", true, ctrlC, 130}, {"SIGTERM", false, sigterm, 143}} {
+		t.Run(c.name, func(t *testing.T) {
+			env, log := fake(t, putBackFake)
+			bin, dir, _ := ownClone(t, nil)
+			if err := os.MkdirAll(filepath.Join(dir, "backups"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "backups", "a.db"), []byte("SQLite format 3\x00 x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"restore", "--from", "backups/a.db"}
+			if c.viaHome {
+				args = nil
+			}
+			tm := onTerminalAt(t, bin, env, args...)
+			if c.viaHome {
+				tm.waitFor(home, 1)
+				tm.write("Back up or restore\r")
+				tm.waitFor("Back up or restore?", 1)
+				time.Sleep(300 * time.Millisecond)
+				tm.write("\x1b[B") // from back up to restore
+				time.Sleep(200 * time.Millisecond)
+				tm.write("\r")
+				tm.waitFor("Which copy?", 1)
+				time.Sleep(300 * time.Millisecond)
+				tm.write("\r")
+			}
+			tm.waitFor("continue?", 1)
+			tm.write("\x1b[A") // the cursor goes from No to Yes
+			time.Sleep(200 * time.Millisecond)
+			tm.write("\r")
+			waitLog(t, log, "compose run")
+			c.end(tm)
+			code, after := tm.exit()
+			tm.restored(after)
+			out := tm.output()
+			tail := out[strings.LastIndex(out, "\x1b[?2004l"):]
+			if code != c.wantCode || !strings.Contains(tail, "stargaite-console: quit; the restore ran to its end: Done: the store is the copy backups/a.db") {
+				t.Fatalf("exit %d, want %d; after the terminal was restored:\n%q", code, c.wantCode, tail)
+			}
+			if l := readLog(t, log); !strings.HasSuffix(strings.TrimSpace(l), "compose up -d --no-build") {
+				t.Errorf("docker log %q", l)
+			}
+		})
 	}
 }

@@ -622,6 +622,14 @@ subcommands:
   status    what exists: providers, aliases, keys, budgets, telemetry and both
             versions; with --check, first whether the clone's upstream has
             an upgrade
+  logs      the container's last log lines; at a terminal it then follows them until Esc
+  stop, start, restart
+            the container; stop and restart need --yes without a terminal
+  backup    a copy of the store into backups/
+  restore   put a copy back (--from <file>, --yes): keys revoked since come back,
+            spend since is forgotten; the container is stopped and started again
+  uninstall the container, its images and the console; the volume, .env, the
+            override, backups/ and tls/ are kept (--yes)
   upgrade   fast-forward this clone to its upstream and rebuild, keeping the
             previous image and taking a backup just before the new version
             starts, then checking it; it prints the way back
@@ -720,6 +728,7 @@ main() {
 	key) console key "$@" ;;
 	budget) console budget "$@" ;;
 	telemetry) console telemetry "$@" ;;
+	stop | start | restart | logs | backup | restore | uninstall) console "$sub" "$@" ;;
 	remote) parse_flags "address tls tls-cert tls-key tls-name tls-ca" "yes" "$@"; remote ;;
 	status) parse_flags "" "check" "$@"; status ;;
 	upgrade) parse_flags "legacy-backup" "yes" "$@"; upgrade ;;

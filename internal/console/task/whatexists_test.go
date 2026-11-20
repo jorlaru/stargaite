@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -239,16 +240,56 @@ func TestSeeWhatExistsDockerFails(t *testing.T) {
 
 func TestMenuFresh(t *testing.T) {
 	m := Menu()
-	if len(m) != 11 {
+	if len(m) != 21 {
 		t.Fatalf("Menu() = %+v", m)
 	}
-	first := m[10]
+	first := m[15]
 	if first.Group != "" || first.Label != "First run" || first.Sub != "install" ||
 		!slices.Equal(first.Flags, []string{"port", "provider", "base-url", "protocol", "api-key-env", "key-env", "model", "alias", "fallback",
 			"max-output-tokens", "effort", "input-price", "output-price", "key-name", "rpm-limit"}) ||
 		!slices.Equal(first.Bools, []string{"replace", "allow-private-network", "yes", "reverify"}) ||
-		!slices.Equal(first.Steps, firstSteps()) || first.Run == nil {
-		t.Fatalf("Menu()[10] = %+v", first)
+		!slices.Equal(first.Steps, firstSteps()) || first.Run == nil || first.Preset != nil {
+		t.Fatalf("Menu()[15] = %+v", first)
+	}
+	// This machine's tasks after See what exists, then, after the first run,
+	// the subcommands that run one of them with a preset answer.
+	machine := []Entry{
+		{Group: "This machine", Label: "Back up or restore", Steps: backupSteps()},
+		{Group: "This machine", Label: "See logs", Sub: "logs", Bools: []string{"follow"}, Steps: logSteps()},
+		{Group: "This machine", Label: "Stop or start", Steps: stopSteps()},
+		{Group: "This machine", Label: "Check everything", Steps: checkSteps()},
+		{Group: "This machine", Label: "Uninstall", Sub: "uninstall", Bools: []string{"yes"}, Steps: uninstallSteps()},
+		{Label: "Back up or restore", Sub: "backup", Preset: map[string]string{"what": "backup"}, Steps: backupSteps()},
+		{Label: "Back up or restore", Sub: "restore", Flags: []string{"from"}, Bools: []string{"yes"}, Preset: map[string]string{"what": "restore"},
+			Steps: backupSteps()},
+		{Label: "Stop or start", Sub: "stop", Bools: []string{"yes"}, Preset: map[string]string{"action": "stop"}, Steps: stopSteps()},
+		{Label: "Stop or start", Sub: "start", Preset: map[string]string{"action": "start"}, Steps: stopSteps()},
+		{Label: "Stop or start", Sub: "restart", Bools: []string{"yes"}, Preset: map[string]string{"action": "restart"}, Steps: stopSteps()},
+	}
+	for i, e := range machine {
+		at := 10 + i
+		if i >= 5 {
+			at++ // the first run is between
+		}
+		got := m[at]
+		if got.Group != e.Group || got.Label != e.Label || got.Sub != e.Sub || !slices.Equal(got.Flags, e.Flags) ||
+			!slices.Equal(got.Bools, e.Bools) || !maps.Equal(got.Preset, e.Preset) || (got.Preset == nil) != (e.Preset == nil) ||
+			!slices.Equal(got.Steps, e.Steps) || got.Run == nil {
+			t.Fatalf("Menu()[%d] = %+v", at, got)
+		}
+	}
+	for steps, want := range map[string][]ui.Step{
+		"backup":    {{ID: "what", Title: "back up or restore"}, {ID: "copy", Title: "which copy"}, {ID: "put", Title: "put back"}},
+		"logs":      {{ID: "logs", Title: "logs"}},
+		"stop":      {{ID: "action", Title: "what"}, {ID: "machine", Title: "the container"}},
+		"check":     {{ID: "read", Title: "findings"}, {ID: "fix", Title: "fix"}},
+		"uninstall": {{ID: "remove", Title: "uninstall"}},
+	} {
+		got := map[string][]ui.Step{"backup": backupSteps(), "logs": logSteps(), "stop": stopSteps(), "check": checkSteps(),
+			"uninstall": uninstallSteps()}[steps]
+		if !slices.Equal(got, want) {
+			t.Fatalf("%s steps = %+v", steps, got)
+		}
 	}
 	see := m[9]
 	if see.Group != "This machine" || see.Label != "See what exists" || see.Sub != "status" ||

@@ -20,16 +20,23 @@ const (
 	localBound = 20 * time.Second
 	// upBound bounds docker compose up, which may pull and build.
 	upBound = 20 * time.Minute
+	// stopBound bounds docker compose stop, restart and down: the container
+	// has 60 s to stop (stop_grace_period in compose.yaml).
+	stopBound = 2 * time.Minute
+	// followBound bounds a follow of the logs (OPS-11).
+	followBound = time.Hour
 )
 
 // Host is the clone. Every command runs with its directory as the working
 // directory. Its bounds are fields that tests shorten, never the constants.
 type Host struct {
-	Dir       string
-	bound     time.Duration // localBound
-	upBound   time.Duration // upBound
-	httpBound time.Duration // httpBound
-	ready     struct {      // readiness: at most tries checks, pause apart, each try long, all within bound
+	Dir         string
+	bound       time.Duration // localBound
+	upBound     time.Duration // upBound
+	stopBound   time.Duration // stopBound
+	followBound time.Duration // followBound
+	httpBound   time.Duration // httpBound
+	ready       struct {      // readiness: at most tries checks, pause apart, each try long, all within bound
 		tries             int
 		pause, try, bound time.Duration
 	}
@@ -38,11 +45,15 @@ type Host struct {
 
 // New returns the clone at dir.
 func New(dir string) *Host {
-	h := &Host{Dir: dir, bound: localBound, upBound: upBound, httpBound: httpBound}
+	h := &Host{Dir: dir, bound: localBound, upBound: upBound, stopBound: stopBound, followBound: followBound, httpBound: httpBound}
 	h.ready.tries, h.ready.pause, h.ready.try, h.ready.bound = 120, time.Second, 2*time.Second, 120*time.Second
 	h.readyCheck = h.Ready
 	return h
 }
+
+// ShortenFollow sets the bound of a follow of the logs to d: the tasks'
+// tests use it, since the bounds are fields no other package sets.
+func (h *Host) ShortenFollow(d time.Duration) { h.followBound = d }
 
 // Find returns the clone the console was exported into: the parent of the
 // executable's directory, bin/, which must hold compose.yaml. It applies the

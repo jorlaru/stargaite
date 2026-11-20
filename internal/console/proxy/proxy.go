@@ -30,6 +30,8 @@ const (
 	cliBound = 90 * time.Second
 	// captureLimit caps the answer of one call.
 	captureLimit = 8 << 20
+	// backupBound bounds a backup, the copy of the whole store.
+	backupBound = 10 * time.Minute
 	// stopGrace is how long a stopped check has, once its standard input is
 	// closed, before its command is cancelled.
 	stopGrace = 10 * time.Second
@@ -47,12 +49,13 @@ type Reply interface{ Required() []string }
 
 // Proxy calls the CLI through a Runner.
 type Proxy struct {
-	run   Runner
-	grace time.Duration // stopGrace; tests shorten the field, never the constant
+	run         Runner
+	grace       time.Duration // stopGrace; tests shorten the fields, never the constants
+	backupBound time.Duration // backupBound
 }
 
 // New returns a Proxy that calls the CLI through run.
-func New(run Runner) *Proxy { return &Proxy{run: run, grace: stopGrace} }
+func New(run Runner) *Proxy { return &Proxy{run: run, grace: stopGrace, backupBound: backupBound} }
 
 // Call runs "stargaite <words> --json <flags> [-- <positionals>]" and decodes
 // its answer into reply. It refuses targets verify (isVerify).
@@ -294,6 +297,57 @@ func (p *Proxy) TelemetryTest(ctx context.Context) (*TelemetryTestReply, error) 
 		return nil, err
 	}
 	return &reply, nil
+}
+
+// Validate runs validate, which exits 1 when a finding is an error and
+// still reports every finding: an answer of exit 0 or 1 that decodes is the
+// findings.
+func (p *Proxy) Validate(ctx context.Context) ([]Finding, error) {
+	const words = "validate"
+	out, code, err := p.call(ctx, words, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("stargaite %s: %w", words, err)
+	}
+	var reply Change
+	if err := decodeAnswer(words, out, code, &reply); err != nil {
+		return nil, err
+	}
+	return reply.Findings, nil
+}
+
+// Backup copies the store to w through "backup - --json" (phase 6's argv:
+// the copy on standard output, never a terminal, OPS-3), within
+// backupBound, and returns its size from the summary the CLI writes to
+// standard error. The error is the bare reason, for the caller's own
+// sentence: the CLI's error message, cleaned; "exit N"; or "no summary".
+func (p *Proxy) Backup(ctx context.Context, w io.Writer) (int64, error) {
+	ctx, cancel := context.WithTimeout(ctx, p.backupBound)
+	defer cancel()
+	var errOut capped
+	code, err := p.run(ctx, []string{"backup", "-", "--json"}, nil, w, &errOut)
+	switch {
+	case err != nil:
+		return 0, err
+	case ctx.Err() != nil:
+		return 0, ctx.Err()
+	}
+	lines := bytes.Split(bytes.TrimSpace(errOut.buf.Bytes()), []byte("\n"))
+	var last struct {
+		Bytes *int64 `json:"bytes"`
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(lines[len(lines)-1], &last)
+	switch {
+	case code != 0 && last.Error != nil && last.Error.Message != "":
+		return 0, errors.New(ui.OneLine(last.Error.Message))
+	case code != 0:
+		return 0, fmt.Errorf("exit %d", code)
+	case last.Bytes == nil:
+		return 0, errors.New("no summary")
+	}
+	return *last.Bytes, nil
 }
 
 // decodeAnswer decodes the answer of a command that exits 1 on an outcome it

@@ -240,7 +240,8 @@ func (r *adding) provider(ctx context.Context, n string) (*picked, error) {
 // unless it has none or the flags give one; for another service, its
 // protocol, URL and credential variable, asked.
 func (r *adding) describe(ctx context.Context, n string) (string, []string, error) {
-	urlQ := ui.Question{ID: "base-url", Flag: "base-url", Step: "add", Prompt: "its base URL"}
+	urlQ := ui.Question{ID: "base-url", Flag: "base-url", Step: "add", Prompt: "its base URL",
+		Check: userinfo("the base URL", "its key is asked hidden")}
 	if p, ok := r.presetAs(n); ok {
 		if p.BaseURL != "" && !r.u.Given(urlQ) {
 			return p.BaseURL, nil, nil

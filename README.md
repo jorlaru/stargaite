@@ -156,6 +156,10 @@ flags:
 | `telemetry` | The console's Send traces: to Langfuse or any OTLP endpoint, replacing what was set whole, then one free test span; `--backend off` turns traces off |
 | `remote` | Publish the data plane beyond loopback, always with TLS: your certificate or a self-signed one ([Install with Docker by hand](#install-with-docker-by-hand), day two) |
 | `status` | What exists: providers and their credentials, aliases with their models in order, models in no alias, keys, budgets, telemetry, and the running and the clone's versions; `--check` first says whether an upgrade is available |
+| `logs` | The container's last log lines; at a terminal it then follows them until Esc |
+| `stop`, `start`, `restart` | The container; stop and restart need `--yes` without a terminal |
+| `backup`, `restore` | A copy of the store into `backups/`; restore puts a copy back (`--from <file>`, `--yes`): keys revoked since come back, spend since is forgotten, and the container is stopped and started again |
+| `uninstall` | The container, its images and the console; the volume, `.env`, the override, `backups/` and `tls/` are kept (`--yes`) |
 | `upgrade` | Fast-forward the clone and rebuild, keeping the previous image and taking a backup first, then print the way back |
 
 It asks only when its standard input and output are both a terminal. Every answer is also a flag, so a script, CI or an
@@ -392,9 +396,9 @@ alias allows. Every answer carries `x-stargaite-request-id`, `x-stargaite-target
 | Meter a subscription plan | `stargaite providers set <name> --billing subscription --quota 5h:requests=1000` · `stargaite usage quota` |
 | See usage and cost | `./setup.sh`, then See usage and cost, a table by key, alias or target · `stargaite usage show --since 24h --by key,model` |
 | Send traces to Langfuse | `stargaite telemetry set --preset langfuse --otlp-endpoint https://<host>/api/public/otel` · `stargaite telemetry test` |
-| Check the whole configuration | `stargaite validate` |
+| Check the whole configuration | `./setup.sh`, then Check everything · `stargaite validate` |
 | Save and apply the configuration as YAML | `stargaite export > config.yaml` · `stargaite apply -f - --dry-run < config.yaml` · `stargaite apply -f - < config.yaml` |
-| Back up the store, and put a backup back with `serve` stopped | `stargaite backup <file>` · `(umask 077 && stargaite backup - > backup.db)` · `stargaite restore backup.db --yes` ([Backup and restore](#backup-and-restore)) |
+| Back up the store, and put a backup back with `serve` stopped | `./setup.sh backup` · `./setup.sh restore --from <file> --yes` · `stargaite backup <file>` · `(umask 077 && stargaite backup - > backup.db)` · `stargaite restore backup.db --yes` ([Backup and restore](#backup-and-restore)) |
 
 Every command accepts `--json`, never prompts, and exits `0` on success, `1` on failure and `2` on wrong usage;
 `remove`, `keys revoke`, `telemetry unset`, `restore` and `apply --prune` (unless `--dry-run`) need `--yes`. Where a
@@ -963,6 +967,9 @@ migration, and budgets and quota windows are rebuilt from it, as at every start.
 those of the backup. A copy from an older version is accepted, and migrated by the next start; a migration is one-way,
 so going back to an older version needs a backup taken before the upgrade, restored with the newer binary, which
 `./setup.sh upgrade` prints.
+
+`./setup.sh backup` writes the copy into `backups/` (mode 0600) and `./setup.sh restore` stops the container, puts a
+copy back with the current image and starts it.
 
 ### Provider credentials
 

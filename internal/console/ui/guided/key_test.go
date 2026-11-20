@@ -376,7 +376,9 @@ func TestGuidedHomeNotReady(t *testing.T) {
 	done := w.home(h)
 	f := h.waitShown("What do you want to do?")
 	h.waitOutput("http://127.0.0.1:" + port + "/v1: not ready · clone dev")
-	if strings.Contains(f.Content, "── Suggested") {
+	// Only Restart is suggested (C64a, plan S6): nothing read from the proxy.
+	if !strings.Contains(f.Content, "── Suggested\n> Restart the container: it is not ready\n── Providers\n") ||
+		strings.Count(f.Content, "── Suggested") != 1 {
 		t.Fatalf("home frame:\n%s", f.Content)
 	}
 	quitHome(t, h, done)

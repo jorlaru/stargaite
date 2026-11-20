@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/signal"
 	"slices"
@@ -50,7 +51,7 @@ const sessionBound = 12 * time.Second
 // homeBound is how long the home reads what exists before each pick.
 const homeBound = 15 * time.Second
 
-const usage = `usage: stargaite-console [install | provider | alias | key | budget | telemetry | status | help] [flags] [--version]
+const usage = `usage: stargaite-console [install | provider | alias | key | budget | telemetry | status | logs | stop | start | restart | backup | restore | uninstall | help] [flags] [--version]
 At a terminal with no subcommand: the guided console.
   install   the first run: this machine, then a provider, an alias with its fallbacks and a key, each kept when it
             exists, ending with one test call; at a terminal it starts at the first missing step
@@ -75,8 +76,16 @@ At a terminal with no subcommand: the guided console.
   telemetry traces to Langfuse or any OTLP endpoint, replacing what was set whole, then one test span (free)
             --backend <langfuse|otlp|off>   --endpoint <url>   --langfuse-public-env <VAR>   --langfuse-secret-env <VAR>
             --header-name <name>   --key-env <VAR>   --replace   --allow-private-network   --yes
+  logs      the container's last 100 log lines; at a terminal it then follows them until Esc, an hour at most
+            --follow is refused without a terminal: the console follows logs only while someone watches
+  stop, start, restart   the container; stop and restart interrupt traffic   --yes
+  backup    a copy of the store into backups/, mode 0600
+  restore   a copy put back: keys revoked since come back, spend since is forgotten; the container is stopped
+            and started again   --from <file>   --yes
+  uninstall the container, its two images and bin/stargaite-console; the volume, .env, the override, backups/
+            and tls/ are kept, and the commands that remove them printed   --yes
   status    what exists: providers, aliases, targets without an alias, keys, budgets, telemetry and both versions
-For what has no flag here (reorder an alias, see what it sends, change a provider or a key, see usage and cost):
+For what has no flag here (reorder an alias, see what it sends, change a provider or a key, see usage and cost, check everything):
 the guided console, or the stargaite command: docker compose exec -T stargaite /stargaite help
 `
 
@@ -199,7 +208,8 @@ func (e ending) code() int {
 
 // parseFlags reads a subcommand's flags into answers keyed by flag name:
 // --name value or --name=value for one of e.Flags, --name for one of
-// e.Bools, whose answer is "yes". The last one given wins.
+// e.Bools, whose answer is "yes". The last one given wins. e.Preset's
+// answers are added after them.
 func parseFlags(e task.Entry, args []string) (map[string]string, error) {
 	answers := map[string]string{}
 	for i := 0; i < len(args); i++ {
@@ -222,14 +232,18 @@ func parseFlags(e task.Entry, args []string) (map[string]string, error) {
 			return nil, fmt.Errorf("--%s needs a value", name)
 		}
 	}
+	maps.Copy(answers, e.Preset)
 	return answers, nil
 }
 
 // runOne runs entry as a subcommand and says its result. It returns the
 // exit code and the error to print on standard error, if any. Leaving the
-// task says so and is a failure.
+// task says so and is a failure; a task that ends the session succeeds.
 func runOne(root context.Context, u *ui.UI, entry task.Entry, px *proxy.Proxy, h *host.Host) (int, error) {
 	res, err := u.Run(root, entry.Steps, func(ctx context.Context) (string, error) { return entry.Run(ctx, u, px, h) })
+	if errors.Is(err, task.ErrEnd) {
+		err = nil
+	}
 	var usageErr *ui.UsageError
 	switch {
 	case err == nil && res == "":
@@ -241,6 +255,8 @@ func runOne(root context.Context, u *ui.UI, entry task.Entry, px *proxy.Proxy, h
 		return exitOK, nil
 	case errors.As(err, &usageErr):
 		return exitUsage, err
+	case errors.Is(err, task.ErrRanOn): // how a restore that ran to its end after Ctrl-C or a signal ended
+		return exitINT, err
 	case errors.Is(err, ui.ErrQuit):
 		return exitINT, nil
 	case errors.Is(err, ui.ErrLeave):
@@ -276,7 +292,8 @@ func plainSession(root context.Context, entry task.Entry, u *ui.UI, px *proxy.Pr
 
 // guidedSession runs the program and, on the session goroutine, the entry
 // only with the flags' answers, or with none the home (task.Home): read what
-// exists, pick a task, run it, say how it ended, again, until Ctrl-C.
+// exists, pick a task, run it, say how it ended, again, until Ctrl-C or a
+// task that ends the session.
 func guidedSession(root context.Context, cancel context.CancelFunc, px *proxy.Proxy, h *host.Host,
 	environ []string, answers map[string]string, only *task.Entry, stdin, stdout, stderr *os.File) ending {
 	var (
@@ -292,7 +309,7 @@ func guidedSession(root context.Context, cancel context.CancelFunc, px *proxy.Pr
 		defer front.Done()
 		if only != nil {
 			code, err := runOne(root, u, *only, px, h)
-			if err != nil && root.Err() == nil {
+			if err != nil && (root.Err() == nil || errors.Is(err, task.ErrRanOn)) {
 				failure = err
 			}
 			return code
@@ -300,7 +317,12 @@ func guidedSession(root context.Context, cancel context.CancelFunc, px *proxy.Pr
 		err := task.Home(root, u, px, h, homeBound)
 		switch {
 		case errors.Is(err, ui.ErrQuit):
+			if errors.Is(err, task.ErrRanOn) {
+				failure = err
+			}
 			return exitINT
+		case errors.Is(err, task.ErrEnd):
+			return exitOK
 		case root.Err() != nil:
 			return exitFail
 		}

@@ -762,3 +762,177 @@ func TestPortNumber(t *testing.T) {
 		}
 	}
 }
+
+// TestCompose: one docker compose verb, its lines said, bounded by stopBound
+// with a fixed text, a failing exit named, a .env line cut after its number.
+func TestCompose(t *testing.T) {
+	if New("x").stopBound != 2*time.Minute {
+		t.Fatalf("stopBound = %v, want 2m", New("x").stopBound)
+	}
+	log := filepath.Join(t.TempDir(), "argv")
+	fakes(t, map[string]string{"docker": `echo "$*" >> ` + log + `
+echo 'Container x Stopped'
+echo 'failed to read /x/.env: line 2: unexpected character "'"'"'" in variable name "sk-SECRET-x"'
+`})
+	h := New(t.TempDir())
+	var said []string
+	if err := h.Compose(context.Background(), func(l string) { said = append(said, l) }, "stop"); err != nil {
+		t.Fatal(err)
+	}
+	if read(t, log) != "compose stop\n" || !slices.Equal(said, []string{"Container x Stopped", "failed to read /x/.env: line 2"}) {
+		t.Fatalf("argv %q, said %q", read(t, log), said)
+	}
+
+	fakes(t, map[string]string{"docker": "exit 3\n"})
+	if err := h.Compose(context.Background(), func(string) {}, "stop"); err == nil || err.Error() != "docker compose stop failed with exit 3" {
+		t.Fatalf("exit 3: err = %v", err)
+	}
+
+	fakes(t, map[string]string{"docker": "exec /bin/sleep 5\n"})
+	h.stopBound = 100 * time.Millisecond
+	start := time.Now()
+	if err := h.Compose(context.Background(), func(string) {}, "stop"); err == nil ||
+		err.Error() != "docker compose stop was not done within 2 minutes" || time.Since(start) > 12*time.Second {
+		t.Fatalf("bound: err = %v after %v", err, time.Since(start))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := h.Compose(ctx, func(string) {}, "stop"); err == nil || !errors.Is(err, context.Canceled) ||
+		!strings.HasPrefix(err.Error(), "docker compose stop: ") {
+		t.Fatalf("cancelled: err = %v", err)
+	}
+}
+
+// TestSeeLogs: the last lines and the follow, each its argv; a follow left
+// open is stopped at its bound with SIGINT to its group, which is no error.
+func TestSeeLogs(t *testing.T) {
+	if New("x").followBound != time.Hour {
+		t.Fatalf("followBound = %v, want 1h", New("x").followBound)
+	}
+	logs := t.TempDir()
+	log := filepath.Join(logs, "argv")
+	fakes(t, map[string]string{"docker": `echo "$*" >> ` + log + "\necho 'a line'\n"})
+	h := New(t.TempDir())
+	var said []string
+	for _, follow := range []bool{false, true} {
+		if timedOut, err := h.SeeLogs(context.Background(), func(l string) { said = append(said, l) }, follow); timedOut || err != nil {
+			t.Fatalf("follow %v: timedOut %v, err %v", follow, timedOut, err)
+		}
+	}
+	if read(t, log) != "compose logs --no-log-prefix --tail 100 stargaite\ncompose logs --no-log-prefix --follow --tail 0 stargaite\n" ||
+		!slices.Equal(said, []string{"a line", "a line"}) {
+		t.Fatalf("argv %q, said %q", read(t, log), said)
+	}
+
+	fakes(t, map[string]string{"docker": "exit 3\n"})
+	if _, err := h.SeeLogs(context.Background(), func(string) {}, false); err == nil || err.Error() != "docker compose logs failed with exit 3" {
+		t.Fatalf("exit 3: err = %v", err)
+	}
+
+	fakes(t, map[string]string{"docker": "exec /bin/sleep 5\n"})
+	h.bound = 100 * time.Millisecond
+	start := time.Now()
+	if _, err := h.SeeLogs(context.Background(), func(string) {}, false); err == nil ||
+		err.Error() != "docker compose logs did not answer within 100ms" || time.Since(start) > 3*time.Second {
+		t.Fatalf("bound: err = %v after %v", err, time.Since(start))
+	}
+
+	sig := filepath.Join(logs, "sig")
+	fakes(t, map[string]string{"docker": "trap 'echo INT >> " + sig + "; exit 130' INT\necho 'a followed line'\n/bin/sleep 60\n"})
+	h.followBound = 200 * time.Millisecond
+	start = time.Now()
+	said = nil
+	timedOut, err := h.SeeLogs(context.Background(), func(l string) { said = append(said, l) }, true)
+	if !timedOut || err != nil || read(t, sig) != "INT\n" || !slices.Equal(said, []string{"a followed line"}) || time.Since(start) > 12*time.Second {
+		t.Fatalf("bound: timedOut %v, err %v, sig %q, said %q, after %v", timedOut, err, read(t, sig), said, time.Since(start))
+	}
+}
+
+// TestConfig: the image and the volume read from docker compose config,
+// whose answer holds .env's values in clear: no error and no line quotes it.
+func TestConfig(t *testing.T) {
+	env := `"environment":{"K":"sk-SECRET-x"}`
+	for _, tc := range []struct {
+		name, answer  string
+		code          int
+		image, volume string
+		err           string
+	}{
+		{"valid", `{"name":"proj","services":{"stargaite":{` + env + `,"image":"stargaite:local"}},"volumes":{"stargaite-data":{"name":"proj_stargaite-data"}}}`, 0,
+			"stargaite:local", "proj_stargaite-data", ""},
+		{"truncated", `{"name":"proj","services":{"stargaite":{` + env, 0, "", "", "docker compose config gave no JSON it could read"},
+		{"no image", `{"name":"proj","services":{"stargaite":{` + env + `}},"volumes":{"stargaite-data":{"name":"v"}}}`, 0, "", "",
+			"docker compose config names no image"},
+		{"a flag for an image", `{"name":"proj","services":{"stargaite":{` + env + `,"image":"-f"}}}`, 0, "", "", "docker compose config names no image"},
+		{"no volume name", `{"name":"proj","services":{"stargaite":{` + env + `,"image":"stargaite:local"}}}`, 0, "stargaite:local", "proj_stargaite-data", ""},
+		{"no project", `{"services":{"stargaite":{` + env + `,"image":"stargaite:local"}}}`, 0, "", "", "docker compose config names no project"},
+		{"exit 1", `{"name":"proj",` + env + `}`, 1, "", "", "docker compose config failed with exit 1"},
+	} {
+		log := filepath.Join(t.TempDir(), "argv")
+		fakes(t, map[string]string{"docker": `echo "$*" >> ` + log + "\necho 'sk-SECRET-x on stderr' >&2\nprintf '%s' '" + tc.answer + "'\nexit " + strconv.Itoa(tc.code) + "\n"})
+		image, volume, err := New(t.TempDir()).Config(context.Background())
+		if image != tc.image || volume != tc.volume || (err == nil) != (tc.err == "") || (err != nil && err.Error() != tc.err) {
+			t.Errorf("%s: %q, %q, %v", tc.name, image, volume, err)
+		}
+		if read(t, log) != "compose config --format json\n" || (err != nil && strings.Contains(err.Error(), "sk-SECRET")) {
+			t.Errorf("%s: argv %q, err %v", tc.name, read(t, log), err)
+		}
+	}
+
+	fakes(t, map[string]string{"docker": "exec /bin/sleep 5\n"})
+	h := New(t.TempDir())
+	h.bound = 100 * time.Millisecond
+	start := time.Now()
+	if _, _, err := h.Config(context.Background()); !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 3*time.Second {
+		t.Errorf("bound: err = %v after %v", err, time.Since(start))
+	}
+}
+
+// TestRemoveImage: a tag not there is not removed; one Docker refuses is
+// said in Docker's words; never forced.
+func TestRemoveImage(t *testing.T) {
+	for _, tc := range []struct {
+		name, inspect, rmi string
+		want, log          string
+		said               []string
+	}{
+		{"not there", "exit 1", "exit 9", "not there", "image inspect --format {{.Id}} x:1\n", nil},
+		{"removed", "echo sha256:ab", "echo 'Untagged: x:1'", "removed", "image inspect --format {{.Id}} x:1\nrmi x:1\n", []string{"Untagged: x:1"}},
+		{"refused", "echo sha256:ab", "echo 'conflict: unable to delete x:1 (must be forced)' >&2; exit 1", "refused",
+			"image inspect --format {{.Id}} x:1\nrmi x:1\n", []string{"conflict: unable to delete x:1 (must be forced)"}},
+	} {
+		log := filepath.Join(t.TempDir(), "argv")
+		fakes(t, map[string]string{"docker": `echo "$*" >> ` + log + "\ncase \"$1\" in\nimage) " + tc.inspect + " ;;\nrmi) " + tc.rmi + " ;;\nesac\n"})
+		var said []string
+		got, err := New(t.TempDir()).RemoveImage(context.Background(), func(l string) { said = append(said, l) }, "x:1")
+		if got != tc.want || err != nil || read(t, log) != tc.log || !slices.Equal(said, tc.said) || slices.Contains(strings.Fields(read(t, log)), "-f") {
+			t.Errorf("%s: %q, %v, argv %q, said %q", tc.name, got, err, read(t, log), said)
+		}
+	}
+
+	for _, at := range []string{"image", "rmi"} {
+		fakes(t, map[string]string{"docker": "case \"$1\" in\n" + at + ") exec /bin/sleep 5 ;;\nimage) echo sha256:ab ;;\nesac\n"})
+		h := New(t.TempDir())
+		h.bound = 100 * time.Millisecond
+		start := time.Now()
+		if _, err := h.RemoveImage(context.Background(), func(string) {}, "x:1"); !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 3*time.Second {
+			t.Errorf("bound at %s: err = %v after %v", at, err, time.Since(start))
+		}
+	}
+}
+
+func TestRemoveConsole(t *testing.T) {
+	h := New(t.TempDir())
+	console := filepath.Join(h.Dir, "bin", "stargaite-console")
+	write(t, console, "x")
+	if err := h.RemoveConsole(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(console); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the console is still there: %v", err)
+	}
+	if err := h.RemoveConsole(); err != nil {
+		t.Fatalf("absent: %v", err)
+	}
+}

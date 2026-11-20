@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -20,7 +21,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jorlaru/stargaite/internal/console/host"
+	"github.com/jorlaru/stargaite/internal/console/proxy"
 	"github.com/jorlaru/stargaite/internal/console/task"
+	"github.com/jorlaru/stargaite/internal/console/ui"
+	"github.com/jorlaru/stargaite/internal/console/ui/plain"
 )
 
 // console is the binary TestMain builds, in a clone: <tmp>/clone/bin/; or,
@@ -138,7 +143,7 @@ func TestVersionFirst(t *testing.T) {
 func TestUsage(t *testing.T) {
 	env, log := fake(t, replies)
 	out, _, code := runConsole(t, console, env, "help")
-	if code != 0 || !strings.HasPrefix(out, "usage: stargaite-console [install | provider | alias | key | budget | telemetry | status | help] [flags] [--version]\n") {
+	if code != 0 || !strings.HasPrefix(out, "usage: stargaite-console [install | provider | alias | key | budget | telemetry | status | logs | stop | start | restart | backup | restore | uninstall | help] [flags] [--version]\n") {
 		t.Fatalf("help: exit %d\n%s", code, out)
 	}
 	for _, c := range []struct {
@@ -161,7 +166,7 @@ func TestUsage(t *testing.T) {
 
 func TestUsageText(t *testing.T) {
 	out, _, _ := runConsole(t, console, nil, "--help")
-	want := "usage: stargaite-console [install | provider | alias | key | budget | telemetry | status | help] [flags] [--version]\n" +
+	want := "usage: stargaite-console [install | provider | alias | key | budget | telemetry | status | logs | stop | start | restart | backup | restore | uninstall | help] [flags] [--version]\n" +
 		"At a terminal with no subcommand: the guided console.\n" +
 		"  install   the first run: this machine, then a provider, an alias with its fallbacks and a key, each kept when it\n" +
 		"            exists, ending with one test call; at a terminal it starts at the first missing step\n" +
@@ -186,8 +191,16 @@ func TestUsageText(t *testing.T) {
 		"  telemetry traces to Langfuse or any OTLP endpoint, replacing what was set whole, then one test span (free)\n" +
 		"            --backend <langfuse|otlp|off>   --endpoint <url>   --langfuse-public-env <VAR>   --langfuse-secret-env <VAR>\n" +
 		"            --header-name <name>   --key-env <VAR>   --replace   --allow-private-network   --yes\n" +
+		"  logs      the container's last 100 log lines; at a terminal it then follows them until Esc, an hour at most\n" +
+		"            --follow is refused without a terminal: the console follows logs only while someone watches\n" +
+		"  stop, start, restart   the container; stop and restart interrupt traffic   --yes\n" +
+		"  backup    a copy of the store into backups/, mode 0600\n" +
+		"  restore   a copy put back: keys revoked since come back, spend since is forgotten; the container is stopped\n" +
+		"            and started again   --from <file>   --yes\n" +
+		"  uninstall the container, its two images and bin/stargaite-console; the volume, .env, the override, backups/\n" +
+		"            and tls/ are kept, and the commands that remove them printed   --yes\n" +
 		"  status    what exists: providers, aliases, targets without an alias, keys, budgets, telemetry and both versions\n" +
-		"For what has no flag here (reorder an alias, see what it sends, change a provider or a key, see usage and cost):\n" +
+		"For what has no flag here (reorder an alias, see what it sends, change a provider or a key, see usage and cost, check everything):\n" +
 		"the guided console, or the stargaite command: docker compose exec -T stargaite /stargaite help\n"
 	if out != want {
 		t.Fatalf("usage:\n%q\nwant:\n%q", out, want)
@@ -222,6 +235,51 @@ func TestParseFlags(t *testing.T) {
 		}
 		if err != nil || !maps.Equal(got, c.want) {
 			t.Errorf("%q: got %v, %v; want %v", c.args, got, err, c.want)
+		}
+	}
+
+	// A subcommand's Preset answers by ID beside its flags; a preset ID is not a flag.
+	restore := task.Entry{Flags: []string{"from"}, Bools: []string{"yes"}, Preset: map[string]string{"what": "restore"}}
+	got, err := parseFlags(restore, []string{"--from", "b.db", "--yes"})
+	if want := map[string]string{"from": "b.db", "yes": "yes", "what": "restore"}; err != nil || !maps.Equal(got, want) {
+		t.Errorf("preset: got %v, %v; want %v", got, err, want)
+	}
+	if got, err := parseFlags(restore, []string{"--what", "backup"}); err == nil || err.Error() != "unknown flag --what" || got != nil {
+		t.Errorf("--what: got %v, %v; want unknown flag --what", got, err)
+	}
+}
+
+// TestRunOneEnd: a task that ends the session (task.ErrEnd) exits 0, its
+// result said, with no error.
+func TestRunOneEnd(t *testing.T) {
+	for _, res := range []string{"bye.", ""} {
+		var out bytes.Buffer
+		u := ui.New(plain.New(&out), nil)
+		e := task.Entry{Label: "End", Run: func(context.Context, *ui.UI, *proxy.Proxy, *host.Host) (string, error) {
+			return res, task.ErrEnd
+		}}
+		code, err := runOne(context.Background(), u, e, nil, nil)
+		want := ""
+		if res != "" {
+			want = res + "\n"
+		}
+		if code != exitOK || err != nil || out.String() != want {
+			t.Errorf("result %q: exit %d, err %v, output %q; want 0, nil, %q", res, code, err, out.String(), want)
+		}
+	}
+}
+
+// TestRunOneQuit: Ctrl-C is exit 130, with nothing to print, even wrapped by
+// a task's last words, unless a restore ran to its end after it: how it
+// ended is then printed.
+func TestRunOneQuit(t *testing.T) {
+	ran := fmt.Errorf("%w; %w: %w", ui.ErrQuit, task.ErrRanOn, errors.New("x"))
+	wrapped := fmt.Errorf("%w; no alias or key was created", ui.ErrQuit)
+	for _, row := range []struct{ ended, printed error }{{ui.ErrQuit, nil}, {wrapped, nil}, {ran, ran}} {
+		e := task.Entry{Label: "Quit", Run: func(context.Context, *ui.UI, *proxy.Proxy, *host.Host) (string, error) { return "", row.ended }}
+		code, err := runOne(context.Background(), ui.New(plain.New(&bytes.Buffer{}), nil), e, nil, nil)
+		if code != exitINT || err != row.printed {
+			t.Errorf("%v: exit %d, err %v; want 130, %v", row.ended, code, err, row.printed)
 		}
 	}
 }

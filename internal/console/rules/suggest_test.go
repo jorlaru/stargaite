@@ -14,6 +14,8 @@ func TestSuggest(t *testing.T) {
 	fallback := Suggestion{Label: "Give alias a a fallback: it has one model", Task: "Change an alias",
 		Presets: map[string]string{"alias": "a", "change": "add"}}
 	uncapped := Suggestion{Label: "Cap spending: spend is not capped", Task: "Cap spending", Presets: map[string]string{"on": "instance"}}
+	check := Suggestion{Label: "Check alias a: no target of mock is checked yet", Task: "Make an alias",
+		Presets: map[string]string{"alias": "a", "unverified": "yes"}}
 	for _, tc := range []struct {
 		facts Facts
 		want  []Suggestion
@@ -27,6 +29,9 @@ func TestSuggest(t *testing.T) {
 		{Facts{Providers: 1, Keys: 1, Aliases: map[string]int{"a": 2}, Uncapped: true}, []Suggestion{uncapped}},
 		{Facts{Uncapped: true}, []Suggestion{provider}},
 		{Facts{Providers: 1, Aliases: map[string]int{"a": 1}, Uncapped: true}, []Suggestion{key, fallback, uncapped}},
+		{Facts{Providers: 2, Keys: 1, Aliases: map[string]int{"a": 2}, Unverified: map[string]string{"mock": "a", "other": ""}}, []Suggestion{check}},
+		{Facts{Providers: 2, Keys: 1, Aliases: map[string]int{"a": 2}, Unverified: map[string]string{"mock": "a", "other": ""}, Uncapped: true},
+			[]Suggestion{uncapped, check}},
 	} {
 		if got := Suggest(tc.facts); !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("Suggest(%+v) = %+v\nwant %+v", tc.facts, got, tc.want)

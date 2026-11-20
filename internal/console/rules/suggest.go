@@ -12,6 +12,7 @@ type Facts struct {
 	Aliases         map[string]int    // alias → how many targets it has
 	Unresolved      map[string]string // provider → the variable its credential names, which does not resolve
 	Uncapped        bool              // no instance budget is set
+	Unverified      map[string]string // provider none of whose chat targets is checked → the alias that holds one ("" none)
 }
 
 // Suggestion is one row the home suggests: its words, the menu entry it
@@ -24,9 +25,9 @@ type Suggestion struct {
 // Suggest is what the home suggests, in this order (design section 3,
 // "Suggestions"): a provider, else an alias, when none exists, and nothing
 // more; then a key when none exists, each provider whose key does not
-// resolve, each alias with one model, by name, and spend not capped. The
-// first three open the first run. A row whose task is not ported yet lands
-// with that task.
+// resolve, each alias with one model, by name, spend not capped, and each
+// provider none of whose targets is checked, by name, through an alias that
+// holds one. The first three open the first run.
 func Suggest(f Facts) []Suggestion {
 	switch {
 	case f.Providers == 0:
@@ -50,6 +51,12 @@ func Suggest(f Facts) []Suggestion {
 	}
 	if f.Uncapped {
 		out = append(out, Suggestion{Label: "Cap spending: spend is not capped", Task: "Cap spending", Presets: map[string]string{"on": "instance"}})
+	}
+	for _, p := range slices.Sorted(maps.Keys(f.Unverified)) {
+		if a := f.Unverified[p]; a != "" {
+			out = append(out, Suggestion{Label: fmt.Sprintf("Check alias %s: no target of %s is checked yet", a, p),
+				Task: "Make an alias", Presets: map[string]string{"alias": a, "unverified": "yes"}})
+		}
 	}
 	return out
 }

@@ -17,7 +17,7 @@ import (
 // home is what the home says above its question.
 type home struct {
 	summary   string
-	suggested []rules.Suggestion // none when the proxy was not read
+	suggested []rules.Suggestion // from the proxy's read, or Start or Restart when the container is stopped or not ready
 	first     bool               // the first run opens (design section 4.1)
 }
 
@@ -26,7 +26,8 @@ type home struct {
 // its summary said; then the picked task runs, a suggestion's with its
 // presets, and how it ended is said. On its first round, when no container,
 // provider, alias or key exists, the first run runs in place of the pick. It
-// returns ui.ErrQuit on Ctrl-C, or the error that ended it.
+// returns ui.ErrQuit on Ctrl-C, ErrEnd once a task ended the session, its
+// result said, or the error that ended it.
 func Home(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host, bound time.Duration) error {
 	menu := Menu()
 	for round := 0; ; round++ {
@@ -58,6 +59,13 @@ func Home(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host, bound ti
 			return err
 		case ctx.Err() != nil:
 			return ctx.Err()
+		case errors.Is(err, ErrEnd):
+			if res != "" {
+				if err := u.Say(ctx, res); err != nil {
+					return err
+				}
+			}
+			return ErrEnd
 		}
 		if line := taskLine(label, res, err); line != "" {
 			if err := u.Say(ctx, line); err != nil {
@@ -69,7 +77,8 @@ func Home(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host, bound ti
 
 // readHome reads what exists (design section 3, Home data): the data plane,
 // the clone's version, whether the container runs, or exists, and is ready,
-// then export, validate and version, concurrently, only when it is ready.
+// then export, validate and version, concurrently, only when it is ready. A
+// stopped container suggests Start, and one not ready Restart.
 func readHome(ctx context.Context, px *proxy.Proxy, h *host.Host) home {
 	p, err := h.Plane()
 	if err != nil {
@@ -87,9 +96,11 @@ func readHome(ctx context.Context, px *proxy.Proxy, h *host.Host) home {
 	case !exists:
 		return home{summary: p.BaseURL + ": not installed yet (./setup.sh install sets it up) · clone " + clone, first: true}
 	case !runs:
-		return home{summary: p.BaseURL + ": stopped (./setup.sh install starts it) · clone " + clone}
+		return home{summary: p.BaseURL + ": stopped · clone " + clone, suggested: []rules.Suggestion{
+			{Label: "Start the container: it is stopped", Task: "Stop or start", Presets: map[string]string{"action": "start"}}}}
 	case h.Ready(ctx) != nil:
-		return home{summary: p.BaseURL + ": not ready · clone " + clone}
+		return home{summary: p.BaseURL + ": not ready · clone " + clone, suggested: []rules.Suggestion{
+			{Label: "Restart the container: it is not ready", Task: "Stop or start", Presets: map[string]string{"action": "restart"}}}}
 	}
 	var (
 		export   proxy.ExportReply

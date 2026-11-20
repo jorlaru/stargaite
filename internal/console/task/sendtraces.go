@@ -105,7 +105,8 @@ func askTraces(ctx context.Context, a *adding, backend string) (traces, error) {
 	header := ui.Question{ID: "header-name", Flag: "header-name", Step: "add",
 		Prompt: "a header that carries a credential, such as Authorization; empty for none", HasDefault: true}
 	keyEnv := ui.Question{ID: "key-env"}
-	q := ui.Question{ID: "endpoint", Flag: "endpoint", Step: "add", Prompt: "the OTLP endpoint in full; spans go to <endpoint>/v1/traces", Check: noUserinfo}
+	q := ui.Question{ID: "endpoint", Flag: "endpoint", Step: "add", Prompt: "the OTLP endpoint in full; spans go to <endpoint>/v1/traces",
+		Check: userinfo("the endpoint", "its credentials are asked as keys, hidden")}
 	var t traces
 	if backend == "langfuse" {
 		if a.u.Given(header) || a.u.Given(keyEnv) {
@@ -143,15 +144,17 @@ func askTraces(ctx context.Context, a *adding, backend string) (traces, error) {
 	return t, nil
 }
 
-// noUserinfo refuses an endpoint with a user or a password, never quoting
-// it: its credentials are keys, asked hidden. Any "@" is refused, so an
-// endpoint url.Parse misreads (a "/" in the password, no scheme) cannot
-// carry one to the screen or an argv.
-func noUserinfo(a string) error {
-	if strings.Contains(a, "@") {
-		return errors.New("the endpoint must not hold a user or a password: its credentials are asked as keys, hidden")
+// userinfo is the check that refuses a URL, what, with a user or a
+// password, never quoting it: its credentials are asked hidden, as asked
+// says. Any "@" is refused, so a URL url.Parse misreads (a "/" in the
+// password, no scheme) cannot carry one to the screen or an argv.
+func userinfo(what, asked string) func(string) error {
+	return func(a string) error {
+		if strings.Contains(a, "@") {
+			return errors.New(what + " must not hold a user or a password: " + asked)
+		}
+		return nil
 	}
-	return nil
 }
 
 // telemetryNow is where traces go now, "" for nowhere, and the variables of

@@ -1,6 +1,7 @@
 package task
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -22,6 +23,7 @@ import (
 	"github.com/jorlaru/stargaite/internal/console/proxy"
 	"github.com/jorlaru/stargaite/internal/console/rules"
 	"github.com/jorlaru/stargaite/internal/console/ui"
+	"github.com/jorlaru/stargaite/internal/console/ui/plain"
 	"github.com/jorlaru/stargaite/tests/mockprovider"
 )
 
@@ -89,6 +91,7 @@ func labels(s []rules.Suggestion) []string {
 func TestHomeRead(t *testing.T) {
 	ctx := context.Background()
 	const fallback = "Give alias a a fallback: it has one model"
+	const check = "Check alias a: no target of mock is checked yet" // H1: mock/m is never checked
 	w, port := homeWorld(t)
 	base := "http://127.0.0.1:" + port + "/v1"
 	hm := readHome(ctx, w.proxy(), w.h)
@@ -98,7 +101,7 @@ func TestHomeRead(t *testing.T) {
 	if got := slices.Sorted(slices.Values(w.cli())); !slices.Equal(got, []string{"export --json", "validate --json", "version --json"}) {
 		t.Errorf("CLI calls %q", got)
 	}
-	if got := labels(hm.suggested); !slices.Equal(got, []string{"Give an app or agent its key: none exists yet", fallback, "Cap spending: spend is not capped"}) {
+	if got := labels(hm.suggested); !slices.Equal(got, []string{"Give an app or agent its key: none exists yet", fallback, "Cap spending: spend is not capped", check}) {
 		t.Errorf("suggested %q", got)
 	}
 
@@ -109,20 +112,23 @@ func TestHomeRead(t *testing.T) {
 	if want := base + ": ready · proxy " + cli.Version + " · clone dev · 1 provider(s), 1 alias(es), 1 key(s)"; hm.summary != want {
 		t.Errorf("summary %q; want %q", hm.summary, want)
 	}
-	if got := labels(hm.suggested); !slices.Equal(got, []string{fallback}) {
+	if got := labels(hm.suggested); !slices.Equal(got, []string{fallback, check}) {
 		t.Errorf("suggested %q", got)
 	}
 
 	// Rows that make no CLI call.
+	start := []rules.Suggestion{{Label: "Start the container: it is stopped", Task: "Stop or start", Presets: map[string]string{"action": "start"}}}
+	restart := []rules.Suggestion{{Label: "Restart the container: it is not ready", Task: "Stop or start", Presets: map[string]string{"action": "restart"}}}
 	for _, row := range []struct {
 		name, ps, env, want string
+		suggested           []rules.Suggestion
 	}{
-		{"stopped", "printf ''", "", "http://127.0.0.1:4000/v1: stopped (./setup.sh install starts it) · clone dev"},
+		{"stopped", "printf ''", "", "http://127.0.0.1:4000/v1: stopped · clone dev", start},
 		{"compose ps fails", "exit 1", "",
-			"http://127.0.0.1:4000/v1: not checked · clone dev · docker compose ps: docker compose ps failed with exit 1"},
-		{"not ready", "echo c0ffee", "STARGAITE_PORT=" + closedPort(t), "http://127.0.0.1:<port>/v1: not ready · clone dev"},
+			"http://127.0.0.1:4000/v1: not checked · clone dev · docker compose ps: docker compose ps failed with exit 1", nil},
+		{"not ready", "echo c0ffee", "STARGAITE_PORT=" + closedPort(t), "http://127.0.0.1:<port>/v1: not ready · clone dev", restart},
 		{"settings", "echo c0ffee", "STARGAITE_PORT=x",
-			"this clone's settings cannot be read: STARGAITE_PORT in .env is not a port number, 1 to 65535: write it as STARGAITE_PORT=<n>"},
+			"this clone's settings cannot be read: STARGAITE_PORT in .env is not a port number, 1 to 65535: write it as STARGAITE_PORT=<n>", nil},
 	} {
 		h := psClone(t, row.ps)
 		want := row.want
@@ -132,7 +138,8 @@ func TestHomeRead(t *testing.T) {
 		}
 		var calls []string
 		hm := readHome(ctx, proxy.New(cannedRunner(t, nil, &calls)), h)
-		if hm.summary != want || hm.suggested != nil || len(calls) != 0 {
+		if hm.summary != want || !slices.EqualFunc(hm.suggested, row.suggested, sameSuggestion) || (hm.suggested == nil) != (row.suggested == nil) ||
+			len(calls) != 0 {
 			t.Errorf("%s: summary %q, suggested %q, calls %q; want %q", row.name, hm.summary, labels(hm.suggested), calls, want)
 		}
 	}
@@ -274,11 +281,16 @@ func TestHomeQuestion(t *testing.T) {
 		"Spend and traces|See usage and cost|See usage and cost",
 		"Spend and traces|Send traces|Send traces",
 		"This machine|See what exists|See what exists",
+		"This machine|Back up or restore|Back up or restore",
+		"This machine|See logs|See logs",
+		"This machine|Stop or start|Stop or start",
+		"This machine|Check everything|Check everything",
+		"This machine|Uninstall|Uninstall",
 	}
 	if q.ID != "home" || q.Prompt != "What do you want to do?" || !slices.Equal(got, want) {
 		t.Fatalf("%s %q: %q", q.ID, q.Prompt, got)
 	}
-	if q := homeQuestion(home{}, Menu()); len(q.Options) != 10 || q.Options[0].Group != "Providers" {
+	if q := homeQuestion(home{}, Menu()); len(q.Options) != 15 || q.Options[0].Group != "Providers" {
 		t.Fatalf("without suggestions: %+v", q.Options)
 	}
 	if slices.ContainsFunc(q.Options, func(o ui.Option) bool { return o.Value == "First run" || o.Label == "First run" }) {
@@ -362,15 +374,88 @@ func TestHomeUnresolved(t *testing.T) {
 	}
 }
 
-// TestSuggestionTasks: every task a suggestion names is a menu entry.
+// TestSuggestionTasks: every task a suggestion, the home's Start and
+// Restart, or a fix of Check everything names is a menu entry.
 func TestSuggestionTasks(t *testing.T) {
+	var all []rules.Suggestion
 	for _, f := range []rules.Facts{{}, {Providers: 1},
-		{Providers: 1, Aliases: map[string]int{"a": 1}, Unresolved: map[string]string{"p": "V"}}} {
-		for _, s := range rules.Suggest(f) {
-			if !slices.ContainsFunc(Menu(), func(e Entry) bool { return e.Label == s.Task }) {
-				t.Errorf("%q opens %q, which is no menu entry", s.Label, s.Task)
-			}
+		{Providers: 1, Aliases: map[string]int{"a": 1}, Unresolved: map[string]string{"p": "V"}},
+		{Providers: 1, Aliases: map[string]int{"a": 1}, Unverified: map[string]string{"p": "a"}}} {
+		all = append(all, rules.Suggest(f)...)
+	}
+	for _, hm := range []home{readHome(context.Background(), nil, psClone(t, "printf ''")), notReady(t)} {
+		all = append(all, hm.suggested...)
+	}
+	for _, f := range [][3]string{{"credential_unresolved", "providers/p", ""}, {"credential_unresolved", "settings", ""},
+		{"target_unverified", "targets/p/m", "a"}, {"unknown_alias", "keys/k", ""}, {"effort_dropped", "models/a", ""},
+		{"endpoint_unservable", "models/a", ""}} {
+		s, ok := rules.Fix(f[0], f[1], f[2])
+		if !ok {
+			t.Errorf("no fix for %q", f)
 		}
+		all = append(all, s)
+	}
+	if len(all) != 16 {
+		t.Errorf("%d suggestions, want 16: %+v", len(all), all)
+	}
+	for _, s := range all {
+		if !slices.ContainsFunc(Menu(), func(e Entry) bool { return e.Label == s.Task }) {
+			t.Errorf("%q opens %q, which is no menu entry", s.Label, s.Task)
+		}
+	}
+}
+
+// notReady is the home of a running container that is not ready.
+func notReady(t *testing.T) home {
+	t.Helper()
+	h := psClone(t, "echo c0ffee")
+	writeFile(t, filepath.Join(h.Dir, ".env"), "STARGAITE_PORT="+closedPort(t)+"\n", 0o600)
+	return readHome(context.Background(), nil, h)
+}
+
+// TestHomeUnverifiedProvider: a provider none of whose chat targets is
+// checked suggests checking an alias that holds one (H1), whatever its other
+// kinds of target; not once one is checked, not for a provider whose key
+// does not resolve, and not when no alias holds one.
+func TestHomeUnverifiedProvider(t *testing.T) {
+	ctx := context.Background()
+	w, _ := homeWorld(t)
+	w.target("mock/e", "--kind", "embeddings")
+	want := rules.Suggestion{Label: "Check alias a: no target of mock is checked yet", Task: "Make an alias",
+		Presets: map[string]string{"alias": "a", "unverified": "yes"}}
+	hm := readHome(ctx, w.proxy(), w.h)
+	if !slices.ContainsFunc(hm.suggested, func(s rules.Suggestion) bool { return sameSuggestion(s, want) }) {
+		t.Fatalf("suggested %+v", hm.suggested)
+	}
+	if _, err := w.checkIn(ui.New(plain.New(&bytes.Buffer{}), nil), "mock/m"); err != nil {
+		t.Fatal(err)
+	}
+	if hm = readHome(ctx, w.proxy(), w.h); slices.ContainsFunc(labels(hm.suggested), func(l string) bool { return strings.HasPrefix(l, "Check alias") }) {
+		t.Errorf("checked: suggested %q", labels(hm.suggested))
+	}
+
+	w, _ = homeWorld(t)
+	w.onMock("acme", "--protocol", "openai", "--api-key-env", "ACME_API_KEY", "--billing", "none")
+	w.target("acme/m", "--kind", "chat")
+	w.must("models", "set", "a", "--target", "mock/m", "--target", "acme/m")
+	w.onMock("free", "--protocol", "openai", "--billing", "none")
+	w.target("free/m", "--kind", "chat")
+	w.onMock("half", "--protocol", "openai", "--billing", "none")
+	w.target("half/v", "--kind", "chat")
+	w.target("half/u", "--kind", "chat")
+	w.must("models", "add", "b", "--target", "half/u", "--target", "half/v")
+	if _, err := w.checkIn(ui.New(plain.New(&bytes.Buffer{}), nil), "half/v"); err != nil {
+		t.Fatal(err)
+	}
+	hm = readHome(ctx, w.proxy(), w.h)
+	var rows []string
+	for _, l := range labels(hm.suggested) {
+		if strings.Contains(l, "acme") || strings.Contains(l, "free") || strings.Contains(l, "half") || strings.HasPrefix(l, "Check alias") {
+			rows = append(rows, l)
+		}
+	}
+	if !slices.Equal(rows, []string{"Replace the key of acme: ACME_API_KEY does not resolve", want.Label}) {
+		t.Errorf("rows %q", rows)
 	}
 }
 

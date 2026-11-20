@@ -320,6 +320,36 @@ func TestAddProvidersFlags(t *testing.T) {
 	}
 }
 
+// TestAddProvidersBaseURLUserinfo: a base URL holding a user or a password
+// is refused before providers add, never quoted, nothing written or started
+// and no key checked; for a new service and for a preset given --base-url.
+func TestAddProvidersBaseURLUserinfo(t *testing.T) {
+	for _, answers := range []map[string]string{
+		{"provider": "acme", "base-url": "https://u:p4ss@192.0.2.1/v1", "protocol": "openai",
+			"api-key-env": "ACME_API_KEY", "key-env": "SRC", "yes": "yes"},
+		{"provider": "openrouter", "base-url": "https://x@192.0.2.1/v1", "key-env": "SRC", "yes": "yes"},
+	} {
+		w := newWorld(t)
+		files := w.files()
+		_, out, err := w.add(answers, "SRC=good")
+		var usage *ui.UsageError
+		if !errors.As(err, &usage) || err.Error() != "--base-url: the base URL must not hold a user or a password: its key is asked hidden" {
+			t.Fatalf("%s: err = %v\n%s", answers["provider"], err, out)
+		}
+		if got, want := w.cli(), []string{"providers presets --json", "providers list --json"}; !slices.Equal(got, want) {
+			t.Errorf("%s: CLI calls %q, want %q", answers["provider"], got, want)
+		}
+		for _, s := range []string{answers["base-url"], "p4ss", "192.0.2.1"} {
+			if where := w.leaks(s, out); len(where) > 0 {
+				t.Errorf("%s: %q is in %q", answers["provider"], s, where)
+			}
+		}
+		if !maps.Equal(files, w.files()) || strings.Contains(w.dockerLog(), "compose up") || len(w.models.requests()) != 0 {
+			t.Errorf("%s: files %q, docker log %q, model list requests %q", answers["provider"], w.files(), w.dockerLog(), w.models.requests())
+		}
+	}
+}
+
 func TestAddProvidersLeakControl(t *testing.T) {
 	w := newWorld(t)
 	if _, _, err := w.h.Capture(context.Background(), "sleep", "0", secret); err != nil {

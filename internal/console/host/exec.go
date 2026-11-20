@@ -3,11 +3,13 @@ package host
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"syscall"
@@ -47,7 +49,7 @@ func (h *Host) capture(ctx context.Context, env []string, name string, args ...s
 // exec -T, with the admin variables the TLS override needs. A nil stdin is
 // /dev/null; an *os.File is handed to docker itself. It is a proxy.Runner.
 func (h *Host) CLI(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
-	admin, err := h.admin()
+	admin, err := h.AdminEnv()
 	if err != nil {
 		return 0, err
 	}
@@ -62,13 +64,14 @@ func (h *Host) CLI(ctx context.Context, args []string, stdin io.Reader, stdout, 
 // number, since Compose quotes the rest of a .env line it cannot parse, which
 // may be a credential. The exit code and the error are Capture's.
 func (h *Host) Display(ctx context.Context, say func(string), name string, args ...string) (int, error) {
-	return h.display(ctx, nil, say, name, args...)
+	return h.display(ctx, nil, nil, say, name, args...)
 }
 
-// display is Display with env added to the command's environment.
-func (h *Host) display(ctx context.Context, env []string, say func(string), name string, args ...string) (int, error) {
+// display is Display with env added to the command's environment and stdin
+// as its standard input (nil: none).
+func (h *Host) display(ctx context.Context, env []string, stdin io.Reader, say func(string), name string, args ...string) (int, error) {
 	out := &lines{say: say}
-	code, err := h.run(ctx, env, nil, out, out, name, args...)
+	code, err := h.run(ctx, env, stdin, out, out, name, args...)
 	if len(out.buf) > 0 {
 		out.flush()
 	}
@@ -110,7 +113,7 @@ func (h *Host) up(ctx context.Context, say func(string), quiet bool, env []strin
 		}
 		return errors.New(msg)
 	}
-	code, err := h.display(bounded, env, show, "docker", append([]string{"compose", "up", "-d"}, args...)...)
+	code, err := h.display(bounded, env, nil, show, "docker", append([]string{"compose", "up", "-d"}, args...)...)
 	switch {
 	case ctx.Err() != nil:
 		return fmt.Errorf("docker compose up: %w", ctx.Err())
@@ -120,6 +123,130 @@ func (h *Host) up(ctx context.Context, say func(string), quiet bool, env []strin
 		return failed("docker compose up failed or was interrupted; its output is above")
 	}
 	return h.WaitReady(ctx, say)
+}
+
+// Compose runs docker compose with args (stop, restart, down), its lines
+// shown through say, bounded by stopBound.
+func (h *Host) Compose(ctx context.Context, say func(string), args ...string) error {
+	bounded, cancel := context.WithTimeout(ctx, h.stopBound)
+	defer cancel()
+	code, err := h.Display(bounded, say, "docker", append([]string{"compose"}, args...)...)
+	switch {
+	case ctx.Err() != nil:
+		return fmt.Errorf("docker compose %s: %w", args[0], ctx.Err())
+	case bounded.Err() != nil:
+		return fmt.Errorf("docker compose %s was not done within 2 minutes", args[0])
+	case err != nil:
+		return err
+	case code != 0:
+		return fmt.Errorf("docker compose %s failed with exit %d", args[0], code)
+	}
+	return nil
+}
+
+// SeeLogs hands say the container's last 100 log lines, bounded by h.bound,
+// or, when follow, the lines it logs from now on until ctx ends or
+// followBound passes: timedOut is then true and the error nil (OPS-11).
+// Each line is cut as Display cuts it.
+func (h *Host) SeeLogs(ctx context.Context, say func(string), follow bool) (timedOut bool, err error) {
+	bound, args := h.bound, []string{"--tail", "100"}
+	if follow {
+		bound, args = h.followBound, []string{"--follow", "--tail", "0"}
+	}
+	bounded, cancel := context.WithTimeout(ctx, bound)
+	defer cancel()
+	argv := append(append([]string{"compose", "logs", "--no-log-prefix"}, args...), "stargaite")
+	code, err := h.Display(bounded, say, "docker", argv...)
+	switch {
+	case ctx.Err() != nil:
+		return false, fmt.Errorf("docker compose logs: %w", ctx.Err())
+	case bounded.Err() != nil && follow:
+		return true, nil
+	case bounded.Err() != nil:
+		return false, fmt.Errorf("docker compose logs did not answer within %s", h.bound)
+	case err != nil:
+		return false, err
+	case code != 0:
+		return false, fmt.Errorf("docker compose logs failed with exit %d", code)
+	}
+	return false, nil
+}
+
+// Config is the image and the volume of the clone's Compose project, read
+// from docker compose config within h.bound; the volume is named from the
+// project, as Compose names it, when the answer names none. The answer
+// holds every .env value in clear, so no error quotes it, nor the
+// decoder's error. An image that would read as a flag is none.
+func (h *Host) Config(ctx context.Context) (image, volume string, err error) {
+	bounded, cancel := context.WithTimeout(ctx, h.bound)
+	defer cancel()
+	out, code, err := h.Capture(bounded, "docker", "compose", "config", "--format", "json")
+	switch {
+	case err != nil:
+		return "", "", err
+	case code != 0:
+		return "", "", fmt.Errorf("docker compose config failed with exit %d", code)
+	}
+	var doc struct {
+		Name     string `json:"name"`
+		Services struct {
+			Stargaite struct {
+				Image string `json:"image"`
+			} `json:"stargaite"`
+		} `json:"services"`
+		Volumes struct {
+			Data struct {
+				Name string `json:"name"`
+			} `json:"stargaite-data"`
+		} `json:"volumes"`
+	}
+	if json.Unmarshal(out, &doc) != nil {
+		return "", "", errors.New("docker compose config gave no JSON it could read")
+	}
+	image, volume = doc.Services.Stargaite.Image, doc.Volumes.Data.Name
+	switch {
+	case image == "" || strings.HasPrefix(image, "-"):
+		return "", "", errors.New("docker compose config names no image")
+	case volume == "" && doc.Name == "":
+		return "", "", errors.New("docker compose config names no project")
+	case volume == "":
+		volume = doc.Name + "_stargaite-data"
+	}
+	return image, volume, nil
+}
+
+// RemoveImage removes the image tag, never forced, within h.bound, Docker's
+// words said: "removed", "not there" when no image has the tag, or
+// "refused", as when a container uses it. One tag per call, since one
+// docker rmi of two tags may remove one and refuse the other.
+func (h *Host) RemoveImage(ctx context.Context, say func(string), tag string) (string, error) {
+	bounded, cancel := context.WithTimeout(ctx, h.bound)
+	defer cancel()
+	_, code, err := h.Capture(bounded, "docker", "image", "inspect", "--format", "{{.Id}}", tag)
+	switch {
+	case err != nil:
+		return "", err
+	case code != 0:
+		return "not there", nil
+	}
+	code, err = h.Display(bounded, say, "docker", "rmi", tag)
+	switch {
+	case err != nil:
+		return "", err
+	case code != 0:
+		return "refused", nil
+	}
+	return "removed", nil
+}
+
+// RemoveConsole removes bin/stargaite-console; one already gone is no
+// error. The running console keeps its open file.
+func (h *Host) RemoveConsole() error {
+	err := os.Remove(filepath.Join(h.Dir, "bin", "stargaite-console"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 // WaitReady checks readiness until it answers, as setup.sh's wait_ready
@@ -206,11 +333,11 @@ func (h *Host) CloneVersion(ctx context.Context) string {
 	return v
 }
 
-// admin is the variables each CLI call gets under TLS, as setup.sh's
+// AdminEnv is the variables each CLI call gets under TLS, as setup.sh's
 // tls_state sets them: the CLI reaches the admin API by its TLS name,
 // trusting the private CA when there is one. The override is read on each
 // call.
-func (h *Host) admin() ([]string, error) {
+func (h *Host) AdminEnv() ([]string, error) {
 	name, ca, err := h.TLSNames()
 	if err != nil || name == "" {
 		return nil, err

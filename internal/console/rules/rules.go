@@ -7,6 +7,7 @@ package rules
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -26,7 +27,7 @@ func Warnings() []Warning {
 		{"target_unverified", "check", "%s is not checked yet: Make an alias or Change an alias checks it, after stating its paid calls"},
 		{"unpriced", "", "%s has no prices, so no budget counts its spend; a budget that reaches it asks them"},
 		{"no_fallback_prices", "", "%s has no prices: its cost is the provider's own report, and a call without one counts nothing"},
-		{"reasoning_undeclared", "everything", ""}, // design section 3, Reasoning: an effort set shows what is sent instead
+		{"reasoning_undeclared", "everything", "%s: its reasoning levels are not declared, so an effort is sent as given and never in the off form"},
 		{"effort_dropped", "", "%s: the alias's effort is not sent toward a target whose reasoning dialect is none"},
 		{"endpoint_unservable", "", ""},
 		{"unknown_alias", "", "%s names an alias that does not exist: its calls to that alias get an error: Change a key sets the aliases it may call"},
@@ -57,6 +58,55 @@ func Plain(code, name, message string) string {
 		return fmt.Sprintf(w.Words, name)
 	}
 	return name + ": " + message
+}
+
+// Command is the stargaite command that fixes a finding of code on resource,
+// with the target's id in it as a shell word, or "" when no command does: a
+// target's reasoning levels and prices, which no task sets (design section 3).
+func Command(code, resource string) string {
+	id, ok := strings.CutPrefix(resource, "targets/")
+	id = shellWord(id)
+	switch {
+	case !ok:
+		return ""
+	case code == "reasoning_undeclared":
+		return "targets set " + id + " --level <level> --can-disable=<true|false>, one --level per level it takes"
+	case code == "unpriced" || code == "no_fallback_prices":
+		return "targets set " + id + " --pricing input_per_million=<usd>,output_per_million=<usd>,as_of=<YYYY-MM-DD>"
+	}
+	return ""
+}
+
+// shellWord is s as it is when a shell reads it so, else single-quoted: a
+// target's id comes from a provider's model list and may hold ; $ or a quote.
+func shellWord(s string) string {
+	if regexp.MustCompile(`^[A-Za-z0-9._:/@+=-]+$`).MatchString(s) {
+		return s
+	}
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// Fix is the task, and its presets, that fixes a finding of code on
+// resource, alias being the alias that holds a target ("" none); false when
+// no task does. A target never checked is checked again through an alias
+// that holds it, its unverified targets only.
+func Fix(code, resource, alias string) (Suggestion, bool) {
+	kind, name, _ := strings.Cut(resource, "/")
+	switch {
+	case code == "credential_unresolved" && kind == "providers":
+		return Suggestion{Task: "Change a provider", Presets: map[string]string{"provider": name, "change": "key"}}, true
+	case code == "credential_unresolved" && resource == "settings":
+		return Suggestion{Task: "Send traces"}, true
+	case code == "target_unverified" && kind == "targets" && alias != "":
+		return Suggestion{Task: "Make an alias", Presets: map[string]string{"alias": alias, "unverified": "yes"}}, true
+	case code == "unknown_alias" && kind == "keys":
+		return Suggestion{Task: "Change a key", Presets: map[string]string{"key": name, "change": "aliases"}}, true
+	case code == "effort_dropped" && kind == "models":
+		return Suggestion{Task: "Change an alias", Presets: map[string]string{"alias": name, "change": "effort"}}, true
+	case code == "endpoint_unservable" && kind == "models":
+		return Suggestion{Task: "Change an alias", Presets: map[string]string{"alias": name}}, true
+	}
+	return Suggestion{}, false
 }
 
 // Named turns a resource of internal/config, such as targets/a, into words;

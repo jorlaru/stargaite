@@ -7,6 +7,8 @@ import (
 	"errors"
 	"io"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"slices"
@@ -1058,5 +1060,100 @@ func TestUsageReplyDecodes(t *testing.T) {
 	if err := New(cliRunner(admintest.Server(t))).Call(context.Background(), &reply, "usage show", []string{"--since", "24h", "--by", "key"}); err != nil ||
 		reply.Source != "records" || len(reply.Groups) != 0 {
 		t.Errorf("the real CLI: %+v, %v", reply, err)
+	}
+}
+
+// TestValidate: an answer of exit 0 or 1 that decodes is the findings, an
+// error among them; anything else follows Call's rule.
+func TestValidate(t *testing.T) {
+	refused := Finding{Severity: "error", Code: "x", Resource: "targets/a", Message: "refused"}
+	for _, tc := range []struct {
+		out  string
+		code int
+		want []Finding
+	}{
+		{`{"findings":[]}`, 0, nil},
+		{`{"findings":[{"severity":"error","code":"x","resource":"targets/a","message":"refused"}]}`, 1, []Finding{refused}},
+	} {
+		var seen [][]string
+		got, err := New(canned(tc.out, tc.code, &seen)).Validate(context.Background())
+		if err != nil || !slices.Equal(got, tc.want) {
+			t.Errorf("%s exit %d: %+v, %v", tc.out, tc.code, got, err)
+		}
+		if len(seen) != 1 || !slices.Equal(seen[0], []string{"validate", "--json"}) {
+			t.Errorf("argv %q", seen)
+		}
+	}
+	for _, tc := range []struct {
+		out  string
+		code int
+		want string
+	}{
+		{`{"findings":[]}`, 2, "stargaite validate: failed with exit 2"},
+		{"not json", 1, "stargaite validate: failed with exit 1"},
+	} {
+		if got, err := New(canned(tc.out, tc.code, nil)).Validate(context.Background()); err == nil || err.Error() != tc.want {
+			t.Errorf("%q exit %d: %+v, err = %v, want %q", tc.out, tc.code, got, err, tc.want)
+		}
+	}
+}
+
+// TestBackup: backup - writes the copy to w and its summary to standard
+// error; a failure is its bare reason.
+func TestBackup(t *testing.T) {
+	f, err := os.Create(filepath.Join(t.TempDir(), "copy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = f.Close() }()
+	var seen [][]string
+	run := cliRunner(admintest.Server(t))
+	n, err := New(func(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
+		seen = append(seen, args)
+		return run(ctx, args, stdin, stdout, stderr)
+	}).Backup(context.Background(), f)
+	info, _ := f.Stat()
+	head := make([]byte, 16)
+	_, _ = f.ReadAt(head, 0)
+	if err != nil || n <= 0 || n != info.Size() || string(head) != "SQLite format 3\x00" || len(seen) != 1 ||
+		!slices.Equal(seen[0], []string{"backup", "-", "--json"}) {
+		t.Fatalf("n %d, size %d, err %v, head %q, argv %q", n, info.Size(), err, head, seen)
+	}
+	for _, tc := range []struct {
+		stderr string
+		code   int
+		want   string
+	}{
+		{`{"error":{"message":"the copy on standard output is not whole: unexpected EOF"}}` + "\n", 1,
+			"the copy on standard output is not whole: unexpected EOF"},
+		{"", 3, "exit 3"},
+		{"", 0, "no summary"},
+		{`time="x" level=warning msg="y"` + "\n" + `{"bytes":5,"path":"-"}` + "\n", 0, ""},
+		{`time="x" level=warning msg="y"` + "\n" + `{"error":{"message":"the store cannot be read"}}` + "\n", 1, "the store cannot be read"},
+	} {
+		n, err := New(func(_ context.Context, _ []string, _ io.Reader, _, stderr io.Writer) (int, error) {
+			_, _ = io.WriteString(stderr, tc.stderr)
+			return tc.code, nil
+		}).Backup(context.Background(), io.Discard)
+		switch {
+		case tc.want == "" && (err != nil || n != 5):
+			t.Errorf("exit %d: %d, %v, want 5 bytes", tc.code, n, err)
+		case tc.want != "" && (err == nil || err.Error() != tc.want):
+			t.Errorf("exit %d: %v, want %q", tc.code, err, tc.want)
+		}
+	}
+
+	// A backup that does not end is cut at its bound.
+	if New(nil).backupBound != 10*time.Minute {
+		t.Fatalf("backupBound = %v, want 10m", New(nil).backupBound)
+	}
+	p := New(func(ctx context.Context, _ []string, _ io.Reader, _, _ io.Writer) (int, error) {
+		<-ctx.Done()
+		return 0, nil
+	})
+	p.backupBound = 100 * time.Millisecond
+	start := time.Now()
+	if _, err := p.Backup(context.Background(), io.Discard); !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 5*time.Second {
+		t.Errorf("bound: %v after %v", err, time.Since(start))
 	}
 }

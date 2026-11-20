@@ -274,12 +274,15 @@ type KeyChange struct {
 // Required names the members the answer must have.
 func (*KeyChange) Required() []string { return []string{"findings", "secrets"} }
 
-// ExportReply is "export --json", only what the home counts. Every member
-// but version is absent when empty.
+// ExportReply is "export --json", only what the home counts and each
+// target's kind. Every member but version is absent when empty.
 type ExportReply struct {
 	Version   int                       `json:"version"`
 	Providers map[string]jsontext.Value `json:"providers"`
-	Models    map[string]struct {
+	Targets   map[string]struct {
+		Kind string `json:"kind"`
+	} `json:"targets"`
+	Models map[string]struct {
 		Targets []string `json:"targets"`
 	} `json:"models"`
 	Keys     map[string]jsontext.Value `json:"keys"`

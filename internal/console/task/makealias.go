@@ -110,7 +110,8 @@ func (r *run) makeAlias(ctx context.Context) (string, error) {
 // exists keeps alias m, which exists; with --fallback, the fallbacks it
 // lacks are added to it, so a run again with the same flags is kept; with
 // --reverify and no fallback to add, its targets are checked again through
-// the paid step.
+// the paid step. The preset unverified, never a flag, is the home's and
+// Check everything's door: it checks only the targets not checked yet.
 func (r *run) exists(ctx context.Context, m proxy.Model) (string, error) {
 	toward := "alias " + m.Name + " exists, toward " + strings.Join(m.Targets, ", ") + "; kept"
 	kept := toward + ": Change an alias changes it"
@@ -123,7 +124,7 @@ func (r *run) exists(ctx context.Context, m proxy.Model) (string, error) {
 		adds = r.fresh(ctx, m, strings.Split(given, ","))
 	}
 	switch {
-	case len(adds) == 0 && r.u.Given(ui.Question{ID: "reverify"}):
+	case len(adds) == 0 && (r.u.Given(ui.Question{ID: "reverify"}) || r.u.Given(ui.Question{ID: "unverified"})):
 		return r.checkAgain(ctx, m, toward, kept)
 	case len(adds) == 0:
 		return kept, nil

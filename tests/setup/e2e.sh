@@ -3,9 +3,10 @@
 # a Linux host with Docker. A temporary copy of the working tree, made a git
 # repository, runs ./setup.sh install, the console's first run, with every
 # answer as a flag and no terminal, then key, budget, telemetry, remote with
-# a self-signed certificate (then renewed), install again under TLS, status
-# and, from one commit more on a bare
-# upstream, upgrade, whose printed way back is then run, on that
+# a self-signed certificate (then renewed), install again under TLS, status,
+# the machine tasks (logs, stop, start, restart, backup and restore) and,
+# from one commit more on a bare upstream, upgrade, whose printed way back is
+# then run, then uninstall, on that
 # installation, under its own Compose project, image name and free host
 # port, so it runs beside a service on port 4000. The mock provider runs
 # from the source in the Go image, listening only on the Docker bridge's
@@ -52,12 +53,13 @@ again() {
 cleanup() {
 	docker rm -f "$project-mock" >/dev/null 2>&1
 	(cd "$tree" && docker compose down --volumes --remove-orphans >/dev/null 2>&1)
+	docker volume rm "${project}_stargaite-data" >/dev/null 2>&1
 	docker image rm "$STARGAITE_IMAGE" "$STARGAITE_IMAGE-previous" ${built:+"$built"} >/dev/null 2>&1
 	[[ $tree == */stargaite-setup-test.* ]] && rm -rf -- "$tree" "$tree.remote"
 }
 
 main() {
-	local root gw mport port key want out code i cert a newer backup line keys adm chats
+	local root gw mport port key want out code i cert a newer backup line keys adm chats copy
 	built=""
 	: "${GO_IMAGE:?GO_IMAGE names the Go image, as the Makefile sets it}"
 	root=$(cd "$(dirname "$0")/../.." && pwd) || fail "no repository root"
@@ -200,6 +202,32 @@ main() {
 	[[ $out == *"version: $want running, $want in this clone"* && $out == *"provider mock: credential resolved"* &&
 		$out == *"credentials resolved"* ]] || fail "status does not show the versions and the credentials"
 	[[ $("$tree/bin/stargaite-console" --version) == "$want" ]] || fail "the console exported is not this clone's version"
+	# The machine tasks (C64a): the last log lines, a follow refused without a terminal, stop refused without
+	# --yes, then stop, start and restart; a backup, a key made after it, and that backup restored, which takes
+	# the key away.
+	again logs
+	[[ $out == *"Done: the last 100 log lines are above."* && $out != *"$key"* ]] || fail "logs did not end with its result, or printed the credential"
+	code=0; out=$(cd "$tree" && ./setup.sh logs --follow </dev/null 2>&1) || code=$?
+	((code == 2)) && [[ $out == *"--follow needs a terminal"* ]] || fail "logs --follow without a terminal exited $code"
+	code=0; out=$(cd "$tree" && ./setup.sh stop </dev/null 2>&1) || code=$?
+	((code == 2)) && [[ -n $(cd "$tree" && docker compose ps -q) ]] || fail "stop without --yes exited $code, or stopped the container"
+	again stop --yes
+	[[ $out == *"Done: the container is stopped."* && -z $(cd "$tree" && docker compose ps -q) ]] || fail "stop did not stop the container"
+	again start
+	[[ $out == *"Done: the container is started and ready."* ]] || fail "start did not end ready"
+	again restart --yes
+	[[ $out == *"Done: the container is restarted and ready."* ]] || fail "restart did not end ready"
+	again backup
+	[[ $out =~ "Done: "(backups/[A-Za-z0-9._-]+\.db)", "([0-9]+)" bytes." ]] || fail "backup named no copy"
+	copy=${BASH_REMATCH[1]}
+	[[ $(stat -c %a "$tree/$copy") == 600 && $(stat -c %a "$tree/backups") == 700 && $(stat -c %s "$tree/$copy") == "${BASH_REMATCH[2]}" ]] ||
+		fail "$copy is not mode 0600 in a 0700 backups/, or not of the size backup said"
+	(cd "$tree" && docker compose exec -T "${adm[@]}" stargaite /stargaite keys create gone --model main --json >/dev/null) ||
+		fail "no key made after the backup"
+	again restore --from "$copy" --yes
+	[[ $out == *"Done: the store is the copy $copy, taken "* ]] || fail "restore did not put $copy back"
+	keys=$(cd "$tree" && docker compose exec -T "${adm[@]}" stargaite /stargaite keys list --json | jq -r '[.keys[].name] | sort | join(",")')
+	[[ $keys == e2e,e2e-2,e2e-3 ]] || fail "the restored store holds the keys $keys, not e2e, e2e-2 and e2e-3"
 	# Upgrade: the copy's upstream, a bare repository, holds one commit more.
 	# upgrade keeps the previous image, builds, backs up, starts and checks
 	# the new version; then the way back it printed is run as printed, and
@@ -234,6 +262,16 @@ main() {
 	[[ $(cd "$tree" && docker compose exec -T stargaite /stargaite version) == "$want" ]] || fail "the previous image, $want, does not run"
 	keys=$(cd "$tree" && docker compose exec -T "${adm[@]}" stargaite /stargaite keys list --json | jq -r '[.keys[].name] | sort | join(",")')
 	[[ $keys == e2e,e2e-2,e2e-3 ]] || fail "the restored store holds the keys $keys, not e2e, e2e-2 and e2e-3"
+	# Uninstall: the container, both image tags and the console go; the volume and .env stay, and the command
+	# that removes the volume names it as Compose does.
+	again uninstall --yes
+	[[ -z $(cd "$tree" && docker compose ps -a -q) ]] || fail "uninstall left the container"
+	for i in "$STARGAITE_IMAGE" "$STARGAITE_IMAGE-previous"; do
+		! docker image inspect "$i" >/dev/null 2>&1 || fail "uninstall left the image $i"
+	done
+	[[ ! -e $tree/bin/stargaite-console && -s $tree/.env ]] || fail "uninstall left the console, or removed .env"
+	docker volume inspect "${project}_stargaite-data" >/dev/null || fail "uninstall removed the volume"
+	[[ $out == *"  docker volume rm ${project}_stargaite-data"* ]] || fail "uninstall did not print the volume's removal"
 	echo "setup-test: passed"
 }
 

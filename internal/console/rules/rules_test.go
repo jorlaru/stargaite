@@ -246,11 +246,13 @@ func TestPlain(t *testing.T) {
 	if got := Plain("credential_unresolved", "providers/acme", "x"); got != want {
 		t.Errorf("credential_unresolved: %q, want %q", got, want)
 	}
+	want = "target a: its reasoning levels are not declared, so an effort is sent as given and never in the off form"
+	if got := Plain("reasoning_undeclared", "targets/a", "x"); got != want {
+		t.Errorf("reasoning_undeclared: %q, want %q", got, want)
+	}
 	msg := "pay-per-use target with neither prices nor a provider cost report: its usage has no cost"
-	for _, code := range []string{"reasoning_undeclared", "never_heard_of"} {
-		if got := Plain(code, "targets/a", msg); got != "target a: "+msg {
-			t.Errorf("%s: %q", code, got)
-		}
+	if got := Plain("never_heard_of", "targets/a", msg); got != "target a: "+msg {
+		t.Errorf("never_heard_of: %q", got)
 	}
 }
 
@@ -280,6 +282,57 @@ func TestPlainNames(t *testing.T) {
 	} {
 		if got := Plain("never_heard_of", res, "m"); got != want+": m" {
 			t.Errorf("%s: %q, want %q", res, got, want+": m")
+		}
+	}
+}
+
+// TestCommand: the stargaite command that fixes a finding, with the target's
+// id; "" for a finding no command fixes.
+func TestCommand(t *testing.T) {
+	pricing := "targets set p/m --pricing input_per_million=<usd>,output_per_million=<usd>,as_of=<YYYY-MM-DD>"
+	for _, tc := range []struct{ code, resource, want string }{
+		{"reasoning_undeclared", "targets/p/m", "targets set p/m --level <level> --can-disable=<true|false>, one --level per level it takes"},
+		{"unpriced", "targets/p/m", pricing},
+		{"no_fallback_prices", "targets/p/m", pricing},
+		{"effort_dropped", "targets/p/m", ""},
+		{"never_heard_of", "targets/p/m", ""},
+		{"unpriced", "providers/p", ""},
+		{"unpriced", "targets/p/a;b'c$(x)", "targets set 'p/a;b'\\''c$(x)' --pricing input_per_million=<usd>,output_per_million=<usd>,as_of=<YYYY-MM-DD>"},
+		{"unpriced", "targets/p/A-z_0.9:@+=", "targets set p/A-z_0.9:@+= --pricing input_per_million=<usd>,output_per_million=<usd>,as_of=<YYYY-MM-DD>"},
+	} {
+		if got := Command(tc.code, tc.resource); got != tc.want {
+			t.Errorf("Command(%s, %s) = %q, want %q", tc.code, tc.resource, got, tc.want)
+		}
+	}
+}
+
+// TestFix: the task and presets that fix a finding; false for one no task
+// fixes.
+func TestFix(t *testing.T) {
+	for _, tc := range []struct {
+		code, resource, alias string
+		task                  string
+		presets               map[string]string
+	}{
+		{"credential_unresolved", "providers/p", "", "Change a provider", map[string]string{"provider": "p", "change": "key"}},
+		{"credential_unresolved", "settings", "", "Send traces", nil},
+		{"target_unverified", "targets/p/m", "a", "Make an alias", map[string]string{"alias": "a", "unverified": "yes"}},
+		{"unknown_alias", "keys/k", "", "Change a key", map[string]string{"key": "k", "change": "aliases"}},
+		{"effort_dropped", "models/a", "", "Change an alias", map[string]string{"alias": "a", "change": "effort"}},
+		{"endpoint_unservable", "models/a", "", "Change an alias", map[string]string{"alias": "a"}},
+	} {
+		s, ok := Fix(tc.code, tc.resource, tc.alias)
+		if !ok || s.Task != tc.task || !maps.Equal(s.Presets, tc.presets) || (s.Presets == nil) != (tc.presets == nil) {
+			t.Errorf("Fix(%s, %s, %q) = %+v, %v; want %s %v", tc.code, tc.resource, tc.alias, s, ok, tc.task, tc.presets)
+		}
+	}
+	for _, tc := range []struct{ code, resource string }{
+		{"target_unverified", "targets/p/m"}, {"credential_unresolved", "keys/k"}, {"unpriced", "targets/p/m"},
+		{"no_fallback_prices", "targets/p/m"}, {"reasoning_undeclared", "targets/p/m"}, {"url_unresolved", "providers/p"},
+		{"unknown_provider", "targets/p/m"}, {"quota_beyond_retention", "keys/k"},
+	} {
+		if s, ok := Fix(tc.code, tc.resource, ""); ok {
+			t.Errorf("Fix(%s, %s) = %+v, want none", tc.code, tc.resource, s)
 		}
 	}
 }

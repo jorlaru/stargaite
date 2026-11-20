@@ -339,6 +339,13 @@ func fakeDocker(args []string) int {
 		return 1
 	case args[1] == "version":
 		fmt.Println(env("FAKE_COMPOSE", "2.29.1"))
+	case slices.Equal(args[1:], []string{"config", "--format", "json"}):
+		// As Compose prints it, with the environment env_file gives in clear;
+		// the project is the directory's base name, lower-cased.
+		dir, _ := os.Getwd()
+		project := strings.ToLower(filepath.Base(dir))
+		fmt.Printf(`{"name":%q,"services":{"stargaite":{"image":%q,"environment":{"SHIM_SECRET":"sk-SHIM-SECRET"}}},`+
+			`"volumes":{"stargaite-data":{"name":%q}}}`+"\n", project, env("STARGAITE_IMAGE", "stargaite:local"), project+"_stargaite-data")
 	case args[1] == "build":
 		if upgrade == "build-fails" {
 			fmt.Fprintln(os.Stderr, "failed to solve: process did not complete successfully: exit code: 1")

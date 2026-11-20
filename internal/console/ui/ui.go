@@ -90,7 +90,10 @@ type UI struct {
 	bare    map[string]bareUse // per ID: the first item a bare per-item value answered
 	steps   []Step             // the running task's table; nil outside a task
 	inTask  bool
-	session *paid.Session // the run's paid calls; only Paid opens a step on it
+	outer   []Step            // inside Stages: the table drawn as the bar; nil otherwise
+	at      map[string]string // inside Stages: the outer step of each inner one; nil in a nested Run
+	stage   int               // inside Stages: the outer step last drawn
+	session *paid.Session     // the run's paid calls; only Paid opens a step on it
 }
 
 // bareUse is the item, and the prompt it asked, that a per-item flag given
@@ -125,9 +128,22 @@ func (u *UI) Given(q Question) bool {
 // Run runs a task with its step table and restores the previous table on
 // return, so tasks nest.
 func (u *UI) Run(ctx context.Context, steps []Step, fn func(context.Context) (string, error)) (string, error) {
-	savedSteps, savedIn := u.steps, u.inTask
-	u.steps, u.inTask = steps, true
-	defer func() { u.steps, u.inTask = savedSteps, savedIn }()
+	savedSteps, savedIn, savedAt := u.steps, u.inTask, u.at
+	u.steps, u.inTask, u.at = steps, true, nil
+	defer func() { u.steps, u.inTask, u.at = savedSteps, savedIn, savedAt }()
+	return fn(ctx)
+}
+
+// Stages runs fn, a task with its own step table steps, inside the task now
+// running, whose table becomes the bar: a question is checked against steps
+// and drawn at the outer step at[q.Step]. A Run nested in fn keeps the bar at
+// the stage last drawn. The outer table comes back on return.
+func (u *UI) Stages(ctx context.Context, at map[string]string, steps []Step, fn func(context.Context) (string, error)) (string, error) {
+	outer, savedAt, stage, savedSteps, savedIn := u.outer, u.at, u.stage, u.steps, u.inTask
+	u.outer, u.at, u.steps, u.inTask = u.steps, at, steps, true
+	defer func() {
+		u.outer, u.at, u.stage, u.steps, u.inTask = outer, savedAt, stage, savedSteps, savedIn
+	}()
 	return fn(ctx)
 }
 
@@ -312,6 +328,9 @@ func (u *UI) prepare(q Question) (Question, error) {
 	if (u.inTask && bar.Current < 0) || (!u.inTask && q.Step != "") {
 		return q, fmt.Errorf("ui: question %s: step %q is not in the task's table", q.ID, q.Step)
 	}
+	if u.outer != nil {
+		bar = u.outerBar(q.Step)
+	}
 	q.Bar = bar
 	q.Prompt = OneLine(q.Prompt)
 	q.Options = slices.Clone(q.Options)
@@ -320,6 +339,19 @@ func (u *UI) prepare(q Question) (Question, error) {
 		q.Options[i].Group = OneLine(q.Options[i].Group)
 	}
 	return q, nil
+}
+
+// outerBar is the bar inside Stages: the outer table, at the outer step of
+// step, or at the stage last drawn in a nested Run.
+func (u *UI) outerBar(step string) Bar {
+	if u.at != nil {
+		u.stage = slices.IndexFunc(u.outer, func(s Step) bool { return s.ID == u.at[step] })
+	}
+	bar := Bar{Current: u.stage}
+	for _, s := range u.outer {
+		bar.Titles = append(bar.Titles, s.Title)
+	}
+	return bar
 }
 
 // ask is the answer chain: flags or front, the default, the options, the

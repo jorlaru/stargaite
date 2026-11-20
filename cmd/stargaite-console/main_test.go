@@ -23,10 +23,17 @@ import (
 	"github.com/jorlaru/stargaite/internal/console/task"
 )
 
-// console is the binary TestMain builds, in a clone: <tmp>/clone/bin/.
+// console is the binary TestMain builds, in a clone: <tmp>/clone/bin/; or,
+// for tests/setup/e2e.sh, the one of the tree it set up.
 var console string
 
 func TestMain(m *testing.M) {
+	// e2e.sh runs this test binary on its host, which has no go: the console
+	// is the tree's own, built by the bootstrap, and nothing is built here.
+	if tree := os.Getenv("STARGAITE_E2E_TREE"); tree != "" {
+		console = filepath.Join(tree, "bin", "stargaite-console")
+		os.Exit(m.Run())
+	}
 	dir, err := os.MkdirTemp("", "stargaite-console-")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -131,7 +138,7 @@ func TestVersionFirst(t *testing.T) {
 func TestUsage(t *testing.T) {
 	env, log := fake(t, replies)
 	out, _, code := runConsole(t, console, env, "help")
-	if code != 0 || !strings.HasPrefix(out, "usage: stargaite-console [provider | alias | key | status | help] [flags] [--version]\n") {
+	if code != 0 || !strings.HasPrefix(out, "usage: stargaite-console [install | provider | alias | key | status | help] [flags] [--version]\n") {
 		t.Fatalf("help: exit %d\n%s", code, out)
 	}
 	for _, c := range []struct {
@@ -154,8 +161,12 @@ func TestUsage(t *testing.T) {
 
 func TestUsageText(t *testing.T) {
 	out, _, _ := runConsole(t, console, nil, "--help")
-	want := "usage: stargaite-console [provider | alias | key | status | help] [flags] [--version]\n" +
+	want := "usage: stargaite-console [install | provider | alias | key | status | help] [flags] [--version]\n" +
 		"At a terminal with no subcommand: the guided console.\n" +
+		"  install   the first run: this machine, then a provider, an alias with its fallbacks and a key, each kept when it\n" +
+		"            exists, ending with one test call; at a terminal it starts at the first missing step\n" +
+		"            --port <n> (4000), and the flags of provider, alias and key\n" +
+		"            its check and its test call are each announced first, capped at 256 output tokens, never retried\n" +
 		"  provider  add providers and their keys; each key is checked for free before it is written\n" +
 		"            --provider <a,b>   presets, a provider already added, or one new name\n" +
 		"            --base-url <url>   --protocol <openai|anthropic>   --api-key-env <VAR|none>\n" +
@@ -640,14 +651,20 @@ const keyCLI = `case "$*" in
 esac
 `
 
+// firstCLI is keyCLI with the container that exists and the first run's
+// reads: one provider resolved, alias main, no key.
+var firstCLI = strings.Replace(keyCLI, `"compose ps -q") echo c0ffee ;;`, `"compose ps -q"|"compose ps -a -q") echo c0ffee ;;
+"compose exec -T stargaite /stargaite export --json") echo '{"version":1,"providers":{"acme":{}},"models":{"main":{"targets":["acme/a"]}}}' ;;
+"compose exec -T stargaite /stargaite validate --json") echo '{"findings":[]}' ;;`, 1)
+
 // chatBody is the shim's chat completion (tests/setup/shim).
 const chatBody = `{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"fake reply"},"finish_reason":"stop"}]}`
 
 // keyClone is a clone of its own whose data plane answers each chat
-// completion with status and body, and a fake docker with keyCLI. It
-// returns the console, the fake's environment and log, and the
+// completion with status and body, and a fake docker with cli, such as
+// keyCLI. It returns the console, the fake's environment and log, and the
 // Authorization headers the data plane got.
-func keyClone(t *testing.T, status int, body string) (bin string, env []string, log string, auth func() []string) {
+func keyClone(t *testing.T, status int, body, cli string) (bin string, env []string, log string, auth func() []string) {
 	t.Helper()
 	var mu sync.Mutex
 	var got []string
@@ -663,7 +680,7 @@ func keyClone(t *testing.T, status int, body string) (bin string, env []string, 
 		w.WriteHeader(status)
 		_, _ = io.WriteString(w, body)
 	}))
-	env, log = fake(t, keyCLI)
+	env, log = fake(t, cli)
 	return bin, env, log, func() []string { mu.Lock(); defer mu.Unlock(); return slices.Clone(got) }
 }
 
@@ -671,7 +688,7 @@ func keyClone(t *testing.T, status int, body string) (bin string, env []string, 
 // then tries it with that key: one request; a try the plane refuses exits
 // 1 with its words.
 func TestKeyPlain(t *testing.T) {
-	bin, env, log, auth := keyClone(t, http.StatusOK, chatBody)
+	bin, env, log, auth := keyClone(t, http.StatusOK, chatBody, keyCLI)
 	out, errOut, code := runConsole(t, bin, env, "key")
 	lines := strings.Split(out, "\n")
 	if code != 0 || strings.Count(out, keySecret) != 1 || !slices.Contains(lines, keySecret) || !strings.Contains(out, "answer: fake reply") {
@@ -691,7 +708,7 @@ func TestKeyPlain(t *testing.T) {
 		{http.StatusBadGateway, `{"error":{"message":"the provider failed","code":"provider_error"}}`, "stargaite-console: the test call answered 502: the provider failed"},
 		{http.StatusInternalServerError, "", "stargaite-console: the test call answered 500"},
 	} {
-		bin, env, _, auth := keyClone(t, c.status, c.body)
+		bin, env, _, auth := keyClone(t, c.status, c.body, keyCLI)
 		out, errOut, code := runConsole(t, bin, env, "key")
 		if code != 1 || !slices.Contains(strings.Split(errOut, "\n"), c.want) || len(auth()) != 1 {
 			t.Errorf("%d: exit %d, %d requests, stderr %q, stdout:\n%s", c.status, code, len(auth()), errOut, out)

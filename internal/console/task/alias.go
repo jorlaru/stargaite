@@ -709,7 +709,7 @@ func (r *run) explain(ctx context.Context, n string) error {
 // check when checked: it has passed by now.
 func (r *run) warn(ctx context.Context, findings []proxy.Finding, checked bool, resources ...string) {
 	for _, f := range findings {
-		if w, ok := rules.Lookup(f.Code); slices.Contains(resources, f.Resource) && (!checked || !ok || w.Held != "check") {
+		if w, ok := rules.Lookup(f.Code); slices.Contains(resources, f.Resource) && (!checked || !ok || w.Held != "check") && w.Held != "everything" {
 			say(ctx, r.u, rules.Plain(f.Code, f.Resource, f.Message))
 		}
 	}

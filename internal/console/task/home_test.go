@@ -148,12 +148,13 @@ func TestHomeRead(t *testing.T) {
 	}
 }
 
-// psClone is a host whose docker runs sh for compose ps -q, with no git on
-// PATH, so the clone's version is dev.
+// psClone is a host whose docker runs sh for compose ps -q and answers
+// compose ps -a -q with a container, with no git on PATH, so the clone's
+// version is dev.
 func psClone(t *testing.T, sh string) *host.Host {
 	t.Helper()
 	bin := t.TempDir()
-	writeFile(t, filepath.Join(bin, "docker"), "#!/bin/sh\n[ \"$*\" = \"compose ps -q\" ] || exit 9\n"+sh+"\n", 0o755)
+	writeFile(t, filepath.Join(bin, "docker"), "#!/bin/sh\ncase \"$*\" in\n'compose ps -q') "+sh+" ;;\n'compose ps -a -q') echo c0ffee ;;\n*) exit 9 ;;\nesac\n", 0o755)
 	t.Setenv("PATH", bin)
 	return host.New(t.TempDir())
 }
@@ -277,11 +278,20 @@ func TestHomeQuestion(t *testing.T) {
 	if q := homeQuestion(home{}, Menu()); len(q.Options) != 7 || q.Options[0].Group != "Providers" {
 		t.Fatalf("without suggestions: %+v", q.Options)
 	}
+	if slices.ContainsFunc(q.Options, func(o ui.Option) bool { return o.Value == "First run" || o.Label == "First run" }) {
+		t.Fatalf("the first run is listed: %+v", q.Options)
+	}
 }
 
 func TestHomeSuggestionPresets(t *testing.T) {
 	w, port := homeWorld(t)
-	s := &scripted{answers: map[string][]string{"home": {"suggested:1"}, "fallback-provider": {leave}}}
+	w.must("keys", "create", "--model", "a", "--", "k")
+	hm := readHome(context.Background(), w.proxy(), w.h)
+	i := slices.IndexFunc(hm.suggested, func(s rules.Suggestion) bool { return s.Label == "Give alias a a fallback: it has one model" })
+	if i < 0 {
+		t.Fatalf("suggested %+v", hm.suggested)
+	}
+	s := &scripted{answers: map[string][]string{"home": {"suggested:" + strconv.Itoa(i)}, "fallback-provider": {leave}}}
 	if err := Home(context.Background(), ui.New(homeFront{s}, nil), w.proxy(), w.h, 15*time.Second); !errors.Is(err, ui.ErrQuit) {
 		t.Fatalf("Home: %v\n%s", err, s.output())
 	}
@@ -292,7 +302,7 @@ func TestHomeSuggestionPresets(t *testing.T) {
 	if !slices.Equal(ids, []string{"home", "fallback-provider", "home"}) {
 		t.Errorf("asked %q", ids)
 	}
-	summary := "http://127.0.0.1:" + port + "/v1: ready · proxy " + cli.Version + " · clone dev · 1 provider(s), 1 alias(es), 0 key(s) · spend not capped\n"
+	summary := "http://127.0.0.1:" + port + "/v1: ready · proxy " + cli.Version + " · clone dev · 1 provider(s), 1 alias(es), 1 key(s) · spend not capped\n"
 	if out := s.output(); out != summary+"Left Change an alias.\n"+summary {
 		t.Errorf("output:\n%s", out)
 	}
@@ -303,6 +313,7 @@ func TestHomeSuggestionPresets(t *testing.T) {
 // provider at its key question.
 func TestHomeUnresolved(t *testing.T) {
 	w, _ := homeWorld(t)
+	w.must("keys", "create", "--model", "a", "--", "k")
 	w.onMock("acme", "--protocol", "openai", "--api-key-env", "NOPE_KEY", "--billing", "pay_per_use")
 	hm := readHome(context.Background(), w.proxy(), w.h)
 	const label = "Replace the key of acme: NOPE_KEY does not resolve"
@@ -349,5 +360,81 @@ func TestHomeTaskLines(t *testing.T) {
 		if got := taskLine("Change a key", row.res, row.err); got != row.want {
 			t.Errorf("taskLine(%q, %v) = %q; want %q", row.res, row.err, got, row.want)
 		}
+	}
+}
+
+func TestHomeOpensFirstRun(t *testing.T) {
+	// (a) No container at all: the first run, at once, from the Machine step.
+	m := machineClone(t, psNone, psNone, "trap 'exit 130' INT\n/bin/sleep 60")
+	p := closedPort(t)
+	m.env("STARGAITE_PORT=" + p + "\n")
+	s := &scripted{answers: map[string][]string{}, leaveWork: func(q ui.Question) bool {
+		return q.Prompt == "building and starting the container" && strings.Contains(m.dockerLog(), "compose up")
+	}}
+	var calls []string
+	if err := Home(context.Background(), ui.New(homeFront{s}, nil), proxy.New(cannedRunner(t, nil, &calls)), m.h, 15*time.Second); !errors.Is(err, ui.ErrQuit) {
+		t.Fatalf("Home: %v\n%s", err, s.output())
+	}
+	f2 := "http://127.0.0.1:" + p + "/v1: not installed yet (./setup.sh install sets it up) · clone dev\n"
+	want := f2 + "building and starting version dev (the first build takes a few minutes)\nLeft First run.\n" + f2
+	if s.output() != want || len(s.homes()) != 1 || len(s.questions) != 1 || len(calls) != 0 {
+		t.Fatalf("output %q; want %q; asked %q, CLI calls %q", s.output(), want, s.asked, calls)
+	}
+
+	// (b) A ready store with no alias: the first run at the alias stage, not the home's pick.
+	w, _, _ := keyWorld(t)
+	s = &scripted{answers: map[string][]string{"alias": {leave, leave}, "home": {"suggested:0"}}}
+	if err := Home(context.Background(), ui.New(homeFront{s}, nil), w.proxy(), w.h, 15*time.Second); !errors.Is(err, ui.ErrQuit) {
+		t.Fatalf("Home: %v\n%s", err, s.output())
+	}
+	var ids []string
+	for _, q := range s.questions {
+		ids = append(ids, q.ID)
+	}
+	if !slices.Equal(ids, []string{"alias", "home", "alias", "home"}) {
+		t.Fatalf("asked %q\n%s", ids, s.output())
+	}
+	for _, i := range []int{0, 2} {
+		if q := s.questions[i]; q.Prompt != "a name for the alias your clients call" || !slices.Equal(q.Bar.Titles, eight) || q.Bar.Current != 2 {
+			t.Errorf("question %d: %q at %+v", i, q.Prompt, q.Bar)
+		}
+	}
+	if o := s.homes()[0].Options[0]; o.Value != "suggested:0" || o.Label != "Make an alias your apps call: none exists yet" {
+		t.Errorf("first option %+v", o)
+	}
+	if strings.Count(s.output(), "Left First run.\n") != 2 {
+		t.Errorf("output:\n%s", s.output())
+	}
+}
+
+func TestHomeNoFirstRunLater(t *testing.T) {
+	// The first run opens on the first round only.
+	w, _, _ := keyWorld(t)
+	s := &scripted{answers: map[string][]string{"alias": {leave}}}
+	if err := Home(context.Background(), ui.New(homeFront{s}, nil), w.proxy(), w.h, 15*time.Second); !errors.Is(err, ui.ErrQuit) {
+		t.Fatalf("Home: %v\n%s", err, s.output())
+	}
+	if len(s.questions) != 2 || s.questions[1].ID != "home" {
+		t.Fatalf("asked %q", s.asked)
+	}
+
+	// (c) A provider whose credential does not resolve, with an alias and a key: the home at once.
+	env, port := admintest.Plane(t)
+	w = worldOn(t, env)
+	writeFile(t, filepath.Join(w.h.Dir, ".env"), "STARGAITE_PORT="+port+"\n", 0o600)
+	srv := httptest.NewServer(mockprovider.New())
+	t.Cleanup(srv.Close)
+	w.must("providers", "add", "acme", "--base-url", srv.URL, "--allow-private-network", "--api-key-env", "NOPE_KEY",
+		"--protocol", "openai", "--billing", "pay_per_use")
+	w.target("acme/m", "--kind", "chat")
+	w.must("models", "add", "a", "--target", "acme/m")
+	w.must("keys", "create", "--model", "a", "--", "k")
+	s = &scripted{answers: map[string][]string{}}
+	if err := Home(context.Background(), ui.New(homeFront{s}, nil), w.proxy(), w.h, 15*time.Second); !errors.Is(err, ui.ErrQuit) {
+		t.Fatalf("Home: %v\n%s", err, s.output())
+	}
+	if len(s.questions) != 1 || s.questions[0].ID != "home" ||
+		!slices.ContainsFunc(s.questions[0].Options, func(o ui.Option) bool { return o.Label == "Replace the key of acme: NOPE_KEY does not resolve" }) {
+		t.Fatalf("asked %+v", s.questions)
 	}
 }

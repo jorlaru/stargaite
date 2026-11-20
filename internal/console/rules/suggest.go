@@ -23,18 +23,18 @@ type Suggestion struct {
 // Suggest is what the home suggests, in this order (design section 3,
 // "Suggestions"): a provider, else an alias, when none exists, and nothing
 // more; then a key when none exists, each provider whose key does not
-// resolve, and each alias with one model, by name. A row whose task is not
-// ported yet lands with that task.
+// resolve, and each alias with one model, by name. The first three open the
+// first run. A row whose task is not ported yet lands with that task.
 func Suggest(f Facts) []Suggestion {
 	switch {
 	case f.Providers == 0:
-		return []Suggestion{{Label: "Add a provider: none is added yet", Task: "Add providers"}}
+		return []Suggestion{{Label: "Add a provider: none is added yet", Task: "First run"}}
 	case len(f.Aliases) == 0:
-		return []Suggestion{{Label: "Make an alias your apps call: none exists yet", Task: "Make an alias"}}
+		return []Suggestion{{Label: "Make an alias your apps call: none exists yet", Task: "First run"}}
 	}
 	var out []Suggestion
 	if f.Keys == 0 {
-		out = append(out, Suggestion{Label: "Give an app or agent its key: none exists yet", Task: "Give an app or agent its key"})
+		out = append(out, Suggestion{Label: "Give an app or agent its key: none exists yet", Task: "First run"})
 	}
 	for _, p := range slices.Sorted(maps.Keys(f.Unresolved)) {
 		out = append(out, Suggestion{Label: fmt.Sprintf("Replace the key of %s: %s does not resolve", p, f.Unresolved[p]),
@@ -45,6 +45,23 @@ func Suggest(f Facts) []Suggestion {
 			out = append(out, Suggestion{Label: fmt.Sprintf("Give alias %s a fallback: it has one model", a),
 				Task: "Change an alias", Presets: map[string]string{"alias": a, "change": "add"}})
 		}
+	}
+	return out
+}
+
+// Missing is the first run's stages whose own thing is missing, in order
+// (design section 4.1): "provider" when no provider's credential resolves,
+// "alias" when no alias exists, "key" when no key exists.
+func Missing(f Facts) []string {
+	var out []string
+	if f.Providers == len(f.Unresolved) {
+		out = append(out, "provider")
+	}
+	if len(f.Aliases) == 0 {
+		out = append(out, "alias")
+	}
+	if f.Keys == 0 {
+		out = append(out, "key")
 	}
 	return out
 }

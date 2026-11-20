@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/jorlaru/stargaite/internal/console/proxy"
-	"github.com/jorlaru/stargaite/internal/console/rules"
 	"github.com/jorlaru/stargaite/internal/console/ui"
 	"github.com/jorlaru/stargaite/internal/console/ui/plain"
 	"github.com/jorlaru/stargaite/tests/mockprovider"
@@ -336,14 +335,15 @@ func TestMakeAliasHeldWarnings(t *testing.T) {
 	w.override(map[string][]reply{"models add --json --target mock/m -- x": {{`{"findings":[` +
 		`{"severity":"warning","code":"target_unverified","resource":"targets/mock/m","message":"unverified message"},` +
 		`{"severity":"warning","code":"url_unresolved","resource":"providers/x","message":"url message"},` +
+		`{"severity":"warning","code":"reasoning_undeclared","resource":"targets/mock/m","message":"levels message"},` +
 		`{"severity":"warning","code":"effort_dropped","resource":"models/x","message":"dropped message"}]}`, 0}}})
 	res, out, err := w.makePlain(map[string]string{"provider": "mock", "model": "m", "alias": "x"})
 	if err != nil || res != "Done: alias x toward mock/m." {
 		t.Fatalf("%q, %v\n%s", res, err, out)
 	}
 	if strings.Contains(out, "not checked yet") || strings.Contains(out, "unverified message") ||
-		strings.Contains(out, "did not resolve") || strings.Contains(out, "url message") ||
-		!strings.Contains(out, rules.Plain("effort_dropped", "models/x", "")+"\n") {
+		strings.Contains(out, "did not resolve") || strings.Contains(out, "url message") || strings.Contains(out, "levels message") ||
+		!strings.Contains(out, "alias x: the alias's effort is not sent toward a target whose reasoning dialect is none\n") {
 		t.Errorf("output:\n%s", out)
 	}
 }
@@ -462,5 +462,52 @@ func TestMakeAliasEffortRequired(t *testing.T) {
 	if !slices.Contains(s.asked, "mock/r always reasons: a default reasoning effort, such as low, medium or high") || len(w.applied()) != 2 ||
 		!slices.Contains(w.cli(), "models add --json --target mock/r --effort low --effort-mode default -- x") {
 		t.Errorf("asked %q, CLI calls %q", s.asked, w.cli())
+	}
+}
+
+func TestMakeAliasExistsReverify(t *testing.T) {
+	w, mock := checkWorld(t)
+	if res, out, err := w.makePlain(map[string]string{"provider": "mock", "model": "m", "alias": "main"}); err != nil {
+		t.Fatalf("%q, %v\n%s", res, err, out)
+	}
+	res, out, err := w.makePlain(map[string]string{"alias": "main", "reverify": "yes"})
+	if err != nil || res != "alias main exists, toward mock/m; kept, and checked again" {
+		t.Fatalf("%q, %v\n%s", res, err, out)
+	}
+	if got := w.verifies(); !slices.Equal(got, []string{verifyOf("mock/m"), verifyOf("mock/m")}) || len(mock.Calls()) != 2 {
+		t.Errorf("verifies %q, %d mock calls", got, len(mock.Calls()))
+	}
+	hasLines(t, out, "check mock/m: 1 paid call(s) to mock, each capped at 256 output tokens, never retried", "target mock/m is checked")
+
+	// Not now at a terminal: kept, and nothing said checked.
+	calls := len(mock.Calls())
+	s := &scripted{answers: map[string][]string{"check": {"not now"}}}
+	res, err = w.makeAlias(ui.New(s, map[string]string{"alias": "main", "reverify": "yes"}))
+	if err != nil || res != "alias main exists, toward mock/m; kept: Change an alias changes it" || len(mock.Calls()) != calls {
+		t.Errorf("not now: %q, %v, %d more mock calls\n%s", res, err, len(mock.Calls())-calls, s.output())
+	}
+
+	// --fallback naming a target the alias has: checked again all the same.
+	res, out, err = w.makePlain(map[string]string{"alias": "main", "reverify": "yes", "fallback": "mock/m"})
+	if err != nil || res != "alias main exists, toward mock/m; kept, and checked again" || len(w.verifies()) != 3 {
+		t.Errorf("its own fallback: %q, %v, verifies %q\n%s", res, err, w.verifies(), out)
+	}
+
+	// --fallback naming a new target wins over --reverify: it is added.
+	w.onMock("mock2", "--protocol", "openai", "--billing", "none")
+	res, out, err = w.makePlain(map[string]string{"alias": "main", "reverify": "yes", "fallback": "mock2/m"})
+	if err != nil || res != "Done: alias main toward mock/m, mock2/m." || !slices.Equal(w.alias("main").Targets, []string{"mock/m", "mock2/m"}) {
+		t.Errorf("a new fallback: %q, %v, targets %q\n%s", res, err, w.alias("main").Targets, out)
+	}
+
+	// A target whose provider's credential does not resolve: no paid call.
+	w, mock = checkWorld(t)
+	w.onMock("acme", "--protocol", "openai", "--api-key-env", "ACME_API_KEY", "--billing", "pay_per_use")
+	w.target("acme/m", "--kind", "chat")
+	w.must("models", "add", "main", "--target", "acme/m")
+	_, out, err = w.makePlain(map[string]string{"alias": "main", "reverify": "yes"})
+	if err == nil || err.Error() != "the credential of acme does not resolve: ACME_API_KEY is not in the container's environment" ||
+		len(w.verifies()) != 0 || len(mock.Calls()) != 0 {
+		t.Fatalf("unresolved: err = %v, verifies %q, %d mock calls\n%s", err, w.verifies(), len(mock.Calls()), out)
 	}
 }

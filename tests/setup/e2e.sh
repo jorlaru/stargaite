@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # make setup-test: setup.sh end to end (docs/design/phase-6.md section 7), on
 # a Linux host with Docker. A temporary copy of the working tree, made a git
-# repository, runs ./setup.sh install with every answer as a flag and no
-# terminal, then key, budget, telemetry, remote with a self-signed
-# certificate (then renewed), status and, from one commit more on a bare
+# repository, runs ./setup.sh install, the console's first run, with every
+# answer as a flag and no terminal, then key, budget, telemetry, remote with
+# a self-signed certificate (then renewed), install again under TLS, status
+# and, from one commit more on a bare
 # upstream, upgrade, whose printed way back is then run, on that
 # installation, under its own Compose project, image name and free host
 # port, so it runs beside a service on port 4000. The mock provider runs
@@ -56,7 +57,7 @@ cleanup() {
 }
 
 main() {
-	local root gw mport port key want out code i cert a newer backup line keys adm
+	local root gw mport port key want out code i cert a newer backup line keys adm chats
 	built=""
 	: "${GO_IMAGE:?GO_IMAGE names the Go image, as the Makefile sets it}"
 	root=$(cd "$(dirname "$0")/../.." && pwd) || fail "no repository root"
@@ -100,6 +101,7 @@ main() {
 	((code == 0)) || fail "setup.sh install exited $code"
 	[[ $out == *"answer: mock reply"* ]] || fail "no first answer from the mock"
 	[[ $out == *", from mock/mock"* ]] || fail "no x-stargaite-target of the first answer"
+	key_out e2e
 	[[ $out != *"$key"* ]] || fail "the credential was printed"
 	[[ $(stat -c %a "$tree/.env") == 600 ]] || fail ".env is not mode 0600"
 	grep -q 'host.docker.internal:host-gateway' "$tree/compose.override.yaml" || fail "the override has no host-gateway"
@@ -174,10 +176,26 @@ main() {
 		[[ $(cd "$tree" && docker compose exec -T "${adm[@]}" stargaite /stargaite targets show "$t" --json | jq '.verified_at > 0') == true ]] ||
 			fail "$t was not verified"
 	done
+	# Layer 4 against this container (phase-7.md section 10): the console's terminal tests, built in the Go image since
+	# the host has no go, then run on the host: Esc during a delayed check on the mock, and no frame left in the history
+	# of tmux or screen (skipped, saying why, when neither is installed).
+	docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$tree:/src" -w /src -e CGO_ENABLED=0 "$GO_IMAGE" \
+		go test -c -o bin/console-pty.test ./cmd/stargaite-console || fail "the layer-4 test binary was not built"
+	STARGAITE_E2E_TREE=$tree STARGAITE_E2E_MOCK=http://$gw:$mport "$tree/bin/console-pty.test" \
+		-test.run '^(TestRealEscDuringCheck|TestFramesNotInHistory)$' -test.v || fail "the layer-4 tests against the real container failed"
 	again key --alias main --key-name e2e-3
 	[[ $out == *"answer: mock reply"* ]] || fail "no first answer over HTTPS"
 	key_out e2e-3
 	grep -qE 'curl --cacert tls/[^ ]+ https://[^ ]+/v1/chat/completions' <<<"$out" || fail "no example call over HTTPS with the CA"
+	# install again under TLS: the Machine step reads the override and checks
+	# readiness over HTTPS with the CA; the provider, alias and key are kept,
+	# so no key is made and nothing paid reaches the mock.
+	chats=$(curl -fsS --max-time 10 "http://$gw:$mport/mock/calls" | jq '[.[] | select(.Path == "/chat/completions")] | length')
+	again install --port "$port" --provider mock --model mock --alias main --key-name e2e-3
+	[[ $out == *"the container runs; kept"* && $out == *"alias main exists"* &&
+		$out == *"key e2e-3 exists, and its secret cannot be shown again"* ]] || fail "install again under TLS did not keep what exists"
+	[[ $(curl -fsS --max-time 10 "http://$gw:$mport/mock/calls" | jq '[.[] | select(.Path == "/chat/completions")] | length') == "$chats" ]] ||
+		fail "install again under TLS made a paid call"
 	again status
 	[[ $out == *"version: $want running, $want in this clone"* && $out == *"provider mock: credential resolved"* &&
 		$out == *"credentials resolved"* ]] || fail "status does not show the versions and the credentials"

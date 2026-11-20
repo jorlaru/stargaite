@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"path/filepath"
 	"regexp"
@@ -325,6 +327,28 @@ func TestGiveKeyNotNow(t *testing.T) {
 	if b, err := u.Paid(context.Background(), ui.Question{ID: "try"}, 12); err != nil || b == nil {
 		t.Errorf("a step of 12 did not open after Not now: %v", err)
 	}
+}
+
+// TestHandOverExampleTLS: on a plane behind TLS (the override's tls_name
+// and tls_ca), the try reaches it over HTTPS and T9 names the https base URL
+// and the CA in tls/ (owner question C62-Q2: the example comes with a new
+// key).
+func TestHandOverExampleTLS(t *testing.T) {
+	w, _, port := keyWorld(t, "mock/m")
+	plane, _ := url.Parse("http://127.0.0.1:" + port)
+	srv := httptest.NewTLSServer(httputil.NewSingleHostReverseProxy(plane))
+	t.Cleanup(srv.Close)
+	tlsPort := strings.TrimPrefix(srv.URL, "https://127.0.0.1:")
+	writeFile(t, filepath.Join(w.h.Dir, ".env"), "STARGAITE_PORT="+tlsPort+"\n", 0o600)
+	writeFile(t, filepath.Join(w.h.Dir, "compose.override.yaml"), "# setup: tls_name=example.com\n# setup: tls_ca=ca.pem\nservices: {}\n", 0o600)
+	writeFile(t, filepath.Join(w.h.Dir, "tls", "ca.pem"), string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})), 0o600)
+	res, out, err := w.givePlain(map[string]string{"alias": "a", "key-name": "app"})
+	if err != nil || res != "Done: key app, which may call a." {
+		t.Fatalf("%q, %v\n%s", res, err, out)
+	}
+	base := "https://example.com:" + tlsPort + "/v1"
+	hasLines(t, out, "answer: mock reply", "Point an OpenAI-compatible client at base URL "+base+", with model a and this key, such as:",
+		"  curl --cacert tls/ca.pem "+base+`/chat/completions -H "Authorization: Bearer $STARGAITE_KEY" -H "Content-Type: application/json" -d '{"model":"a","max_tokens":256,"messages":[{"role":"user","content":"Hello"}]}'`)
 }
 
 func TestGiveKeyEscBeforeTry(t *testing.T) {

@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -91,6 +92,7 @@ func TestMain(m *testing.M) {
 type run struct {
 	t               *testing.T
 	dir, log, bash  string
+	state           string // $SETUP_STATE, the fake docker's state
 	shims, realPath string
 	env             []string
 }
@@ -104,7 +106,8 @@ func newRun(t *testing.T, env []string, without ...string) *run {
 	}
 	r := &run{t: t, dir: t.TempDir(), shims: t.TempDir()}
 	tmp := t.TempDir()
-	r.log = filepath.Join(tmp, "log")
+	r.log, r.state = filepath.Join(tmp, "log"), filepath.Join(tmp, "state")
+	t.Cleanup(r.stopPlane)
 	var err error
 	if r.bash, err = exec.LookPath("bash"); err != nil {
 		t.Fatal(err)
@@ -127,7 +130,7 @@ func newRun(t *testing.T, env []string, without ...string) *run {
 	}
 	r.realPath = toolsDir(t) + string(os.PathListSeparator) + os.Getenv("PATH")
 	r.env = append([]string{"PATH=" + r.shims, "HOME=" + tmp, "LANG=C", "SETUP_LOG=" + r.log,
-		"SETUP_STATE=" + filepath.Join(tmp, "state"), "SETUP_REAL_PATH=" + r.realPath, "SETUP_CONSOLE=" + consoleBin}, env...)
+		"SETUP_STATE=" + r.state, "SETUP_REAL_PATH=" + r.realPath, "SETUP_CONSOLE=" + consoleBin}, env...)
 	return r
 }
 
@@ -287,6 +290,35 @@ func (r *run) cli() []string {
 	return list
 }
 
+// reads is r.cli() with each pair of reads the console makes at once,
+// export and validate, in that order: the order they reach the log in is
+// not theirs to keep.
+func (r *run) reads() []string {
+	list := r.cli()
+	for i := 1; i < len(list); i++ {
+		if list[i-1] == "validate" && list[i] == "export" {
+			list[i-1], list[i] = list[i], list[i-1]
+		}
+	}
+	return list
+}
+
+// afterUp is how many calls of command holding text, as count matches
+// them, were recorded after the last docker compose up.
+func (r *run) afterUp(command, text string) int {
+	n := 0
+	for _, c := range r.calls() {
+		argv := slices.DeleteFunc(slices.Clone(c.Argv), func(a string) bool { return a == "--json" })
+		switch {
+		case c.Argv[0] == "docker" && len(c.Argv) > 2 && c.Argv[1] == "compose" && c.Argv[2] == "up":
+			n = 0
+		case c.Argv[0] == command && strings.Contains(strings.Join(argv, " "), text):
+			n++
+		}
+	}
+	return n
+}
+
 // count is how many recorded calls of command hold text in their argv
 // joined by spaces, "--json" left out.
 func (r *run) count(command, text string) int {
@@ -298,18 +330,6 @@ func (r *run) count(command, text string) int {
 		}
 	}
 	return n
-}
-
-// curlOf is the recorded curl call of url, its last argument.
-func (r *run) curlOf(url string) record {
-	r.t.Helper()
-	for _, c := range r.calls() {
-		if c.Argv[0] == "curl" && c.Argv[len(c.Argv)-1] == url {
-			return c
-		}
-	}
-	r.t.Fatalf("no curl of %s", url)
-	return record{}
 }
 
 func (r *run) file(name string) string {
@@ -359,49 +379,66 @@ func (r *run) written() string {
 	return s
 }
 
-// plane is the data plane serveReady serves: each chat request it got.
-type plane struct {
-	mu   sync.Mutex
-	chat []chatRequest
-}
-
 // chatRequest is a chat completion's Authorization header and body.
 type chatRequest struct{ auth, body string }
 
-func (p *plane) requests() []chatRequest {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return slices.Clone(p.chat)
+// chats are the chat requests the fake container's data plane got, in
+// order: the console's first answer and its try (the shim's plane).
+func (r *run) chats() []chatRequest {
+	r.t.Helper()
+	data, err := os.ReadFile(r.state + ".chat")
+	if err != nil && !os.IsNotExist(err) {
+		r.t.Fatal(err)
+	}
+	var list []chatRequest
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var c struct{ Auth, Body string }
+		if line != "" {
+			if err := json.Unmarshal([]byte(line), &c); err != nil {
+				r.t.Fatalf("chat line %q: %v", line, err)
+			}
+			list = append(list, chatRequest{c.Auth, c.Body})
+		}
+	}
+	return list
 }
 
-// serveReady answers /health/ready with 200 on 127.0.0.1:port until the test
-// ends: the data plane's readiness, which the console checks over HTTP
-// itself; and a chat completion with the shim's answer, the console's try.
-// It is started after install, which checks the port is free.
-func serveReady(t *testing.T, port string) *plane {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:"+port)
-	if err != nil {
-		t.Fatal(err)
+// planePID is the pid of the fake container's data plane, 0 when none runs.
+func (r *run) planePID() int {
+	var st struct{ Plane int }
+	data, _ := os.ReadFile(r.state)
+	_ = json.Unmarshal(data, &st)
+	return st.Plane
+}
+
+// stopPlane ends the fake container's data plane, waiting up to 3 s for it
+// to be gone, so its port is free for the next run.
+func (r *run) stopPlane() {
+	if pid := r.planePID(); pid > 0 {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		waitGone(pid, 3*time.Second)
 	}
-	p := &plane{}
-	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/health/ready":
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
-			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
-			p.mu.Lock()
-			p.chat = append(p.chat, chatRequest{r.Header.Get("Authorization"), string(body)})
-			p.mu.Unlock()
-			w.Header().Set("X-Stargaite-Target", "fake/target")
-			_, _ = io.WriteString(w, `{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"fake reply"},"finish_reason":"stop"}]}`)
-		default:
-			w.WriteHeader(http.StatusNotFound)
+}
+
+// gone reports whether no process pid runs: none, or one that ended and
+// waits to be reaped (a zombie holds no port).
+func gone(pid int) bool {
+	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return true
+	}
+	_, rest, _ := strings.Cut(string(data), ") ")
+	return strings.HasPrefix(rest, "Z")
+}
+
+// waitGone waits up to d for pid to be gone, and reports whether it is.
+func waitGone(pid int, d time.Duration) bool {
+	for end := time.Now().Add(d); !gone(pid); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(end) {
+			return false
 		}
-	}), ReadHeaderTimeout: 10 * time.Second}
-	go func() { _ = srv.Serve(ln) }()
-	t.Cleanup(func() { _ = srv.Close() })
-	return p
+	}
+	return true
 }
 
 // freePort is a loopback port nothing listens on.
@@ -416,10 +453,12 @@ func freePort(t *testing.T) string {
 }
 
 // acme is install with every answer of a compatible service as a flag, its
-// credential read from SRC.
+// credential read from SRC. Its address, in a documentation range, is one
+// the console's dial guard refuses before any I/O: its free key check sends
+// no DNS query and no packet.
 func acme(port string, extra ...string) []string {
 	return append([]string{"install", "--port", port, "--provider", "acme", "--protocol", "openai",
-		"--base-url", "https://api.acme.example/v1", "--api-key-env", "ACME_API_KEY", "--key-env", "SRC",
+		"--base-url", "https://192.0.2.1/v1", "--api-key-env", "ACME_API_KEY", "--key-env", "SRC",
 		"--model", "m1", "--alias", "main", "--key-name", "app", "--rpm-limit", "30", "--yes"}, extra...)
 }
 
@@ -431,10 +470,80 @@ func without(args []string, flag string) []string {
 	return slices.Delete(slices.Clone(args), i, i+2)
 }
 
+// TestShimPlane: the fake container serves its data plane on the port it
+// publishes, as a real one does, from its compose up until the test's
+// cleanup: past a console run, whose process group the console kills when
+// its command ends, and not once $SETUP_STATE is gone.
+func TestShimPlane(t *testing.T) {
+	var pid int
+	t.Run("serves", func(t *testing.T) {
+		r := newRun(t, []string{"SRC=v"})
+		port := freePort(t)
+		if code, out := r.exec(acme(port)...); code != 0 {
+			t.Fatalf("install: exit %d:\n%s", code, out)
+		}
+		if pid = r.planePID(); pid <= 0 || gone(pid) {
+			t.Fatalf("no plane runs: pid %d", pid)
+		}
+		ready := func(when string) {
+			t.Helper()
+			resp, err := http.Get("http://127.0.0.1:" + port + "/health/ready")
+			if err != nil {
+				t.Fatalf("%s: %v", when, err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("%s: readiness answered %d", when, resp.StatusCode)
+			}
+		}
+		ready("after install")
+		before := len(r.chats())
+		req, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+port+"/v1/chat/completions", strings.NewReader(`{"model":"main"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer sk-test")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		chats := r.chats()
+		if !strings.Contains(string(body), "fake reply") || resp.Header.Get("X-Stargaite-Target") != "fake/target" || len(chats) != before+1 ||
+			chats[before] != (chatRequest{"Bearer sk-test", `{"model":"main"}`}) {
+			t.Errorf("chat: %d %q, chats %q", resp.StatusCode, body, chats)
+		}
+		if code, out := r.exec("status"); code != 0 {
+			t.Fatalf("status: exit %d:\n%s", code, out)
+		}
+		ready("after a console run")
+	})
+	if !waitGone(pid, 3*time.Second) {
+		t.Errorf("the plane, pid %d, outlived the test's cleanup", pid)
+	}
+	t.Run("state removed", func(t *testing.T) {
+		r := newRun(t, []string{"SRC=v"})
+		if code, out := r.exec(acme(freePort(t))...); code != 0 {
+			t.Fatalf("install: exit %d:\n%s", code, out)
+		}
+		pid := r.planePID()
+		if pid <= 0 {
+			t.Fatal("no plane runs")
+		}
+		if err := os.Remove(r.state); err != nil {
+			t.Fatal(err)
+		}
+		if !waitGone(pid, 3*time.Second) {
+			t.Errorf("the plane, pid %d, runs 3 s after $SETUP_STATE was removed", pid)
+		}
+	})
+}
+
 // TestSetupFlags: install with every answer as a flag, for a compatible
 // service, a local preset and an anthropic preset, runs every step through
-// the CLI; run again, it resumes, keeping what exists and calling nothing
-// paid.
+// the CLI, the console's first run in its flags mode; run again, it resumes,
+// keeping what exists and calling nothing paid.
 func TestSetupFlags(t *testing.T) {
 	t.Run("compatible service", func(t *testing.T) {
 		r := newRun(t, []string{"SRC=secret-value"})
@@ -444,14 +553,17 @@ func TestSetupFlags(t *testing.T) {
 			t.Fatalf("exit %d:\n%s", code, out)
 		}
 		want := []string{
+			"export", "validate",
 			"providers presets", "providers list",
-			"providers add --base-url https://api.acme.example/v1 --api-key-env ACME_API_KEY --protocol openai --billing pay_per_use -- acme",
+			"providers add --base-url https://192.0.2.1/v1 --api-key-env ACME_API_KEY --protocol openai --billing pay_per_use -- acme",
 			"providers show -- acme",
-			"targets list", "targets add --kind chat -- acme/m1", "settings show", "targets verify --max-output-tokens 256 -- acme/m1",
-			"models list", "models add --target acme/m1 -- main",
-			"keys list", "keys create --model main --rpm-limit 30 -- app",
+			"export", "validate",
+			"models list", "providers list", "targets list", "apply --dry-run -f -", "targets add --kind chat -- acme/m1", "settings show",
+			"targets verify --max-output-tokens 256 --until-stdin-closes -- acme/m1", "models add --target acme/m1 -- main",
+			"export", "validate",
+			"models list", "keys list", "keys create --model main --rpm-limit 30 -- app",
 		}
-		if got := r.cli(); !slices.Equal(got, want) {
+		if got := r.reads(); !slices.Equal(got, want) {
 			t.Errorf("CLI calls:\n%q\nwant:\n%q", got, want)
 		}
 		if r.count("docker", "compose up -d --build") != 1 || r.count("docker", "compose up -d --no-build") != 1 {
@@ -462,8 +574,8 @@ func TestSetupFlags(t *testing.T) {
 				t.Errorf("no %q in:\n%s", s, out)
 			}
 		}
-		// The client key: printed once, read by curl from standard input,
-		// in no argv and no file.
+		// The client key: printed once, sent by the console in the test
+		// call's header, in no argv and no file.
 		const key = "sk-stargaite-fake-app"
 		if n := strings.Count(out, key); n != 1 {
 			t.Errorf("the client key printed %d times:\n%s", n, out)
@@ -471,8 +583,9 @@ func TestSetupFlags(t *testing.T) {
 		if found := r.leaks(key, ""); len(found) > 0 {
 			t.Errorf("the client key is in %q", found)
 		}
-		if c := r.curlOf("http://127.0.0.1:" + port + "/v1/chat/completions"); c.Stdin != `header = "Authorization: Bearer `+key+`"`+"\n" {
-			t.Errorf("curl config of the test call: %q", c.Stdin)
+		if c := r.chats(); len(c) != 1 || c[0].auth != "Bearer "+key || !strings.Contains(c[0].body, `"model":"main"`) ||
+			!strings.Contains(c[0].body, `"max_tokens":256`) {
+			t.Errorf("the test call: %q", c)
 		}
 		if env := r.file(".env"); env != "STARGAITE_PORT='"+port+"'\nACME_API_KEY='secret-value'\n" {
 			t.Errorf(".env: %q", env)
@@ -486,14 +599,14 @@ func TestSetupFlags(t *testing.T) {
 			t.Fatalf("again: exit %d:\n%s", code, out)
 		}
 		for _, s := range []string{"the container runs; kept", "provider acme exists; kept", "ACME_API_KEY is in .env; kept",
-			"target acme/m1 exists; kept", "target acme/m1 is verified; not verified again", "alias main exists, toward acme/m1; kept",
-			"key app exists", "the first answer is skipped"} {
+			"alias main exists, toward acme/m1; kept",
+			"key app exists, and its secret cannot be shown again: no key made and no test call; Change a key rotates it"} {
 			if !strings.Contains(out, s) {
 				t.Errorf("again: no %q in:\n%s", s, out)
 			}
 		}
 		if r.count("docker", "providers add") != 1 || r.count("docker", "targets verify") != 1 || r.count("docker", "keys create") != 1 ||
-			r.count("docker", "compose up") != 2 || r.count("curl", "chat/completions") != 1 {
+			r.count("docker", "compose up") != 2 || len(r.chats()) != 1 {
 			t.Errorf("again: something was made or called twice:\n%q", r.cli())
 		}
 	})
@@ -515,9 +628,14 @@ func TestSetupFlags(t *testing.T) {
 		}
 	})
 
+	// Its key is in .env already, so the console checks no key at the
+	// preset's real host.
 	t.Run("anthropic preset", func(t *testing.T) {
-		r := newRun(t, []string{"SRC=sk-ant-x"})
-		code, out := r.exec("install", "--port", freePort(t), "--provider", "anthropic", "--key-env", "SRC", "--model", "claude-x",
+		r := newRun(t, nil)
+		if err := os.WriteFile(filepath.Join(r.dir, ".env"), []byte("ANTHROPIC_API_KEY='sk-ant-x'\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		code, out := r.exec("install", "--port", freePort(t), "--provider", "anthropic", "--model", "claude-x",
 			"--max-output-tokens", "4096", "--effort", "high", "--yes")
 		if code != 0 {
 			t.Fatalf("exit %d:\n%s", code, out)
@@ -528,8 +646,8 @@ func TestSetupFlags(t *testing.T) {
 	})
 
 	// An installation started by hand: .env without STARGAITE_PORT and the
-	// container on 4000. The port it already publishes is kept, with no
-	// recreate.
+	// container on 4000, Compose's default, where its data plane answers. The
+	// port it already publishes is kept, with no recreate.
 	t.Run("started by hand", func(t *testing.T) {
 		r := newRun(t, []string{"SRC=v"})
 		port := freePort(t)
@@ -539,6 +657,13 @@ func TestSetupFlags(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(r.dir, ".env"), []byte("ACME_API_KEY='v'\n"), 0o600); err != nil {
 			t.Fatal(err)
 		}
+		ln, err := net.Listen("tcp", "127.0.0.1:4000")
+		if err != nil {
+			t.Skipf("127.0.0.1:4000 is in use: this row emulates a container started by hand on Compose's default port (%v)", err)
+		}
+		srv := &http.Server{Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}), ReadHeaderTimeout: 10 * time.Second}
+		go func() { _ = srv.Serve(ln) }()
+		defer func() { _ = srv.Close() }()
 		code, out := r.exec(without(without(acme(port), "--port"), "--yes")...)
 		if code != 0 || r.count("docker", "compose up") != 2 || !strings.Contains(out, "the container runs; kept") {
 			t.Errorf("exit %d, %d compose up (want 2):\n%s", code, r.count("docker", "compose up"), out)
@@ -548,10 +673,10 @@ func TestSetupFlags(t *testing.T) {
 	t.Run("replace and allow private network", func(t *testing.T) {
 		r := newRun(t, []string{"SRC=old-value", "SRC2=new-value"})
 		port := freePort(t)
-		if code, out := r.exec(acme(port, "--base-url", "http://llm.acme.example/v1", "--allow-private-network")...); code != 0 {
+		if code, out := r.exec(acme(port, "--base-url", "http://192.0.0.1/v1", "--allow-private-network")...); code != 0 {
 			t.Fatalf("exit %d:\n%s", code, out)
 		}
-		if r.count("docker", "providers add --base-url http://llm.acme.example/v1 --api-key-env ACME_API_KEY --protocol openai --billing pay_per_use --allow-private-network -- acme") != 1 {
+		if r.count("docker", "providers add --base-url http://192.0.0.1/v1 --api-key-env ACME_API_KEY --protocol openai --billing pay_per_use --allow-private-network -- acme") != 1 {
 			t.Errorf("providers add: %q", r.cli())
 		}
 		code, out := r.exec(acme(port, "--key-env", "SRC2", "--replace")...)
@@ -578,7 +703,6 @@ func TestSetupFlags(t *testing.T) {
 		if code, out := r.exec(acme(port)...); code != 0 {
 			t.Fatalf("install: exit %d:\n%s", code, out)
 		}
-		pl := serveReady(t, port)
 		// sub runs a subcommand and returns its CLI calls; all holds every
 		// output, for the leak check.
 		var all string
@@ -615,14 +739,15 @@ func TestSetupFlags(t *testing.T) {
 
 		got, out = sub("key", "--alias", "local", "--key-name", "second", "--rpm-limit", "10")
 		if !slices.Equal(got, []string{"models list", "keys list", "keys create --model local --rpm-limit 10 -- second"}) ||
-			!strings.Contains(out, "answer: fake reply") || r.count("curl", "chat/completions") != 1 {
+			!strings.Contains(out, "answer: fake reply") || r.count("curl", "chat/completions") != 0 {
 			t.Errorf("key: %q:\n%s", got, out)
 		}
-		// The console's try is no curl: the data plane got it, with the new
-		// key, and the key is printed once, alone on its line.
+		// The console's try is no curl: the data plane got it, after the
+		// install's first answer, with the new key, and the key is printed
+		// once, alone on its line.
 		const secret = "sk-stargaite-fake-second"
-		if req := pl.requests(); len(req) != 1 || req[0].auth != "Bearer "+secret || !strings.Contains(req[0].body, `"model":"local"`) ||
-			!strings.Contains(req[0].body, `"max_tokens":256`) {
+		if req := r.chats(); len(req) != 2 || req[1].auth != "Bearer "+secret || !strings.Contains(req[1].body, `"model":"local"`) ||
+			!strings.Contains(req[1].body, `"max_tokens":256`) {
 			t.Errorf("the data plane got %q", req)
 		}
 		if strings.Count(out, secret) != 1 || !slices.Contains(strings.Split(out, "\n"), secret) {
@@ -738,7 +863,6 @@ func TestSetupFlags(t *testing.T) {
 		if code, out := r.exec(acme(port)...); code != 0 {
 			t.Fatalf("install: exit %d:\n%s", code, out)
 		}
-		serveReady(t, port)
 		otlp := []string{"telemetry", "--backend", "otlp", "--endpoint", "https://otlp.example", "--header-name", "Authorization", "--key-env", "OT"}
 		for _, args := range [][]string{{"provider", "--provider", "ollama"}, otlp} {
 			up := r.count("docker", "compose up")
@@ -849,7 +973,7 @@ func TestSetupFlags(t *testing.T) {
 	t.Run("key-env not exported", func(t *testing.T) {
 		r := newRun(t, nil)
 		code, out := r.exec(acme(freePort(t), "--key-env", "from")...)
-		if code != 2 || !strings.Contains(out, "exported to this script") || strings.Contains(r.file(".env"), "ACME_API_KEY") {
+		if code != 2 || !strings.Contains(out, "exported to the console") || strings.Contains(r.file(".env"), "ACME_API_KEY") {
 			t.Errorf("exit %d:\n%s", code, out)
 		}
 	})
@@ -950,7 +1074,7 @@ func TestSetupNoTTY(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			r := newRun(t, []string{"SRC=v"})
-			code, out := r.exec(without(full, c.flag)...)
+			code, out := r.exec(without(acme(freePort(t)), c.flag)...)
 			if code != 2 || !strings.Contains(out, c.missing) {
 				t.Errorf("exit %d, want 2 and %q:\n%s", code, c.missing, out)
 			}
@@ -960,7 +1084,7 @@ func TestSetupNoTTY(t *testing.T) {
 	t.Run("terminal in, pipe out", func(t *testing.T) {
 		r := newRun(t, []string{"SRC=v"})
 		// The run's PATH has no cat: the pipe ends in builtins.
-		code, out := r.pty(append(without(full, "--provider"), `| { read -r -d '' x; printf %s "$x"; }; exit ${PIPESTATUS[0]}`))
+		code, out := r.pty(append(without(acme(freePort(t)), "--provider"), `| { read -r -d '' x; printf %s "$x"; }; exit ${PIPESTATUS[0]}`))
 		if code != 2 || !strings.Contains(out, "missing --provider") {
 			t.Errorf("exit %d, want 2 and missing --provider:\n%s", code, out)
 		}
@@ -1022,7 +1146,6 @@ func TestSetupNoTTY(t *testing.T) {
 			if code, out := r.exec(acme(port)...); code != 0 {
 				t.Fatalf("install: exit %d:\n%s", code, out)
 			}
-			serveReady(t, port)
 			before, up, files := len(r.cli()), r.count("docker", "compose up"), r.written()
 			code, out := r.exec(c.args...)
 			if got := r.cli()[before:]; code != 2 || !strings.Contains(out, c.missing) || !slices.Equal(got, c.cli) || r.count("docker", "compose up") != up {
@@ -1039,57 +1162,37 @@ func TestSetupNoTTY(t *testing.T) {
 	}
 }
 
-// TestSetupPrompts: at a terminal, install with no flag asks each question
-// with its default in brackets, offers the presets and the model list, and
-// reaches the first answer.
+// TestSetupPrompts: at a terminal, ./setup.sh with no subcommand opens the
+// console's home on an installation; budget asks for the prices of the
+// target its budget reaches unpriced, telemetry and remote ask their
+// questions, hidden ones for credentials. The first run's prompts are the
+// console's (TestGuidedFirstRun, TestFirstRunAtTerminalResumesAtKey).
 func TestSetupPrompts(t *testing.T) {
-	r := newRun(t, nil)
+	r := newRun(t, []string{"SRC=v"})
 	port := freePort(t)
-	code, out := r.pty([]string{"install", "--port", port},
-		step{"provider: a number or a name: ", "1"},
-		step{"OPENAI_API_KEY (typed hidden): ", "typed-secret-1"},
-		step{"continue? [y/N]: ", "y"},
-		step{"model: a number, an id, or part of one to filter: ", "pt-"},
-		step{"model: a number, an id, or part of one to filter: ", "2"},
-		step{"a name for the alias your clients call [main]: ", ""},
-		step{"empty for none: ", ""},
-		step{"a name for the client key [my-app]: ", ""},
-		step{"the requests a minute the key may send [60]: ", ""},
-	)
-	if code != 0 {
-		t.Fatalf("exit %d:\n%s", code, out)
-	}
-	// The terminal echoes what is typed, so the hidden prompt of
-	// TestSetupSecrets proves something by echoing nothing.
-	for _, s := range []string{"to filter: pt-", "1) openai", "8) dashscope, asks for its URL", "11) deepseek, untested", "19) another OpenAI- or Anthropic-compatible service",
-		"3) other-model", "answer: fake reply"} {
-		if !strings.Contains(out, s) {
-			t.Errorf("no %q in:\n%s", s, out)
-		}
-	}
-	for _, c := range []string{"providers add --base-url https://api.openai.com/v1 -- openai", "targets add --kind chat -- openai/gpt-b",
-		"models add --target openai/gpt-b -- main", "keys create --model main --rpm-limit 60 -- my-app"} {
-		if !slices.Contains(r.cli(), c) {
-			t.Errorf("no CLI call %q in %q", c, r.cli())
-		}
+	if code, out := r.exec(acme(port)...); code != 0 {
+		t.Fatalf("install: exit %d:\n%s", code, out)
 	}
 
-	// Run again with no subcommand (C55): the menu of the others; budget
-	// asks for the prices of the target its budget reaches unpriced.
+	// No subcommand at a terminal: the console's home, left with Ctrl-C.
+	if code, out := r.pty(nil, step{"What do you want to do?", "\x03"}); code != 130 {
+		t.Errorf("no subcommand: exit %d, want 130:\n%s", code, out)
+	}
+
+	// budget asks for the prices of the target its budget reaches unpriced.
 	before := len(r.cli())
-	code, out = r.pty(nil,
-		step{"what to do: a number or a name: ", "4"},
+	code, out := r.pty([]string{"budget"},
 		step{"what the budget is on: instance, alias:<name> or key:<name>: ", "alias:main"},
 		step{"the limit in USD: ", "5"},
 		step{"when it resets: daily, monthly or never [monthly]: ", ""},
-		step{"the price of openai/gpt-b in USD per million input tokens: ", "2"},
-		step{"the price of openai/gpt-b in USD per million output tokens: ", "8"},
+		step{"the price of acme/m1 in USD per million input tokens: ", "2"},
+		step{"the price of acme/m1 in USD per million output tokens: ", "8"},
 	)
 	want := []string{"models show -- main", "models set --budget limit_usd=5,reset_interval=monthly -- main",
-		"targets set --pricing input_per_million=2,output_per_million=8,as_of=" + time.Now().Format(time.DateOnly) + " -- openai/gpt-b",
+		"targets set --pricing input_per_million=2,output_per_million=8,as_of=" + time.Now().Format(time.DateOnly) + " -- acme/m1",
 		"models set --budget limit_usd=5,reset_interval=monthly -- main"}
-	if got := r.cli()[before:]; code != 0 || !strings.Contains(out, "1) provider  2) alias  3) key  4) budget  5) telemetry  6) status") || !slices.Equal(got, want) {
-		t.Errorf("menu, budget: exit %d, %q, want %q:\n%s", code, got, want, out)
+	if got := r.cli()[before:]; code != 0 || !slices.Equal(got, want) {
+		t.Errorf("budget: exit %d, %q, want %q:\n%s", code, got, want, out)
 	}
 
 	// telemetry reads a header credential hidden.
@@ -1129,18 +1232,6 @@ func TestSetupPrompts(t *testing.T) {
 		}
 	}
 
-	// A key that exists: Enter skips it, said, and is no failure. key is
-	// the console's since C61; install still asks this way until C62.
-	code, out = r.pty([]string{"install", "--port", port, "--provider", "openai", "--model", "gpt-b"},
-		step{"OPENAI_API_KEY is in .env: replace it? [y/N]: ", ""},
-		step{"a name for the alias your clients call [main]: ", ""},
-		step{"a name for the client key [my-app]: ", ""},
-		step{"another name, or Enter to skip the first answer: ", ""},
-	)
-	if code != 0 || !strings.Contains(out, "no key made; the first answer is skipped") {
-		t.Errorf("key skipped: exit %d:\n%s", code, out)
-	}
-
 	// remote lists this host's addresses, asks for those to publish on and
 	// the certificate, then confirms.
 	code, out = r.pty([]string{"remote"},
@@ -1155,9 +1246,10 @@ func TestSetupPrompts(t *testing.T) {
 }
 
 // TestSetupSecrets: a credential reaches .env (mode 0600) byte for byte and
-// nothing else: no argv, no output, no other file, not the transcript of the
-// hidden prompt. Values .env cannot hold are refused. Control: a copy of
-// setup.sh that passes the credential in an argv is caught.
+// nothing else: no argv, no output, no other file. Values .env cannot hold
+// are refused. Control: a copy of setup.sh whose env_set, which telemetry
+// still runs, passes the credential in an argv is caught. The hidden prompt
+// is the console's (TestProviderSecretNeverOnTerminal, TestGuidedFirstRun).
 func TestSetupSecrets(t *testing.T) {
 	const value = `s3cr3t $HOME #x y\z`
 	t.Run("flags", func(t *testing.T) {
@@ -1176,17 +1268,6 @@ func TestSetupSecrets(t *testing.T) {
 			t.Errorf(".env mode: %v %v", info.Mode(), err)
 		}
 	})
-	t.Run("hidden prompt", func(t *testing.T) {
-		r := newRun(t, nil)
-		args := append(without(acme(freePort(t)), "--key-env"), "--effort=")
-		code, out := r.pty(args, step{"ACME_API_KEY (typed hidden): ", value})
-		if code != 0 {
-			t.Fatalf("exit %d:\n%s", code, out)
-		}
-		if found := r.leaks(value, out); len(found) > 0 {
-			t.Errorf("the credential is in %q", found)
-		}
-	})
 	for _, bad := range []string{"it's", "two\nlines", `ends\`} {
 		r := newRun(t, []string{"SRC=" + bad})
 		code, out := r.exec(acme(freePort(t))...)
@@ -1202,8 +1283,44 @@ func TestSetupSecrets(t *testing.T) {
 			t.Errorf("--key-env %s: exit %d:\n%s", pasted, code, out)
 		}
 	}
+	// telemetry reads its credential in bash: a value .env cannot hold, a value
+	// given instead of a name and a variable not exported are refused, and
+	// --replace replaces it.
+	t.Run("telemetry", func(t *testing.T) {
+		r := newRun(t, []string{"SRC=v", "Q=it's", "NL=two\nlines", `BS=ends\`, "OT=first", "OT2=second"})
+		if code, out := r.exec(acme(freePort(t))...); code != 0 {
+			t.Fatalf("install: exit %d:\n%s", code, out)
+		}
+		otlp := func(more ...string) []string {
+			return append([]string{"telemetry", "--backend", "otlp", "--endpoint", "https://otlp.example", "--header-name", "Authorization", "--yes"}, more...)
+		}
+		env := r.file(".env")
+		for _, bad := range []string{"Q", "NL", "BS"} {
+			if code, out := r.exec(otlp("--key-env", bad)...); code != 1 || !strings.Contains(out, ".env cannot hold it") || r.file(".env") != env {
+				t.Errorf("%s: exit %d, .env %q:\n%s", bad, code, r.file(".env"), out)
+			}
+		}
+		if code, out := r.exec(otlp("--key-env", "sk-pasted-value")...); code != 2 || strings.Contains(out, "sk-pasted-value") ||
+			!strings.Contains(out, "--key-env takes the name of a variable exported to this script") || r.file(".env") != env {
+			t.Errorf("a value for a name: exit %d:\n%s", code, out)
+		}
+		// from is one of setup.sh's own variables, not exported to it.
+		if code, out := r.exec(otlp("--key-env", "from")...); code != 2 ||
+			!strings.Contains(out, "--key-env takes the name of a variable exported to this script") || r.file(".env") != env {
+			t.Errorf("a variable not exported: exit %d:\n%s", code, out)
+		}
+		if code, out := r.exec(otlp("--key-env", "OT")...); code != 0 || !strings.Contains(r.file(".env"), "\nOTLP_AUTHORIZATION='first'\n") {
+			t.Fatalf("first: exit %d, .env %q:\n%s", code, r.file(".env"), out)
+		}
+		if code, out := r.exec(otlp("--key-env", "OT2", "--replace")...); code != 0 || !strings.Contains(r.file(".env"), "\nOTLP_AUTHORIZATION='second'\n") {
+			t.Errorf("--replace: exit %d, .env %q:\n%s", code, r.file(".env"), out)
+		}
+	})
 	t.Run("leaking control", func(t *testing.T) {
-		r := newRun(t, []string{"SRC=" + value})
+		r := newRun(t, []string{"SRC=v", "OT=" + value})
+		if code, out := r.exec(acme(freePort(t))...); code != 0 {
+			t.Fatalf("install: exit %d:\n%s", code, out)
+		}
 		src := r.file("setup.sh")
 		leaky := strings.Replace(src, "env_set() {\n", "env_set() {\n\tsleep 0 \"$2\"\n", 1)
 		if leaky == src {
@@ -1212,7 +1329,7 @@ func TestSetupSecrets(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(r.dir, "setup.sh"), []byte(leaky), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		_, out := r.exec(acme(freePort(t))...)
+		_, out := r.exec("telemetry", "--backend", "otlp", "--endpoint", "https://otlp.example", "--header-name", "Authorization", "--key-env", "OT", "--yes")
 		if found := r.leaks(value, out); !slices.Contains(found, "the argv of sleep") {
 			t.Errorf("the leak was not caught: %q", found)
 		}
@@ -1222,13 +1339,29 @@ func TestSetupSecrets(t *testing.T) {
 // TestSetupOverride: an override without the marker is the reader's and is
 // left untouched, the step that needs it stopping with what to add; control:
 // one with the marker is regenerated, keeping the "# setup:" lines it holds.
+// telemetry toward an endpoint on the host needs the host-gateway line.
 func TestSetupOverride(t *testing.T) {
-	r := newRun(t, nil)
-	mine := "services:\n  stargaite:\n    environment:\n      MINE: \"1\"\n"
-	if err := os.WriteFile(filepath.Join(r.dir, "compose.override.yaml"), []byte(mine), 0o600); err != nil {
-		t.Fatal(err)
+	local := []string{"telemetry", "--backend", "otlp", "--endpoint", "http://127.0.0.1:4318", "--yes"}
+	// installed is an installation whose override is then the one given.
+	installed := func(override string) *run {
+		t.Helper()
+		r := newRun(t, []string{"SRC=v"})
+		if code, out := r.exec(acme(freePort(t))...); code != 0 {
+			t.Fatalf("install: exit %d:\n%s", code, out)
+		}
+		if err := os.WriteFile(filepath.Join(r.dir, "compose.override.yaml"), []byte(override), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// The container restarted on it, as Compose starts it with the override.
+		restart := exec.Command(filepath.Join(r.shims, "docker"), "compose", "up", "-d", "--no-build")
+		restart.Env, restart.Dir = r.env, r.dir
+		if out, err := restart.CombinedOutput(); err != nil {
+			t.Fatalf("restart: %v: %s", err, out)
+		}
+		return r
 	}
-	local := []string{"install", "--port", freePort(t), "--provider", "ollama", "--model", "llama3", "--yes"}
+	mine := "services:\n  stargaite:\n    environment:\n      MINE: \"1\"\n"
+	r := installed(mine)
 	code, out := r.exec(local...)
 	if code != 1 || !strings.Contains(out, "compose.override.yaml was not written by setup.sh") || !strings.Contains(out, "host.docker.internal:host-gateway") {
 		t.Errorf("exit %d:\n%s", code, out)
@@ -1238,26 +1371,21 @@ func TestSetupOverride(t *testing.T) {
 	}
 
 	// The reader's own override that already holds the line goes on, untouched.
-	r = newRun(t, nil)
 	theirs := mine + "    extra_hosts:\n      - host.docker.internal:host-gateway\n"
-	if err := os.WriteFile(filepath.Join(r.dir, "compose.override.yaml"), []byte(theirs), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	r = installed(theirs)
 	if code, out := r.exec(local...); code != 0 || r.file("compose.override.yaml") != theirs {
 		t.Errorf("an override that holds the line: exit %d, %q:\n%s", code, r.file("compose.override.yaml"), out)
 	}
 
 	// The control: an override that holds TLS, as remote writes it, keeps it
-	// when the local provider's line joins.
-	r = newRun(t, nil)
+	// when the host-gateway line joins.
 	marker := "# Written by setup.sh from its \"# setup:\" lines below; it rewrites this file whole.\n"
 	setup := "# setup: tls=self-signed\n# setup: tls_name=localhost\n# setup: tls_ca=cert.pem\n# setup: addresses=127.0.0.1\n"
 	tls := "    command: [\"serve\", \"--listen\", \"0.0.0.0:4000\", \"--tls-cert\", \"/tls/cert.pem\", \"--tls-key\", \"/tls/key.pem\"]\n" +
 		"    ports: !override\n      - \"127.0.0.1:${STARGAITE_PORT:-4000}:4000\"\n    volumes:\n      - ./tls:/tls:ro\n"
 	marked := marker + setup + "services:\n  stargaite:\n    extra_hosts:\n      - \"localhost:127.0.0.1\"\n" + tls
-	if err := os.WriteFile(filepath.Join(r.dir, "compose.override.yaml"), []byte(marked), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	r = installed(marked)
+	before := len(r.cli())
 	if code, out := r.exec(local...); code != 0 {
 		t.Fatalf("control: exit %d:\n%s", code, out)
 	}
@@ -1266,8 +1394,8 @@ func TestSetupOverride(t *testing.T) {
 	if got := r.file("compose.override.yaml"); got != want {
 		t.Errorf("override:\n%s\nwant:\n%s", got, want)
 	}
-	if !slices.Contains(r.cli(), "providers add --base-url http://host.docker.internal:11434/v1 --allow-private-network -- ollama") {
-		t.Errorf("CLI calls: %q", r.cli())
+	if !slices.Contains(r.cli()[before:], "telemetry set --otlp-endpoint http://host.docker.internal:4318 --allow-private-network") {
+		t.Errorf("CLI calls: %q", r.cli()[before:])
 	}
 }
 
@@ -1420,13 +1548,13 @@ func TestSetupRemote(t *testing.T) {
 			t.Errorf("%d recreates, want 2", r.count("docker", "compose up -d --no-build"))
 		}
 
-		// Every later CLI call carries the admin URL and the certificate,
-		// every readiness check the name and the certificate, and the first
-		// answer goes over HTTPS.
+		// Every later CLI call carries the admin URL and the certificate, and
+		// every readiness check the name and the certificate. The console's
+		// first answer over HTTPS is TestTryCompletionTransport's and e2e's.
 		ready(t, r, n, "localhost", port, " --cacert tls/cert.pem ")
 		n = len(r.calls())
-		if code, out := r.exec(append(without(acme(port), "--key-name"), "--key-name", "second")...); code != 0 || !strings.Contains(out, "answer: fake reply") {
-			t.Errorf("install again, key second: exit %d:\n%s", code, out)
+		if code, out := r.exec("budget", "--on", "instance", "--limit-usd", "1", "--input-price", "1", "--output-price", "2", "--yes"); code != 0 {
+			t.Errorf("budget: exit %d:\n%s", code, out)
 		}
 		if code, out := r.exec("status"); code != 0 || !strings.Contains(out, "provider acme: credential resolved") {
 			t.Errorf("status: exit %d:\n%s", code, out)
@@ -1437,8 +1565,14 @@ func TestSetupRemote(t *testing.T) {
 			}
 		}
 		ready(t, r, n, "localhost", port, " --cacert tls/cert.pem ")
-		if c := r.curlOf("https://localhost:" + port + "/v1/chat/completions"); !strings.Contains(strings.Join(c.Argv, " "), "--resolve localhost:"+port+":127.0.0.1 --cacert tls/cert.pem") {
-			t.Errorf("first answer: %q", c.Argv)
+		checks := 0
+		for _, c := range r.calls()[n:] {
+			if c.Argv[0] == "curl" && strings.HasSuffix(strings.Join(c.Argv, " "), "/health/ready") {
+				checks++
+			}
+		}
+		if checks == 0 {
+			t.Errorf("no readiness check after remote")
 		}
 
 		// Run again without --address, it renews keeping the addresses: a
@@ -1607,8 +1741,7 @@ func TestSetupRemote(t *testing.T) {
 
 	// Without hostname and getent: no error line, and 0.0.0.0 alone is warned
 	// of, its certificate naming no address of this host. The flags of own are
-	// refused with self-signed. Once remote is on, install again prints a
-	// client example that trusts the certificate, and a container that never
+	// refused with self-signed. Once remote is on, a container that never
 	// gets ready names remote as the repair.
 	t.Run("without hostname and getent", func(t *testing.T) {
 		r := newRun(t, []string{"SRC=v"}, "hostname", "getent")
@@ -1625,9 +1758,6 @@ func TestSetupRemote(t *testing.T) {
 		if code != 0 || strings.Contains(out, "not found") || strings.Contains(out, "getent") || ipsOf(certOf(t, r)) != "127.0.0.1" ||
 			!strings.Contains(out, "warning: this host's addresses are unknown here (no hostname -I), so the certificate names only those given beside 0.0.0.0") {
 			t.Errorf("0.0.0.0: exit %d, addresses on the certificate %s:\n%s", code, ipsOf(certOf(t, r)), out)
-		}
-		if code, out := r.exec(acme(port)...); code != 0 || !strings.Contains(out, "  curl --cacert tls/cert.pem https://localhost:"+port+"/v1/chat/completions -H") {
-			t.Errorf("install again: exit %d:\n%s", code, out)
 		}
 		r.env = append(r.env, "FAKE_READY=never")
 		if code, out := r.exec("budget", "--on", "instance", "--limit-usd", "1", "--yes"); code != 1 || !strings.Contains(out, "a log line\n./setup.sh remote again repairs a remote that did not finish") {
@@ -1758,17 +1888,33 @@ func TestSetupRemote(t *testing.T) {
 }
 
 // TestSetupPrereqs: everything missing is reported at once, each with where
-// to get it, before anything runs; control: Compose 2.24.4 passes.
+// to get it, before anything runs; control: Compose 2.24.4 passes. install
+// checks Docker before the console; the subcommands still in bash check curl
+// and jq too.
 func TestSetupPrereqs(t *testing.T) {
 	port := freePort(t)
+	t.Run("missing tools", func(t *testing.T) {
+		r := newRun(t, []string{"SRC=v"}, "docker", "curl", "jq")
+		code, out := r.exec(acme(port)...)
+		if code != 1 || !strings.Contains(out, "Docker: see https://docs.docker.com/engine/install/") || r.count("docker", "compose up") != 0 {
+			t.Errorf("install: exit %d:\n%s", code, out)
+		}
+		code, out = r.exec("budget", "--on", "instance", "--limit-usd", "1", "--yes")
+		for _, s := range []string{"Docker: see https://docs.docker.com/engine/install/", "curl: see https://curl.se/download.html", "jq: see https://jqlang.org/download/"} {
+			if !strings.Contains(out, s) {
+				t.Errorf("budget: no %q in:\n%s", s, out)
+			}
+		}
+		if code != 1 || r.count("docker", "compose up") != 0 {
+			t.Errorf("budget: exit %d, or it went on:\n%s", code, out)
+		}
+	})
 	for _, c := range []struct {
 		name    string
 		env     []string
 		without []string
 		want    []string
 	}{
-		{"missing tools", nil, []string{"docker", "curl", "jq"}, []string{"Docker: see https://docs.docker.com/engine/install/",
-			"curl: see https://curl.se/download.html", "jq: see https://jqlang.org/download/"}},
 		{"no permission", []string{"FAKE_DOCKER=denied"}, nil, []string{"join the docker group, which is equivalent to root"}},
 		{"daemon down", []string{"FAKE_DOCKER=down"}, nil, []string{"a reachable Docker daemon"}},
 		{"old compose", []string{"FAKE_COMPOSE=v2.24.3"}, nil, []string{"Docker Compose 2.24.4 or later, found v2.24.3"}},
@@ -1818,6 +1964,34 @@ func TestSetupPrereqs(t *testing.T) {
 			t.Errorf("exit %d, .env %q:\n%s", code, r.file(".env"), out)
 		}
 	})
+	// remote on a stopped container checks the port .env names in bash.
+	t.Run("port taken while stopped", func(t *testing.T) {
+		r := newRun(t, []string{"SRC=v"})
+		p := freePort(t)
+		if code, out := r.exec(acme(p)...); code != 0 {
+			t.Fatalf("exit %d:\n%s", code, out)
+		}
+		stop := exec.Command(filepath.Join(r.shims, "docker"), "compose", "stop")
+		stop.Env, stop.Dir = r.env, r.dir
+		if out, err := stop.CombinedOutput(); err != nil {
+			t.Fatalf("stop: %v: %s", err, out)
+		}
+		var ln net.Listener
+		var err error
+		for end := time.Now().Add(3 * time.Second); ; time.Sleep(50 * time.Millisecond) { // the stopped plane lets go of it
+			if ln, err = net.Listen("tcp", "127.0.0.1:"+p); err == nil || time.Now().After(end) {
+				break
+			}
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = ln.Close() }()
+		ups := r.count("docker", "compose up")
+		if code, out := r.exec("remote"); code != 1 || !strings.Contains(out, "127.0.0.1:"+p+" is taken") || r.count("docker", "compose up") != ups {
+			t.Errorf("exit %d:\n%s", code, out)
+		}
+	})
 	t.Run("control", func(t *testing.T) {
 		r := newRun(t, []string{"SRC=v", "FAKE_COMPOSE=v2.24.4"})
 		if code, out := r.exec(acme(port)...); code != 0 {
@@ -1826,93 +2000,25 @@ func TestSetupPrereqs(t *testing.T) {
 	})
 }
 
-// TestSetupModels: at a terminal, the model is offered from the provider's
-// list: openai with a Bearer header, anthropic with x-api-key and
-// anthropic-version, a local provider at its host-side URL while the target
-// gets host.docker.internal; the credential is in no argv, only in the
-// config curl reads from standard input. Controls: an error, an empty list
-// and an answer that is not JSON each print one line and fall back to a
-// typed id.
-func TestSetupModels(t *testing.T) {
-	rest := []string{"--alias", "main", "--effort=", "--key-name", "app", "--rpm-limit", "30", "--yes"}
-	pick := step{"model: a number, an id, or part of one to filter: ", "2"}
-	// The value holds " and \, which the curl config escapes.
-	const value = `k"1\2`
-	t.Run("openai", func(t *testing.T) {
-		r := newRun(t, []string{"SRC=" + value})
-		args := append(without(acme(freePort(t)), "--model"), "--effort=")
-		code, out := r.pty(args, pick)
-		if code != 0 || !slices.Contains(r.cli(), "targets add --kind chat -- acme/gpt-b") {
-			t.Fatalf("exit %d, %q:\n%s", code, r.cli(), out)
-		}
-		if c := r.curlOf("https://api.acme.example/v1/models"); c.Stdin != `header = "Authorization: Bearer k\"1\\2"`+"\n" {
-			t.Errorf("curl config: %q", c.Stdin)
-		}
-		if found := r.leaks(value, out); len(found) > 0 {
-			t.Errorf("the credential is in %q", found)
-		}
-	})
-	t.Run("anthropic", func(t *testing.T) {
-		r := newRun(t, []string{"SRC=sk-ant-1"})
-		code, out := r.pty(append([]string{"install", "--port", freePort(t), "--provider", "anthropic", "--key-env", "SRC", "--max-output-tokens", "1024"}, rest...), pick)
-		if code != 0 {
-			t.Fatalf("exit %d:\n%s", code, out)
-		}
-		c := r.curlOf("https://api.anthropic.com/v1/models?limit=1000")
-		if c.Stdin != "header = \"x-api-key: sk-ant-1\"\n" || !slices.Contains(c.Argv, "anthropic-version: 2023-06-01") {
-			t.Errorf("curl: %q, config %q", c.Argv, c.Stdin)
-		}
-	})
-	t.Run("local", func(t *testing.T) {
-		r := newRun(t, nil)
-		code, out := r.pty(append([]string{"install", "--port", freePort(t), "--provider", "ollama"}, rest...), pick)
-		if code != 0 {
-			t.Fatalf("exit %d:\n%s", code, out)
-		}
-		if c := r.curlOf("http://localhost:11434/v1/models"); slices.Contains(c.Argv, "-K") {
-			t.Errorf("a config for a provider without a credential: %q", c.Argv)
-		}
-		if !slices.Contains(r.cli(), "providers add --base-url http://host.docker.internal:11434/v1 --allow-private-network -- ollama") ||
-			!slices.Contains(r.cli(), "targets add --kind chat -- ollama/gpt-b") {
-			t.Errorf("CLI calls: %q", r.cli())
-		}
-	})
-	for _, answer := range []string{"error", "empty", "nonjson"} {
-		t.Run("control "+answer, func(t *testing.T) {
-			r := newRun(t, []string{"SRC=" + value, "FAKE_MODELS=" + answer})
-			args := append(without(acme(freePort(t)), "--model"), "--effort=")
-			code, out := r.pty(args, step{"the model id at acme: ", "typed-id"})
-			if code != 0 || !slices.Contains(r.cli(), "targets add --kind chat -- acme/typed-id") {
-				t.Fatalf("exit %d, %q:\n%s", code, r.cli(), out)
-			}
-			if n := strings.Count(out, "the model list at https://api.acme.example/v1"); n != 1 {
-				t.Errorf("%d lines on the list, want 1:\n%s", n, out)
-			}
-			if found := r.leaks(value, out); len(found) > 0 {
-				t.Errorf("the credential is in %q", found)
-			}
-		})
-	}
-}
-
-// TestSetupPaidCalls: one verify and one completion per run, each announced;
-// none after a failed verify, no second attempt of either, no verify of a
-// verified target unless --reverify.
+// TestSetupPaidCalls: one check and one test call per first run, each
+// announced; none after a failed check, no second attempt of either, no check
+// of a verified target unless --reverify. A test call that outlives its
+// bound is TestTryCompletionBound's and TestGiveKeyTryFails'.
 func TestSetupPaidCalls(t *testing.T) {
 	port := freePort(t)
 	r := newRun(t, []string{"SRC=v"})
 	code, out := r.exec(acme(port)...)
-	if code != 0 || r.count("docker", "targets verify") != 1 || r.count("curl", "chat/completions") != 1 {
+	if code != 0 || r.count("docker", "targets verify") != 1 || len(r.chats()) != 1 {
 		t.Fatalf("exit %d, %q:\n%s", code, r.cli(), out)
 	}
-	for _, s := range []string{"targets verify acme/m1: 1 paid call(s) to acme, each capped at 256 output tokens, never retried; interrupted, the server still ends them within 185 s",
-		"one test chat completion through the proxy: a paid call through alias main, capped at 256 output tokens, never retried"} {
+	for _, s := range []string{"check acme/m1: 1 paid call(s) to acme, each capped at 256 output tokens, never retried",
+		"try alias main: up to 1 paid call(s), one per target if the earlier fail, each capped at 256 output tokens, never retried"} {
 		if !strings.Contains(out, s) {
 			t.Errorf("no %q in:\n%s", s, out)
 		}
 	}
-	// Run again with a new key: the target is verified, so no verify.
-	if code, out := r.exec(append(without(acme(port), "--key-name"), "--key-name", "second")...); code != 0 || r.count("docker", "targets verify") != 1 || r.count("curl", "chat/completions") != 2 {
+	// Run again with a new key: the alias exists, so no check.
+	if code, out := r.exec(append(without(acme(port), "--key-name"), "--key-name", "second")...); code != 0 || r.count("docker", "targets verify") != 1 || len(r.chats()) != 2 {
 		t.Errorf("verified target: exit %d, %q:\n%s", code, r.cli(), out)
 	}
 	if code, out := r.exec(append(without(acme(port), "--key-name"), "--key-name", "third", "--reverify")...); code != 0 || r.count("docker", "targets verify") != 2 {
@@ -1921,7 +2027,7 @@ func TestSetupPaidCalls(t *testing.T) {
 
 	r = newRun(t, []string{"SRC=v", "FAKE_VERIFY=fail"})
 	code, out = r.exec(acme(freePort(t))...)
-	if code != 1 || r.count("docker", "targets verify") != 1 || r.count("docker", "models add") != 0 || r.count("docker", "keys create") != 0 || r.count("curl", "chat/completions") != 0 {
+	if code != 1 || r.count("docker", "targets verify") != 1 || r.count("docker", "models add") != 0 || r.count("docker", "keys create") != 0 || len(r.chats()) != 0 {
 		t.Errorf("failed verify: exit %d, %q:\n%s", code, r.cli(), out)
 	}
 	if !strings.Contains(out, "status 404, model not found: acme/m1") || !strings.Contains(out, "no alias or key was created") {
@@ -1930,67 +2036,76 @@ func TestSetupPaidCalls(t *testing.T) {
 
 	r = newRun(t, []string{"SRC=v", "FAKE_CHAT=fail"})
 	code, out = r.exec(acme(freePort(t))...)
-	if code != 1 || r.count("curl", "chat/completions") != 1 || !strings.Contains(out, "the test call answered 502: the provider failed") {
+	if code != 1 || len(r.chats()) != 1 || !strings.Contains(out, "the test call answered 502: the provider failed") {
 		t.Errorf("failed completion: exit %d:\n%s", code, out)
-	}
-
-	r = newRun(t, []string{"SRC=v", "FAKE_CHAT=timeout"})
-	code, out = r.exec(acme(freePort(t))...)
-	if code != 1 || r.count("curl", "chat/completions") != 1 || !strings.Contains(out, "the test call did not complete (curl exit 28)") {
-		t.Errorf("curl failed: exit %d:\n%s", code, out)
 	}
 }
 
-// TestSetupBounds: every wait is bounded (rule 6) and the paid test call is
-// capped: every curl has --max-time, docker compose up runs under timeout,
-// the test completion asks for 256 tokens at most; a container never ready
-// stops after 120 checks with the last log lines; a docker compose up that
-// outlives its bound is stopped.
+// TestSetupBounds: every wait of the bash still shipped is bounded (rule
+// 6): every curl has --max-time, docker compose up runs under timeout; a
+// container never ready stops after 120 checks with the last log lines; a
+// docker compose up that outlives its bound is stopped. The console's own
+// bounds are its tests' (TestUp*, TestWaitReady*, TestTryCompletionRequest).
 func TestSetupBounds(t *testing.T) {
-	r := newRun(t, []string{"SRC=v"})
-	port := freePort(t)
-	if code, out := r.exec(acme(port)...); code != 0 {
-		t.Fatalf("exit %d:\n%s", code, out)
+	// installed is a console install by flags, then env added.
+	installed := func(env ...string) *run {
+		t.Helper()
+		r := newRun(t, []string{"SRC=v", "OT=Bearer otlp-secret"})
+		if code, out := r.exec(acme(freePort(t))...); code != 0 {
+			t.Fatalf("install: exit %d:\n%s", code, out)
+		}
+		r.env = append(r.env, env...)
+		return r
+	}
+	telemetry := []string{"telemetry", "--backend", "otlp", "--endpoint", "https://otlp.example", "--header-name", "Authorization", "--key-env", "OT", "--yes"}
+	r := installed()
+	ups := r.count("docker", "compose up")
+	if code, out := r.exec(telemetry...); code != 0 {
+		t.Fatalf("telemetry: exit %d:\n%s", code, out)
 	}
 	for _, c := range r.calls() {
 		if c.Argv[0] == "curl" && !slices.Contains(c.Argv, "--max-time") {
 			t.Errorf("curl without --max-time: %q", c.Argv)
 		}
 	}
-	if c := r.curlOf("http://127.0.0.1:" + port + "/v1/chat/completions"); !strings.Contains(strings.Join(c.Argv, " "), `"max_tokens":256`) {
-		t.Errorf("the test call is not capped: %q", c.Argv)
-	}
-	if n := r.count("timeout", "timeout --foreground -k 10 1200 docker compose up -d"); n != 2 || r.count("docker", "compose up") != n {
-		t.Errorf("%d bounded docker compose up, want 2, all of the %d", n, r.count("docker", "compose up"))
+	if n := r.count("timeout", "timeout --foreground -k 10 1200 docker compose up -d"); n != 1 || r.count("docker", "compose up")-ups != n {
+		t.Errorf("%d bounded docker compose up, want 1, all of the %d after the install", n, r.count("docker", "compose up")-ups)
 	}
 
 	t.Run("never ready", func(t *testing.T) {
-		r := newRun(t, []string{"SRC=v", "FAKE_READY=never"})
-		code, out := r.exec(acme(freePort(t))...)
+		r := installed("FAKE_READY=never")
+		before := len(r.cli())
+		code, out := r.exec("budget", "--on", "instance", "--limit-usd", "1", "--yes")
 		if code != 1 || !strings.Contains(out, "not ready within 120 s; the last 30 log lines:\na log line") || strings.Contains(out, "remote again") ||
-			r.count("curl", "/health/ready") != 120 || r.count("docker", "compose logs --tail 30 stargaite") != 1 || len(r.cli()) != 0 {
+			r.count("curl", "/health/ready") != 120 || r.count("docker", "compose logs --tail 30 stargaite") != 1 || len(r.cli()) != before {
 			t.Errorf("exit %d, %d readiness checks:\n%s", code, r.count("curl", "/health/ready"), out)
 		}
 	})
 	t.Run("up outlives its bound", func(t *testing.T) {
-		r := newRun(t, []string{"SRC=v", "FAKE_UP=hang", "FAKE_TIMEOUT=1"})
+		r := installed("FAKE_UP=hang", "FAKE_TIMEOUT=1")
 		start := time.Now()
-		code, out := r.exec(acme(freePort(t))...)
+		code, out := r.exec(telemetry...)
 		if took := time.Since(start); code != 1 || took > 15*time.Second || !strings.Contains(out, "docker compose up failed or was interrupted") ||
-			r.count("curl", "/health/ready") != 0 || len(r.cli()) != 0 {
-			t.Errorf("exit %d after %s:\n%s", code, took, out)
+			r.afterUp("curl", "/health/ready") != 0 || r.afterUp("docker", "/stargaite") != 0 {
+			t.Errorf("exit %d after %s, %d CLI calls after the up:\n%s", code, took, r.afterUp("docker", "/stargaite"), out)
 		}
 	})
 }
 
-// TestSetupInterrupt: Ctrl-C at the terminal while docker compose up builds
-// stops the run at once with 130, though the build would last 30 s.
+// TestSetupInterrupt: Ctrl-C at the terminal while docker compose up runs
+// stops the run at once with 130, though it would last 30 s; the first run's
+// is TestFirstRunCtrlCDuringBuild.
 func TestSetupInterrupt(t *testing.T) {
-	r := newRun(t, []string{"FAKE_UP=hang"})
+	r := newRun(t, []string{"SRC=v", "OT=Bearer otlp-secret"})
+	if code, out := r.exec(acme(freePort(t))...); code != 0 {
+		t.Fatalf("install: exit %d:\n%s", code, out)
+	}
+	r.env = append(r.env, "FAKE_UP=hang")
 	start := time.Now()
-	code, out := r.pty([]string{"install", "--port", freePort(t), "--provider", "ollama", "--model", "m"}, step{"fake build: 30 s", "\x03"})
-	if took := time.Since(start); code != 130 || took > 10*time.Second || len(r.cli()) != 0 {
-		t.Errorf("exit %d after %s, CLI calls %q:\n%s", code, took, r.cli(), out)
+	code, out := r.pty([]string{"telemetry", "--backend", "otlp", "--endpoint", "https://otlp.example", "--header-name", "Authorization", "--key-env", "OT", "--yes"},
+		step{"fake build: 30 s", "\x03"})
+	if took := time.Since(start); code != 130 || took > 10*time.Second || r.afterUp("docker", "/stargaite") != 0 {
+		t.Errorf("exit %d after %s, %d CLI calls after the up:\n%s", code, took, r.afterUp("docker", "/stargaite"), out)
 	}
 }
 
@@ -2077,7 +2192,7 @@ func installed(t *testing.T, newer bool) (*run, string) {
 // the clone repaired as its control; up to date, it exits 0 with no backup.
 // It tags the previous image, merges, builds, takes the backup, starts and
 // checks the new version, in that order, and prints the way back. Without a
-// terminal it needs --yes; at one, from the menu too, it shows at most 20
+// terminal it needs --yes; at one it shows at most 20
 // commits, never through a pager, before it asks. A build or a backup that
 // fails or is never written leaves the old container running; a start or a
 // check that fails prints the way back and exits 1. A CLI from before
@@ -2227,16 +2342,15 @@ func TestSetupUpgrade(t *testing.T) {
 	})
 
 	t.Run("at a terminal", func(t *testing.T) {
-		// Chosen from the menu, with more commits than are shown: at most
-		// 20, written out rather than through a pager, then the question;
-		// declined, nothing changes.
+		// With more commits than are shown: at most 20, written out rather
+		// than through a pager, then the question; declined, nothing changes.
 		r, other := installed(t, true)
 		for i := range 25 {
 			gitIn(t, other, "commit", "-q", "--allow-empty", "-m", fmt.Sprintf("change %02d", i+1))
 		}
 		gitIn(t, other, "push", "-q")
 		head := gitIn(t, r.dir, "rev-parse", "HEAD")
-		code, out := r.pty(nil, step{"what to do: a number or a name: ", "8"}, step{"continue? [y/N]: ", "n"})
+		code, out := r.pty([]string{"upgrade"}, step{"continue? [y/N]: ", "n"})
 		if code != 1 || !strings.Contains(out, "26 new commit(s) on origin/main:") || !strings.Contains(out, "stopped; nothing more was changed") ||
 			strings.Contains(out, "pager") || strings.Contains(out, "change 05") || changed(r) != 0 || gitIn(t, r.dir, "rev-parse", "HEAD") != head {
 			t.Errorf("exit %d, %d changes:\n%s", code, changed(r), out)

@@ -22,6 +22,8 @@ const (
 	captureLimit = 8 << 20
 	// lineLimit cuts each line Display shows.
 	lineLimit = 64 << 10
+	// buildTail is how many of a build's last lines are shown when it fails.
+	buildTail = 30
 )
 
 // Capture runs name in the clone with standard input closed and standard
@@ -60,8 +62,13 @@ func (h *Host) CLI(ctx context.Context, args []string, stdin io.Reader, stdout, 
 // number, since Compose quotes the rest of a .env line it cannot parse, which
 // may be a credential. The exit code and the error are Capture's.
 func (h *Host) Display(ctx context.Context, say func(string), name string, args ...string) (int, error) {
+	return h.display(ctx, nil, say, name, args...)
+}
+
+// display is Display with env added to the command's environment.
+func (h *Host) display(ctx context.Context, env []string, say func(string), name string, args ...string) (int, error) {
 	out := &lines{say: say}
-	code, err := h.run(ctx, nil, nil, out, out, name, args...)
+	code, err := h.run(ctx, env, nil, out, out, name, args...)
 	if len(out.buf) > 0 {
 		out.flush()
 	}
@@ -71,16 +78,46 @@ func (h *Host) Display(ctx context.Context, say func(string), name string, args 
 // Up runs docker compose up -d with args, shown through say and bounded by
 // upBound, then waits for readiness.
 func (h *Host) Up(ctx context.Context, say func(string), args ...string) error {
+	return h.up(ctx, say, false, nil, args...)
+}
+
+// Build is Up with --build, building the image of version: Compose passes
+// STARGAITE_VERSION to the build (compose.yaml), so a console run past the
+// bootstrap still builds the clone's version. The build's many lines are
+// kept back: only its last buildTail are shown, and only when it fails or
+// runs out of time.
+func (h *Host) Build(ctx context.Context, say func(string), version string) error {
+	return h.up(ctx, say, true, []string{"STARGAITE_VERSION=" + version}, "--build")
+}
+
+// up is Up with env added to Compose's environment; when quiet, Compose's
+// output is said only on failure, its last buildTail lines. Display hands
+// the lines over from one goroutine, which has ended when it returns.
+func (h *Host) up(ctx context.Context, say func(string), quiet bool, env []string, args ...string) error {
 	bounded, cancel := context.WithTimeout(ctx, h.upBound)
 	defer cancel()
-	code, err := h.Display(bounded, say, "docker", append([]string{"compose", "up", "-d"}, args...)...)
+	var tail []string
+	show := say
+	if quiet {
+		show = func(l string) { tail = append(tail[max(0, len(tail)+1-buildTail):], l) }
+	}
+	failed := func(msg string) error {
+		if len(tail) > 0 {
+			say("the build's last lines:")
+		}
+		for _, l := range tail {
+			say(l)
+		}
+		return errors.New(msg)
+	}
+	code, err := h.display(bounded, env, show, "docker", append([]string{"compose", "up", "-d"}, args...)...)
 	switch {
 	case ctx.Err() != nil:
 		return fmt.Errorf("docker compose up: %w", ctx.Err())
 	case bounded.Err() != nil:
-		return errors.New("docker compose up was not done within 20 minutes; its output is above")
+		return failed("docker compose up was not done within 20 minutes; its output is above")
 	case err != nil || code != 0:
-		return errors.New("docker compose up failed or was interrupted; its output is above")
+		return failed("docker compose up failed or was interrupted; its output is above")
 	}
 	return h.WaitReady(ctx, say)
 }
@@ -129,9 +166,21 @@ func (h *Host) Logs(ctx context.Context, say func(string)) {
 // ContainerRuns reports whether the clone's container runs. Compose's
 // standard error is never shown, since it may quote a line of .env.
 func (h *Host) ContainerRuns(ctx context.Context) (bool, error) {
+	return h.ps(ctx, "-q")
+}
+
+// ContainerExists reports whether the clone's container exists, running or
+// stopped, as ContainerRuns does.
+func (h *Host) ContainerExists(ctx context.Context) (bool, error) {
+	return h.ps(ctx, "-a", "-q")
+}
+
+// ps reports whether docker compose ps with args lists a container, bounded
+// by h.bound.
+func (h *Host) ps(ctx context.Context, args ...string) (bool, error) {
 	bounded, cancel := context.WithTimeout(ctx, h.bound)
 	defer cancel()
-	out, code, err := h.Capture(bounded, "docker", "compose", "ps", "-q")
+	out, code, err := h.Capture(bounded, "docker", append([]string{"compose", "ps"}, args...)...)
 	switch {
 	case err != nil && ctx.Err() == nil && errors.Is(err, context.DeadlineExceeded):
 		return false, fmt.Errorf("docker compose ps did not answer within %s", h.bound)
@@ -162,7 +211,7 @@ func (h *Host) CloneVersion(ctx context.Context) string {
 // trusting the private CA when there is one. The override is read on each
 // call.
 func (h *Host) admin() ([]string, error) {
-	name, ca, err := h.tlsNames()
+	name, ca, err := h.TLSNames()
 	if err != nil || name == "" {
 		return nil, err
 	}

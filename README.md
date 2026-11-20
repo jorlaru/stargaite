@@ -121,31 +121,34 @@ cd stargaite
 ./setup.sh
 ```
 
-It reports everything missing at once, with where to get it, and installs nothing. Then it asks, each question with its
-default in brackets, which Enter takes:
+It reports everything missing at once, with where to get it, and installs nothing. Then the console's guided first run
+asks its steps under a step bar (machine, provider, alias, model, fallbacks, check, key, first answer), each question
+with its default, which Enter takes; run again, it resumes at the first missing step:
 
-1. **The machine.** The data plane goes on `127.0.0.1:4000`; when that port is taken, `--port <n>` picks another.
-   The container is built and started (a few minutes the first time).
-2. **A provider.** A preset from a numbered list, or another OpenAI- or Anthropic-compatible service by its URL. Its
+1. **The machine.** The data plane goes on `127.0.0.1:4000`; when that port is taken, it offers the next free one
+   (or give `--port <n>`). The container is built and started (a few minutes the first time).
+2. **A provider.** A preset picked from a list, or another OpenAI- or Anthropic-compatible service by its URL. Its
    credential is typed hidden and written only to `.env` (mode `0600`), never shown; the container is recreated to
    read it. A server on this host, such as Ollama, is reached from the container at `host.docker.internal`, so it must
    listen beyond the host's loopback (Ollama: `OLLAMA_HOST=0.0.0.0`).
-3. **A model.** Offered from the provider's own list (one free request), filtered by what you type, or typed.
+3. **An alias and a model.** The alias your clients call (`main`), then its model, offered from the provider's own
+   list (one free request), filtered by what you type, or typed.
 4. **The check.** `targets verify` calls the model for real (see [Targets verify](#targets-verify)); a failure prints
    the provider's reason and stops before anything else is made.
-5. **An alias and a key.** The alias your clients call (`main`) and a client key (`my-app`, 60 requests a minute),
-   printed once, inside a frame, and written nowhere: store it then.
+5. **A key.** A client key (`my-app`, 60 requests a minute), shown once, until you confirm you stored it, and written
+   nowhere.
 6. **A first answer.** One chat completion with that key, then the base URL and an example call.
 
 It makes two kinds of paid call, each announced first with its count, capped at 256 output tokens and never retried:
 `targets verify` (one call per reasoning level the target declares), skipped for a target already verified, and the
 test chat completion. Interrupted, it resumes when run again: what exists is kept, never made twice.
 
-Run again on an installation, it offers a menu, or takes a subcommand; `./setup.sh help` lists each one's flags:
+Run again on an installation, it opens the console's home, or takes a subcommand; `./setup.sh help` lists each one's
+flags:
 
 | Subcommand | What it does |
 |---|---|
-| `install` | The steps above; the default at a terminal before the container exists |
+| `install` | The first run above; the default at a terminal before anything is set up |
 | `provider` | Add providers and their keys in one go; each key is checked for free (its model list) before it is written to `.env`, and the container is recreated once |
 | `alias` | An alias toward a provider's model, with fallbacks from any provider; its new targets are checked first, each paid call announced |
 | `key` | A client key for one or more aliases, shown once, then one test call through it, announced first |

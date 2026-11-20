@@ -14,7 +14,6 @@ set -u
 
 override_marker='# Written by setup.sh from its "# setup:" lines below; it rewrites this file whole.'
 tmp_file="" agreed=0 tls_args=() admin=() published=""
-provider="" model="" alias="" key_name="" protocol="" provider_json="" key_value="" client_key=""
 declare -A opt=()
 
 say() { printf '%s\n' "$*"; }
@@ -143,11 +142,10 @@ secret() {
 
 # credentials NAME FLAG...: each credential NAME kept from .env unless
 # --replace (or y at a terminal) replaces it, otherwise read by secret from
-# FLAG; all are read before any is written, each through agree. key_value is
-# the last one's value.
+# FLAG; all are read before any is written, each through agree.
 credentials() {
 	local -a names=() values=()
-	local i
+	local i key_value
 	while (($#)); do
 		key_value=""
 		if env_get key_value "$1" && ! yesno replace "$1 is in .env: replace it?"; then
@@ -304,7 +302,7 @@ ctl() { docker compose exec -T "${admin[@]}" stargaite /stargaite "$@" </dev/nul
 # cli WORD WORD ARGS...: one CLI command in the container, with --json; the
 # answer is in $reply. Its findings, warnings included, are printed; a failure
 # also prints the CLI's message and returns 1. The CLI bounds its own wait:
-# 90 s, or the server's deadline for a verify.
+# 90 s.
 cli() {
 	local code message
 	reply=$(ctl "$1" "$2" --json "${@:3}")
@@ -314,16 +312,6 @@ cli() {
 	message=$(field "$reply" '.error.message // empty' 2>/dev/null)
 	say "stargaite $1 $2: ${message:-failed with exit $code}"
 	return 1
-}
-
-# curl_auth HEADER VALUE ARGS...: curl, bounded to 30 s, with "HEADER: VALUE"
-# in a curl config on standard input, so the value is in no argument; \ and "
-# are escaped for the config's quoted string.
-curl_auth() {
-	local v=$2
-	v=${v//\\/\\\\}
-	v=${v//\"/\\\"}
-	printf 'header = "%s: %s"\n' "$1" "$v" | curl -sS --max-time 30 -K - "${@:3}"
 }
 
 # at_least VERSION MINIMUM: true when the dotted VERSION, with or without a
@@ -381,9 +369,9 @@ report_missing() {
 	exit 1
 }
 
-# check_machine: the root rule, then everything install needs, all reported
-# at once. The host port must be free on loopback unless it is the one .env
-# names and the container runs already.
+# check_machine: the root rule, then everything a subcommand needs, all reported
+# at once. The host port .env names must be free on loopback unless the
+# container runs already.
 check_machine() {
 	local -a missing=()
 	local v
@@ -391,8 +379,8 @@ check_machine() {
 	check_docker
 	command -v curl >/dev/null || missing+=("curl: see https://curl.se/download.html")
 	command -v jq >/dev/null || missing+=("jq: see https://jqlang.org/download/")
-	if v=$(docker compose ps -q 2>/dev/null) && [[ $port != "$env_port" || -z $v ]] && (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
-		missing+=("a free host port: 127.0.0.1:$port is taken; give another with --port <n>")
+	if v=$(docker compose ps -q 2>/dev/null) && [[ -z $v ]] && (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+		missing+=("a free host port: 127.0.0.1:$port is taken; ./setup.sh install --port <n> publishes another")
 	fi
 	report_missing
 }
@@ -437,34 +425,6 @@ clone_version() {
 	export STARGAITE_VERSION
 }
 
-# start: .env (mode 0600) with the host port, then the container, built with
-# the clone's version when none exists; one that runs on the port .env named
-# (4000 without the line) is kept, and a stopped one is started.
-start() {
-	local kept=""
-	[[ -f .env ]] || (umask 077 && : >.env) || die ".env was not created"
-	if ! env_get kept STARGAITE_PORT; then
-		say "writing STARGAITE_PORT=$port to .env"
-		env_set STARGAITE_PORT "$port"
-	elif [[ $kept != "$port" ]]; then
-		confirm "STARGAITE_PORT is replaced in .env, from $kept to $port"
-		env_set STARGAITE_PORT "$port"
-	fi
-	clone_version
-	if [[ -z $(docker compose ps -a -q) ]]; then
-		say "building and starting version $STARGAITE_VERSION (the first build takes a few minutes)"
-		compose_up --build
-	elif [[ $port != "$env_port" ]]; then
-		recreate "publish 127.0.0.1:$port"
-	elif [[ -z $(docker compose ps -q) ]]; then
-		say "starting the stopped container"
-		compose_up --no-build
-	else
-		say "the container runs; kept"
-		wait_ready
-	fi
-}
-
 # reach VAR WHAT [HINT]: a URL on the host's loopback becomes one on
 # host.docker.internal, as the container reaches the host, and
 # --allow-private-network joins the caller's args; a plain-HTTP URL is
@@ -486,249 +446,13 @@ gateway() {
 	[[ $1 == *//host.docker.internal* ]] && override_set host.docker.internal:host-gateway extra_hosts host_gateway=1
 }
 
-# step_provider: the provider, from a preset or another compatible service,
-# added through the CLI before any secret is typed, which checks the variable
-# name and the URL; then its credential into .env and, for a local service,
-# the override, once the recreate that reads them is agreed; the container is
-# recreated once. A provider that exists is kept.
-step_provider() {
-	local presets n choice existing preset url var billing args=()
-	cli providers presets || exit 1
-	presets=$reply
-	cli providers list || exit 1
-	existing=$(field "$reply" '[.providers[].name] | join(", ")')
-	if [[ ! -v opt[provider] ]] && interactive; then
-		say "providers:"
-		field "$presets" '.presets | to_entries[] | "  \(.key + 1)) \(.value.name)" +
-			(if .value.untested then ", untested" else "" end) + (if (.value.base_url // "") == "" then ", asks for its URL" else "" end)'
-		n=$(field "$presets" '.presets | length')
-		say "  $((n + 1))) another OpenAI- or Anthropic-compatible service"
-		[[ -n $existing ]] && say "  already added: $existing"
-		ask choice provider "" "provider: a number or a name"
-		if [[ $choice =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= n)); then
-			choice=$(field "$presets" --argjson i "$((choice - 1))" '.presets[$i].name')
-		elif [[ $choice == "$((n + 1))" ]]; then
-			ask choice provider "" "a name for the service"
-		fi
-		opt[provider]=$choice
-	fi
-	ask provider provider "" "the provider: a preset, a provider already added, or a new name"
-	provider_json=$(field "$reply" --arg n "$provider" '.providers[] | select(.name == $n)')
-	if [[ -n $provider_json ]]; then
-		say "provider $provider exists; kept"
-	else
-		preset=$(field "$presets" --arg n "$provider" '.presets[] | select(.name == $n)')
-		if [[ -n $preset ]]; then
-			url=$(field "$preset" '.base_url // ""')
-			[[ -n $url && ! -v opt[base-url] ]] || ask url base-url "" "the base URL of $provider"
-		else
-			say "$provider is not a preset: another OpenAI- or Anthropic-compatible service"
-			ask protocol protocol openai "its protocol, openai or anthropic"
-			ask url base-url "" "its base URL"
-			var=${provider^^}
-			ask var api-key-env "${var//[^A-Z0-9_]/_}_API_KEY" "the variable for its credential, or none"
-			billing=none
-			[[ $var != none ]] && billing=pay_per_use && args+=(--api-key-env "$var")
-			args+=(--protocol "$protocol" --billing "$billing")
-		fi
-		reach url "$provider" "Ollama binds 127.0.0.1 unless OLLAMA_HOST=0.0.0.0"
-		say "adding provider $provider"
-		cli providers add --base-url "$url" "${args[@]}" -- "$provider" || exit 1
-		provider_json=$(field "$reply" .resource)
-	fi
-	protocol=$(field "$provider_json" .protocol)
-	var=$(field "$provider_json" '.api_key_env // ""')
-	key_value=""
-	[[ -n $var ]] && credentials "$var" key-env
-	gateway "$(field "$provider_json" .base_url)"
-	# A credential the container lacks, as after a run that stopped before
-	# its recreate, recreates it too.
-	if ((agreed)) || { cli providers show -- "$provider" && [[ $(field "$reply" .credential) == unresolved ]]; }; then
-		recreate "read $var"
-	fi
-	cli providers show -- "$provider" || exit 1
-	[[ $(field "$reply" .credential) =~ ^(resolved|none)$ ]] || die "the credential of $provider does not resolve: $var is not in the container's environment"
-}
-
-# list_models URL: the ids the provider lists, one per line, from one free
-# GET of its model list, the credential in a header read from standard input.
-# A failure, an empty list or an answer that is not one prints one line on
-# standard error and nothing else.
-list_models() {
-	local answer ids
-	if [[ $protocol == anthropic ]]; then
-		answer=$(curl_auth x-api-key "$key_value" -H 'anthropic-version: 2023-06-01' --fail "${1%/}/v1/models?limit=1000" 2>/dev/null)
-	elif [[ -n $key_value ]]; then
-		answer=$(curl_auth Authorization "Bearer $key_value" --fail "${1%/}/models" 2>/dev/null)
-	else
-		answer=$(curl -sS --max-time 30 --fail "${1%/}/models" 2>/dev/null)
-	fi || {
-		say "the model list at $1 was not read; type the model id" >&2
-		return
-	}
-	ids=$(field "$answer" '.data[].id' 2>/dev/null)
-	[[ -n $ids ]] || {
-		say "the model list at $1 is empty or not a list; type the model id" >&2
-		return
-	}
-	printf '%s\n' "$ids"
-}
-
-# step_model: the model id, offered at a terminal from the provider's own
-# list, read at the host-side URL and filtered by what the reader types.
-step_model() {
-	local url answer filter="" id i pick="" ids=() shown=()
-	if [[ ! -v opt[model] ]] && interactive; then
-		url=$(field "$provider_json" .base_url)
-		mapfile -t ids < <(list_models "${url/\/\/host.docker.internal/\/\/localhost}")
-		while ((${#ids[@]})) && [[ -z $pick ]]; do
-			shown=()
-			for id in "${ids[@]}"; do
-				[[ $id == *"$filter"* ]] && shown+=("$id")
-			done
-			if ((${#shown[@]} == 0)); then
-				say "$filter is not in the list; it is taken as typed"
-				pick=$filter
-				break
-			fi
-			for i in "${!shown[@]}"; do
-				((i < 40)) && printf '  %d) %s\n' $((i + 1)) "${shown[i]}"
-			done
-			((${#shown[@]} > 40)) && say "  and $((${#shown[@]} - 40)) more: type part of an id to filter"
-			read -r -p "model: a number, an id, or part of one to filter: " answer || die "no answer to: model"
-			if [[ $answer =~ ^[0-9]+$ ]] && ((answer >= 1 && answer <= ${#shown[@]} && answer <= 40)); then
-				pick=${shown[answer - 1]}
-			fi
-			for id in "${ids[@]}"; do
-				[[ $id == "$answer" ]] && pick=$id
-			done
-			filter=$answer
-		done
-		[[ -n $pick ]] && opt[model]=$pick
-	fi
-	ask model model "" "the model id at $provider"
-}
-
-# step_target: the chat target provider/model, kept when it exists, then
-# checked with targets verify unless it is verified and --reverify is not
-# given: the paid calls counted and bounded first, never retried.
-step_target() {
-	local t calls total
-	target=$provider/$model
-	cli targets list || exit 1
-	t=$(field "$reply" --arg id "$target" '.targets[] | select(.id == $id)')
-	if [[ -n $t ]]; then
-		say "target $target exists; kept"
-	else
-		say "adding target $target"
-		cli targets add --kind chat -- "$target" || exit 1
-		t=$(field "$reply" .resource)
-	fi
-	if [[ -n $(field "$t" '.verified_at // empty') && ! -v opt[reverify] ]]; then
-		say "target $target is verified; not verified again (--reverify asks for it)"
-		return
-	fi
-	calls=$(field "$t" '[(.reasoning.levels // [])[], (if .reasoning.can_disable then "none" else empty end)] | length | if . == 0 then 1 else . end')
-	total=$(field "$provider_json" '.timeouts.total_ms // empty')
-	if [[ -z $total ]]; then
-		cli settings show || exit 1
-		total=$(field "$reply" .timeouts.total_ms)
-	fi
-	say "targets verify $target: $calls paid call(s) to $provider, each capped at 256 output tokens, never retried; interrupted, the server still ends them within $((calls * (total / 1000 + 5))) s"
-	if ! cli targets verify --max-output-tokens 256 -- "$target"; then
-		field "$reply" '.calls[]? | "  \(.effort // "" | if . == "" then "call" else . end): status \(.status), \(.provider_message // .error.message // "no answer")"' 2>/dev/null
-		die "target $target failed its check; no alias or key was created"
-	fi
-	say "target $target is verified"
-}
-
-# alias_kept: the alias's name; true, and said, when it exists: it is kept.
-alias_kept() {
-	local exists
-	ask alias alias main "a name for the alias your clients call"
-	cli models list || exit 1
-	exists=$(field "$reply" --arg n "$alias" '.models[] | select(.name == $n) | .targets | join(", ")')
-	[[ -n $exists ]] && say "alias $alias exists, toward $exists; kept"
-}
-
-# step_alias: the alias, which alias_kept found new, toward the target.
-step_alias() {
-	local max effort args=()
-	if [[ $protocol == anthropic ]]; then
-		ask max max-output-tokens 8192 "the alias's output cap in tokens, which an anthropic target needs"
-		args+=(--max-output-tokens "$max")
-	fi
-	ask effort effort "" "a default reasoning effort, such as low, medium or high; empty for none" optional
-	[[ -n $effort ]] && args+=(--effort "$effort" --effort-mode default)
-	say "adding alias $alias toward $target"
-	cli models add --target "$target" "${args[@]}" -- "$alias" || exit 1
-}
-
-# step_key: a client key allowed the alias, printed once inside a frame and
-# written nowhere. A key that exists keeps its secret, which cannot be shown
-# again: the reader names another, or the first answer is skipped (false),
-# which, as for anything kept, is no failure.
-step_key() {
-	local rpm
-	ask key_name key-name my-app "a name for the client key"
-	cli keys list || exit 1
-	while [[ -n $(field "$reply" --arg n "$key_name" '.keys[] | select(.name == $n) | .name') ]]; do
-		say "key $key_name exists; its secret cannot be shown again"
-		if ! interactive; then
-			say "the first answer is skipped: give --key-name with a new name to make a key for it"
-			return 1
-		fi
-		read -r -p "another name, or Enter to skip the first answer: " key_name && [[ -n $key_name ]] || {
-			say "no key made; the first answer is skipped"
-			return 1
-		}
-	done
-	ask rpm rpm-limit 60 "the requests a minute the key may send"
-	say "creating key $key_name for alias $alias"
-	cli keys create --model "$alias" --rpm-limit "$rpm" -- "$key_name" || exit 1
-	client_key=$(field "$reply" --arg n "$key_name" '.secrets[$n]')
-	say "+-------------------------------------------------------------------"
-	say "| client key $key_name, shown once and written nowhere: store it now"
-	say "| $client_key"
-	say "+-------------------------------------------------------------------"
-}
-
-# step_answer: one chat completion through the data plane with the new key.
-# The headers come first in the answer (-D -), up to an empty line: curl's
-# %header{} needs 7.84.0, newer than some supported systems ship.
-step_answer() {
-	local body out status code time served="" re=$'\nx-stargaite-target: *([^\r]*)'
-	say "one test chat completion through the proxy: a paid call through alias $alias, capped at 256 output tokens, never retried"
-	body=$(jq -nc --arg m "$alias" '{model: $m, max_tokens: 256, messages: [{role: "user", content: "Say hello in one short sentence."}]}')
-	out=$(curl_auth Authorization "Bearer $client_key" -H 'Content-Type: application/json' -d "$body" \
-		-D - -w '\n%{http_code} %{time_total}' "${tls_args[@]}" "$base_url/chat/completions") || {
-		code=$?
-		say "the test call did not complete (curl exit $code); the last 30 log lines:"
-		docker compose logs --tail 30 stargaite
-		exit 1
-	}
-	status=${out##*$'\n'}
-	out=${out%$'\n'*}
-	shopt -s nocasematch
-	[[ ${out%%$'\r\n\r\n'*} =~ $re ]] && served=${BASH_REMATCH[1]}
-	shopt -u nocasematch
-	out=${out#*$'\r\n\r\n'}
-	read -r code time <<<"$status"
-	[[ $code == 2* ]] || die "the test call answered $code: $(field "$out" '.error.message // empty' 2>/dev/null)"
-	say "answer: $(field "$out" '.choices[0].message.content // ""')"
-	say "finish_reason: $(field "$out" '.choices[0].finish_reason // "-"'), $time s, from ${served:--}"
-}
-
-# machine: the host port, from --port or .env (4000 without either), the
-# checks of check_machine and how the proxy is reached.
+# machine: the host port, from .env (4000 without it), the checks of
+# check_machine and how the proxy is reached.
 machine() {
 	port=4000
 	env_get port STARGAITE_PORT
-	env_port=$port
-	[[ -v opt[port] ]] && port=${opt[port]}
 	if [[ ! $port =~ ^[1-9][0-9]{0,4}$ ]] || ((port > 65535)); then
-		[[ -v opt[port] ]] || die "STARGAITE_PORT in .env is not a port number, 1 to 65535: write it as STARGAITE_PORT=<n>, or give --port"
-		usage_error "--port takes a port number, 1 to 65535"
+		die "STARGAITE_PORT in .env is not a port number, 1 to 65535: write it as STARGAITE_PORT=<n>, or ./setup.sh install --port <n> replaces it"
 	fi
 	check_machine
 	tls_state
@@ -1080,20 +804,6 @@ upgrade() {
 	exit "$failed"
 }
 
-install() {
-	machine
-	start
-	step_provider
-	step_model
-	step_target
-	alias_kept || step_alias
-	step_key && step_answer
-	say ""
-	say "Ready. Point an OpenAI-compatible client at base URL $base_url, with model $alias and its key, such as:"
-	say "  curl ${tls_args[2]:+${tls_args[*]:2} }$base_url/chat/completions -H \"Authorization: Bearer sk-stargaite-...\" -d '{\"model\":\"$alias\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}'"
-	say "Run ./setup.sh again to resume or check this installation; ./setup.sh help lists what it does."
-}
-
 usage() {
 	printf '%s\n' "usage: ./setup.sh [subcommand] [flags]
 
@@ -1101,10 +811,9 @@ The guided assistant: it asks only at a terminal, and only for what no flag
 gave; without a terminal, a missing answer exits 2 naming its flag.
 
 subcommands:
-  install   check this machine, start the container, and go from a provider
-            to a key and a first answer; run again, it resumes and keeps
-            what exists (the default at a terminal before it exists; a menu
-            of the others after)
+  install   the first run: this machine, then a provider, an alias with its
+            fallbacks and a key, each kept when it exists, then a first
+            answer; the default at a terminal before anything is set up
   provider  add providers and their keys; each key is checked for free before it is written
   alias     an alias toward a provider's model, with fallbacks from any provider (--fallback a/m,b/m);
             its new targets are checked first, each paid call counted and announced
@@ -1141,8 +850,10 @@ install flags, which provider, alias and key take for their steps:
   --alias <name>            the alias clients call (main)
   --max-output-tokens <n>   the alias's output cap, for an anthropic target (8192)
   --effort <level>          the alias's default reasoning effort (none)
-  --fallback <p/m,…>        alias only: its fallbacks, in order, of providers
-                            added; alias also takes budget's price flags
+  --fallback <p/m,…>        the alias's fallbacks, in order, of providers added
+  --input-price <usd>, --output-price <usd>
+                            per million tokens, when a budget reaches the new
+                            target unpriced
   --key-name <name>         the client key's name (my-app)
   --rpm-limit <n>           the client key's requests a minute (60)
   --yes                     confirm a change that replaces something or
@@ -1197,22 +908,16 @@ main() {
 		cd -- "${BASH_SOURCE[0]%/*}" || exit 1
 	fi
 	[[ -f compose.yaml ]] || die "compose.yaml is not beside setup.sh: run it from the clone of stargaite"
-	local sub=${1-} menu=(provider alias key budget telemetry status remote upgrade)
-	local pf="provider base-url protocol api-key-env key-env" bf="replace allow-private-network yes"
+	local sub=${1-} bf="replace allow-private-network yes"
 	shift
-	# With no subcommand at a terminal: install, or a menu once it exists.
+	# With no subcommand at a terminal: the console's home, which opens the
+	# first run when nothing is set up yet.
 	if [[ -z $sub ]]; then
 		interactive || usage_error "no subcommand; ./setup.sh help lists them"
-		sub=install
-		if [[ -n $(docker compose ps -a -q 2>/dev/null) ]]; then
-			say "this installation exists; ./setup.sh help says what each choice does:"
-			say "  1) provider  2) alias  3) key  4) budget  5) telemetry  6) status  7) remote  8) upgrade"
-			read -r -p "what to do: a number or a name: " sub || die "no answer to: what to do"
-			[[ $sub =~ ^[1-8]$ ]] && sub=${menu[sub - 1]}
-		fi
+		console
 	fi
 	case $sub in
-	install) parse_flags "port $pf model alias max-output-tokens effort key-name rpm-limit" "$bf reverify" "$@"; install ;;
+	install) console install "$@" ;;
 	provider) console provider "$@" ;;
 	alias) console alias "$@" ;;
 	key) console key "$@" ;;

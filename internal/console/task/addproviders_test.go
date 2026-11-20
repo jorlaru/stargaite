@@ -24,7 +24,6 @@ import (
 	"github.com/jorlaru/stargaite/internal/cli"
 	"github.com/jorlaru/stargaite/internal/console/host"
 	"github.com/jorlaru/stargaite/internal/console/proxy"
-	"github.com/jorlaru/stargaite/internal/console/rules"
 	"github.com/jorlaru/stargaite/internal/console/ui"
 	"github.com/jorlaru/stargaite/internal/console/ui/plain"
 )
@@ -124,7 +123,7 @@ func worldOn(t *testing.T, env map[string]string) *world {
 	bin := t.TempDir()
 	w := &world{t: t, h: host.New(t.TempDir()), env: env, log: filepath.Join(bin, "log")}
 	writeFile(t, filepath.Join(bin, "docker"), "#!/bin/sh\necho \"$*\" >>'"+w.log+"'\ncase \"$*\" in\n"+
-		"'compose ps -q') echo c0ffee ;;\n'compose up -d --no-build') ;;\n'compose logs --tail 30 stargaite') echo 'a log line' ;;\n"+
+		"'compose ps -q'|'compose ps -a -q') echo c0ffee ;;\n'compose up -d --no-build') ;;\n'compose logs --tail 30 stargaite') echo 'a log line' ;;\n"+
 		"*) exit 9 ;;\nesac\n", 0o755)
 	writeFile(t, filepath.Join(bin, "sleep"), "#!/bin/sh\necho \"sleep $*\" >>'"+w.log+"'\n", 0o755)
 	t.Setenv("PATH", bin)
@@ -844,6 +843,7 @@ func TestAddProvidersHeldWarnings(t *testing.T) {
 	canned[addAcme] = reply{`{"findings":[` +
 		`{"severity":"warning","code":"credential_unresolved","resource":"providers/acme","message":"credential message"},` +
 		`{"severity":"warning","code":"url_unresolved","resource":"providers/acme","message":"url message"},` +
+		`{"severity":"warning","code":"reasoning_undeclared","resource":"providers/acme","message":"levels message"},` +
 		`{"severity":"warning","code":"unpriced","resource":"targets/x","message":"unpriced message"}],` +
 		`"resource":` + acmeListed("unresolved") + `}`, 0}
 	w.canned(canned)
@@ -851,7 +851,7 @@ func TestAddProvidersHeldWarnings(t *testing.T) {
 	if err != nil || res != "Done: acme added, key kept in .env." {
 		t.Fatalf("%q, %v\n%s", res, err, out)
 	}
-	if !before(out, rules.Plain("url_unresolved", "providers/acme", "url message"), "") ||
+	if !before(out, "provider acme: its host name did not resolve from the container; the proxy tries again on each call, so check the URL if this lasts", "") || strings.Contains(out, "levels message") ||
 		strings.Contains(out, "credential message") || strings.Contains(out, "its key is not in the container yet") || strings.Contains(out, "unpriced") {
 		t.Errorf("output:\n%s", out)
 	}

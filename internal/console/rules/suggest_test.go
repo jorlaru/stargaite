@@ -6,9 +6,9 @@ import (
 )
 
 func TestSuggest(t *testing.T) {
-	provider := Suggestion{Label: "Add a provider: none is added yet", Task: "Add providers"}
-	alias := Suggestion{Label: "Make an alias your apps call: none exists yet", Task: "Make an alias"}
-	key := Suggestion{Label: "Give an app or agent its key: none exists yet", Task: "Give an app or agent its key"}
+	provider := Suggestion{Label: "Add a provider: none is added yet", Task: "First run"}
+	alias := Suggestion{Label: "Make an alias your apps call: none exists yet", Task: "First run"}
+	key := Suggestion{Label: "Give an app or agent its key: none exists yet", Task: "First run"}
 	replace := Suggestion{Label: "Replace the key of acme: ACME_KEY does not resolve", Task: "Change a provider",
 		Presets: map[string]string{"provider": "acme", "change": "key"}}
 	fallback := Suggestion{Label: "Give alias a a fallback: it has one model", Task: "Change an alias",
@@ -36,5 +36,23 @@ func TestSuggest(t *testing.T) {
 	got[0].Presets["change"] = "x"
 	if again := Suggest(f); again[0].Presets["change"] != "key" {
 		t.Fatalf("a change to one result reached the next: %+v", again[0])
+	}
+}
+
+func TestMissing(t *testing.T) {
+	two := map[string]string{"a": "A", "b": "B"}
+	for _, tc := range []struct {
+		facts Facts
+		want  []string
+	}{
+		{Facts{}, []string{"provider", "alias", "key"}},
+		{Facts{Providers: 2, Unresolved: two, Aliases: map[string]int{"main": 1}, Keys: 1}, []string{"provider"}},
+		{Facts{Providers: 2, Unresolved: map[string]string{"a": "A"}}, []string{"alias", "key"}},
+		{Facts{Providers: 1, Aliases: map[string]int{"main": 1}}, []string{"key"}},
+		{Facts{Providers: 1, Aliases: map[string]int{"main": 1}, Keys: 1}, nil},
+	} {
+		if got := Missing(tc.facts); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("Missing(%+v) = %q; want %q", tc.facts, got, tc.want)
+		}
 	}
 }

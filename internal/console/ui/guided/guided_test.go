@@ -202,7 +202,7 @@ func TestHomePickAnswers(t *testing.T) {
 	got := h.asked(homeQuestion())
 	f := h.waitShown("What do you want to do?")
 	lines := strings.Split(f.Content, "\n")
-	if lines[0] != "StargAIte console v-test" || lines[1] != "" || lines[2] != "What do you want to do?" {
+	if lines[0] != "" || lines[1] != "What do you want to do?" {
 		t.Fatalf("home frame:\n%s", f.Content)
 	}
 	h.p.Send(key(tea.KeyDown))
@@ -219,7 +219,7 @@ func TestStepBarFrames(t *testing.T) {
 		Options: []ui.Option{{Value: "x", Label: "x"}}, Bar: ui.Bar{Titles: []string{"name", "model", "check"}, Current: 1}}
 	h.asked(q)
 	f := h.waitShown("Which model?")
-	if lines := strings.Split(f.Content, "\n"); lines[1] != "✓ name → ● model → check" || lines[2] != "" {
+	if lines := strings.Split(f.Content, "\n"); lines[0] != "✓ name → ● model → check" || lines[1] != "" {
 		t.Fatalf("frame:\n%s", f.Content)
 	}
 }
@@ -253,15 +253,15 @@ func TestTextCursorBelowHeader(t *testing.T) {
 	h.waitShown("Name?")
 	h.p.Send(tea.KeyPressMsg{Code: 'é', Text: "é"})
 	f := h.waitShown("> é")
-	if f.Cursor == nil || f.Cursor.X != 3 || f.Cursor.Y != 4 { // title, bar, blank, prompt; "> é"
+	if f.Cursor == nil || f.Cursor.X != 3 || f.Cursor.Y != 3 { // bar, blank, prompt; "> é"
 		t.Fatalf("cursor %+v in\n%s", f.Cursor, f.Content)
 	}
-	// Five rows leave the piece one: only the input, on row 3 of the frame.
+	// Five rows leave the piece one: only the input, on row 2 of the frame.
 	h.p.Send(tea.WindowSizeMsg{Width: 80, Height: 5})
 	f = h.waitFrame(func(f tea.View) bool {
 		return strings.Contains(f.Content, "> é") && !strings.Contains(f.Content, "Name?")
 	})
-	if f.Cursor == nil || f.Cursor.X != 3 || f.Cursor.Y != 3 {
+	if f.Cursor == nil || f.Cursor.X != 3 || f.Cursor.Y != 2 {
 		t.Fatalf("cursor %+v at height 5 in\n%s", f.Cursor, f.Content)
 	}
 }
@@ -649,7 +649,7 @@ func TestFrameFits(t *testing.T) {
 			t.Fatalf("frame without a final newline:\n%s", f.Content)
 		}
 		lines := strings.Split(f.Content, "\n")
-		if len(lines) > 24 {
+		if len(lines) > 23 { // one row less than the screen (TestFrameLeavesARowAbove)
 			t.Fatalf("%d lines:\n%s", len(lines), f.Content)
 		}
 		for _, l := range lines {
@@ -858,5 +858,61 @@ func TestGuidedPickManyFrame(t *testing.T) {
 				t.Fatalf("line %q is %d wide", l, ansi.StringWidth(l))
 			}
 		}
+	}
+}
+
+// bigPick is a pick whose window fills the room it is given.
+func bigPick() ui.Question {
+	q := ui.Question{ID: "model", Step: "model", Prompt: "Which model?", Kind: ui.KindPick,
+		Bar: ui.Bar{Titles: []string{"provider", "model", "check"}, Current: 1}}
+	for i := range 100 {
+		id := fmt.Sprintf("vendor-%02d/model-%03d", i/10, i)
+		q.Options = append(q.Options, ui.Option{Value: id, Label: id, Group: fmt.Sprintf("Vendor %d", i/10)})
+	}
+	return q
+}
+
+// TestFrameLeavesARowAbove: a frame, with the empty row its final newline
+// makes, is at most one row less than the screen, so growing never scrolls
+// its first row to the screen's first row, where an erase scrolls the whole
+// screen into tmux's history (scroll-on-clear).
+func TestFrameLeavesARowAbove(t *testing.T) {
+	h := start(t)
+	got := h.asked(bigPick())
+	f := h.waitShown("Which model?")
+	if rows := strings.Count(f.Content, "\n") + 1; rows > 23 {
+		t.Fatalf("the frame takes %d rows of 24:\n%s", rows, f.Content)
+	}
+	h.p.Send(key(tea.KeyEnter))
+	answer(t, got)
+}
+
+// TestSayWaitsForTheAnsweredFrame: a line said right after an answer is held
+// until the frame without the question is drawn, so it is never inserted
+// above a frame as tall as the screen.
+func TestSayWaitsForTheAnsweredFrame(t *testing.T) {
+	reply := make(chan result, 1)
+	var m tea.Model = NewModel("v-test")
+	m, _ = m.Update(askMsg{q: bigPick(), reply: reply})
+	m, _ = m.Update(key(tea.KeyEnter))
+	<-reply
+	m, cmd := m.Update(sayMsg{text: "said at once", done: make(chan struct{})})
+	if mm := m.(Model); len(mm.held) != 1 || cmd != nil {
+		t.Fatalf("the line was not held: held %d, cmd %v", len(mm.held), cmd != nil)
+	}
+	m, cmd = m.Update(releaseMsg{})
+	if mm := m.(Model); len(mm.held) != 0 || cmd == nil {
+		t.Fatal("the release printed nothing")
+	}
+}
+
+// TestTitleSaidFirst: the title is printed once, above the first frame, so
+// no frame starts on the screen's first row in a fresh or cleared terminal.
+func TestTitleSaidFirst(t *testing.T) {
+	h := start(t)
+	f := h.waitShown("working…")
+	h.waitOutput("StargAIte console v-test")
+	if strings.Contains(f.Content, "StargAIte console") {
+		t.Fatalf("the title is in the frame:\n%s", f.Content)
 	}
 }

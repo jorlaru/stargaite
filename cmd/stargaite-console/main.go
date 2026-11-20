@@ -50,8 +50,12 @@ const sessionBound = 12 * time.Second
 // homeBound is how long the home reads what exists before each pick.
 const homeBound = 15 * time.Second
 
-const usage = `usage: stargaite-console [provider | alias | key | status | help] [flags] [--version]
+const usage = `usage: stargaite-console [install | provider | alias | key | status | help] [flags] [--version]
 At a terminal with no subcommand: the guided console.
+  install   the first run: this machine, then a provider, an alias with its fallbacks and a key, each kept when it
+            exists, ending with one test call; at a terminal it starts at the first missing step
+            --port <n> (4000), and the flags of provider, alias and key
+            its check and its test call are each announced first, capped at 256 output tokens, never retried
   provider  add providers and their keys; each key is checked for free before it is written
             --provider <a,b>   presets, a provider already added, or one new name
             --base-url <url>   --protocol <openai|anthropic>   --api-key-env <VAR|none>

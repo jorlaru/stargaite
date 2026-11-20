@@ -120,7 +120,8 @@ func Verify(d Deps) func(ctx context.Context, target string, maxOutput *int64) (
 				break
 			}
 		}
-		v.OK = len(v.Calls) == len(plans) && !slices.ContainsFunc(v.Calls, func(c domain.VerifyCall) bool { return c.Status/100 != 2 || c.Error != nil })
+		// A call the request's end cut carries no error of its own, even after a 200 status line.
+		v.OK = ctx.Err() == nil && len(v.Calls) == len(plans) && !slices.ContainsFunc(v.Calls, func(c domain.VerifyCall) bool { return c.Status/100 != 2 || c.Error != nil })
 		v.At = d.Config.Now()
 		return v, nil
 	}

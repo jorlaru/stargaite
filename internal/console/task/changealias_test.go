@@ -236,7 +236,7 @@ func TestChangeAliasRemove(t *testing.T) {
 	w.must("keys", "create", "k1", "--model", "a", "--model", "zz")
 	w.must("keys", "create", "k2", "--model", "zz")
 	if _, out, err := w.changeAliasPlain(map[string]string{"alias": "a", "change": "remove", "yes": "yes"}); err != nil ||
-		!strings.HasSuffix(out, "keys/k1 names an alias that does not exist: its calls to that alias get an error: Change a key sets the aliases it may call\n") ||
+		!strings.HasSuffix(out, "key k1 names an alias that does not exist: its calls to that alias get an error: Change a key sets the aliases it may call\n") ||
 		strings.Count(out, "names an alias") != 1 {
 		t.Errorf("key: %v\n%s", err, out)
 	}

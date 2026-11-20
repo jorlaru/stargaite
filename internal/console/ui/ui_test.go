@@ -607,3 +607,92 @@ func TestWorkLeave(t *testing.T) {
 		t.Fatalf("err = %v after %s, want ErrLeave within 1s", err, time.Since(start))
 	}
 }
+
+// inStages runs fn inside Stages({x: b, y: c}, inner x, y), itself inside
+// Run(outer a, b, c), as the first run runs a task under its own bar.
+func inStages(t *testing.T, u *UI, fn func(ctx context.Context) error) {
+	t.Helper()
+	outer := []Step{{"a", "a"}, {"b", "b"}, {"c", "c"}}
+	inner := []Step{{"x", "x"}, {"y", "y"}}
+	_, err := u.Run(context.Background(), outer, func(ctx context.Context) (string, error) {
+		return u.Stages(ctx, map[string]string{"x": "b", "y": "c"}, inner, func(ctx context.Context) (string, error) {
+			return "", fn(ctx)
+		})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// wantBar fails unless the question asked n-th had the outer bar a, b, c at
+// current.
+func wantBar(t *testing.T, front *fakeFront, n, current int) {
+	t.Helper()
+	if b := front.asked[n].Bar; !slices.Equal(b.Titles, []string{"a", "b", "c"}) || b.Current != current {
+		t.Fatalf("question %d (%s): bar %+v; want a, b, c at %d", n, front.asked[n].ID, b, current)
+	}
+}
+
+func TestStagesBar(t *testing.T) {
+	front := &fakeFront{t: t, answers: []string{"v"}}
+	u := New(front, nil)
+	inStages(t, u, func(ctx context.Context) error {
+		if _, err := u.Text(ctx, Question{ID: "q1", Step: "x"}); err != nil {
+			return err
+		}
+		_, err := u.Text(ctx, Question{ID: "q2", Step: "y"})
+		return err
+	})
+	wantBar(t, front, 0, 1)
+	wantBar(t, front, 1, 2)
+}
+
+func TestStagesNestedRun(t *testing.T) {
+	front := &fakeFront{t: t, answers: []string{"v"}}
+	u := New(front, nil)
+	inStages(t, u, func(ctx context.Context) error {
+		if _, err := u.Text(ctx, Question{ID: "q1", Step: "y"}); err != nil {
+			return err
+		}
+		if _, err := u.Run(ctx, []Step{{"z", "z"}}, func(ctx context.Context) (string, error) {
+			return u.Text(ctx, Question{ID: "q2", Step: "z"})
+		}); err != nil {
+			return err
+		}
+		_, err := u.Text(ctx, Question{ID: "q3", Step: "x"})
+		return err
+	})
+	wantBar(t, front, 1, 2)
+	wantBar(t, front, 2, 1)
+}
+
+func TestStagesRefuses(t *testing.T) {
+	u := New(refusingFront{t}, nil)
+	var err error
+	inStages(t, u, func(ctx context.Context) error {
+		_, err = u.Text(ctx, Question{ID: "q", Step: "a"})
+		return nil
+	})
+	if err == nil || err.Error() != `ui: question q: step "a" is not in the task's table` {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestStagesRestores(t *testing.T) {
+	front := &fakeFront{t: t, answers: []string{"v"}}
+	u := New(front, nil)
+	outer := []Step{{"a", "a"}, {"b", "b"}, {"c", "c"}}
+	_, err := u.Run(context.Background(), outer, func(ctx context.Context) (string, error) {
+		if _, err := u.Stages(ctx, map[string]string{"x": "c"}, []Step{{"x", "x"}}, func(ctx context.Context) (string, error) {
+			return u.Text(ctx, Question{ID: "q1", Step: "x"})
+		}); err != nil {
+			return "", err
+		}
+		return u.Text(ctx, Question{ID: "q2", Step: "a"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBar(t, front, 0, 2)
+	wantBar(t, front, 1, 0)
+}

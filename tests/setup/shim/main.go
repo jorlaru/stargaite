@@ -3,7 +3,7 @@
 // it appends a record of the call to $SETUP_LOG, then answers as a fake
 // (docker, curl, id, stat -c %u ., sleep, chown, hostname, getent) or runs
 // the real command; FAKE_TIMEOUT replaces the 1200 s bound given to the real
-// timeout.
+// timeout. Run as stargaite-plane, it is the fake container's data plane.
 // A separate binary, built once without the race detector, so each call
 // starts fast.
 package main
@@ -14,9 +14,12 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -45,8 +48,10 @@ type record struct {
 // version the image was last built with and the one the container runs, and
 // the configuration the fake CLI holds: budgets by scope (instance,
 // alias:<name> or key:<name>) and the telemetry flags given since the last
-// unset, merged as telemetry set merges its patch.
+// unset, merged as telemetry set merges its patch; Plane is the pid of the
+// running container's data plane.
 type state struct {
+	Plane     int                          `json:"plane"`
 	Built     string                       `json:"built"`
 	Version   string                       `json:"version"`
 	Up        bool                         `json:"up"`
@@ -64,7 +69,27 @@ type state struct {
 }
 
 func main() {
+	if filepath.Base(os.Args[0]) == "stargaite-plane" {
+		os.Exit(plane(os.Args[1]))
+	}
 	os.Exit(shim(filepath.Base(os.Args[0]), os.Args[1:]))
+}
+
+// The chat completion the data plane answers, and its answer with
+// FAKE_CHAT=fail, as a 502.
+const (
+	chatReply   = `{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"fake reply"},"finish_reason":"stop"}]}`
+	chatFailure = `{"error":{"message":"the provider failed","code":"provider_error"}}`
+)
+
+// appendLine appends line and a newline to the file at path.
+func appendLine(path string, line []byte) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(append(line, '\n'))
+	return errors.Join(err, f.Close())
 }
 
 // shim runs as the command name: it appends its record to $SETUP_LOG, then
@@ -77,13 +102,10 @@ func shim(name string, args []string) int {
 		rec.Stdin = string(in)
 	}
 	line, _ := json.Marshal(rec)
-	f, err := os.OpenFile(os.Getenv("SETUP_LOG"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err != nil {
+	if err := appendLine(os.Getenv("SETUP_LOG"), line); err != nil {
 		fmt.Fprintln(os.Stderr, "shim:", err)
 		return 127
 	}
-	_, _ = f.Write(append(line, '\n'))
-	_ = f.Close()
 	switch {
 	case name == "docker":
 		return fakeDocker(args)
@@ -147,9 +169,15 @@ func loadState() *state {
 	return st
 }
 
+// save writes the state through a rename, so a call running at the same
+// time, as the console's concurrent reads do, never reads it half written.
 func (st *state) save() {
 	data, _ := json.Marshal(st)
-	_ = os.WriteFile(os.Getenv("SETUP_STATE"), data, 0o600)
+	path := os.Getenv("SETUP_STATE")
+	tmp := path + ".tmp" + strconv.Itoa(os.Getpid())
+	if os.WriteFile(tmp, data, 0o600) == nil {
+		_ = os.Rename(tmp, path)
+	}
 }
 
 // envNames are the variable names .env in the working directory sets.
@@ -168,10 +196,98 @@ func envNames() []string {
 	return names
 }
 
+// envPort is the port .env in the working directory publishes, 4000
+// without its STARGAITE_PORT line, as compose.yaml reads it.
+func envPort() string {
+	data, _ := os.ReadFile(".env")
+	for _, line := range strings.Split(string(data), "\n") {
+		if v, ok := strings.CutPrefix(line, "STARGAITE_PORT="); ok {
+			return strings.Trim(v, `'"`)
+		}
+	}
+	return "4000"
+}
+
+// startPlane starts the container's data plane, after stopping the one it
+// replaces: this binary as stargaite-plane, in its own session, so a console
+// that kills its command's process group leaves it running, as a container
+// outlives the docker command that started it.
+func (st *state) startPlane() {
+	st.stopPlane()
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	cmd := &exec.Cmd{Path: exe, Args: []string{"stargaite-plane", envPort()}, SysProcAttr: &syscall.SysProcAttr{Setsid: true}}
+	if cmd.Start() == nil {
+		st.Plane = cmd.Process.Pid
+		_ = cmd.Process.Release()
+	}
+}
+
+func (st *state) stopPlane() {
+	if st.Plane > 0 {
+		_ = syscall.Kill(st.Plane, syscall.SIGKILL)
+	}
+	st.Plane = 0
+}
+
+// plane serves the data plane on 127.0.0.1:port, as a running container
+// does: /health/ready, and a chat completion, each appended to
+// $SETUP_STATE.chat as its Authorization and body. It waits up to 2 s for
+// the port, which the plane it replaces may still hold, and exits once
+// $SETUP_STATE is gone, or after 10 minutes: a test killed by its timeout
+// runs no cleanup.
+func plane(port string) int {
+	var ln net.Listener
+	var err error
+	for end := time.Now().Add(2 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		if ln, err = net.Listen("tcp", "127.0.0.1:"+port); err == nil || time.Now().After(end) {
+			break
+		}
+	}
+	if err != nil {
+		return 1
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(planeAnswer), ReadHeaderTimeout: 10 * time.Second}
+	go func() { _ = srv.Serve(ln) }()
+	for end := time.Now().Add(10 * time.Minute); time.Now().Before(end); time.Sleep(time.Second) {
+		if _, err := os.Stat(os.Getenv("SETUP_STATE")); err != nil {
+			break
+		}
+	}
+	return 0
+}
+
+// planeAnswer is the data plane's handler. FAKE_CHAT=fail fails the chat
+// completion with a 502, and FAKE_CHAT=timeout never answers it.
+func planeAnswer(w http.ResponseWriter, r *http.Request) {
+	switch {
+	case r.URL.Path == "/health/ready":
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		line, _ := json.Marshal(map[string]string{"auth": r.Header.Get("Authorization"), "body": string(body)})
+		_ = appendLine(os.Getenv("SETUP_STATE")+".chat", line)
+		w.Header().Set("X-Stargaite-Target", "fake/target")
+		switch os.Getenv("FAKE_CHAT") {
+		case "fail":
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = io.WriteString(w, chatFailure)
+		case "timeout":
+			<-r.Context().Done()
+		default:
+			_, _ = io.WriteString(w, chatReply)
+		}
+	default:
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
 // fakeDocker answers what setup.sh asks Docker and Compose. A container is
 // created by up, which takes the variable names of .env at that moment, as
 // Compose gives the container the file's values when it creates it.
-// FAKE_UP=hang makes up last 30 s, a build that takes long; FAKE_UP=noenv
+// A container that runs serves its data plane (startPlane); down and stop
+// end it. FAKE_UP=hang makes up last 30 s, a build that takes long; FAKE_UP=noenv
 // gives the container none of the variables of .env; FAKE_UP=fail leaves it
 // stopped, as Compose does when the new one cannot bind its port. Compose
 // starts the container anew, and serve reads tls/cert.pem, when none runs,
@@ -246,6 +362,7 @@ func fakeDocker(args []string) int {
 		}
 		if os.Getenv("FAKE_UP") == "fail" || upgrade == "start-fails" && st.Built != "" {
 			st.Up, st.Stopped = false, true
+			st.stopPlane()
 			fmt.Fprintln(os.Stderr, "Error response from daemon: failed to bind host port: address already in use")
 			return 1
 		}
@@ -262,7 +379,11 @@ func fakeDocker(args []string) int {
 		if os.Getenv("FAKE_UP") == "noenv" {
 			st.Env = nil
 		}
+		st.startPlane()
 		fmt.Println(" Container fake-stargaite-1 Started")
+	case args[1] == "down" || args[1] == "stop":
+		st.stopPlane()
+		st.Up, st.Stopped = false, args[1] == "stop"
 	case args[1] == "logs":
 		fmt.Println("a log line")
 		if slices.Contains(args, "--no-log-prefix") {
@@ -283,6 +404,9 @@ func fakeDocker(args []string) int {
 			if upgrade != "legacy" {
 				fmt.Print("  restore file\n")
 			}
+			return 0
+		case "export --json":
+			fmt.Println(st.export())
 			return 0
 		case "validate --json":
 			if upgrade == "invalid" && st.Built != "" && st.Version == st.Built {
@@ -347,6 +471,19 @@ func fakeExport(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// export is the store as export --json shows it: the members the console
+// reads to judge what exists.
+func (st *state) export() string {
+	models, keys := map[string]any{}, map[string]any{}
+	for name, targets := range st.Models {
+		models[name] = map[string]any{"targets": targets}
+	}
+	for _, name := range st.Keys {
+		keys[name] = map[string]any{}
+	}
+	return encode(map[string]any{"version": 1, "providers": st.Providers, "models": models, "keys": keys})
 }
 
 // cliArgs splits the arguments after the command words: flags by name, each
@@ -497,6 +634,12 @@ func fakeCLI(st *state, args []string) (string, int) {
 			list = append(list, map[string]any{"name": name, "targets": targets})
 		}
 		return encode(map[string]any{"models": list}), 0
+	case "models explain": // which effort and output cap are sent is the proxy's to say: none here
+		list := []any{}
+		for _, id := range st.Models[pos[0]] {
+			list = append(list, map[string]any{"target": id})
+		}
+		return encode(map[string]any{"targets": list}), 0
 	case "models add":
 		st.Models[pos[0]] = flags["target"]
 		return written(map[string]any{"name": pos[0], "targets": flags["target"]}), 0
@@ -552,87 +695,39 @@ func fakeCLI(st *state, args []string) (string, int) {
 	return failure(fmt.Sprintf("fake CLI: not handled: %q", args))
 }
 
-// fakeCurl answers the readiness check, a provider's model list and the
-// first answer, whose headers it puts first with -D -, the names as Go's
-// server writes them over HTTP/1.1. FAKE_MODELS picks the list's answer (list, error, empty or
-// nonjson); FAKE_CHAT=fail fails the chat completion with a 502, and
-// FAKE_CHAT=timeout fails curl itself. The proxy's own URLs answer only in
-// the scheme the container speaks, as the fake docker last started it, and
-// over HTTPS not once the certificate it serves has expired.
+// fakeCurl answers the readiness check, the only curl setup.sh runs. The
+// proxy answers only in the scheme the container speaks, as the fake docker
+// last started it, and over HTTPS not once the certificate it serves has
+// expired.
 func fakeCurl(args []string) int {
-	var url, format string
-	quiet, headers := false, false
+	url := ""
 	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "-o":
-			quiet = true
+		switch {
+		case slices.Contains([]string{"-o", "--max-time", "--resolve", "--cacert"}, args[i]):
 			i++
-		case "-D":
-			headers = true
-			i++
-		case "--max-time", "-K", "-H", "-d", "--resolve", "--cacert":
-			i++
-		case "-w":
-			format = args[i+1]
-			i++
-		default:
-			if !strings.HasPrefix(args[i], "-") {
-				url = args[i]
-			}
+		case !strings.HasPrefix(args[i], "-"):
+			url = args[i]
 		}
 	}
-	body, code := "", "200"
+	if !strings.HasSuffix(url, "/health/ready") {
+		fmt.Fprintln(os.Stderr, "fake curl: not handled:", url)
+		return 6
+	}
 	st := loadState()
-	proxy := strings.HasSuffix(url, "/health/ready") || strings.HasSuffix(url, "/v1/chat/completions")
-	if proxy && strings.HasPrefix(url, "https://") != st.TLS {
+	if strings.HasPrefix(url, "https://") != st.TLS {
 		fmt.Fprintln(os.Stderr, "curl: (35) the proxy speaks", map[bool]string{false: "HTTP", true: "HTTPS"}[st.TLS], "only")
 		return 35
 	}
-	if block, _ := pem.Decode([]byte(st.Cert)); proxy && st.TLS && block != nil {
+	if block, _ := pem.Decode([]byte(st.Cert)); st.TLS && block != nil {
 		if cert, err := x509.ParseCertificate(block.Bytes); err == nil && time.Now().After(cert.NotAfter) {
 			fmt.Fprintln(os.Stderr, "curl: (60) SSL certificate problem: certificate has expired")
 			return 60
 		}
 	}
-	switch {
-	case strings.HasSuffix(url, "/health/ready"):
-		if os.Getenv("FAKE_READY") == "never" {
-			fmt.Fprintln(os.Stderr, "curl: (7) Failed to connect")
-			return 7
-		}
-		body = "ready"
-	case strings.Contains(url, "/models"):
-		switch os.Getenv("FAKE_MODELS") {
-		case "error":
-			fmt.Fprintln(os.Stderr, "curl: (22) The requested URL returned error: 401")
-			return 22
-		case "empty":
-			body = `{"data":[]}`
-		case "nonjson":
-			body = "<html>not a list</html>"
-		default:
-			body = `{"object":"list","data":[{"id":"gpt-a"},{"id":"gpt-b"},{"id":"other-model"}]}`
-		}
-	case strings.HasSuffix(url, "/chat/completions"):
-		body = `{"id":"c1","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"fake reply"},"finish_reason":"stop"}]}`
-		switch os.Getenv("FAKE_CHAT") {
-		case "fail":
-			body, code = `{"error":{"message":"the provider failed","code":"provider_error"}}`, "502"
-		case "timeout":
-			fmt.Fprintln(os.Stderr, "curl: (28) Operation timed out after 30001 milliseconds with 0 bytes received")
-			return 28
-		}
-	default:
-		fmt.Fprintln(os.Stderr, "fake curl: not handled:", url)
-		return 6
+	if os.Getenv("FAKE_READY") == "never" {
+		fmt.Fprintln(os.Stderr, "curl: (7) Failed to connect")
+		return 7
 	}
-	if headers {
-		fmt.Print("HTTP/1.1 " + code + " X\r\nContent-Type: application/json\r\nX-Stargaite-Target: fake/target\r\n\r\n")
-	}
-	if !quiet {
-		fmt.Print(body)
-	}
-	fmt.Print(strings.NewReplacer(`\n`, "\n", "%{http_code}", code, "%{time_total}", "0.012").Replace(format))
 	return 0
 }
 

@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -616,6 +617,148 @@ func TestLogsBound(t *testing.T) {
 	for deadline := time.Now().Add(2 * time.Second); !gone(n); time.Sleep(10 * time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatalf("the hanging docker %d was not cut", n)
+		}
+	}
+}
+
+func TestContainerExists(t *testing.T) {
+	fakes(t, map[string]string{"docker": `[ "$*" = "compose ps -a -q" ] || exit 9
+case "$FAKE" in
+exists) echo c0ffee ;;
+none) ;;
+fail) echo "STARGAITE_PORT=sk-hand-edited-secret" >&2; exit 1 ;;
+esac
+`})
+	h := New(t.TempDir())
+	for _, tc := range []struct {
+		fake string
+		want bool
+		err  string
+	}{
+		{"exists", true, ""},
+		{"none", false, ""},
+		{"fail", false, "docker compose ps failed with exit 1"},
+	} {
+		t.Setenv("FAKE", tc.fake)
+		got, err := h.ContainerExists(context.Background())
+		if got != tc.want || (err == nil) != (tc.err == "") || (err != nil && err.Error() != tc.err) {
+			t.Fatalf("%s: got %v, %v; want %v, %q", tc.fake, got, err, tc.want, tc.err)
+		}
+	}
+}
+
+// TestBuildVersion: Build runs up with --build and the clone's version in
+// Compose's environment, then waits for readiness.
+func TestBuildVersion(t *testing.T) {
+	logs := t.TempDir()
+	log := filepath.Join(logs, "argv")
+	fakes(t, map[string]string{"docker": `echo "$* STARGAITE_VERSION=$STARGAITE_VERSION" >> ` + log + "\n"})
+	t.Setenv("STARGAITE_VERSION", "from-the-shell")
+	h, tries := upHost(t, true)
+	if err := h.Build(context.Background(), func(string) {}, "v-x"); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, log); got != "compose up -d --build STARGAITE_VERSION=v-x\n" || *tries != 1 {
+		t.Fatalf("docker %q, %d readiness tries", got, *tries)
+	}
+}
+
+// TestBuildQuiet: a build that works says none of Compose's lines; one that
+// fails says its last 30, in order, before the error; one that runs out of
+// time says what it wrote so far.
+func TestBuildQuiet(t *testing.T) {
+	for _, exit := range []int{0, 1} {
+		fakes(t, map[string]string{"docker": "i=1; while [ $i -le 45 ]; do echo line $i; i=$((i+1)); done; echo err >&2; exit " + strconv.Itoa(exit) + "\n"})
+		h, _ := upHost(t, true)
+		var said []string
+		err := h.Build(context.Background(), func(l string) { said = append(said, l) }, "v-x")
+		var want []string
+		if exit != 0 {
+			want = append(want, "the build's last lines:")
+			for i := 17; i <= 45; i++ {
+				want = append(want, "line "+strconv.Itoa(i))
+			}
+			want = append(want, "err")
+		}
+		if (err != nil) != (exit != 0) || !slices.Equal(said, want) {
+			t.Fatalf("exit %d: err %v, said %q", exit, err, said)
+		}
+	}
+	fakes(t, map[string]string{"docker": "echo pulling\nexec /bin/sleep 60\n"})
+	h, tries := upHost(t, true)
+	h.upBound = 500 * time.Millisecond
+	var said []string
+	err := h.Build(context.Background(), func(l string) { said = append(said, l) }, "v-x")
+	if err == nil || err.Error() != "docker compose up was not done within 20 minutes; its output is above" ||
+		!slices.Equal(said, []string{"the build's last lines:", "pulling"}) || *tries != 0 {
+		t.Fatalf("bound: err %v, said %q, %d readiness tries", err, said, *tries)
+	}
+}
+
+// listen holds a loopback port open until the test ends, or reports false
+// when it cannot be bound.
+func listen(t *testing.T, port int) bool {
+	t.Helper()
+	l, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+	if err != nil {
+		return false
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	return true
+}
+
+// freePort is a loopback port nothing listens on: one closed a moment ago.
+func freePort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	_ = l.Close()
+	return port
+}
+
+func TestPortTaken(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = l.Close() }()
+	if !PortTaken(l.Addr().(*net.TCPAddr).Port) {
+		t.Fatal("a listener's port is not taken")
+	}
+	if p := freePort(t); PortTaken(p) {
+		t.Fatalf("closed port %d is taken", p)
+	}
+}
+
+func TestNextFree(t *testing.T) {
+	for range 20 {
+		p := freePort(t)
+		if p+3 > 65535 || !listen(t, p+1) || !listen(t, p+2) || PortTaken(p+3) {
+			continue // another process holds one of them: try elsewhere
+		}
+		if got := NextFree(p); got != p+3 {
+			t.Fatalf("NextFree(%d) = %d with %d and %d taken; want %d", p, got, p+1, p+2, p+3)
+		}
+		if got := NextFree(65535); got != 0 {
+			t.Fatalf("NextFree(65535) = %d; want 0", got)
+		}
+		return
+	}
+	t.Fatal("no port with its next two free to bind in 20 tries")
+}
+
+func TestPortNumber(t *testing.T) {
+	for s, want := range map[string]int{"1": 1, "4000": 4000, "65535": 65535} {
+		if n, ok := PortNumber(s); !ok || n != want {
+			t.Errorf("PortNumber(%q) = %d, %v", s, n, ok)
+		}
+	}
+	for _, s := range []string{"", "0", "04000", "+4000", "-1", "65536", "99999", "4000 ", "abc", "1e3"} {
+		if n, ok := PortNumber(s); ok || n != 0 {
+			t.Errorf("PortNumber(%q) = %d, %v", s, n, ok)
 		}
 	}
 }

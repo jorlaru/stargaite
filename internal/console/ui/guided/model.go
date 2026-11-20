@@ -16,8 +16,9 @@ import (
 	"github.com/jorlaru/stargaite/internal/console/ui"
 )
 
-// releaseWait is how long lines said after a reveal are held, so the frame
-// that leaves the alternate screen is drawn before they are printed: Bubble
+// releaseWait is how long lines said after an answer are held, so the frame
+// without the answered question (after a reveal, the one that leaves the
+// alternate screen) is drawn before they are printed: Bubble
 // Tea prints a line at once, on whichever screen was drawn last (research:
 // RB section 0.6), and draws a frame at most 1/60 s after it changes.
 const releaseWait = 100 * time.Millisecond
@@ -41,13 +42,14 @@ type (
 	releaseMsg struct{}
 )
 
-// Model is the root model: a title, the step bar, and the asked piece.
+// Model is the root model: the step bar and the asked piece, under the
+// title said once at start.
 type Model struct {
 	version       string
 	width, height int
 	ask           *askMsg     // the question asked, nil while the session works
 	piece         piece.Piece // its piece
-	holding       bool        // a reveal is shown, or just ended: lines wait
+	holding       bool        // a reveal is shown, or a question just ended: lines wait
 	held          []sayMsg
 	interrupted   bool
 	quitting      bool // the program ends: its last frame is drawn empty
@@ -61,8 +63,10 @@ func NewModel(version string) Model {
 // Interrupted reports whether Ctrl-C was pressed.
 func (m Model) Interrupted() bool { return m.interrupted }
 
-// Init implements tea.Model.
-func (m Model) Init() tea.Cmd { return nil }
+// Init implements tea.Model. The title is said once, above the first frame,
+// so no frame starts on the screen's first row, where an erase scrolls the
+// whole screen into tmux's or screen's history (research: RC section 3.2).
+func (m Model) Init() tea.Cmd { return tea.Println("StargAIte console " + m.version) }
 
 // Update implements tea.Model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -132,15 +136,13 @@ func (m Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m.answered()
 }
 
-// answered clears the question; after a reveal, the held lines are released
-// once the frame that leaves the alternate screen has been drawn.
+// answered clears the question and holds the lines said next until the
+// frame without it has been drawn: a line printed above a frame as tall as
+// the room left would scroll that frame's first rows into the history, and
+// after a reveal it would land on the alternate screen.
 func (m Model) answered() (tea.Model, tea.Cmd) {
-	_, revealed := m.piece.(*reveal)
-	m.ask, m.piece = nil, nil
-	if revealed {
-		return m, tea.Tick(releaseWait, func(time.Time) tea.Msg { return releaseMsg{} })
-	}
-	return m, nil
+	m.ask, m.piece, m.holding = nil, nil, true
+	return m, tea.Tick(releaseWait, func(time.Time) tea.Msg { return releaseMsg{} })
 }
 
 // printLine prints a said line above the frame, then tells the bridge, so the
@@ -178,7 +180,7 @@ func (m Model) View() tea.View {
 	if m.quitting {
 		return tea.View{}
 	}
-	lines := []string{ansi.Truncate("StargAIte console "+m.version, m.width, "…")}
+	var lines []string
 	if m.ask != nil && m.ask.q.Bar.Current >= 0 {
 		lines = append(lines, stepBar(m.ask.q.Bar, m.width))
 	}
@@ -187,10 +189,13 @@ func (m Model) View() tea.View {
 	if m.piece == nil {
 		lines = append(lines, "working…")
 	} else {
-		used := len(lines)
-		lines = append(lines, m.piece.View(m.width, m.height-used-1))
+		// The frame, with the empty row its final "\n" makes, stays one row
+		// less than the screen, so growing never brings its first row to the
+		// screen's first row.
+		used, room := len(lines), m.height-len(lines)-2
+		lines = append(lines, m.piece.View(m.width, room))
 		if c, ok := m.piece.(piece.Cursorer); ok {
-			x, y := c.Cursor(m.width, m.height-used-1)
+			x, y := c.Cursor(m.width, room)
 			v.Cursor = tea.NewCursor(x, y+used)
 		}
 		_, v.AltScreen = m.piece.(*reveal)

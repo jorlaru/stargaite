@@ -179,7 +179,7 @@ func TestRowsWellFormed(t *testing.T) {
 			t.Errorf("%s: two rows", w.Code)
 		}
 		seen[w.Code] = true
-		if !slices.Contains([]string{"", "recreate", "check"}, w.Held) {
+		if !slices.Contains([]string{"", "recreate", "check", "everything"}, w.Held) {
 			t.Errorf("%s: held until %q", w.Code, w.Held)
 		}
 		if w.Words != "" && (strings.Count(w.Words, "%") != 1 || !strings.Contains(w.Words, "%s")) {
@@ -191,7 +191,8 @@ func TestRowsWellFormed(t *testing.T) {
 		held[w.Code] = w.Held
 	}
 	if held["credential_unresolved"] != "recreate" || held["target_unverified"] != "check" || held["url_unresolved"] != "" ||
-		held["unpriced"] != "" || held["no_fallback_prices"] != "" || held["effort_dropped"] != "" {
+		held["unpriced"] != "" || held["no_fallback_prices"] != "" || held["effort_dropped"] != "" ||
+		held["reasoning_undeclared"] != "everything" {
 		t.Errorf("held = %v", held)
 	}
 	for code, words := range c60Words {
@@ -221,34 +222,52 @@ var c60Words = map[string]string{
 // code says the CLI's own message and where to find it again.
 func TestPlain(t *testing.T) {
 	for code, words := range map[string]string{
-		"target_unverified":  "targets/a is not checked yet: Make an alias or Change an alias checks it, after stating its paid calls",
-		"unpriced":           "targets/a has no prices, so no budget counts its spend; a budget that reaches it asks them",
-		"no_fallback_prices": "targets/a has no prices: its cost is the provider's own report, and a call without one counts nothing",
-		"effort_dropped":     "targets/a: the alias's effort is not sent toward a target whose reasoning dialect is none",
+		"target_unverified":  "target a is not checked yet: Make an alias or Change an alias checks it, after stating its paid calls",
+		"unpriced":           "target a has no prices, so no budget counts its spend; a budget that reaches it asks them",
+		"no_fallback_prices": "target a has no prices: its cost is the provider's own report, and a call without one counts nothing",
+		"effort_dropped":     "target a: the alias's effort is not sent toward a target whose reasoning dialect is none",
 	} {
 		if got := Plain(code, "targets/a", "x"); got != words {
 			t.Errorf("%s: %q, want %q", code, got, words)
 		}
 	}
 	for code, words := range map[string]string{
-		"unknown_alias": "keys/k names an alias that does not exist: its calls to that alias get an error: Change a key sets the aliases it may call",
+		"unknown_alias": "key k names an alias that does not exist: its calls to that alias get an error: Change a key sets the aliases it may call",
 	} {
 		if got := Plain(code, "keys/k", "x"); got != words {
 			t.Errorf("%s: %q, want %q", code, got, words)
 		}
 	}
-	want := "providers/acme: its host name did not resolve from the container; the proxy tries again on each call, so check the URL if this lasts"
+	want := "provider acme: its host name did not resolve from the container; the proxy tries again on each call, so check the URL if this lasts"
 	if got := Plain("url_unresolved", "providers/acme", "x"); got != want {
 		t.Errorf("url_unresolved: %q, want %q", got, want)
 	}
-	want = "providers/acme: its key is not in the container yet: Add providers writes it to .env and recreates the container"
+	want = "provider acme: its key is not in the container yet: Add providers writes it to .env and recreates the container"
 	if got := Plain("credential_unresolved", "providers/acme", "x"); got != want {
 		t.Errorf("credential_unresolved: %q, want %q", got, want)
 	}
 	msg := "pay-per-use target with neither prices nor a provider cost report: its usage has no cost"
 	for _, code := range []string{"reasoning_undeclared", "never_heard_of"} {
-		if got := Plain(code, "targets/a", msg); got != "targets/a: "+msg {
+		if got := Plain(code, "targets/a", msg); got != "target a: "+msg {
 			t.Errorf("%s: %q", code, got)
+		}
+	}
+}
+
+// TestPlainNames: a resource is named by its kind in words, its name kept
+// whole; a resource of another form is kept as it is.
+func TestPlainNames(t *testing.T) {
+	for res, want := range map[string]string{
+		"providers/acme":                  "provider acme",
+		"targets/openrouter/openai/gpt-x": "target openrouter/openai/gpt-x",
+		"models/c62":                      "alias c62",
+		"keys/k":                          "key k",
+		".env":                            ".env",
+		"limits/x":                        "limits/x",
+		"targets":                         "targets",
+	} {
+		if got := Plain("never_heard_of", res, "m"); got != want+": m" {
+			t.Errorf("%s: %q, want %q", res, got, want+": m")
 		}
 	}
 }

@@ -2,6 +2,8 @@ package guided
 
 import (
 	"errors"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -20,25 +22,42 @@ import (
 	"github.com/jorlaru/stargaite/tests/mockprovider"
 )
 
-// newKeyWorld is aliasWorld on admintest.Plane: .env names the data plane's
-// port, so readiness and every try reach it; providers mock and mock2 on one
-// mock, without a credential; alias a toward targets, when given. It returns
-// the world and the data plane's port.
-func newKeyWorld(t *testing.T, targets ...string) (*aliasWorld, string) {
+// planeWorld is aliasWorld on admintest.Plane with an empty store: .env
+// names the data plane's port, so readiness and every try reach it; the
+// docker fake answers the container as running, its recreate and its logs;
+// and a provider on 127.0.0.1, whose URL it returns with the data plane's
+// port, serves the model list (gpt-a and m) and the mock's chat.
+func planeWorld(t *testing.T) (w *aliasWorld, port, provider string) {
 	t.Helper()
 	env, port := admintest.Plane(t)
 	bin := t.TempDir()
-	w := &aliasWorld{h: host.New(t.TempDir()), env: env, mock: mockprovider.New()}
-	fake := "#!/bin/sh\ncase \"$*\" in\n'compose ps -q') echo c0ffee ;;\n'compose logs --tail 30 stargaite') echo 'a log line' ;;\n*) exit 9 ;;\nesac\n"
+	w = &aliasWorld{h: host.New(t.TempDir()), env: env, mock: mockprovider.New()}
+	fake := "#!/bin/sh\ncase \"$*\" in\n'compose ps -q'|'compose ps -a -q') echo c0ffee ;;\n'compose up -d --no-build') ;;\n" +
+		"'compose logs --tail 30 stargaite') echo 'a log line' ;;\n*) exit 9 ;;\nesac\n"
 	if err := errors.Join(os.WriteFile(filepath.Join(bin, "docker"), []byte(fake), 0o755),
 		os.WriteFile(filepath.Join(w.h.Dir, ".env"), []byte("STARGAITE_PORT="+port+"\n"), 0o600)); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin)
-	srv := httptest.NewServer(w.mock)
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/models" {
+			_, _ = io.WriteString(rw, `{"data":[{"id":"gpt-a"},{"id":"m"}]}`)
+			return
+		}
+		w.mock.ServeHTTP(rw, r)
+	}))
 	t.Cleanup(srv.Close)
+	return w, port, srv.URL
+}
+
+// newKeyWorld is planeWorld with providers mock and mock2 on its provider,
+// without a credential, and alias a toward targets, when given. It returns
+// the world and the data plane's port.
+func newKeyWorld(t *testing.T, targets ...string) (*aliasWorld, string) {
+	t.Helper()
+	w, port, url := planeWorld(t)
 	for _, p := range []string{"mock", "mock2"} {
-		w.must(t, "providers", "add", p, "--protocol", "openai", "--base-url", srv.URL, "--allow-private-network", "--billing", "none")
+		w.must(t, "providers", "add", p, "--protocol", "openai", "--base-url", url, "--allow-private-network", "--billing", "none")
 	}
 	if len(targets) > 0 {
 		args := []string{"models", "add", "a"}
@@ -316,9 +335,12 @@ func TestGuidedHome(t *testing.T) {
 	h := start(t)
 	w, port := newKeyWorld(t, "mock/m")
 	done := w.home(h)
+	h.waitShown("Which aliases may it call?") // no key: the home opens the first run at its key stage
+	h.p.Send(key(tea.KeyEscape))
+	h.waitOutput("Left First run.")
 	f := h.waitShown("What do you want to do?")
 	h.waitOutput("http://127.0.0.1:" + port + "/v1: ready · proxy ")
-	if lines := strings.Split(f.Content, "\n"); len(lines) < 6 || lines[4] != "── Suggested" || lines[5] != "> Give an app or agent its key: none exists yet" {
+	if lines := strings.Split(f.Content, "\n"); len(lines) < 5 || lines[3] != "── Suggested" || lines[4] != "> Give an app or agent its key: none exists yet" {
 		t.Fatalf("home frame:\n%s", f.Content)
 	}
 	h.typeText("fallback")
@@ -330,7 +352,7 @@ func TestGuidedHome(t *testing.T) {
 	h.waitShown("A fallback for a: from which provider?")
 	h.p.Send(key(tea.KeyEscape))
 	h.waitOutput("Left Change an alias.")
-	h.waitCount(": ready · proxy ", 2)
+	h.waitCount(": ready · proxy ", 3)
 	h.waitShown("What do you want to do?")
 	quitHome(t, h, done)
 	h.mu.Lock()

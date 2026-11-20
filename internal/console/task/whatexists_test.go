@@ -239,8 +239,16 @@ func TestSeeWhatExistsDockerFails(t *testing.T) {
 
 func TestMenuFresh(t *testing.T) {
 	m := Menu()
-	if len(m) != 7 {
+	if len(m) != 8 {
 		t.Fatalf("Menu() = %+v", m)
+	}
+	first := m[7]
+	if first.Group != "" || first.Label != "First run" || first.Sub != "install" ||
+		!slices.Equal(first.Flags, []string{"port", "provider", "base-url", "protocol", "api-key-env", "key-env", "model", "alias", "fallback",
+			"max-output-tokens", "effort", "input-price", "output-price", "key-name", "rpm-limit"}) ||
+		!slices.Equal(first.Bools, []string{"replace", "allow-private-network", "yes", "reverify"}) ||
+		!slices.Equal(first.Steps, firstSteps()) || first.Run == nil {
+		t.Fatalf("Menu()[7] = %+v", first)
 	}
 	see := m[6]
 	if see.Group != "This machine" || see.Label != "See what exists" || see.Sub != "status" ||

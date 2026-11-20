@@ -720,6 +720,57 @@ func TestVerifyClientGone(t *testing.T) {
 	}
 }
 
+// TestVerifyClientGoneAfterStatus is TestVerifyClientGone on a target of one
+// level, once the provider has sent its 200 status line: the cut call, the
+// whole run, carries no error of its own, yet the run is not OK, so the
+// target is not verified.
+func TestVerifyClientGoneAfterStatus(t *testing.T) {
+	f := newVerifyFixture(t)
+	f.setUp(t)
+	f.must(t, http.StatusCreated, http.MethodPost, "/admin/v1/targets", `{"id":"mock/one","kind":"chat","max_output_tokens":1000,`+
+		`"pricing":{"input_per_million":1,"output_per_million":1,"as_of":"2026-11-01"}}`)
+	f.mock.Script(mockprovider.Step{Hang: true})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.url+"/admin/v1/verify/mock%2Fone", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+testKey)
+	done := make(chan error, 1)
+	go func() {
+		resp, err := f.client.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		done <- err
+	}()
+	for deadline := time.Now().Add(5 * time.Second); len(f.mock.Calls()) == 0; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the run never reached the mock")
+		}
+	}
+	time.Sleep(300 * time.Millisecond) // the flushed status line reaches the proxy over loopback
+	cancel()
+	if err := <-done; err == nil {
+		t.Error("the cancelled request returned no error")
+	}
+	f.flight.Wait()
+	// The audit row is written after the run lets go of Flight: wait for it, bounded.
+	const audited = "SELECT COUNT(*) FROM audit WHERE action = 'targets verify mock/one'"
+	for deadline := time.Now().Add(5 * time.Second); f.count(t, audited) == 0; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the run was not audited within 5 s")
+		}
+	}
+	if got, want := f.lastAudit(t), "targets verify mock/one target mock/one failed"; got != want {
+		t.Errorf("audit %q, want %q", got, want)
+	}
+	if n := f.count(t, "SELECT COUNT(*) FROM targets WHERE verified_at > 0"); n != 0 {
+		t.Errorf("%d targets verified", n)
+	}
+}
+
 // TestVerifyAlongsideTraffic runs verify runs and chat requests on one data
 // plane at once (run under -race in make ci): every request and every run
 // completes, each record lands under its own key, the client keys' budgets

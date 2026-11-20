@@ -79,7 +79,9 @@ func (w *aliasWorld) must(t *testing.T, args ...string) {
 	}
 }
 
-// proxy is the world's CLI, every argv recorded.
+// proxy is the world's CLI, every argv recorded as the console sent it. The
+// CLI reaches host.docker.internal on 127.0.0.1, as the container's
+// host-gateway does, since the admin API runs in process.
 func (w *aliasWorld) proxy() *proxy.Proxy {
 	return proxy.New(func(_ context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 		w.mu.Lock()
@@ -88,7 +90,11 @@ func (w *aliasWorld) proxy() *proxy.Proxy {
 		if stdin == nil {
 			stdin = strings.NewReader("")
 		}
-		return cli.Main(args, func(k string) string { return w.env[k] }, stdin, stdout, stderr), nil
+		onHost := make([]string, len(args))
+		for i, a := range args {
+			onHost[i] = strings.ReplaceAll(a, "//host.docker.internal:", "//127.0.0.1:")
+		}
+		return cli.Main(onHost, func(k string) string { return w.env[k] }, stdin, stdout, stderr), nil
 	})
 }
 
@@ -148,14 +154,15 @@ func (h *harness) steps(titles ...string) []string {
 	return out
 }
 
-// fits fails the test on a frame over 24 lines or 80 cells.
+// fits fails the test on a frame over 23 lines (one row less than the
+// screen, with the empty row its final newline makes) or 80 cells.
 func (h *harness) fits() {
 	h.t.Helper()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, f := range h.frames {
 		lines := strings.Split(f.Content, "\n")
-		if len(lines) > 24 {
+		if len(lines) > 23 {
 			h.t.Fatalf("%d lines:\n%s", len(lines), f.Content)
 		}
 		for _, l := range lines {

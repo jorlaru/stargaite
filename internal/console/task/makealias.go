@@ -108,19 +108,24 @@ func (r *run) makeAlias(ctx context.Context) (string, error) {
 }
 
 // exists keeps alias m, which exists; with --fallback, the fallbacks it
-// lacks are added to it, so a run again with the same flags is kept.
+// lacks are added to it, so a run again with the same flags is kept; with
+// --reverify and no fallback to add, its targets are checked again through
+// the paid step.
 func (r *run) exists(ctx context.Context, m proxy.Model) (string, error) {
-	kept := "alias " + m.Name + " exists, toward " + strings.Join(m.Targets, ", ") + "; kept: Change an alias changes it"
-	q := ui.Question{ID: "fallback", Flag: "fallback", Step: "fallbacks"}
-	if !r.u.Given(q) {
-		return kept, nil
+	toward := "alias " + m.Name + " exists, toward " + strings.Join(m.Targets, ", ") + "; kept"
+	kept := toward + ": Change an alias changes it"
+	var adds []string
+	if q := (ui.Question{ID: "fallback", Flag: "fallback", Step: "fallbacks"}); r.u.Given(q) {
+		given, err := r.u.Text(ctx, q)
+		if err != nil {
+			return "", err
+		}
+		adds = r.fresh(ctx, m, strings.Split(given, ","))
 	}
-	given, err := r.u.Text(ctx, q)
-	if err != nil {
-		return "", err
-	}
-	adds := r.fresh(ctx, m, strings.Split(given, ","))
-	if len(adds) == 0 {
+	switch {
+	case len(adds) == 0 && r.u.Given(ui.Question{ID: "reverify"}):
+		return r.checkAgain(ctx, m, toward, kept)
+	case len(adds) == 0:
 		return kept, nil
 	}
 	if err := r.listProviders(ctx); err != nil {
@@ -143,4 +148,23 @@ func (r *run) fresh(ctx context.Context, m proxy.Model, adds []string) []string 
 		}
 	}
 	return out
+}
+
+// checkAgain checks alias m's targets again through the paid step: the
+// providers first, so the check reads their credentials and timeouts.
+func (r *run) checkAgain(ctx context.Context, m proxy.Model, toward, kept string) (string, error) {
+	if err := r.listProviders(ctx); err != nil {
+		return "", err
+	}
+	if err := r.listTargets(ctx); err != nil {
+		return "", err
+	}
+	checked, err := r.check(ctx, "check", inAll, m.Targets)
+	switch {
+	case err != nil:
+		return "", err
+	case !checked:
+		return kept, nil
+	}
+	return toward + ", and checked again", nil
 }

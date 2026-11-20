@@ -4,7 +4,10 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
@@ -572,7 +575,7 @@ esac
 // to the reveal, then waits past the reveal's guard on Enter.
 func toReveal(t *testing.T) *terminal {
 	t.Helper()
-	bin, env, _, _ := keyClone(t, http.StatusOK, chatBody)
+	bin, env, _, _ := keyClone(t, http.StatusOK, chatBody, keyCLI)
 	tm := onTerminalAt(t, bin, env, "key")
 	for _, s := range []string{"Which aliases may it call?", "a name for the key", "the requests a minute"} {
 		tm.waitFor(s, 1)
@@ -679,4 +682,288 @@ func onAltScreenOnly(out, s string) bool {
 		i += len(s) + next
 	}
 	return true
+}
+
+// execs is the CLI calls in the fake docker's log.
+func execs(t *testing.T, log string) []string {
+	t.Helper()
+	var out []string
+	for _, l := range strings.Split(readLog(t, log), "\n") {
+		if strings.HasPrefix(l, "compose exec") {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// install at a terminal on a store with a provider and an alias: the first
+// run starts at the key, under its bar, and ends with the first answer.
+func TestFirstRunAtTerminalResumesAtKey(t *testing.T) {
+	bin, env, log, _ := keyClone(t, http.StatusOK, chatBody, firstCLI)
+	tm := onTerminalAt(t, bin, env, "install")
+	tm.waitFor("Which aliases may it call?", 1)
+	tm.write("\r")
+	tm.waitFor("a name for the key", 1)
+	tm.write("my-app\r")
+	tm.waitFor("the requests a minute", 1)
+	tm.write("\r")
+	tm.waitFor("enter: I have stored it", 1)
+	time.Sleep(450 * time.Millisecond)
+	tm.write("\r")
+	tm.waitFor("try it: up to 1 paid call(s)", 1)
+	time.Sleep(450 * time.Millisecond)
+	tm.write("\r")
+	code, after := tm.exit()
+	out := tm.output()
+	if code != 0 || !strings.Contains(out, "answer: fake reply") || !strings.Contains(out, "Done: key my-app, which may call main.") {
+		t.Fatalf("exit %d:\n%q", code, out)
+	}
+	tm.restored(after)
+	reveal := strings.Index(out, "\x1b[?1049h")
+	if k, a := strings.Index(out, "● key"), strings.LastIndex(out, "● first answer"); k < 0 || k > reveal || a < reveal {
+		t.Errorf("the bar is not at key before the reveal (at %d, the reveal at %d) and at first answer after it (at %d):\n%q", k, reveal, a, out)
+	}
+	if !onAltScreenOnly(out, keySecret) {
+		t.Errorf("the secret is written off the alternate screen:\n%q", out)
+	}
+	for _, e := range execs(t, log) {
+		if strings.Contains(e, "providers add") || strings.Contains(e, "targets verify") || strings.Contains(e, "models add") {
+			t.Errorf("CLI call %q", e)
+		}
+	}
+}
+
+// Ctrl-C during the first build: compose up gets SIGINT, the console exits
+// 130, restores the terminal and makes no CLI call (successor of
+// tests/setup's TestSetupInterrupt for install).
+func TestFirstRunCtrlCDuringBuild(t *testing.T) {
+	env, log := fake(t, `case "$*" in
+"compose ps -q"|"compose ps -a -q") ;;
+"compose up -d --build") `+trapUp+` ;;
+*) exit 9 ;;
+esac
+`)
+	bin, dir, _ := ownClone(t, nil)
+	port := closedPort()
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("STARGAITE_PORT="+port+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tm := onTerminalAt(t, bin, env, "install", "--port", port)
+	waitLog(t, log, "compose up")
+	sent := time.Now()
+	tm.write("\x03")
+	code, after := tm.exit()
+	if took := time.Since(sent); code != 130 || took > 12*time.Second || !strings.Contains(readLog(t, log), "INT\n") {
+		t.Fatalf("exit %d after %s, log %q", code, took, readLog(t, log))
+	}
+	tm.restored(after)
+	if e := execs(t, log); len(e) != 0 {
+		t.Errorf("CLI calls %q", e)
+	}
+}
+
+// framesCLI answers Add providers' first reads with more presets than the
+// screen has rows, so the pick fills it.
+func framesCLI() string {
+	presets := make([]string, 40)
+	for i := range presets {
+		presets[i] = fmt.Sprintf(`{"name":"p%02d","protocol":"openai","base_url":"https://p%02d.example/v1"}`, i, i)
+	}
+	return "case \"$*\" in\n\"compose ps -q\") echo c0ffee ;;\n" +
+		"\"compose exec -T stargaite /stargaite providers presets --json\") echo '{\"presets\":[" + strings.Join(presets, ",") + "]}' ;;\n" +
+		"\"compose exec -T stargaite /stargaite providers list --json\") echo '{\"providers\":[]}' ;;\n*) exit 9 ;;\nesac\n"
+}
+
+// muxSession runs script with sh as the one window of a new tmux session,
+// or else GNU screen's, at 80x24, with no user configuration read, ended
+// with the test. It returns how to type text and press Esc in it, and how
+// to read its whole history and screen; it skips the test when neither is
+// on PATH.
+func muxSession(t *testing.T, script string) (typed func(string), esc func(), dump func() string) {
+	t.Helper()
+	name := fmt.Sprintf("stargaite-test-%d-%d", os.Getpid(), time.Now().UnixNano())
+	run := func(args ...string) string {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, args[0], args[1:]...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("%q: %v\n%s", args, err, out)
+		}
+		return string(out)
+	}
+	if _, err := exec.LookPath("tmux"); err == nil {
+		tmux := func(args ...string) string {
+			return run(append([]string{"tmux", "-L", name, "-f", "/dev/null"}, args...)...)
+		}
+		tmux("new-session", "-d", "-x", "80", "-y", "24", "sh", "-c", script)
+		t.Cleanup(func() { _ = exec.Command("tmux", "-L", name, "kill-server").Run() })
+		return func(s string) { tmux("send-keys", "-l", s) }, func() { tmux("send-keys", "Escape") },
+			func() string { return tmux("capture-pane", "-p", "-J", "-S", "-") }
+	}
+	if _, err := exec.LookPath("screen"); err == nil {
+		file := filepath.Join(t.TempDir(), "hardcopy")
+		run("screen", "-U", "-dmS", name, "-h", "2000", "sh", "-c", "stty rows 24 cols 80; "+script)
+		t.Cleanup(func() { _ = exec.Command("screen", "-S", name, "-X", "quit").Run() })
+		stuff := func(s string) { run("screen", "-S", name, "-X", "stuff", s) }
+		return stuff, func() { stuff("\x1b") }, func() string {
+			_ = os.Remove(file)
+			run("screen", "-S", name, "-X", "hardcopy", "-h", file)
+			for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+				if b, err := os.ReadFile(file); err == nil && len(b) > 0 {
+					return string(b)
+				}
+			}
+			t.Fatal("screen wrote no hardcopy within 10 s")
+			return ""
+		}
+	}
+	t.Skip("neither tmux nor screen is on PATH: the frames left in a multiplexer's history are not checked")
+	return nil, nil, nil
+}
+
+// waitDump waits until dump holds s, polling for 10 s at most, and returns it.
+func waitDump(t *testing.T, dump func() string, s string) string {
+	t.Helper()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(200 * time.Millisecond) {
+		out := dump()
+		if strings.Contains(out, s) {
+			return out
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%q never shown:\n%s", s, out)
+		}
+	}
+}
+
+// No frame of the guided front is left in a terminal multiplexer's history,
+// which tmux and screen fill with the whole screen when a frame on its
+// first row is erased (research-console section 3): a pick that fills the
+// screen, filtered, so its height changes where it stands, then left with
+// Esc.
+func TestFramesNotInHistory(t *testing.T) {
+	env, _ := fake(t, framesCLI())
+	bin, _, _ := ownClone(t, nil)
+	typed, esc, dump := muxSession(t, strings.Join(env, " ")+" "+bin+" provider; echo EXIT=$?; /bin/sleep 60")
+	waitDump(t, dump, "Which providers do you want to add?")
+	typed("p1")
+	waitDump(t, dump, "filter: p1")
+	esc()
+	out := waitDump(t, dump, "EXIT=")
+	for _, l := range strings.Split(out, "\n") {
+		l = strings.TrimRight(l, " ")
+		// The root's frame with no piece; screen's hardcopy keeps each cell's
+		// low byte, so its "…" reads "&" there.
+		working := l == "working…" || l == "working&"
+		if strings.HasSuffix(l, "ctrl+c quit") || strings.HasPrefix(l, "filter: ") || working {
+			t.Fatalf("a frame's line is left in the history, %q:\n%s", l, out)
+		}
+	}
+}
+
+// mockCall is a call the e2e mock provider lists.
+type mockCall struct {
+	Path      string
+	Body      []byte
+	Ended     time.Time
+	Cancelled bool
+}
+
+// slowCalls is the e2e mock's chat calls toward model slow (its OTLP
+// traces, from telemetry set up earlier, name the model too).
+func slowCalls(t *testing.T, mock string) []mockCall {
+	t.Helper()
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Get(mock + "/mock/calls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var all, slow []mockCall
+	if err := json.NewDecoder(resp.Body).Decode(&all); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range all {
+		if c.Path == "/chat/completions" && bytes.Contains(c.Body, []byte(`"model":"slow"`)) {
+			slow = append(slow, c)
+		}
+	}
+	return slow
+}
+
+// realCLI runs the proxy's CLI in the e2e container, as e2e.sh does since
+// remote set up TLS: through docker compose exec, with the admin variables.
+func realCLI(tree string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", append([]string{"compose", "exec", "-T", "-e", "STARGAITE_ADMIN_URL=https://localhost:4001",
+		"-e", "SSL_CERT_FILE=/tls/cert.pem", "stargaite", "/stargaite"}, args...)...)
+	cmd.Dir = tree
+	return cmd.Output()
+}
+
+// Esc during a hanging check against the real container (design section 10,
+// layer 4), run by tests/setup/e2e.sh: the server's call to the mock ends
+// with the CLI's, the stated count is never passed, and nothing is made.
+// The mock only: no paid call.
+func TestRealEscDuringCheck(t *testing.T) {
+	tree, mock := os.Getenv("STARGAITE_E2E_TREE"), os.Getenv("STARGAITE_E2E_MOCK")
+	if tree == "" || mock == "" {
+		t.Skip("STARGAITE_E2E_TREE and STARGAITE_E2E_MOCK are unset: tests/setup/e2e.sh runs this against a real container")
+	}
+	// The provider sends its 200 status line, then holds the body: a call cut
+	// after a status line leaves its target unverified too.
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Post(mock+"/mock/script", "application/json", strings.NewReader(`[{"Hang": true}]`))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("the mock was not scripted: %v %v", resp, err)
+	}
+	_ = resp.Body.Close()
+	tm := onTerminalAt(t, console, os.Environ(), "alias", "--alias", "e2e-esc", "--provider", "mock", "--model", "slow", "--fallback", "mock2/slow")
+	tm.waitFor("a default reasoning effort", 1)
+	tm.write("\r")
+	tm.waitFor("2 paid call(s) in all", 1)
+	time.Sleep(450 * time.Millisecond)
+	tm.write("\r")
+	tm.waitFor("checking mock/slow, mock2/slow", 1)
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		if c := slowCalls(t, mock); len(c) == 1 && c[0].Ended.IsZero() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no call toward slow in flight at the mock: %+v", slowCalls(t, mock))
+		}
+	}
+	sent := time.Now()
+	tm.write("\x1b")
+	code, after := tm.exit()
+	out := tm.output()
+	if took := time.Since(sent); code != 1 || took > 12*time.Second {
+		t.Fatalf("exit %d after %s:\n%q", code, took, out)
+	}
+	tm.restored(after)
+	if !strings.Contains(out, "the check of mock/slow was stopped: the call in flight may still be billed") || !strings.Contains(out, "Left Make an alias.") {
+		t.Errorf("output:\n%q", out)
+	}
+	for deadline := time.Now().Add(10 * time.Second); slowCalls(t, mock)[0].Ended.IsZero(); time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the call in flight never ended at the mock")
+		}
+	}
+	if c := slowCalls(t, mock)[0]; !c.Cancelled || c.Ended.Sub(sent) > 5*time.Second {
+		t.Errorf("the call in flight: cancelled %v, ended %s after the Esc", c.Cancelled, c.Ended.Sub(sent))
+	}
+	time.Sleep(30 * time.Second) // past any retry or second target the server could start
+	if c := slowCalls(t, mock); len(c) != 1 {
+		t.Errorf("%d calls toward slow; want 1", len(c))
+	}
+	if b, err := realCLI(tree, "models", "show", "e2e-esc", "--json"); err == nil {
+		t.Errorf("alias e2e-esc exists: %s", b)
+	}
+	for _, id := range []string{"mock/slow", "mock2/slow"} {
+		var target struct {
+			VerifiedAt int64 `json:"verified_at"`
+		}
+		b, err := realCLI(tree, "targets", "show", id, "--json")
+		if err != nil || json.Unmarshal(b, &target) != nil || target.VerifiedAt != 0 {
+			t.Errorf("target %s: %s, %v", id, b, err)
+		}
+	}
 }

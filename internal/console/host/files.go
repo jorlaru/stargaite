@@ -231,13 +231,13 @@ func (h *Host) Plane() (Plane, error) {
 		return Plane{}, err
 	}
 	if ok {
-		n, err := strconv.Atoi(v)
-		if err != nil || !regexp.MustCompile(`^[1-9][0-9]{0,4}$`).MatchString(v) || n > 65535 {
+		n, isPort := PortNumber(v)
+		if !isPort {
 			return Plane{}, errors.New("STARGAITE_PORT in .env is not a port number, 1 to 65535: write it as STARGAITE_PORT=<n>")
 		}
 		p.Port = n
 	}
-	if p.Name, p.CA, err = h.tlsNames(); err != nil {
+	if p.Name, p.CA, err = h.TLSNames(); err != nil {
 		return Plane{}, err
 	}
 	p.BaseURL = "http://127.0.0.1:" + strconv.Itoa(p.Port) + "/v1"
@@ -247,9 +247,9 @@ func (h *Host) Plane() (Plane, error) {
 	return p, nil
 }
 
-// tlsNames is the override's tls_name and tls_ca, checked, or "" for both
+// TLSNames is the override's tls_name and tls_ca, checked, or "" for both
 // when it names no tls_name.
-func (h *Host) tlsNames() (name, ca string, err error) {
+func (h *Host) TLSNames() (name, ca string, err error) {
 	o, err := h.ReadOverride()
 	if err != nil {
 		return "", "", err

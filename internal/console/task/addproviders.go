@@ -425,7 +425,7 @@ func (r *adding) resolves(ctx context.Context, run []*picked) error {
 func (r *adding) warn(ctx context.Context, run []*picked) {
 	for _, p := range run {
 		for _, f := range p.findings {
-			if w, ok := rules.Lookup(f.Code); !ok || w.Held != "recreate" {
+			if w, _ := rules.Lookup(f.Code); w.Held != "recreate" && w.Held != "everything" {
 				say(ctx, r.u, rules.Plain(f.Code, f.Resource, f.Message))
 			}
 		}

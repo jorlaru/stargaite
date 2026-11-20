@@ -18,16 +18,18 @@ import (
 type home struct {
 	summary   string
 	suggested []rules.Suggestion // none when the proxy was not read
+	first     bool               // the first run opens (design section 4.1)
 }
 
 // Home is the guided console's home (design section 4.2): before each pick,
 // what exists is read within bound under a work piece, which Esc stops, and
 // its summary said; then the picked task runs, a suggestion's with its
-// presets, and how it ended is said. It returns ui.ErrQuit on Ctrl-C, or the
-// error that ended it.
+// presets, and how it ended is said. On its first round, when no container,
+// provider, alias or key exists, the first run runs in place of the pick. It
+// returns ui.ErrQuit on Ctrl-C, or the error that ended it.
 func Home(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host, bound time.Duration) error {
 	menu := Menu()
-	for {
+	for round := 0; ; round++ {
 		var hm home
 		err := u.Work(ctx, ui.Question{ID: "home-read", Prompt: "reading what exists"}, func(ctx context.Context) error {
 			read, cancel := context.WithTimeout(ctx, bound)
@@ -44,9 +46,11 @@ func Home(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host, bound ti
 		if err := u.Say(ctx, hm.summary); err != nil {
 			return err
 		}
-		picked, err := u.Pick(ctx, homeQuestion(hm, menu))
-		if err != nil {
-			return err
+		picked := "First run"
+		if round > 0 || !hm.first {
+			if picked, err = u.Pick(ctx, homeQuestion(hm, menu)); err != nil {
+				return err
+			}
 		}
 		label, res, err := runPicked(ctx, u, px, h, menu, hm.suggested, picked)
 		switch {
@@ -64,8 +68,8 @@ func Home(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host, bound ti
 }
 
 // readHome reads what exists (design section 3, Home data): the data plane,
-// the clone's version, whether the container runs and is ready, then export,
-// validate and version, concurrently, only when it is ready.
+// the clone's version, whether the container runs, or exists, and is ready,
+// then export, validate and version, concurrently, only when it is ready.
 func readHome(ctx context.Context, px *proxy.Proxy, h *host.Host) home {
 	p, err := h.Plane()
 	if err != nil {
@@ -73,9 +77,15 @@ func readHome(ctx context.Context, px *proxy.Proxy, h *host.Host) home {
 	}
 	clone := h.CloneVersion(ctx)
 	runs, err := h.ContainerRuns(ctx)
+	exists := runs
+	if err == nil && !runs {
+		exists, err = h.ContainerExists(ctx)
+	}
 	switch {
 	case err != nil:
 		return home{summary: p.BaseURL + ": not checked · clone " + clone + " · docker compose ps: " + err.Error()}
+	case !exists:
+		return home{summary: p.BaseURL + ": not installed yet (./setup.sh install sets it up) · clone " + clone, first: true}
 	case !runs:
 		return home{summary: p.BaseURL + ": stopped (./setup.sh install starts it) · clone " + clone}
 	case h.Ready(ctx) != nil:
@@ -97,12 +107,8 @@ func readHome(ctx context.Context, px *proxy.Proxy, h *host.Host) home {
 	if export.Settings.Budget == nil {
 		summary += " · spend not capped"
 	}
-	aliases := map[string]int{}
-	for n, m := range export.Models {
-		aliases[n] = len(m.Targets)
-	}
-	return home{summary: summary, suggested: rules.Suggest(rules.Facts{Providers: len(export.Providers), Keys: len(export.Keys),
-		Aliases: aliases, Unresolved: unresolved(validate.Findings)})}
+	f := facts(export, validate)
+	return home{summary: summary, suggested: rules.Suggest(f), first: f.Providers == 0 || len(f.Aliases) == 0 || f.Keys == 0}
 }
 
 // read is one CLI read: its words and the reply it decodes into.
@@ -144,14 +150,17 @@ func unresolved(findings []proxy.Finding) map[string]string {
 }
 
 // homeQuestion is the home's pick: Suggested first, valued
-// "suggested:<i>", then the menu's entries in their groups.
+// "suggested:<i>", then the menu's entries in their groups; an entry without
+// a group is not listed.
 func homeQuestion(hm home, menu []Entry) ui.Question {
 	q := ui.Question{ID: "home", Prompt: "What do you want to do?"}
 	for i, s := range hm.suggested {
 		q.Options = append(q.Options, ui.Option{Value: "suggested:" + strconv.Itoa(i), Label: s.Label, Group: "Suggested"})
 	}
 	for _, e := range menu {
-		q.Options = append(q.Options, ui.Option{Value: e.Label, Label: e.Label, Group: e.Group})
+		if e.Group != "" { // the first run: the home opens it
+			q.Options = append(q.Options, ui.Option{Value: e.Label, Label: e.Label, Group: e.Group})
+		}
 	}
 	return q
 }

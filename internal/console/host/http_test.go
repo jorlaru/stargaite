@@ -6,18 +6,22 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -185,7 +189,7 @@ func TestListModelsNoRedirect(t *testing.T) {
 
 func TestClientTransport(t *testing.T) {
 	h := New(t.TempDir())
-	c := h.client(false, nil, "", "")
+	c := h.client(true, false, nil, "", "")
 	tr, ok := c.Transport.(*http.Transport)
 	if !ok || tr.Proxy != nil || !tr.DisableKeepAlives || tr.ForceAttemptHTTP2 || c.CheckRedirect == nil || c.Timeout != h.httpBound ||
 		tr.TLSClientConfig == nil || tr.TLSClientConfig.InsecureSkipVerify {
@@ -543,7 +547,7 @@ func TestTryCompletionTransport(t *testing.T) {
 
 	// Go never sends a loopback request through an environment proxy, so the
 	// try's own client is looked at instead.
-	if _, c, err := h.planeClient(); err != nil || c.Transport.(*http.Transport).Proxy != nil {
+	if _, c, err := h.planeClient("127.0.0.1", true); err != nil || c.Transport.(*http.Transport).Proxy != nil {
 		t.Fatalf("proxy: the try's client takes a proxy (err %v)", err)
 	}
 
@@ -562,5 +566,86 @@ func TestTryCompletionTransport(t *testing.T) {
 	write(t, ca, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})))
 	if got, err := h.TryCompletion(ctx, budget(t, 1), 1, key, "a"); err != nil || got.Status != 200 || len(l.got()) != 1 {
 		t.Fatalf("tls/ca.pem: completion %+v, err %v, %d requests", got, err, len(l.got()))
+	}
+}
+
+// listenOn listens on addr. 127.0.0.2 and its like are on Linux's loopback;
+// elsewhere they may not be configured, and the test is skipped.
+func listenOn(t *testing.T, addr string) net.Listener {
+	t.Helper()
+	l, err := net.Listen("tcp", addr)
+	if err != nil && runtime.GOOS != "linux" {
+		t.Skipf("%s is not configured on this host's loopback", addr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	return l
+}
+
+// tlsPlane serves /health/ready under TLS with files' pair on 127.0.0.1
+// and 127.0.0.2 at one port, and logs the local address of each request.
+func tlsPlane(t *testing.T, files TLSFiles) (port int, local func() []string) {
+	t.Helper()
+	pair, err := tls.X509KeyPair(files["cert.pem"], files["key.pem"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var seen []string
+	srv := &http.Server{TLSConfig: &tls.Config{Certificates: []tls.Certificate{pair}},
+		Handler: http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			defer mu.Unlock()
+			seen = append(seen, r.Context().Value(http.LocalAddrContextKey).(net.Addr).String())
+		})}
+	one := listenOn(t, "127.0.0.1:0")
+	port = one.Addr().(*net.TCPAddr).Port
+	two := listenOn(t, "127.0.0.2:"+strconv.Itoa(port))
+	for _, l := range []net.Listener{one, two} {
+		go func() { _ = srv.ServeTLS(l, "", "") }()
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	return port, func() []string { mu.Lock(); defer mu.Unlock(); return slices.Clone(seen) }
+}
+
+func TestCheckHTTPS(t *testing.T) {
+	files, err := SelfSigned([]string{"127.0.0.1", "127.0.0.2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, local := tlsPlane(t, files)
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:"+strconv.Itoa(freePort(t)))
+	h := New(t.TempDir())
+	write(t, filepath.Join(h.Dir, ".env"), "STARGAITE_PORT="+strconv.Itoa(port)+"\n")
+	write(t, filepath.Join(h.Dir, "compose.override.yaml"), "# setup: tls_name=localhost\n# setup: tls_ca=cert.pem\nservices: {}\n")
+	write(t, filepath.Join(h.Dir, "tls", "cert.pem"), string(files["cert.pem"]))
+	p := strconv.Itoa(port)
+	for _, tc := range []struct{ addr, at string }{{"127.0.0.1", "127.0.0.1:" + p}, {"127.0.0.2", "127.0.0.2:" + p}, {"0.0.0.0", "127.0.0.1:" + p}} {
+		if err := h.CheckHTTPS(context.Background(), tc.addr); err != nil {
+			t.Fatalf("%s: %v", tc.addr, err)
+		}
+		if got := local(); got[len(got)-1] != tc.at {
+			t.Fatalf("%s: dialled %q, want %s", tc.addr, got, tc.at)
+		}
+	}
+	other, err := SelfSigned([]string{"127.0.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, filepath.Join(h.Dir, "tls", "cert.pem"), string(other["cert.pem"]))
+	if err := h.CheckHTTPS(context.Background(), "127.0.0.1"); err == nil {
+		t.Fatal("a certificate outside tls/ was trusted")
+	}
+
+	// The host's own addresses are no provider's: no guard refuses them.
+	h.httpBound = 300 * time.Millisecond
+	dial := "169.254.1.1:" + strconv.Itoa(freePort(t))
+	_, unguarded := h.client(false, true, nil, dial, "").Get("https://x/health/ready")
+	_, guarded := h.client(true, true, nil, dial, "").Get("https://x/health/ready")
+	const refused = "is link-local, cloud metadata or reserved"
+	if unguarded == nil || strings.Contains(unguarded.Error(), refused) || guarded == nil || !strings.Contains(guarded.Error(), refused) {
+		t.Fatalf("unguarded %v, guarded %v", unguarded, guarded)
 	}
 }

@@ -81,7 +81,7 @@ func (h *Host) ListModels(ctx context.Context, p Provider) (ids []string, status
 	case p.Key != "":
 		req.Header.Set("Authorization", "Bearer "+p.Key)
 	}
-	body, status, _, err := h.get(h.client(p.AllowPrivate, nil, "", ""), req, cmp.Or(p.Limit, httpLimit))
+	body, status, _, err := h.get(h.client(true, p.AllowPrivate, nil, "", ""), req, cmp.Or(p.Limit, httpLimit))
 	switch {
 	case ctx.Err() != nil:
 		return nil, 0, fmt.Errorf("the model list at %s was not read: %w", u, ctx.Err())
@@ -107,13 +107,29 @@ func (h *Host) ListModels(ctx context.Context, p Provider) (ids []string, status
 // Ready is one readiness check of the data plane, as setup.sh's wait_ready
 // makes it, bounded by h.ready.try.
 func (h *Host) Ready(ctx context.Context) error {
-	p, c, err := h.planeClient()
+	try, cancel := context.WithTimeout(ctx, h.ready.try)
+	defer cancel()
+	return h.health(try, "127.0.0.1", true)
+}
+
+// CheckHTTPS is one readiness check of the data plane at addr, 0.0.0.0
+// dialled at 127.0.0.1, under TLS by the certificate's name, within
+// httpBound. No provider guard stands between the console and the host's
+// own addresses.
+func (h *Host) CheckHTTPS(ctx context.Context, addr string) error {
+	if addr == "0.0.0.0" {
+		addr = "127.0.0.1"
+	}
+	return h.health(ctx, addr, false)
+}
+
+// health is one GET of /health/ready at addr, which must answer 2xx.
+func (h *Host) health(ctx context.Context, addr string, guard bool) error {
+	p, c, err := h.planeClient(addr, guard)
 	if err != nil {
 		return err
 	}
-	try, cancel := context.WithTimeout(ctx, h.ready.try)
-	defer cancel()
-	req, err := http.NewRequestWithContext(try, http.MethodGet, strings.TrimSuffix(p.BaseURL, "/v1")+"/health/ready", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimSuffix(p.BaseURL, "/v1")+"/health/ready", nil)
 	if err != nil {
 		return err
 	}
@@ -127,10 +143,10 @@ func (h *Host) Ready(ctx context.Context) error {
 	return nil
 }
 
-// planeClient is the data plane and its client: on loopback at the port,
+// planeClient is the data plane and its client: dialling addr at the port,
 // under TLS by the certificate's name, trusting only tls/<CA> when the
-// override names one.
-func (h *Host) planeClient() (Plane, *http.Client, error) {
+// override names one, guarded as a provider when guard.
+func (h *Host) planeClient(addr string, guard bool) (Plane, *http.Client, error) {
 	p, err := h.Plane()
 	if err != nil {
 		return Plane{}, nil, err
@@ -146,7 +162,7 @@ func (h *Host) planeClient() (Plane, *http.Client, error) {
 			return Plane{}, nil, fmt.Errorf("tls/%s holds no certificate", p.CA)
 		}
 	}
-	return p, h.client(true, pool, "127.0.0.1:"+strconv.Itoa(p.Port), p.Name), nil
+	return p, h.client(guard, true, pool, addr+":"+strconv.Itoa(p.Port), p.Name), nil
 }
 
 // Completion is what a test chat completion answered, every string cleaned.
@@ -166,7 +182,7 @@ func (h *Host) TryCompletion(ctx context.Context, b *paid.Budget, calls int, key
 	if err := b.Take(calls); err != nil {
 		return Completion{}, err
 	}
-	p, c, err := h.planeClient()
+	p, c, err := h.planeClient("127.0.0.1", true)
 	if err != nil {
 		return Completion{}, err
 	}
@@ -256,18 +272,22 @@ func (h *Host) plain(err error) string {
 }
 
 // client is the one HTTP client: bounded by httpBound, no redirect followed,
-// no proxy from the environment, no keep-alive, HTTP/1.1. It refuses a
-// private address unless allowPrivate; pool nil trusts the system's roots.
-// With dial set, every connection goes to that address, with serverName as
-// the name the certificate must hold.
-func (h *Host) client(allowPrivate bool, pool *x509.CertPool, dial, serverName string) *http.Client {
-	dialer := &net.Dialer{Control: func(_, address string, _ syscall.RawConn) error {
-		ap, err := netip.ParseAddrPort(address)
-		if err != nil {
-			return err
+// no proxy from the environment, no keep-alive, HTTP/1.1. With guard, it
+// refuses what the proxy's guard refuses, a private address unless
+// allowPrivate; without, it dials any address (the host's own). pool nil
+// trusts the system's roots. With dial set, every connection goes to that
+// address, with serverName as the name the certificate must hold.
+func (h *Host) client(guard, allowPrivate bool, pool *x509.CertPool, dial, serverName string) *http.Client {
+	dialer := &net.Dialer{}
+	if guard {
+		dialer.Control = func(_, address string, _ syscall.RawConn) error {
+			ap, err := netip.ParseAddrPort(address)
+			if err != nil {
+				return err
+			}
+			return refuse(ap.Addr(), allowPrivate)
 		}
-		return refuse(ap.Addr(), allowPrivate)
-	}}
+	}
 	transport := &http.Transport{
 		Proxy:             nil,
 		DisableKeepAlives: true,

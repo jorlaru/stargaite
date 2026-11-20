@@ -13,6 +13,9 @@ type Facts struct {
 	Unresolved      map[string]string // provider → the variable its credential names, which does not resolve
 	Uncapped        bool              // no instance budget is set
 	Unverified      map[string]string // provider none of whose chat targets is checked → the alias that holds one ("" none)
+	Running, Clone  string            // the proxy's version and the clone's
+	Upstream        string            // the clone's upstream
+	Ahead           int               // its commits the clone lacks, as last fetched
 }
 
 // Suggestion is one row the home suggests: its words, the menu entry it
@@ -24,11 +27,27 @@ type Suggestion struct {
 
 // Suggest is what the home suggests, in this order (design section 3,
 // "Suggestions"): a provider, else an alias, when none exists, and nothing
-// more; then a key when none exists, each provider whose key does not
-// resolve, each alias with one model, by name, spend not capped, and each
-// provider none of whose targets is checked, by name, through an alias that
-// holds one. The first three open the first run.
-func Suggest(f Facts) []Suggestion {
+// more but Upgrades; then a key when none exists, each provider whose key
+// does not resolve, each alias with one model, by name, spend not capped,
+// each provider none of whose targets is checked, by name, through an alias
+// that holds one, and Upgrades. The first three open the first run.
+func Suggest(f Facts) []Suggestion { return append(suggest(f), Upgrades(f)...) }
+
+// Upgrades is what the home suggests last: Rebuild when the proxy runs
+// another version than the clone's, neither a dev build, then Upgrade when
+// the clone's upstream has commits it lacks.
+func Upgrades(f Facts) []Suggestion {
+	var out []Suggestion
+	if f.Running != "" && f.Clone != "" && f.Running != f.Clone && f.Running != "dev" && f.Clone != "dev" {
+		out = append(out, Suggestion{Label: "Rebuild to this clone's version", Task: "Upgrade", Presets: map[string]string{"rebuild": "yes"}})
+	}
+	if f.Ahead > 0 {
+		out = append(out, Suggestion{Label: fmt.Sprintf("Upgrade: %d new commit(s) on %s", f.Ahead, f.Upstream), Task: "Upgrade"})
+	}
+	return out
+}
+
+func suggest(f Facts) []Suggestion {
 	switch {
 	case f.Providers == 0:
 		return []Suggestion{{Label: "Add a provider: none is added yet", Task: "First run"}}

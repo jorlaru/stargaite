@@ -75,6 +75,12 @@ func onTerminal(t *testing.T, env []string, args ...string) *terminal {
 func onTerminalAt(t *testing.T, bin string, env []string, args ...string) *terminal {
 	t.Helper()
 	m, s := openPTY(t)
+	return startOn(t, m, s, bin, env, args...)
+}
+
+// startOn starts the console at bin with args on the pseudo-terminal m, s.
+func startOn(t *testing.T, m, s *os.File, bin string, env []string, args ...string) *terminal {
+	t.Helper()
 	before, err := unix.IoctlGetTermios(int(s.Fd()), unix.TCGETS)
 	if err != nil {
 		t.Fatal(err)
@@ -1057,7 +1063,7 @@ func TestRealEscDuringCheck(t *testing.T) {
 const putBackFake = `case "$*" in
 "compose ps -q"|"compose ps -a -q") echo c0ffee ;;
 "compose stop") echo stopping ;;
-"compose run --rm --no-deps -T stargaite restore --yes -") /bin/cat >/dev/null; /bin/sleep 2; echo restored ;;
+"compose run --rm --no-deps -T stargaite restore --yes --json -") /bin/cat >/dev/null; /bin/sleep 2; echo '{"path":"-","bytes":1,"data_dir":"/data","replaced":[]}' ;;
 "compose up -d --no-build") echo started ;;
 *) exit 9 ;;
 esac
@@ -1118,5 +1124,229 @@ func TestRestoreOutcomeAfterQuit(t *testing.T) {
 				t.Errorf("docker log %q", l)
 			}
 		})
+	}
+}
+
+// rebuildClone is a clone of its own made a git repository at a commit
+// tagged v-new, and a fake docker that keeps the running version (v-old
+// until compose build stores v-new and compose up starts it) and answers
+// the home's reads and a Rebuild, whose export writes bin/stargaite-console
+// as a shell script of the given mode that prints "REEXEC <pid> <argc>
+// <marker> <stty -g>" to the terminal and to <state>/reexec, then exits 7.
+// It returns the console, the environment (real git after the fake on
+// PATH), the fake's log and the state directory.
+func rebuildClone(t *testing.T, mode string) (bin string, env []string, log, state string) {
+	t.Helper()
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("no git here")
+	}
+	bin, dir, _ := ownClone(t, nil)
+	for _, args := range [][]string{{"init", "-q", "-b", "main"}, {"add", "compose.yaml"}, {"commit", "-q", "-m", "c"}, {"tag", "v-new"}} {
+		cmd := exec.Command(real, append([]string{"-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"}, args...)...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	state = t.TempDir()
+	newConsole := "#!/bin/sh\nline=\"REEXEC $$ $# $" + reexecMarker + " $(stty -g)\"\necho \"$line\"\necho \"$line\" >'" + state + "/reexec'\nexit 7\n"
+	if err := errors.Join(os.WriteFile(filepath.Join(state, "running"), []byte("v-old\n"), 0o644),
+		os.WriteFile(filepath.Join(state, "new"), []byte(newConsole), 0o644)); err != nil {
+		t.Fatal(err)
+	}
+	cli := `"compose exec -T stargaite /stargaite `
+	env, log = fake(t, "S='"+state+"'\ncase \"$*\" in\n"+
+		`"compose ps -q"|"compose ps -a -q"|"compose ps -q stargaite") echo c0ffee ;;`+"\n"+
+		cli+`version --json") echo "{\"version\":\"$(/bin/cat "$S/running")\"}" ;;`+"\n"+
+		cli+`export --json") echo '{"version":1,"providers":{"p":{}},"models":{"main":{"targets":["p/m"]}},"keys":{"k":{}}}' ;;`+"\n"+
+		cli+`validate --json") echo '{"findings":[]}' ;;`+"\n"+
+		cli+`--help") printf 'usage: stargaite <command>\n  restore file\n' ;;`+"\n"+
+		cli+`backup - --json") printf 'SQLite format 3\000 the store'; echo '{"bytes":26,"path":"-"}' >&2 ;;`+"\n"+
+		`"inspect --format {{.Image}} {{.Config.Image}} c0ffee") echo 'sha256:0123abcd stargaite:local' ;;`+"\n"+
+		`"tag sha256:0123abcd stargaite:local-previous") ;;`+"\n"+
+		`"compose build") echo "$STARGAITE_VERSION" >"$S/built" ;;`+"\n"+
+		`"compose up -d --no-build") /bin/cp "$S/built" "$S/running" ;;`+"\n"+
+		`"compose logs --no-log-prefix --tail 100 stargaite") echo "{\"msg\":\"ready\",\"version\":\"$(/bin/cat "$S/running")\"}" ;;`+"\n"+
+		`"compose logs --tail 30 stargaite") ;;`+"\n"+
+		`"build --quiet --build-arg VERSION --target console --output type=local,dest=bin .") `+
+		`/bin/cp "$S/new" bin/.new && /bin/chmod `+mode+` bin/.new && /bin/mv -f bin/.new bin/stargaite-console ;;`+"\n"+
+		"*) exit 9 ;;\nesac\n")
+	for i, e := range env {
+		if strings.HasPrefix(e, "PATH=") {
+			env[i] = e + ":" + filepath.Dir(real)
+		}
+	}
+	return bin, env, log, state
+}
+
+// rebuildAtHome picks the home's Rebuild and confirms it.
+func rebuildAtHome(tm *terminal) {
+	tm.waitFor("Rebuild to this clone's version", 1)
+	time.Sleep(300 * time.Millisecond)
+	tm.write("Rebuild\r")
+	tm.waitFor("continue?", 1)
+	tm.write("\x1b[A") // the cursor goes from No to Yes
+	time.Sleep(200 * time.Millisecond)
+	tm.write("\r")
+}
+
+// After a Rebuild from the home, the console exports the new console and
+// execs it once, in the same process, with no arguments and the marker,
+// the terminal restored before the new console's first byte.
+func TestReexecAfterRebuild(t *testing.T) {
+	bin, env, _, state := rebuildClone(t, "0755")
+	tm := onTerminalAt(t, bin, env)
+	pid := tm.cmd.Process.Pid
+	rebuildAtHome(tm)
+	code, after := tm.exit()
+	tm.restored(after)
+	out := tm.output()
+	got, err := os.ReadFile(filepath.Join(state, "reexec"))
+	f := strings.Fields(string(got))
+	if code != 7 || err != nil || len(f) < 5 || f[0] != "REEXEC" || f[1] != strconv.Itoa(pid) || f[2] != "0" || f[3] != "1" {
+		t.Fatalf("exit %d, the new console wrote %q (%v); want REEXEC %d 0 1\n%q", code, got, err, pid, out)
+	}
+	at := strings.Index(out, "REEXEC ")
+	for _, seq := range []string{"\x1b[?2004l", "\x1b[?25h", "\x1b[<1u", "rebuilt: "} {
+		if i := strings.LastIndex(out[:max(at, 0)], seq); i < 0 || strings.Contains(out[at:], seq) {
+			t.Errorf("%q is not written before the new console's first byte (%d, at %d):\n%q", seq, i, at, out)
+		}
+	}
+}
+
+// A new console that cannot be executed: E2, exit 1, the terminal restored.
+func TestReexecExecFails(t *testing.T) {
+	bin, env, _, state := rebuildClone(t, "0644")
+	tm := onTerminalAt(t, bin, env)
+	rebuildAtHome(tm)
+	code, after := tm.exit()
+	tm.restored(after)
+	out := tm.output()
+	tail := out[strings.LastIndex(out, "\x1b[?2004l"):]
+	if code != 1 || !strings.Contains(tail, "stargaite-console: the new console did not start: ") || !strings.Contains(tail, "; ./setup.sh starts it") {
+		t.Fatalf("exit %d; after the terminal was restored:\n%q", code, tail)
+	}
+	if _, err := os.Stat(filepath.Join(state, "reexec")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the new console ran: %v", err)
+	}
+}
+
+// A Ctrl-C typed before the console starts, on a terminal already raw so
+// that it waits as a byte, is flushed: the home opens and the console runs
+// on (TestFlushInput proves the ioctl).
+func TestFlushAtStart(t *testing.T) {
+	bin, env, _, _ := rebuildClone(t, "0755")
+	m, s := openPTY(t)
+	tio, err := unix.IoctlGetTermios(int(s.Fd()), unix.TCGETS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tio.Lflag &^= unix.ICANON | unix.ECHO | unix.ISIG
+	if err := unix.IoctlSetTermios(int(s.Fd()), unix.TCSETS, tio); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.WriteString("\x03"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	tm := startOn(t, m, s, bin, env)
+	tm.waitFor(home, 1)
+	time.Sleep(500 * time.Millisecond)
+	select {
+	case <-tm.waited:
+		t.Fatalf("the console read the Ctrl-C typed before it started:\n%q", tm.output())
+	default:
+	}
+	tm.write("\x03")
+	if code, after := tm.exit(); code != 130 {
+		t.Errorf("exit %d; want 130", code)
+	} else {
+		tm.restored(after)
+	}
+}
+
+// editFake replaces old with new in the fake docker that log belongs to.
+func editFake(t *testing.T, log, old, new string) {
+	t.Helper()
+	p := filepath.Join(filepath.Dir(log), "docker")
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), old) {
+		t.Fatalf("the fake holds no %q", old)
+	}
+	if err := os.WriteFile(p, []byte(strings.Replace(string(b), old, new, 1)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// tailAfterRestore is what the console wrote once it restored the terminal.
+func tailAfterRestore(out string) string { return out[max(strings.LastIndex(out, "\x1b[?2004l"), 0):] }
+
+// Ctrl-C during Rebuild's backup, the image's name already the new build's,
+// from the home and from the subcommand: how to return is printed once the
+// terminal is restored, and nothing is started.
+func TestRebuildCtrlCDuringBackup(t *testing.T) {
+	for name, args := range map[string][]string{"home": nil, "subcommand": {"upgrade", "--rebuild", "--yes"}} {
+		t.Run(name, func(t *testing.T) {
+			bin, env, log, _ := rebuildClone(t, "0755")
+			editFake(t, log, `backup - --json") printf`, `backup - --json") /bin/sleep 5; printf`)
+			tm := onTerminalAt(t, bin, env, args...)
+			if args == nil {
+				rebuildAtHome(tm)
+			}
+			tm.waitFor("backing up the store to", 1)
+			time.Sleep(500 * time.Millisecond)
+			tm.write("\x03")
+			code, after := tm.exit()
+			tm.restored(after)
+			tail := tailAfterRestore(tm.output())
+			if code != 130 || !strings.Contains(tail, "stargaite-console: quit; the upgrade did not finish: the backup failed (stopped), so the new version "+
+				"was not started: v-old still runs, the store unchanged; docker tag stargaite:local-previous stargaite:local returns to it") {
+				t.Fatalf("exit %d; after the terminal was restored:\n%q", code, tail)
+			}
+			if strings.Contains(readLog(t, log), "compose up") {
+				t.Errorf("started: %q", readLog(t, log))
+			}
+		})
+	}
+}
+
+// E1 through main: a session restarted once already says so and exits 0,
+// starting nothing.
+func TestReexecMarkerSet(t *testing.T) {
+	bin, env, _, state := rebuildClone(t, "0755")
+	tm := onTerminalAt(t, bin, append(env, reexecMarker+"=1"))
+	rebuildAtHome(tm)
+	code, after := tm.exit()
+	tm.restored(after)
+	tail := tailAfterRestore(tm.output())
+	if code != 0 || !strings.Contains(tail, "stargaite-console: the console was restarted once in this session; ./setup.sh starts the new one") {
+		t.Fatalf("exit %d; after the terminal was restored:\n%q", code, tail)
+	}
+	if _, err := os.Stat(filepath.Join(state, "reexec")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the new console ran: %v", err)
+	}
+}
+
+// V14 through main: an export that fails after the rebuild says the result,
+// then exits 1 with why, starting nothing.
+func TestRebuildExportFails(t *testing.T) {
+	bin, env, log, state := rebuildClone(t, "0755")
+	editFake(t, log, `/bin/cp "$S/new" bin/.new &&`, `exit 1; /bin/cp "$S/new" bin/.new &&`)
+	tm := onTerminalAt(t, bin, env)
+	rebuildAtHome(tm)
+	code, after := tm.exit()
+	tm.restored(after)
+	out := tm.output()
+	tail := tailAfterRestore(out)
+	if code != 1 || !strings.Contains(tail, "stargaite-console: the new version runs, but the new console was not exported (") ||
+		!strings.Contains(out[:len(out)-len(tail)], "rebuilt: ") {
+		t.Fatalf("exit %d:\n%q", code, out)
+	}
+	if _, err := os.Stat(filepath.Join(state, "reexec")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the new console ran: %v", err)
 	}
 }

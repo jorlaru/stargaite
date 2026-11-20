@@ -216,6 +216,40 @@ func TestOverrideSet(t *testing.T) {
 	}
 }
 
+// TestOverrideFormats: host_gateway=1 set on no override and on a marked TLS
+// override gives the bytes setup.sh's override_set wrote, mode 0600 (carried
+// from tests/setup's TestSharedOverrideFormat, which compared the two).
+func TestOverrideFormats(t *testing.T) {
+	m := OverrideMarker + "\n"
+	tlsLines := "    command: [\"serve\", \"--listen\", \"0.0.0.0:4000\", \"--tls-cert\", \"/tls/cert.pem\", \"--tls-key\", \"/tls/key.pem\"]\n" +
+		"    ports: !override\n      - \"127.0.0.1:${STARGAITE_PORT:-4000}:4000\"\n    volumes:\n      - ./tls:/tls:ro\n"
+	marked := m + "# setup: tls=self-signed\n# setup: tls_name=localhost\n# setup: tls_ca=cert.pem\n# setup: addresses=127.0.0.1\n" +
+		"services:\n  stargaite:\n    extra_hosts:\n      - \"localhost:127.0.0.1\"\n" + tlsLines
+	for _, row := range []struct{ name, seed, want string }{
+		{"no override", "", m + "# setup: host_gateway=1\nservices:\n  stargaite:\n    extra_hosts:\n      - \"host.docker.internal:host-gateway\"\n"},
+		{"marked, with TLS", marked, m + "# setup: tls=self-signed\n# setup: tls_name=localhost\n# setup: tls_ca=cert.pem\n# setup: addresses=127.0.0.1\n" +
+			"# setup: host_gateway=1\nservices:\n  stargaite:\n    extra_hosts:\n      - \"host.docker.internal:host-gateway\"\n      - \"localhost:127.0.0.1\"\n" + tlsLines},
+	} {
+		h := New(t.TempDir())
+		path := filepath.Join(h.Dir, "compose.override.yaml")
+		if row.seed != "" {
+			write(t, path, row.seed)
+		}
+		o, err := h.ReadOverride()
+		if err != nil {
+			t.Fatal(err)
+		}
+		o.Set("host_gateway", "1")
+		if err := h.WriteOverride(o); err != nil {
+			t.Fatalf("%s: %v", row.name, err)
+		}
+		info, err := os.Stat(path)
+		if got := read(t, path); got != row.want || err != nil || info.Mode().Perm() != 0o600 {
+			t.Errorf("%s: mode %v, %v:\n%s\nwant:\n%s", row.name, info.Mode(), err, got, row.want)
+		}
+	}
+}
+
 func TestPlane(t *testing.T) {
 	h := New(t.TempDir())
 	if p, err := h.Plane(); err != nil || p.BaseURL != "http://127.0.0.1:4000/v1" || p.Port != 4000 {
@@ -295,4 +329,36 @@ func TestEnvUnsetLeavesNoTemp(t *testing.T) {
 		t.Fatal(err)
 	}
 	noTemp(t, h.Dir, ".env", ".env.")
+}
+
+func TestRestoreOverride(t *testing.T) {
+	h := New(t.TempDir())
+	path := filepath.Join(h.Dir, "compose.override.yaml")
+	write(t, path, markedFixture+"\n\n") // the trailing blank lines are bytes too
+	o, err := h.ReadOverride()
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(t, path, "other bytes\n")
+	if err := h.RestoreOverride(o); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if got := read(t, path); err != nil || got != markedFixture+"\n\n" || info.Mode().Perm() != 0o600 {
+		t.Fatalf("put back: %q, %v", got, err)
+	}
+	noTemp(t, h.Dir, "compose.override.yaml", "compose.override.")
+
+	h = New(t.TempDir())
+	path = filepath.Join(h.Dir, "compose.override.yaml")
+	if o, err = h.ReadOverride(); err != nil {
+		t.Fatal(err)
+	}
+	write(t, path, marker+"services: {}\n")
+	if err := h.RestoreOverride(o); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("an override that was not there is: %v", err)
+	}
 }

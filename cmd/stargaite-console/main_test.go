@@ -143,7 +143,7 @@ func TestVersionFirst(t *testing.T) {
 func TestUsage(t *testing.T) {
 	env, log := fake(t, replies)
 	out, _, code := runConsole(t, console, env, "help")
-	if code != 0 || !strings.HasPrefix(out, "usage: stargaite-console [install | provider | alias | key | budget | telemetry | status | logs | stop | start | restart | backup | restore | uninstall | help] [flags] [--version]\n") {
+	if code != 0 || !strings.HasPrefix(out, "usage: stargaite-console [install | provider | alias | key | budget | telemetry | remote | status | logs | stop | start | restart | backup | restore | uninstall | upgrade | help] [flags] [--version]\n") {
 		t.Fatalf("help: exit %d\n%s", code, out)
 	}
 	for _, c := range []struct {
@@ -166,7 +166,7 @@ func TestUsage(t *testing.T) {
 
 func TestUsageText(t *testing.T) {
 	out, _, _ := runConsole(t, console, nil, "--help")
-	want := "usage: stargaite-console [install | provider | alias | key | budget | telemetry | status | logs | stop | start | restart | backup | restore | uninstall | help] [flags] [--version]\n" +
+	want := "usage: stargaite-console [install | provider | alias | key | budget | telemetry | remote | status | logs | stop | start | restart | backup | restore | uninstall | upgrade | help] [flags] [--version]\n" +
 		"At a terminal with no subcommand: the guided console.\n" +
 		"  install   the first run: this machine, then a provider, an alias with its fallbacks and a key, each kept when it\n" +
 		"            exists, ending with one test call; at a terminal it starts at the first missing step\n" +
@@ -191,6 +191,8 @@ func TestUsageText(t *testing.T) {
 		"  telemetry traces to Langfuse or any OTLP endpoint, replacing what was set whole, then one test span (free)\n" +
 		"            --backend <langfuse|otlp|off>   --endpoint <url>   --langfuse-public-env <VAR>   --langfuse-secret-env <VAR>\n" +
 		"            --header-name <name>   --key-env <VAR>   --replace   --allow-private-network   --yes\n" +
+		"  remote    publish the data plane beyond loopback, always with TLS: your certificate or a self-signed one; run again, it renews it\n" +
+		"            --address <a,b>   --tls <own|self-signed>   --tls-cert <file>   --tls-key <file>   --tls-name <name>   --tls-ca <file>   --yes\n" +
 		"  logs      the container's last 100 log lines; at a terminal it then follows them until Esc, an hour at most\n" +
 		"            --follow is refused without a terminal: the console follows logs only while someone watches\n" +
 		"  stop, start, restart   the container; stop and restart interrupt traffic   --yes\n" +
@@ -199,7 +201,9 @@ func TestUsageText(t *testing.T) {
 		"            and started again   --from <file>   --yes\n" +
 		"  uninstall the container, its two images and bin/stargaite-console; the volume, .env, the override, backups/\n" +
 		"            and tls/ are kept, and the commands that remove them printed   --yes\n" +
-		"  status    what exists: providers, aliases, targets without an alias, keys, budgets, telemetry and both versions\n" +
+		"  upgrade   fast-forward this clone to its upstream and rebuild, keeping the previous image and taking a backup just before the new version starts, then checking it; it prints the way back\n" +
+		"            --rebuild rebuilds this clone's version, without fetching   --legacy-backup <file>   --yes\n" +
+		"  status    what exists: providers, aliases, targets without an alias, keys, budgets, telemetry and both versions; --check first says whether the clone's upstream has an upgrade (one git fetch)\n" +
 		"For what has no flag here (reorder an alias, see what it sends, change a provider or a key, see usage and cost, check everything):\n" +
 		"the guided console, or the stargaite command: docker compose exec -T stargaite /stargaite help\n"
 	if out != want {
@@ -269,13 +273,71 @@ func TestRunOneEnd(t *testing.T) {
 	}
 }
 
+// TestRunOneReexec: a task that restarts the console succeeds with its
+// result said; one that ends the session with an error fails with it.
+func TestRunOneReexec(t *testing.T) {
+	var out bytes.Buffer
+	e := task.Entry{Label: "Upgrade", Run: func(context.Context, *ui.UI, *proxy.Proxy, *host.Host) (string, error) {
+		return "upgraded: x", task.ErrReexec
+	}}
+	if code, err := runOne(context.Background(), ui.New(plain.New(&out), nil), e, nil, nil); code != exitOK || err != nil || out.String() != "upgraded: x\n" {
+		t.Fatalf("reexec: exit %d, err %v, output %q", code, err, out.String())
+	}
+	out.Reset()
+	boom := task.Entry{Label: "Upgrade", Run: func(context.Context, *ui.UI, *proxy.Proxy, *host.Host) (string, error) {
+		return "", ended{errors.New("boom")}
+	}}
+	if code, err := runOne(context.Background(), ui.New(plain.New(&out), nil), boom, nil, nil); code != exitFail || err == nil || err.Error() != "boom" {
+		t.Fatalf("ended: exit %d, err %v", code, err)
+	}
+}
+
+// ended is an error that ends the session with err's text, as Upgrade
+// returns when the new console was not exported: one that errors.Is
+// task.ErrEnd and is not it.
+type ended struct{ err error }
+
+func (e ended) Error() string        { return e.err.Error() }
+func (e ended) Is(target error) bool { return target == task.ErrEnd }
+
+// TestRestartDecision: the new console starts only after a session that
+// asked for it ended cleanly, once per session.
+func TestRestartDecision(t *testing.T) {
+	clean := ending{restart: true, ended: true, session: exitOK}
+	marked := []string{"PATH=/bin", "STARGAITE_CONSOLE_REEXEC=1"}
+	for _, tc := range []struct {
+		name    string
+		e       ending
+		environ []string
+		exec    bool
+		line    string
+	}{
+		{"clean", clean, []string{"PATH=/bin"}, true, ""},
+		{"marked", clean, marked, false, "the console was restarted once in this session; ./setup.sh starts the new one"},
+		{"SIGINT", ending{restart: true, ended: true, signal: syscall.SIGINT}, nil, false, ""},
+		{"SIGTERM", ending{restart: true, ended: true, signal: syscall.SIGTERM}, nil, false, ""},
+		{"SIGHUP", ending{restart: true, ended: true, signal: syscall.SIGHUP}, nil, false, ""},
+		{"interrupted", ending{restart: true, ended: true, interrupted: true}, nil, false, ""},
+		{"panicked", ending{restart: true, ended: true, panicked: true}, nil, false, ""},
+		{"not ended", ending{restart: true}, nil, false, ""},
+		{"session 1", ending{restart: true, ended: true, session: exitFail}, nil, false, ""},
+		{"not asked", ending{ended: true}, nil, false, ""},
+		{"not asked, marked", ending{ended: true}, marked, false, ""},
+	} {
+		if exec, line := restartDecision(tc.e, tc.environ); exec != tc.exec || line != tc.line {
+			t.Errorf("%s: exec %v, line %q; want %v, %q", tc.name, exec, line, tc.exec, tc.line)
+		}
+	}
+}
+
 // TestRunOneQuit: Ctrl-C is exit 130, with nothing to print, even wrapped by
-// a task's last words, unless a restore ran to its end after it: how it
-// ended is then printed.
+// a task's last words, unless a restore ran to its end after it or an
+// upgrade did not finish: how it ended is then printed.
 func TestRunOneQuit(t *testing.T) {
 	ran := fmt.Errorf("%w; %w: %w", ui.ErrQuit, task.ErrRanOn, errors.New("x"))
+	unfinished := fmt.Errorf("%w; %w: %s", ui.ErrQuit, task.ErrUnfinished, "y")
 	wrapped := fmt.Errorf("%w; no alias or key was created", ui.ErrQuit)
-	for _, row := range []struct{ ended, printed error }{{ui.ErrQuit, nil}, {wrapped, nil}, {ran, ran}} {
+	for _, row := range []struct{ ended, printed error }{{ui.ErrQuit, nil}, {wrapped, nil}, {ran, ran}, {unfinished, unfinished}} {
 		e := task.Entry{Label: "Quit", Run: func(context.Context, *ui.UI, *proxy.Proxy, *host.Host) (string, error) { return "", row.ended }}
 		code, err := runOne(context.Background(), ui.New(plain.New(&bytes.Buffer{}), nil), e, nil, nil)
 		if code != exitINT || err != row.printed {

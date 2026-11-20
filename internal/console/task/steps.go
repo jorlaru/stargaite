@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"strings"
 
 	"github.com/jorlaru/stargaite/internal/console/host"
 	"github.com/jorlaru/stargaite/internal/console/proxy"
@@ -40,6 +42,30 @@ func confirm(ctx context.Context, u *ui.UI, step, text string) error {
 	return nil
 }
 
+// cliFromClone is the command that runs the proxy's CLI from this clone,
+// with the admin variables TLS needs.
+func cliFromClone(h *host.Host) (string, error) {
+	admin, err := h.AdminEnv()
+	if err != nil {
+		return "", err
+	}
+	return "docker compose exec -T " + strings.Join(append(admin, ""), " ") + "stargaite /stargaite", nil
+}
+
+// backupStore copies the running proxy's store into backups/, named by
+// version and the time, under a work piece of step, which Esc stops.
+func backupStore(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host, step, version string) (host.Copy, error) {
+	var c host.Copy
+	err := u.Work(ctx, ui.Question{ID: "backup", Step: step, Prompt: "backing up the store"}, func(ctx context.Context) (err error) {
+		c, err = h.Backup(ctx, sayer(ctx, u), version, func(w io.Writer) (int64, error) { return px.Backup(ctx, w) })
+		return err
+	})
+	return c, err
+}
+
+// pressed reports whether err is the reader leaving the task or quitting.
+func pressed(err error) bool { return errors.Is(err, ui.ErrLeave) || errors.Is(err, ui.ErrQuit) }
+
 // ready checks the container runs, then waits until the proxy is ready
 // under a work piece, which Esc stops.
 func ready(ctx context.Context, u *ui.UI, h *host.Host, step string) error {
@@ -54,19 +80,21 @@ func ready(ctx context.Context, u *ui.UI, h *host.Host, step string) error {
 		func(ctx context.Context) error { return h.WaitReady(ctx, sayer(ctx, u)) })
 }
 
-// recreate recreates the container and waits until it is ready, under a
-// work piece. When wrote, it first says how to finish the recreate by hand.
-func recreate(ctx context.Context, u *ui.UI, h *host.Host, step string, wrote bool) error {
+// recreate recreates the container, with args after --no-build, and waits
+// until it is ready, under a work piece. When wrote, it first says how to
+// finish the recreate by hand.
+func recreate(ctx context.Context, u *ui.UI, h *host.Host, step string, wrote bool, args ...string) error {
+	up := append([]string{"--no-build"}, args...)
 	say(ctx, u, "recreating the container")
 	if wrote {
 		// The next run finds the files kept and does not recreate. Said
 		// before the recreate, so a stop at any point, Ctrl-C included,
 		// leaves it shown, and it claims nothing about how far it got.
 		say(ctx, u, "the files are written: if the recreate stops before the container is recreated, "+
-			"docker compose up -d --no-build in this clone does it")
+			"docker compose up -d "+strings.Join(up, " ")+" in this clone does it")
 	}
 	return u.Work(ctx, ui.Question{ID: "recreate", Step: step, Prompt: "recreating the container and waiting until it is ready"},
-		func(ctx context.Context) error { return h.Up(ctx, sayer(ctx, u), "--no-build") })
+		func(ctx context.Context) error { return h.Up(ctx, sayer(ctx, u), up...) })
 }
 
 // resolved reads provider name back: its credential must resolve, or it

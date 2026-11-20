@@ -21,6 +21,19 @@ type Func func(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host) (st
 // main exits 0.
 var ErrEnd = errors.New("the session ends")
 
+// ErrReexec is returned by Upgrade, with its result, once the new console
+// is exported at a terminal: the session ends and main starts it.
+var ErrReexec = errors.New("the new console starts")
+
+// endWith is err as an error that ends the session (errors.Is ErrEnd) with
+// err's text alone: main prints it and exits 1.
+func endWith(err error) error { return ended{err} }
+
+type ended struct{ err error }
+
+func (e ended) Error() string        { return e.err.Error() }
+func (e ended) Is(target error) bool { return target == ErrEnd }
+
 // Entry is a task in the menu: its group, its label, the subcommand that runs
 // it on its own, the value flags and the boolean flags that subcommand takes,
 // the answers it gives by question ID (Preset, never a flag's), and its step
@@ -60,8 +73,12 @@ func Menu() []Entry {
 		{Group: "Spend and traces", Label: "Send traces", Sub: "telemetry",
 			Flags: []string{"backend", "endpoint", "langfuse-public-env", "langfuse-secret-env", "header-name", "key-env"},
 			Bools: []string{"replace", "allow-private-network", "yes"}, Steps: traceSteps(), Run: SendTraces},
-		{Group: "This machine", Label: "See what exists", Sub: "status",
-			Steps: []ui.Step{{ID: "show", Title: "what exists"}}, Run: SeeWhatExists},
+		{Group: "This machine", Label: "See what exists", Sub: "status", Bools: []string{"check"},
+			Steps: []ui.Step{{ID: "show", Title: "what exists"}, {ID: "remove", Title: "remove a target"}}, Run: SeeWhatExists},
+		{Group: "This machine", Label: "Open to the network", Sub: "remote", Flags: []string{"address", "tls", "tls-cert", "tls-key", "tls-name", "tls-ca"},
+			Bools: []string{"yes"}, Steps: remoteSteps(), Run: OpenToNetwork},
+		{Group: "This machine", Label: "Upgrade", Sub: "upgrade", Flags: []string{"legacy-backup"}, Bools: []string{"yes", "rebuild"},
+			Steps: upgradeSteps(), Run: Upgrade},
 		{Group: "This machine", Label: "Back up or restore", Steps: backupSteps(), Run: BackUpOrRestore},
 		{Group: "This machine", Label: "See logs", Sub: "logs", Bools: []string{"follow"}, Steps: logSteps(), Run: SeeLogs},
 		{Group: "This machine", Label: "Stop or start", Steps: stopSteps(), Run: StopOrStart},

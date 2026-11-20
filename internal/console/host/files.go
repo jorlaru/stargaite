@@ -151,6 +151,15 @@ func (o *Override) Exists() bool { return o.exists }
 // Marked reports whether setup.sh or the console wrote it.
 func (o *Override) Marked() bool { return o.marked }
 
+// Ours refuses the reader's own override, one that exists without the
+// marker: the console never writes it.
+func (o *Override) Ours() error {
+	if o.exists && !o.marked {
+		return errors.New("compose.override.yaml was not written by setup.sh, so it is left as it is: move it away and run this again")
+	}
+	return nil
+}
+
 // Holds reports whether its text holds s.
 func (o *Override) Holds(s string) bool { return strings.Contains(o.raw, s) }
 
@@ -169,8 +178,8 @@ func (o *Override) Set(key, value string) {
 // WriteOverride writes the override whole from its keys, as setup.sh's
 // override_set renders it. It refuses an override it did not write.
 func (h *Host) WriteOverride(o *Override) error {
-	if o.exists && !o.marked {
-		return errors.New("compose.override.yaml was not written by setup.sh, so it is left as it is: move it away and run this again")
+	if err := o.Ours(); err != nil {
+		return err
 	}
 	var b strings.Builder
 	b.WriteString(OverrideMarker + "\n")
@@ -213,6 +222,18 @@ func (h *Host) WriteOverride(o *Override) error {
 		}
 	}
 	return h.replace("compose.override.yaml", "compose.override.", b.String())
+}
+
+// RestoreOverride puts back the override o was read from, byte for byte,
+// or removes the file when there was none.
+func (h *Host) RestoreOverride(o *Override) error {
+	if o.exists {
+		return h.replace("compose.override.yaml", "compose.override.", o.raw)
+	}
+	if err := os.Remove(filepath.Join(h.Dir, "compose.override.yaml")); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // Plane is how the host reaches the proxy's data plane: on loopback at Port,
@@ -266,26 +287,38 @@ func (h *Host) TLSNames() (name, ca string, err error) {
 	return name, ca, nil
 }
 
-// replace writes content to file in the clone through a temporary file of
-// prefix beside it (mode 0600), moved over it; the temporary file is removed
-// on every failure.
+// replace writes content to file, a path in the clone, through a temporary
+// file of prefix beside it (mode 0600), moved over it; the temporary file is
+// removed on every failure.
 func (h *Host) replace(file, prefix, content string) error {
-	tmp, err := os.CreateTemp(h.Dir, prefix)
+	tmp, err := h.temporary(file, prefix, content)
 	if err != nil {
-		return fmt.Errorf("no temporary file beside %s: %w", file, err)
+		return err
+	}
+	if err := os.Rename(tmp, filepath.Join(h.Dir, file)); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("%s was not written: %w", file, err)
+	}
+	return nil
+}
+
+// temporary writes content to a new temporary file of prefix beside file, a
+// path in the clone, mode 0600, and returns its path; on a failure it
+// leaves none.
+func (h *Host) temporary(file, prefix, content string) (string, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(filepath.Join(h.Dir, file)), prefix)
+	if err != nil {
+		return "", fmt.Errorf("no temporary file beside %s: %w", file, err)
 	}
 	_, err = tmp.WriteString(content)
 	if cerr := tmp.Close(); err == nil {
 		err = cerr
 	}
-	if err == nil {
-		err = os.Rename(tmp.Name(), filepath.Join(h.Dir, file))
-	}
 	if err != nil {
 		_ = os.Remove(tmp.Name())
-		return fmt.Errorf("%s was not written: %w", file, err)
+		return "", fmt.Errorf("%s was not written: %w", file, err)
 	}
-	return nil
+	return tmp.Name(), nil
 }
 
 // envLines splits .env as bash's `while IFS= read -r line || [[ -n $line ]]`

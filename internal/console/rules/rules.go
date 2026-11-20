@@ -65,7 +65,7 @@ func Plain(code, name, message string) string {
 // target's reasoning levels and prices, which no task sets (design section 3).
 func Command(code, resource string) string {
 	id, ok := strings.CutPrefix(resource, "targets/")
-	id = shellWord(id)
+	id = ShellWord(id)
 	switch {
 	case !ok:
 		return ""
@@ -77,9 +77,10 @@ func Command(code, resource string) string {
 	return ""
 }
 
-// shellWord is s as it is when a shell reads it so, else single-quoted: a
-// target's id comes from a provider's model list and may hold ; $ or a quote.
-func shellWord(s string) string {
+// ShellWord is s as it is when a shell reads it so, else single-quoted: a
+// target's id comes from a provider's model list and may hold ; $ or a
+// quote, a file name a space.
+func ShellWord(s string) string {
 	if regexp.MustCompile(`^[A-Za-z0-9._:/@+=-]+$`).MatchString(s) {
 		return s
 	}

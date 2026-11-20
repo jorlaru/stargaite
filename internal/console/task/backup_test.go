@@ -93,7 +93,7 @@ func restoreClone(t *testing.T, psa, stop, run, up string) *machineWorld {
 	m := &machineWorld{t: t, h: host.New(t.TempDir()), log: filepath.Join(bin, "log")}
 	writeFile(t, filepath.Join(bin, "docker"), "#!/bin/sh\necho \"$*\" >>'"+m.log+"'\ncase \"$*\" in\n"+
 		"'compose ps -a -q') "+psa+" ;;\n'compose ps -q') echo c0ffee ;;\n'compose stop') "+stop+" ;;\n"+
-		"'compose run --rm --no-deps -T stargaite restore --yes -')\n"+run+"\n;;\n'compose up -d --no-build') "+up+" ;;\n"+
+		"'compose run --rm --no-deps -T stargaite restore --yes --json -')\n"+run+"\n;;\n'compose up -d --no-build') "+up+" ;;\n"+
 		"'compose logs --tail 30 stargaite') ;;\n*) exit 9 ;;\nesac\n", 0o755)
 	t.Setenv("PATH", bin)
 	copyAt := filepath.Join(m.h.Dir, "backups", "a.db")
@@ -111,7 +111,12 @@ func restoreClone(t *testing.T, psa, stop, run, up string) *machineWorld {
 // each saying so.
 const (
 	stops   = "echo 'Container stopping'"
-	putBack = "/bin/cat >/dev/null; echo 'restored'"
+	putBack = "/bin/cat >/dev/null; echo 'restored' >&2; echo '" + `{"path":"-","bytes":25,"data_dir":"/data","replaced":["stargaite.db"]}` + "'"
+	// putIntoEmpty is putBack into a volume that held no store.
+	putIntoEmpty = "/bin/cat >/dev/null; echo '" + `{"path":"-","bytes":25,"data_dir":"/data","replaced":[]}` + "'"
+	// replacedB8 and emptyB8 end B8's two results.
+	replacedB8 = ": 25 bytes; the store it replaced is kept in the volume under replaced/ until the next restore."
+	emptyB8    = ": 25 bytes; the volume held no store."
 )
 
 func (m *machineWorld) restore(u *ui.UI) (string, error) {
@@ -132,7 +137,7 @@ func (m *machineWorld) changes() string {
 }
 
 func TestRestoreFlags(t *testing.T) {
-	const all = "compose stop\ncompose run --rm --no-deps -T stargaite restore --yes -\ncompose up -d --no-build"
+	const all = "compose stop\ncompose run --rm --no-deps -T stargaite restore --yes --json -\ncompose up -d --no-build"
 	given := map[string]string{"what": "restore", "from": "backups/a.db", "yes": "yes"}
 	notPut := "the copy was not put back (restore exits 1): its words above say whether anything moved"
 	var usage *ui.UsageError
@@ -142,7 +147,8 @@ func TestRestoreFlags(t *testing.T) {
 		res, err, prefix   string // prefix: the error starts with it and ends with startsIt
 		changes            string
 	}{
-		{"restored", psRuns, putBack, upPause, given, "Done: the store is the copy backups/a.db, taken " + copyTaken + ".", "", "", all},
+		{"restored", psRuns, putBack, upPause, given, "Done: the store is the copy backups/a.db, taken " + copyTaken + replacedB8, "", "", all},
+		{"into an empty volume", psRuns, putIntoEmpty, upPause, given, "Done: the store is the copy backups/a.db, taken " + copyTaken + emptyB8, "", "", all},
 		{"without --yes", psRuns, putBack, upPause, map[string]string{"what": "restore", "from": "backups/a.db"}, "", "missing --yes: " + restoreText, "", ""},
 		{"not a copy", psRuns, putBack, upPause, map[string]string{"what": "restore", "from": "nope.db", "yes": "yes"}, "",
 			"nope.db is not a file with a copy in it; nothing was changed", "", ""},
@@ -206,8 +212,23 @@ func TestRestored(t *testing.T) {
 		{nil, may + "; the container is started again"},
 		{up, may + ", and the container did not start: exit 1" + startsIt},
 	} {
-		if res, err := restored("backups/a.db", copyTaken, 0, put, row.upErr); res != "" || err == nil || err.Error() != row.want {
+		if res, err := restored("backups/a.db", copyTaken, 0, host.Restored{}, put, row.upErr); res != "" || err == nil || err.Error() != row.want {
 			t.Errorf("start %v: %q, %v; want %q", row.upErr, res, err, row.want)
+		}
+	}
+	// Put back and started: B8's words when restore's answer was decoded,
+	// B7's line when it was not.
+	done := "Done: the store is the copy backups/a.db, taken " + copyTaken
+	for _, row := range []struct {
+		r    host.Restored
+		want string
+	}{
+		{host.Restored{Bytes: 25, Replaced: []string{"stargaite.db"}, Decoded: true}, done + replacedB8},
+		{host.Restored{Bytes: 25, Decoded: true}, done + emptyB8},
+		{host.Restored{}, done + "."},
+	} {
+		if res, err := restored("backups/a.db", copyTaken, 0, row.r, nil, nil); res != row.want || err != nil {
+			t.Errorf("%+v: %q, %v; want %q", row.r, res, err, row.want)
 		}
 	}
 }
@@ -263,21 +284,22 @@ func TestRestoreEscDuringPutBack(t *testing.T) {
 	if err != nil || res != "Done: the store is the copy backups/a.db, taken "+copyTaken+"." || time.Since(start) < time.Second {
 		t.Fatalf("%q, %v after %v\n%s", res, err, time.Since(start), s.output())
 	}
-	if readFile(sig) != "" || !strings.HasSuffix(m.changes(), "compose run --rm --no-deps -T stargaite restore --yes -\ncompose up -d --no-build") {
+	if readFile(sig) != "" || !strings.HasSuffix(m.changes(), "compose run --rm --no-deps -T stargaite restore --yes --json -\ncompose up -d --no-build") {
 		t.Errorf("sig %q, docker log %q", readFile(sig), m.changes())
 	}
 }
 
-// quitFront is scripted, but answers Ctrl-C to the put-back's work, and
+// quitFront is scripted, but answers Ctrl-C to the work piece id, and
 // from then on its Show blocks until its context ends, as the guided front
 // does once its program has quit.
 type quitFront struct {
 	*scripted
+	id   string
 	quit atomic.Bool
 }
 
 func (f *quitFront) Ask(ctx context.Context, q ui.Question) (string, error) {
-	if q.Kind == ui.KindWork && q.ID == "put" {
+	if q.Kind == ui.KindWork && q.ID == f.id {
 		f.quit.Store(true)
 		return "", ui.ErrQuit
 	}
@@ -298,7 +320,7 @@ func (f *quitFront) Show(ctx context.Context, text string) error {
 func TestRestoreQuitDuringPutBack(t *testing.T) {
 	sig := filepath.Join(t.TempDir(), "sig")
 	m := restoreClone(t, psRuns, stops, slowPutBack(sig), upPause)
-	f := &quitFront{scripted: &scripted{answers: map[string][]string{"what": {"restore"}, "from": {"backups/a.db"}, "yes": {"yes"}}}}
+	f := &quitFront{scripted: &scripted{answers: map[string][]string{"what": {"restore"}, "from": {"backups/a.db"}, "yes": {"yes"}}}, id: "put"}
 	done := make(chan error, 1)
 	go func() { _, err := m.restore(ui.New(f, nil)); done <- err }()
 	select {
@@ -309,7 +331,7 @@ func TestRestoreQuitDuringPutBack(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the task did not return within 5 s of the quit")
 	}
-	if readFile(sig) != "" || !strings.HasSuffix(m.changes(), "compose run --rm --no-deps -T stargaite restore --yes -\ncompose up -d --no-build") ||
+	if readFile(sig) != "" || !strings.HasSuffix(m.changes(), "compose run --rm --no-deps -T stargaite restore --yes --json -\ncompose up -d --no-build") ||
 		!inOrder(f.output(), restoring, startHint, "Container stopping") {
 		t.Errorf("sig %q, docker log %q\n%s", readFile(sig), m.changes(), f.output())
 	}

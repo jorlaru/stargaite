@@ -26,8 +26,8 @@ type home struct {
 // its summary said; then the picked task runs, a suggestion's with its
 // presets, and how it ended is said. On its first round, when no container,
 // provider, alias or key exists, the first run runs in place of the pick. It
-// returns ui.ErrQuit on Ctrl-C, ErrEnd once a task ended the session, its
-// result said, or the error that ended it.
+// returns ui.ErrQuit on Ctrl-C, ErrReexec or an ErrEnd once a task ended
+// the session, its result said, or the error that ended it.
 func Home(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host, bound time.Duration) error {
 	menu := Menu()
 	for round := 0; ; round++ {
@@ -59,13 +59,13 @@ func Home(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host, bound ti
 			return err
 		case ctx.Err() != nil:
 			return ctx.Err()
-		case errors.Is(err, ErrEnd):
+		case errors.Is(err, ErrEnd) || errors.Is(err, ErrReexec):
 			if res != "" {
 				if err := u.Say(ctx, res); err != nil {
 					return err
 				}
 			}
-			return ErrEnd
+			return err
 		}
 		if line := taskLine(label, res, err); line != "" {
 			if err := u.Say(ctx, line); err != nil {
@@ -111,7 +111,10 @@ func readHome(ctx context.Context, px *proxy.Proxy, h *host.Host) home {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			err = errors.New("no answer in time")
 		}
-		return home{summary: p.BaseURL + ": ready · clone " + clone + " · the proxy was not read: " + err.Error()}
+		// A proxy this console cannot decode: Rebuild mends it, when the
+		// version was read.
+		return home{summary: p.BaseURL + ": ready · clone " + clone + " · the proxy was not read: " + err.Error(),
+			suggested: rules.Upgrades(rules.Facts{Running: version.Version, Clone: clone})}
 	}
 	summary := fmt.Sprintf("%s: ready · proxy %s · clone %s · %d provider(s), %d alias(es), %d key(s)",
 		p.BaseURL, version.Version, clone, len(export.Providers), len(export.Models), len(export.Keys))
@@ -119,6 +122,8 @@ func readHome(ctx context.Context, px *proxy.Proxy, h *host.Host) home {
 		summary += " · spend not capped"
 	}
 	f := facts(export, validate)
+	f.Running, f.Clone = version.Version, clone
+	f.Upstream, f.Ahead, _ = h.Ahead(ctx)
 	return home{summary: summary, suggested: rules.Suggest(f), first: f.Providers == 0 || len(f.Aliases) == 0 || f.Keys == 0}
 }
 

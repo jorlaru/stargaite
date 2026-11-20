@@ -56,12 +56,11 @@ func CheckEverything(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Hos
 		}
 	}
 	if commands {
-		env, err := h.AdminEnv()
+		cli, err := cliFromClone(h)
 		if err != nil {
 			return "", err
 		}
-		say(ctx, u, "stargaite above is the proxy's command, run from this clone as docker compose exec -T "+
-			strings.Join(append(env, ""), " ")+"stargaite /stargaite; a target it changes must be checked again, which is paid")
+		say(ctx, u, "stargaite above is the proxy's command, run from this clone as "+cli+"; a target it changes must be checked again, which is paid")
 	}
 	if len(fixes) == 0 {
 		return fmt.Sprintf("%d finding(s), none with a task here: the lines above say what fixes each.", len(findings)), nil

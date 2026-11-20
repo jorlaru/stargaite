@@ -435,7 +435,7 @@ func TestCallEmptyTelemetry(t *testing.T) {
 
 func TestCallMissingKey(t *testing.T) {
 	err := New(canned(`{"provider":[]}`, 0, nil)).Call(context.Background(), &ProvidersReply{}, "providers list", nil)
-	want := `stargaite providers list: the answer has no "providers": this console and the running proxy are different versions; rebuild the proxy from this clone`
+	want := `stargaite providers list: the answer has no "providers": this console and the running proxy are different versions; Rebuild to this clone's version (./setup.sh upgrade --rebuild) mends it`
 	if err == nil || err.Error() != want {
 		t.Fatalf("err = %v, want %q", err, want)
 	}
@@ -461,7 +461,7 @@ func TestCallNeverQuotesOutput(t *testing.T) {
 }
 
 func TestCallExitZeroNotJSON(t *testing.T) {
-	want := "stargaite providers list: the answer was not understood: this console and the running proxy are different versions; rebuild the proxy from this clone"
+	want := "stargaite providers list: the answer was not understood: this console and the running proxy are different versions; Rebuild to this clone's version (./setup.sh upgrade --rebuild) mends it"
 	for _, out := range []string{"sk-hand-edited-secret not json\n", `{"providers":"sk-x"}`} {
 		err := New(canned(out, 0, nil)).Call(context.Background(), &ProvidersReply{}, "providers list", nil)
 		if err == nil || err.Error() != want || strings.Contains(err.Error(), "sk-") {
@@ -629,7 +629,7 @@ func TestVerifyOtherOutcomes(t *testing.T) {
 	}{
 		{`{"error":{"message":"target \"acme/m1\" does not exist"}}`, 1, `stargaite targets verify: target "acme/m1" does not exist`},
 		{"usage: sk-hand-edited-secret\n", 2, "stargaite targets verify: failed with exit 2"},
-		{`{"ok":true}`, 0, `stargaite targets verify: the answer has no "target": this console and the running proxy are different versions; rebuild the proxy from this clone`},
+		{`{"ok":true}`, 0, `stargaite targets verify: the answer has no "target": this console and the running proxy are different versions; Rebuild to this clone's version (./setup.sh upgrade --rebuild) mends it`},
 	} {
 		var seen [][]string
 		var stdins []bool
@@ -1098,6 +1098,27 @@ func TestValidate(t *testing.T) {
 	}
 }
 
+// TestValidateExit: validate's exit, whatever its answer; an error only
+// when the CLI did not run.
+func TestValidateExit(t *testing.T) {
+	for _, tc := range []struct {
+		out  string
+		code int
+	}{{`{"findings":[]}`, 0}, {`{"problems":[]}`, 0}, {"not json", 1}, {"", 2}} {
+		var seen [][]string
+		got, err := New(canned(tc.out, tc.code, &seen)).ValidateExit(context.Background())
+		if err != nil || got != tc.code || len(seen) != 1 || !slices.Equal(seen[0], []string{"validate", "--json"}) {
+			t.Errorf("%q exit %d: %d, %v, argv %q", tc.out, tc.code, got, err, seen)
+		}
+	}
+	failed := New(func(context.Context, []string, io.Reader, io.Writer, io.Writer) (int, error) {
+		return 0, errors.New("no docker")
+	})
+	if _, err := failed.ValidateExit(context.Background()); err == nil || err.Error() != "stargaite validate: no docker" {
+		t.Errorf("not run: %v", err)
+	}
+}
+
 // TestBackup: backup - writes the copy to w and its summary to standard
 // error; a failure is its bare reason.
 func TestBackup(t *testing.T) {
@@ -1155,5 +1176,17 @@ func TestBackup(t *testing.T) {
 	start := time.Now()
 	if _, err := p.Backup(context.Background(), io.Discard); !errors.Is(err, context.DeadlineExceeded) || time.Since(start) > 5*time.Second {
 		t.Errorf("bound: %v after %v", err, time.Since(start))
+	}
+}
+
+func TestHelp(t *testing.T) {
+	var seen [][]string
+	text := "usage: stargaite <command>\n  backup file\n  restore file\n"
+	got, err := New(canned(text, 0, &seen)).Help(context.Background())
+	if err != nil || got != text || len(seen) != 1 || !slices.Equal(seen[0], []string{"--help"}) {
+		t.Fatalf("got %q, err %v, argv %q", got, err, seen)
+	}
+	if _, err := New(canned("", 2, nil)).Help(context.Background()); err == nil {
+		t.Fatal("a failing --help is no error")
 	}
 }

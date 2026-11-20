@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -281,6 +282,8 @@ func TestHomeQuestion(t *testing.T) {
 		"Spend and traces|See usage and cost|See usage and cost",
 		"Spend and traces|Send traces|Send traces",
 		"This machine|See what exists|See what exists",
+		"This machine|Open to the network|Open to the network",
+		"This machine|Upgrade|Upgrade",
 		"This machine|Back up or restore|Back up or restore",
 		"This machine|See logs|See logs",
 		"This machine|Stop or start|Stop or start",
@@ -290,7 +293,7 @@ func TestHomeQuestion(t *testing.T) {
 	if q.ID != "home" || q.Prompt != "What do you want to do?" || !slices.Equal(got, want) {
 		t.Fatalf("%s %q: %q", q.ID, q.Prompt, got)
 	}
-	if q := homeQuestion(home{}, Menu()); len(q.Options) != 15 || q.Options[0].Group != "Providers" {
+	if q := homeQuestion(home{}, Menu()); len(q.Options) != 17 || q.Options[0].Group != "Providers" {
 		t.Fatalf("without suggestions: %+v", q.Options)
 	}
 	if slices.ContainsFunc(q.Options, func(o ui.Option) bool { return o.Value == "First run" || o.Label == "First run" }) {
@@ -549,5 +552,58 @@ func TestHomeNoFirstRunLater(t *testing.T) {
 	if len(s.questions) != 1 || s.questions[0].ID != "home" ||
 		!slices.ContainsFunc(s.questions[0].Options, func(o ui.Option) bool { return o.Label == "Replace the key of acme: NOPE_KEY does not resolve" }) {
 		t.Fatalf("asked %+v", s.questions)
+	}
+}
+
+// setUp is an export with a provider, an alias and a key: the home opens
+// no first run.
+const setUp = `{"version":1,"providers":{"p":{}},"models":{"main":{"targets":["p/m"]}},"keys":{"k":{}}}`
+
+// TestHomeReexec: a task that restarts the console, or ends the session
+// with an error, ends the home with it, its result said first.
+func TestHomeReexec(t *testing.T) {
+	w := upgradeWorld(t, 1)
+	w.export = setUp
+	s := &scripted{answers: map[string][]string{"home": {"Upgrade"}, "yes": {"yes"}}}
+	err := Home(context.Background(), ui.New(s, nil), w.proxy(), w.h, 15*time.Second)
+	if !errors.Is(err, ErrReexec) || !strings.Contains(s.output(), "\nupgraded: ") {
+		t.Fatalf("err %v\n%s", err, s.output())
+	}
+	w = upgradeWorld(t, 1)
+	w.export = setUp
+	t.Setenv("EXPORT_DO", "exit 1")
+	s = &scripted{answers: map[string][]string{"home": {"Upgrade"}, "yes": {"yes"}}}
+	err = Home(context.Background(), ui.New(s, nil), w.proxy(), w.h, 15*time.Second)
+	if !errors.Is(err, ErrEnd) || err == ErrEnd || !strings.HasPrefix(err.Error(), "the new version runs, but the new console was not exported") {
+		t.Fatalf("export fails: err %v\n%s", err, s.output())
+	}
+}
+
+// TestHomeUpgradeRows: the home suggests Rebuild when the proxy runs
+// another version than the clone's, and Upgrade when the clone's upstream,
+// as last fetched, has new commits; it fetches nothing. A proxy whose
+// answers this console cannot decode is mended by Rebuild alone.
+func TestHomeUpgradeRows(t *testing.T) {
+	rebuild := rules.Suggestion{Label: "Rebuild to this clone's version", Task: "Upgrade", Presets: map[string]string{"rebuild": "yes"}}
+	upgrade := rules.Suggestion{Label: "Upgrade: 1 new commit(s) on origin/main", Task: "Upgrade"}
+	w := upgradeWorld(t, 1)
+	writeFile(t, filepath.Join(w.bin, "running"), "v-old\n", 0o644)
+	w.git(w.h.Dir, "fetch", "-q")
+	hm := readHome(context.Background(), w.proxy(), w.h)
+	got := hm.suggested
+	if len(got) < 2 || !reflect.DeepEqual(got[len(got)-2:], []rules.Suggestion{rebuild, upgrade}) {
+		t.Fatalf("suggested %+v", got)
+	}
+	gitCalls := strings.Join(slices.DeleteFunc(w.entries(), func(l string) bool { return !strings.HasPrefix(l, "git ") }), "\n")
+	if !strings.Contains(gitCalls, "git rev-parse --abbrev-ref @{upstream}") || !strings.Contains(gitCalls, "git rev-list --count HEAD..@{upstream}") ||
+		strings.Contains(gitCalls, "fetch") {
+		t.Fatalf("git calls:\n%s", gitCalls)
+	}
+	w.export = `{"providers":{}}`
+	hm = readHome(context.Background(), w.proxy(), w.h)
+	if !strings.Contains(hm.summary, "the proxy was not read: ") ||
+		!strings.HasSuffix(hm.summary, "this console and the running proxy are different versions; Rebuild to this clone's version (./setup.sh upgrade --rebuild) mends it") ||
+		!reflect.DeepEqual(hm.suggested, []rules.Suggestion{rebuild}) {
+		t.Fatalf("summary %q, suggested %+v", hm.summary, hm.suggested)
 	}
 }

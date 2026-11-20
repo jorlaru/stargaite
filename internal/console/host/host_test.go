@@ -936,3 +936,64 @@ func TestRemoveConsole(t *testing.T) {
 		t.Fatalf("absent: %v", err)
 	}
 }
+
+func TestKeepImage(t *testing.T) {
+	logs := t.TempDir()
+	log := filepath.Join(logs, "argv")
+	fakes(t, map[string]string{"docker": `echo "$*" >> ` + log + "\n" +
+		"case \"$1\" in compose) echo c0ffee;; inspect) echo \"sha256:0123abcd $FAKE_IMAGE\";; esac\n"})
+	t.Setenv("FAKE_IMAGE", "stargaite:local")
+	h := New(t.TempDir())
+	image, err := h.KeepImage(context.Background())
+	want := "compose ps -q stargaite\ninspect --format {{.Image}} {{.Config.Image}} c0ffee\ntag sha256:0123abcd stargaite:local-previous\n"
+	if image != "stargaite:local" || err != nil || read(t, log) != want {
+		t.Fatalf("image %q, err %v, argv %q", image, err, read(t, log))
+	}
+	_ = os.Remove(log)
+	t.Setenv("FAKE_IMAGE", "-x")
+	if _, err := h.KeepImage(context.Background()); err == nil || err.Error() != "the running image was not kept; nothing was changed" ||
+		strings.Contains(read(t, log), "tag") {
+		t.Fatalf("an image that reads as a flag: %v, argv %q", err, read(t, log))
+	}
+}
+
+func TestComposeBuild(t *testing.T) {
+	logs := t.TempDir()
+	log := filepath.Join(logs, "argv")
+	fakes(t, map[string]string{"docker": `echo "$* STARGAITE_VERSION=$STARGAITE_VERSION" >> ` + log + "\n" +
+		"[ -z \"$FAKE_FAIL\" ] && exit 0\ni=1; while [ $i -le 40 ]; do echo line $i; i=$((i+1)); done; exit 1\n"})
+	h := New(t.TempDir())
+	var said []string
+	say := func(l string) { said = append(said, l) }
+	if err := h.ComposeBuild(context.Background(), say, "v9"); err != nil || len(said) != 0 || read(t, log) != "compose build STARGAITE_VERSION=v9\n" {
+		t.Fatalf("err %v, said %q, argv %q", err, said, read(t, log))
+	}
+	t.Setenv("FAKE_FAIL", "1")
+	err := h.ComposeBuild(context.Background(), say, "v9")
+	want := []string{"the build's last lines:"}
+	for i := 11; i <= 40; i++ {
+		want = append(want, "line "+strconv.Itoa(i))
+	}
+	if err == nil || err.Error() != "docker compose build failed or was interrupted" || !slices.Equal(said, want) {
+		t.Fatalf("err %v, said %q", err, said)
+	}
+}
+
+func TestExportConsole(t *testing.T) {
+	logs := t.TempDir()
+	log := filepath.Join(logs, "argv")
+	fakes(t, map[string]string{"docker": `echo "$* VERSION=$VERSION DOCKER_BUILDKIT=$DOCKER_BUILDKIT" >> ` + log + "\n" +
+		"[ -z \"$FAKE_SLOW\" ] || exec /bin/sleep 60\n"})
+	h := New(t.TempDir())
+	if err := h.ExportConsole(context.Background(), func(string) {}, "v9"); err != nil ||
+		read(t, log) != "build --quiet --build-arg VERSION --target console --output type=local,dest=bin . VERSION=v9 DOCKER_BUILDKIT=1\n" {
+		t.Fatalf("err %v, argv %q", err, read(t, log))
+	}
+	t.Setenv("FAKE_SLOW", "1")
+	h.ShortenWaits(100 * time.Millisecond)
+	start := time.Now()
+	err := h.ExportConsole(context.Background(), func(string) {}, "v9")
+	if err == nil || err.Error() != "docker build of the console was not done within 20 minutes" || time.Since(start) > 12*time.Second {
+		t.Fatalf("err %v after %v", err, time.Since(start))
+	}
+}

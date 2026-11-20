@@ -288,6 +288,16 @@ func TestPlainNames(t *testing.T) {
 
 // TestCommand: the stargaite command that fixes a finding, with the target's
 // id; "" for a finding no command fixes.
+func TestShellWord(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"p/m", "p/m"}, {"p/A-z_0.9:@+=", "p/A-z_0.9:@+="}, {"p/a;b'c$(x)", `'p/a;b'\''c$(x)'`}, {"a b", "'a b'"},
+	} {
+		if got := ShellWord(tc.in); got != tc.want {
+			t.Errorf("ShellWord(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
 func TestCommand(t *testing.T) {
 	pricing := "targets set p/m --pricing input_per_million=<usd>,output_per_million=<usd>,as_of=<YYYY-MM-DD>"
 	for _, tc := range []struct{ code, resource, want string }{

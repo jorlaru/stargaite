@@ -36,7 +36,7 @@ const (
 	// closed, before its command is cancelled.
 	stopGrace = 10 * time.Second
 	// stale ends every error that says the answer was not understood.
-	stale = "this console and the running proxy are different versions; rebuild the proxy from this clone"
+	stale = "this console and the running proxy are different versions; Rebuild to this clone's version (./setup.sh upgrade --rebuild) mends it"
 )
 
 // Runner runs the CLI with args and returns its exit code. A nil stdin is
@@ -299,6 +299,20 @@ func (p *Proxy) TelemetryTest(ctx context.Context) (*TelemetryTestReply, error) 
 	return &reply, nil
 }
 
+// Help is the CLI's --help, its standard output whole, bounded as Call.
+func (p *Proxy) Help(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, cliBound)
+	defer cancel()
+	out, code, err := p.exec(ctx, []string{"--help"}, nil)
+	switch {
+	case err != nil:
+		return "", fmt.Errorf("stargaite --help: %w", err)
+	case code != 0:
+		return "", fmt.Errorf("stargaite --help: failed with exit %d", code)
+	}
+	return string(out), nil
+}
+
 // Validate runs validate, which exits 1 when a finding is an error and
 // still reports every finding: an answer of exit 0 or 1 that decodes is the
 // findings.
@@ -313,6 +327,17 @@ func (p *Proxy) Validate(ctx context.Context) ([]Finding, error) {
 		return nil, err
 	}
 	return reply.Findings, nil
+}
+
+// ValidateExit is validate's exit code, its answer unread, as setup.sh's
+// upgrade compared it, so an answer this console cannot decode still gives
+// a verdict; the error is only that the CLI did not run.
+func (p *Proxy) ValidateExit(ctx context.Context) (int, error) {
+	_, code, err := p.call(ctx, "validate", nil, nil)
+	if err != nil {
+		return 0, fmt.Errorf("stargaite validate: %w", err)
+	}
+	return code, nil
 }
 
 // Backup copies the store to w through "backup - --json" (phase 6's argv:

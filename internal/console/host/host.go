@@ -29,9 +29,13 @@ const (
 
 // Host is the clone. Every command runs with its directory as the working
 // directory. Its bounds are fields that tests shorten, never the constants.
+// UID is the user the console runs as: every root decision reads it.
 type Host struct {
 	Dir         string
+	UID         int
 	bound       time.Duration // localBound
+	fetchBound  time.Duration // fetchBound
+	mergeBound  time.Duration // mergeBound
 	upBound     time.Duration // upBound
 	stopBound   time.Duration // stopBound
 	followBound time.Duration // followBound
@@ -45,7 +49,8 @@ type Host struct {
 
 // New returns the clone at dir.
 func New(dir string) *Host {
-	h := &Host{Dir: dir, bound: localBound, upBound: upBound, stopBound: stopBound, followBound: followBound, httpBound: httpBound}
+	h := &Host{Dir: dir, UID: os.Getuid(), bound: localBound, fetchBound: fetchBound, mergeBound: mergeBound, upBound: upBound,
+		stopBound: stopBound, followBound: followBound, httpBound: httpBound}
 	h.ready.tries, h.ready.pause, h.ready.try, h.ready.bound = 120, time.Second, 2*time.Second, 120*time.Second
 	h.readyCheck = h.Ready
 	return h
@@ -55,10 +60,18 @@ func New(dir string) *Host {
 // tests use it, since the bounds are fields no other package sets.
 func (h *Host) ShortenFollow(d time.Duration) { h.followBound = d }
 
+// ShortenWaits sets the long waits to d, the start, the merge and
+// readiness, and readiness to three tries a millisecond apart, for the
+// tasks' tests.
+func (h *Host) ShortenWaits(d time.Duration) {
+	h.upBound, h.mergeBound = d, d
+	h.ready.tries, h.ready.pause, h.ready.bound = 3, time.Millisecond, d
+}
+
 // Find returns the clone the console was exported into: the parent of the
-// executable's directory, bin/, which must hold compose.yaml. It applies the
-// root rule for uid, then changes to the clone, so a Host from Find has
-// passed both.
+// executable's directory, bin/, which must hold compose.yaml, run by uid. It
+// applies the root rule for uid, then changes to the clone, so a Host from
+// Find has passed both.
 func Find(executable string, uid int) (*Host, error) {
 	exe, err := filepath.EvalSymlinks(executable)
 	if err != nil {
@@ -69,6 +82,7 @@ func Find(executable string, uid int) (*Host, error) {
 		return nil, fmt.Errorf("compose.yaml is not in %s, the parent of bin/: run ./setup.sh from the clone of stargaite", dir)
 	}
 	h := New(dir)
+	h.UID = uid
 	if err := h.RootRule(uid); err != nil {
 		return nil, err
 	}

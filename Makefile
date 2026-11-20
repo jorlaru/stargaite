@@ -59,8 +59,7 @@ check:
 	done
 	go test -race ./...
 
-# shellcheck lints setup.sh; jq is the one setup.sh needs, which the tests of
-# tests/setup find here.
+# shellcheck lints setup.sh; jq is for the tests of tests/setup and make setup-test.
 tools: $(BIN)/golangci-lint $(BIN)/govulncheck $(BIN)/shellcheck $(BIN)/jq
 
 # Outside make ci, which replays the committed seeds: every Fuzz target of the

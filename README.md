@@ -90,7 +90,6 @@ The `stargaite` binary is both the server (`stargaite serve`) and its CLI, which
 container, and goes from a provider to a client key and a first answer. You need:
 
 - Docker Engine with Docker Compose 2.24.4 or later and Docker's buildx component, which your user may run;
-- `curl` and `jq`;
 - `git`, to clone this repository and, later, to upgrade;
 - bash 4.4 or later, which every current Linux distribution has. macOS and native Windows are not supported yet; WSL
   is Linux.
@@ -98,22 +97,21 @@ container, and goes from a provider to a client key and a first answer. You need
 On Debian and Ubuntu:
 
 ```sh
-sudo apt-get update && sudo apt-get install -y ca-certificates curl git jq
+sudo apt-get update && sudo apt-get install -y ca-certificates curl git
 curl -fsSL https://get.docker.com -o get-docker.sh && sudo sh get-docker.sh
 sudo usermod -aG docker "$USER"
 ```
 
 As root, where `sudo` may not be installed, leave out `sudo` and the third line. The second line runs Docker's own
-script, which adds Docker's package repository and installs Docker Engine and Compose; read it first if you like, and
+script, fetched with `curl`, which adds Docker's package repository and installs Docker Engine and Compose; read it first if you like, and
 for a production machine follow Docker's step-by-step instructions for
 [Debian](https://docs.docker.com/engine/install/debian/) or [Ubuntu](https://docs.docker.com/engine/install/ubuntu/)
 instead. The distributions' own packages may lack Compose or ship one older than 2.24.4. Docker's packages install
 the buildx component with Compose (`docker-buildx-plugin`); among Debian's own it is `docker-buildx`, which
 `./setup.sh status` needs to build the console. The third line lets your user run Docker once you log in again;
 membership of the `docker` group is equivalent to root. On another distribution,
-install [Docker](https://docs.docker.com/engine/install/), [curl](https://curl.se/download.html),
-[jq](https://jqlang.org/download/) and [git](https://git-scm.com/downloads) from their pages. Then, as the user
-who owns the clone (not with `sudo`):
+install [Docker](https://docs.docker.com/engine/install/) and [git](https://git-scm.com/downloads) from their pages.
+Then, as the user who owns the clone (not with `sudo`):
 
 ```sh
 git clone https://github.com/jorlaru/stargaite.git
@@ -154,13 +152,13 @@ flags:
 | `key` | A client key for one or more aliases, shown once, then one test call through it, announced first |
 | `budget` | The console's Cap spending: a limit on the instance, an alias or a key; the prices of the targets it reaches unpriced are asked first, and a target they leave unverified is checked again, paid, only at a terminal or with `--reverify` |
 | `telemetry` | The console's Send traces: to Langfuse or any OTLP endpoint, replacing what was set whole, then one free test span; `--backend off` turns traces off |
-| `remote` | Publish the data plane beyond loopback, always with TLS: your certificate or a self-signed one ([Install with Docker by hand](#install-with-docker-by-hand), day two) |
+| `remote` | The console's Open to the network: publish the data plane beyond loopback, always with TLS, your certificate or a self-signed one it makes; run again, it renews it ([Install with Docker by hand](#install-with-docker-by-hand), day two) |
 | `status` | What exists: providers and their credentials, aliases with their models in order, models in no alias, keys, budgets, telemetry, and the running and the clone's versions; `--check` first says whether an upgrade is available |
 | `logs` | The container's last log lines; at a terminal it then follows them until Esc |
 | `stop`, `start`, `restart` | The container; stop and restart need `--yes` without a terminal |
 | `backup`, `restore` | A copy of the store into `backups/`; restore puts a copy back (`--from <file>`, `--yes`): keys revoked since come back, spend since is forgotten, and the container is stopped and started again |
 | `uninstall` | The container, its images and the console; the volume, `.env`, the override, `backups/` and `tls/` are kept (`--yes`) |
-| `upgrade` | Fast-forward the clone and rebuild, keeping the previous image and taking a backup first, then print the way back |
+| `upgrade` | The console's Upgrade: fast-forward the clone and rebuild, keeping the previous image and taking a backup first, printing the way back before the new version starts; `--rebuild` rebuilds this clone's version without fetching; at a terminal the console then restarts as the new version |
 
 It asks only when its standard input and output are both a terminal. Every answer is also a flag, so a script, CI or an
 agent runs it without one: an answer with a default takes it, a missing one exits `2` naming its flag, and a change
@@ -307,8 +305,8 @@ names what to fix (for example, a key with a budget needs prices on every target
 **Day two.**
 
 - **Reach it from other machines.** `./setup.sh remote` publishes the data plane on the addresses of this host you
-  give, beside loopback, always with TLS: your certificate and its key, or a self-signed certificate it makes with
-  `openssl` for `localhost`, the host's name and each address, and says how each kind of client trusts it. It mounts
+  give, beside loopback, always with TLS: your certificate and its key, or a self-signed certificate it makes itself
+  for `localhost`, the host's name and each address, and says how each kind of client trusts it. It mounts
   the files from `tls/` and replaces `--behind-tls-proxy` with `--tls-cert` and `--tls-key` in
   `compose.override.yaml`, never in `compose.yaml`; the admin API then speaks TLS too, and it prints the CLI alias
   that reaches it (see [Listeners, TLS and the container](#listeners-tls-and-the-container)). `serve` reads the
@@ -329,8 +327,12 @@ names what to fix (for example, a key with a budget needs prices on every target
   (a failed build leaves the old version running and the store untouched), backs the store up into `backups/` just
   before it starts the new version, checks that version and that `validate` exits as before, and prints the way back:
   the exact `restore` of that backup and `docker tag` of the previous image. Nothing rolls back by itself, since a
-  migration is one-way and an older binary refuses a newer store. `./setup.sh status --check` says whether an upgrade
-  is available. By hand: take a backup, `git pull --ff-only`, then step 2.
+  migration is one-way and an older binary refuses a newer store; the way back is printed before the new version
+  starts, so it is on screen even when the start is interrupted. `./setup.sh upgrade --rebuild` rebuilds the clone's
+  own version the same way, fetching and merging nothing: the console's home offers it when the running proxy is
+  another version. At a terminal the console then exports the new console and restarts as it.
+  `./setup.sh status --check` says whether an upgrade is available. By hand: take a backup, `git pull --ff-only`, then
+  step 2.
 - **Back up.** `(umask 077 && stargaite backup - > backup.db)` writes a checked copy, taken while traffic flows, to a
   private file on the host, and nothing stays in the volume; `docker compose stop`, then
   `docker compose run --rm --no-deps -T stargaite restore --yes - < backup.db` and `docker compose up -d` put it back
@@ -1043,9 +1045,8 @@ in flight may hold a body and an answer of up to those sizes.
 `make ci` runs every check (format, vet, tidy, lint, `shellcheck` on the shell scripts, vulnerability scan, four
 cross-builds, `go test -race ./...`, including `tests/e2e`) with Go 1.27.4 or later and a C compiler, which the race
 detector needs; `make tools` fetches the pinned linters, `shellcheck` and `jq`, each checked against its checksum.
-On Linux, `tests/setup` runs `setup.sh` against stubs of every command it calls, and needs bash 4.4 or later,
-`script(1)` (util-linux), for its runs at a terminal, `openssl`, for the self-signed certificate of `remote`, and
-`git`, for the clones of `upgrade`.
+On Linux, `tests/setup` runs `setup.sh` and the console it starts against stubs of every command they call, and
+needs bash 4.4 or later, `script(1)` (util-linux), for its runs at a terminal, and `git`, for the clones of `upgrade`.
 `make ci-container` runs the same inside the Go image, which has all of them, and `make image-test` builds the image
 and runs it. `make setup-test`, on a Linux host with Docker and outside `make ci` like `make image-test`, runs
 `setup.sh` end to end in a temporary copy of the working tree, under its own Compose project, image name and free

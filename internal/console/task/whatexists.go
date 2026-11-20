@@ -2,21 +2,30 @@ package task
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/jorlaru/stargaite/internal/console/host"
 	"github.com/jorlaru/stargaite/internal/console/proxy"
+	"github.com/jorlaru/stargaite/internal/console/rules"
 	"github.com/jorlaru/stargaite/internal/console/ui"
 )
 
 // SeeWhatExists says what the proxy holds, one line per thing: both
 // versions, the providers and their credentials, the aliases with their
 // targets in order, the targets in no alias, the keys, the budgets and
-// telemetry. It only reads, and stops at the first read that fails, with
-// the lines already said kept.
+// telemetry. It reads, and stops at the first read that fails, with the
+// lines already said kept. With check, it first fetches the clone's
+// upstream and says whether it has an upgrade. At a terminal it then offers
+// to remove a target in no alias.
 func SeeWhatExists(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host) (string, error) {
+	if u.Given(ui.Question{ID: "check", Flag: "check"}) {
+		if err := sayUpgrade(ctx, u, h); err != nil {
+			return "", err
+		}
+	}
 	runs, err := h.ContainerRuns(ctx)
 	if err != nil {
 		return "", err
@@ -34,6 +43,7 @@ func SeeWhatExists(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host)
 		settings  proxy.SettingsReply
 		telemetry proxy.TelemetryReply
 	)
+	var orphans []string
 	reads := []struct {
 		reply proxy.Reply
 		words string
@@ -60,6 +70,7 @@ func SeeWhatExists(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host)
 			var lines []string
 			for _, t := range targets.Targets {
 				if !slices.ContainsFunc(models.Models, func(m proxy.Model) bool { return slices.Contains(m.Targets, t.ID) }) {
+					orphans = append(orphans, t.ID)
 					lines = append(lines, "target "+t.ID+": in no alias")
 				}
 			}
@@ -101,7 +112,51 @@ func SeeWhatExists(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host)
 			}
 		}
 	}
-	return "", nil
+	if len(orphans) == 0 || !u.Asks() {
+		return "", nil
+	}
+	return removeTarget(ctx, u, px, orphans)
+}
+
+// removeTarget offers to remove one of the targets in no alias, confirmed
+// first; none keeps them.
+func removeTarget(ctx context.Context, u *ui.UI, px *proxy.Proxy, ids []string) (string, error) {
+	options := []ui.Option{{Value: "none", Label: "keep them"}}
+	for _, id := range ids {
+		options = append(options, ui.Option{Value: id, Label: "target " + id})
+	}
+	id, err := u.Pick(ctx, ui.Question{ID: "remove", Step: "remove", Prompt: "Remove a target that is in no alias?", Options: options})
+	if err != nil || id == "none" {
+		return "", err
+	}
+	if err := confirm(ctx, u, "remove", "target "+id+" is removed: no alias lists it, and its prices and its check go with it"); err != nil {
+		return "", err
+	}
+	var change proxy.Change
+	refused, err := px.CallRefusable(ctx, &change, "targets remove", []string{"--yes"}, id)
+	if err != nil {
+		return "", err
+	}
+	for _, f := range append(refused, change.Findings...) {
+		say(ctx, u, rules.Plain(f.Code, f.Resource, f.Message))
+	}
+	if len(refused) > 0 {
+		return "", errors.New("the proxy refused to remove target " + id + "; nothing was changed")
+	}
+	return "Done: target " + id + " removed.", nil
+}
+
+// sayUpgrade fetches the clone's upstream and says whether it has commits
+// the clone lacks.
+func sayUpgrade(ctx context.Context, u *ui.UI, h *host.Host) error {
+	upstream, ahead, err := h.Fetch(ctx)
+	if err != nil {
+		return err
+	}
+	if ahead > 0 {
+		return u.Say(ctx, "upgrade: "+strconv.Itoa(ahead)+" new commit(s) on "+upstream+"; ./setup.sh upgrade applies them")
+	}
+	return u.Say(ctx, "upgrade: none, up to date with "+upstream)
 }
 
 // orNone is lines, or the one line none when there are no lines.

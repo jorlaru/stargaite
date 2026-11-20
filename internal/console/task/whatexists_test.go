@@ -6,8 +6,10 @@ import (
 	"io"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -225,6 +227,179 @@ func TestSeeWhatExistsStopsOnError(t *testing.T) {
 	}
 }
 
+// gitClone is a clone of a bare upstream, its branch main tracking
+// origin/main, with ahead commits pushed to the upstream after it, so a
+// fetch finds them. It returns the clone and the real git's directory.
+func gitClone(t *testing.T, ahead int) (clone, gitDir string) {
+	t.Helper()
+	real, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("no git in this image")
+	}
+	root := t.TempDir()
+	up, other := filepath.Join(root, "up.git"), filepath.Join(root, "other")
+	clone = filepath.Join(root, "clone")
+	git := func(dir string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command(real, append([]string{"-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"}, args...)...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	commit := func(n int) {
+		f := "f" + strconv.Itoa(n)
+		if err := os.WriteFile(filepath.Join(other, f), []byte(f+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		git(other, "add", f)
+		git(other, "commit", "-q", "-m", f)
+	}
+	git(root, "init", "-q", "--bare", "-b", "main", up)
+	git(root, "init", "-q", "-b", "main", other)
+	commit(0)
+	git(other, "remote", "add", "origin", up)
+	git(other, "push", "-q", "-u", "origin", "main")
+	git(root, "clone", "-q", up, clone)
+	for i := 1; i <= ahead; i++ {
+		commit(i)
+	}
+	if ahead > 0 {
+		git(other, "push", "-q", "origin", "main")
+	}
+	return clone, filepath.Dir(real)
+}
+
+// TestSeeWhatExistsCheck: with check, the clone's upstream is fetched and
+// the upgrade line said first, before what exists; a fetch refused stops
+// the task before any CLI call.
+func TestSeeWhatExistsCheck(t *testing.T) {
+	for _, tc := range []struct {
+		ahead    int
+		detached bool
+		first    string
+	}{
+		{1, false, "upgrade: 1 new commit(s) on origin/main; ./setup.sh upgrade applies them"},
+		{0, false, "upgrade: none, up to date with origin/main"},
+		{0, true, ""},
+	} {
+		dir, gitDir := gitClone(t, tc.ahead)
+		if tc.detached {
+			cmd := exec.Command(filepath.Join(gitDir, "git"), "checkout", "-q", "--detach", "HEAD")
+			cmd.Dir = dir
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("%v\n%s", err, out)
+			}
+		}
+		bin := t.TempDir()
+		if err := os.WriteFile(filepath.Join(bin, "docker"), []byte("#!/bin/sh\n[ \"$*\" = \"compose ps -q\" ] || exit 9\necho c0ffee\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", bin+":"+gitDir)
+		var out bytes.Buffer
+		var calls []string
+		u := ui.New(plain.New(&out), map[string]string{"check": "yes"})
+		_, err := SeeWhatExists(context.Background(), u, proxy.New(cannedRunner(t, shapes(), &calls)), host.New(dir))
+		lines := strings.Split(out.String(), "\n")
+		if tc.detached {
+			if err == nil || err.Error() != "HEAD is detached, so no branch says what to upgrade to: git switch <branch>, then run this again" ||
+				out.Len() != 0 || len(calls) != 0 {
+				t.Fatalf("detached: err %v, out %q, calls %q", err, out.String(), calls)
+			}
+			continue
+		}
+		if err != nil || len(lines) < 2 || lines[0] != tc.first || !strings.HasPrefix(lines[1], "version: v1.2.3 running, ") || len(calls) != 7 {
+			t.Fatalf("ahead %d: err %v, calls %q, out:\n%s", tc.ahead, err, calls, out.String())
+		}
+	}
+}
+
+// orphans is a canned store with target a in alias m and targets b and c in
+// no alias.
+func orphans() map[string]reply {
+	return map[string]reply{
+		"version --json":          {`{"version":"v1"}`, 0},
+		"providers list --json":   {`{"providers":[]}`, 0},
+		"models list --json":      {`{"models":[{"name":"m","targets":["a"]}]}`, 0},
+		"targets list --json":     {`{"targets":[{"id":"a"},{"id":"b"},{"id":"c"}]}`, 0},
+		"keys list --json":        {`{"keys":[]}`, 0},
+		"settings show --json":    {`{"timeouts":{}}`, 0},
+		"telemetry status --json": {`{"telemetry":null}`, 0},
+	}
+}
+
+// TestSeeWhatExistsRemove: at a terminal, after its lines, See what exists
+// offers to remove a target in no alias (X1), confirmed first.
+func TestSeeWhatExistsRemove(t *testing.T) {
+	const remove = "targets remove --json --yes -- c"
+	run := func(answers map[string][]string, removed reply) (string, *scripted, []string, error) {
+		t.Helper()
+		var calls []string
+		canned := orphans()
+		canned[remove] = removed
+		s := &scripted{answers: answers}
+		u, px, h := ui.New(s, nil), proxy.New(cannedRunner(t, canned, &calls)), clone(t, "c0ffee")
+		res, err := u.Run(context.Background(), Menu()[9].Steps, func(ctx context.Context) (string, error) { return SeeWhatExists(ctx, u, px, h) })
+		var writes []string
+		for _, c := range calls {
+			if !strings.Contains(c, " list ") && !strings.HasPrefix(c, "version ") && !strings.HasPrefix(c, "settings show") &&
+				!strings.HasPrefix(c, "telemetry status") {
+				writes = append(writes, c)
+			}
+		}
+		return res, s, writes, err
+	}
+	done := reply{`{"findings":[]}`, 0}
+
+	res, s, writes, err := run(map[string][]string{"remove": {"none"}}, done)
+	if err != nil || res != "" || len(writes) != 0 {
+		t.Fatalf("none: %q, %v, writes %q\n%s", res, err, writes, s.output())
+	}
+	if !inOrder(s.output(), "target b: in no alias", "target c: in no alias") || len(s.questions) != 1 {
+		t.Errorf("output:\n%s", s.output())
+	}
+	q := s.questions[0]
+	if q.ID != "remove" || q.Step != "remove" || q.Kind != ui.KindPick || q.Prompt != "Remove a target that is in no alias?" ||
+		!slices.Equal(valueLabels(q), []string{"none|keep them", "b|target b", "c|target c"}) {
+		t.Errorf("pick %+v: %q", q, valueLabels(q))
+	}
+
+	res, s, writes, err = run(map[string][]string{"remove": {"c"}, "yes": {"no"}}, done)
+	if err == nil || err.Error() != "stopped; nothing more was changed" || res != "" || len(writes) != 0 {
+		t.Fatalf("no: %q, %v, writes %q", res, err, writes)
+	}
+	if !strings.Contains(s.output(), "target c is removed: no alias lists it, and its prices and its check go with it\n") {
+		t.Errorf("output:\n%s", s.output())
+	}
+
+	res, s, writes, err = run(map[string][]string{"remove": {"c"}, "yes": {"yes"}}, done)
+	if err != nil || res != "Done: target c removed." || !slices.Equal(writes, []string{remove}) {
+		t.Fatalf("yes: %q, %v, writes %q\n%s", res, err, writes, s.output())
+	}
+
+	refused := reply{`{"error":{"code":"invalid_config","message":"refused","findings":[` +
+		`{"severity":"error","code":"x","resource":"targets/c","message":"still wanted"}]}}`, 1}
+	res, s, writes, err = run(map[string][]string{"remove": {"c"}, "yes": {"yes"}}, refused)
+	if err == nil || res != "" || !slices.Equal(writes, []string{remove}) || !strings.HasSuffix(s.output(), "target c: still wanted\n") {
+		t.Fatalf("refused: %q, %v, writes %q\n%s", res, err, writes, s.output())
+	}
+}
+
+// TestSeeWhatExistsFlagsNoRemove: without a terminal (status) See what
+// exists only reads: no pick and no write, targets in no alias or not.
+func TestSeeWhatExistsFlagsNoRemove(t *testing.T) {
+	var calls []string
+	out, err := seeWhatExists(t, clone(t, "c0ffee"), cannedRunner(t, orphans(), &calls))
+	if err != nil || !strings.HasSuffix(out, "target b: in no alias\ntarget c: in no alias\nkeys: none\nspend: not capped\ntelemetry: not set\n") {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if len(calls) != 7 {
+		t.Errorf("calls %q", calls)
+	}
+}
+
 func TestSeeWhatExistsDockerFails(t *testing.T) {
 	bin := t.TempDir()
 	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte("#!/bin/sh\necho sk-secret >&2\nexit 1\n"), 0o755); err != nil {
@@ -240,20 +415,24 @@ func TestSeeWhatExistsDockerFails(t *testing.T) {
 
 func TestMenuFresh(t *testing.T) {
 	m := Menu()
-	if len(m) != 21 {
+	if len(m) != 23 {
 		t.Fatalf("Menu() = %+v", m)
 	}
-	first := m[15]
+	first := m[17]
 	if first.Group != "" || first.Label != "First run" || first.Sub != "install" ||
 		!slices.Equal(first.Flags, []string{"port", "provider", "base-url", "protocol", "api-key-env", "key-env", "model", "alias", "fallback",
 			"max-output-tokens", "effort", "input-price", "output-price", "key-name", "rpm-limit"}) ||
 		!slices.Equal(first.Bools, []string{"replace", "allow-private-network", "yes", "reverify"}) ||
 		!slices.Equal(first.Steps, firstSteps()) || first.Run == nil || first.Preset != nil {
-		t.Fatalf("Menu()[15] = %+v", first)
+		t.Fatalf("Menu()[17] = %+v", first)
 	}
 	// This machine's tasks after See what exists, then, after the first run,
 	// the subcommands that run one of them with a preset answer.
 	machine := []Entry{
+		{Group: "This machine", Label: "Open to the network", Sub: "remote", Flags: []string{"address", "tls", "tls-cert", "tls-key", "tls-name", "tls-ca"},
+			Bools: []string{"yes"}, Steps: remoteSteps()},
+		{Group: "This machine", Label: "Upgrade", Sub: "upgrade", Flags: []string{"legacy-backup"}, Bools: []string{"yes", "rebuild"},
+			Steps: upgradeSteps()},
 		{Group: "This machine", Label: "Back up or restore", Steps: backupSteps()},
 		{Group: "This machine", Label: "See logs", Sub: "logs", Bools: []string{"follow"}, Steps: logSteps()},
 		{Group: "This machine", Label: "Stop or start", Steps: stopSteps()},
@@ -268,7 +447,7 @@ func TestMenuFresh(t *testing.T) {
 	}
 	for i, e := range machine {
 		at := 10 + i
-		if i >= 5 {
+		if i >= 7 {
 			at++ // the first run is between
 		}
 		got := m[at]
@@ -284,16 +463,21 @@ func TestMenuFresh(t *testing.T) {
 		"stop":      {{ID: "action", Title: "what"}, {ID: "machine", Title: "the container"}},
 		"check":     {{ID: "read", Title: "findings"}, {ID: "fix", Title: "fix"}},
 		"uninstall": {{ID: "remove", Title: "uninstall"}},
+		"remote": {{ID: "where", Title: "addresses"}, {ID: "cert", Title: "certificate"}, {ID: "write", Title: "files and override"},
+			{ID: "recreate", Title: "recreate and check"}},
+		"upgrade": {{ID: "check", Title: "check"}, {ID: "changes", Title: "what changes"}, {ID: "keep", Title: "previous image"},
+			{ID: "merge", Title: "fast-forward"}, {ID: "build", Title: "build"}, {ID: "backup", Title: "backup"}, {ID: "start", Title: "start and check"}},
 	} {
 		got := map[string][]ui.Step{"backup": backupSteps(), "logs": logSteps(), "stop": stopSteps(), "check": checkSteps(),
-			"uninstall": uninstallSteps()}[steps]
+			"uninstall": uninstallSteps(), "remote": remoteSteps(),
+			"upgrade": upgradeSteps()}[steps]
 		if !slices.Equal(got, want) {
 			t.Fatalf("%s steps = %+v", steps, got)
 		}
 	}
 	see := m[9]
-	if see.Group != "This machine" || see.Label != "See what exists" || see.Sub != "status" ||
-		len(see.Steps) != 1 || see.Steps[0] != (ui.Step{ID: "show", Title: "what exists"}) || see.Run == nil {
+	if see.Group != "This machine" || see.Label != "See what exists" || see.Sub != "status" || !slices.Equal(see.Bools, []string{"check"}) ||
+		!slices.Equal(see.Steps, []ui.Step{{ID: "show", Title: "what exists"}, {ID: "remove", Title: "remove a target"}}) || see.Run == nil {
 		t.Fatalf("Menu()[9] = %+v", see)
 	}
 	spend := []Entry{

@@ -102,6 +102,14 @@ func TestBackupFile(t *testing.T) {
 			t.Errorf("%s was changed or left", n)
 		}
 	}
+
+	// backups a regular file: its own reason, and no part beside it.
+	h = New(t.TempDir())
+	write(t, filepath.Join(h.Dir, "backups"), "a file")
+	_, err = h.Backup(context.Background(), func(string) {}, "v1", writing("mine", 4, nil))
+	if err == nil || !strings.HasSuffix(err.Error(), "not a directory") || read(t, filepath.Join(h.Dir, "backups")) != "a file" {
+		t.Errorf("backups a file: err %v", err)
+	}
 }
 
 func TestCopies(t *testing.T) {
@@ -171,7 +179,7 @@ func TestCopyAt(t *testing.T) {
 func TestRestore(t *testing.T) {
 	logs := t.TempDir()
 	log, got := filepath.Join(logs, "argv"), filepath.Join(logs, "stdin")
-	fakes(t, map[string]string{"docker": `echo "$*" >> ` + log + "\n/bin/cat > " + got + "\necho 'restored'\n"})
+	fakes(t, map[string]string{"docker": `echo "$*" >> ` + log + "\n/bin/cat > " + got + "\necho 'restored' >&2\n"})
 	h := New(t.TempDir())
 	write(t, filepath.Join(h.Dir, "backups", "a.db"), "SQLite format 3\x00 the copy")
 	c, err := h.CopyAt("backups/a.db")
@@ -179,13 +187,13 @@ func TestRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 	var said []string
-	code, err := h.Restore(context.Background(), func(l string) { said = append(said, l) }, c)
-	if code != 0 || err != nil || read(t, log) != "compose run --rm --no-deps -T stargaite restore --yes -\n" ||
+	code, r, err := h.Restore(context.Background(), func(l string) { said = append(said, l) }, c)
+	if code != 0 || err != nil || r.Decoded || read(t, log) != "compose run --rm --no-deps -T stargaite restore --yes --json -\n" ||
 		read(t, got) != "SQLite format 3\x00 the copy" || !slices.Equal(said, []string{"restored"}) {
-		t.Fatalf("code %d, err %v, argv %q, said %q", code, err, read(t, log), said)
+		t.Fatalf("code %d, %+v, err %v, argv %q, said %q", code, r, err, read(t, log), said)
 	}
 	fakes(t, map[string]string{"docker": "exit 3\n"})
-	if code, err := h.Restore(context.Background(), func(string) {}, c); code != 3 || err != nil {
+	if code, _, err := h.Restore(context.Background(), func(string) {}, c); code != 3 || err != nil {
 		t.Errorf("exit 3: code %d, err %v", code, err)
 	}
 	// A copy that is no longer a file once open is refused before docker runs.
@@ -193,13 +201,42 @@ func TestRestore(t *testing.T) {
 		t.Fatal(err)
 	}
 	fakes(t, map[string]string{"docker": `echo "$*" >> ` + log + "\n"})
-	if _, err := h.Restore(context.Background(), func(string) {}, Copy{Path: "backups"}); err == nil ||
+	if _, _, err := h.Restore(context.Background(), func(string) {}, Copy{Path: "backups"}); err == nil ||
 		err.Error() != "backups is not a file with a copy in it" || read(t, log) != "" {
 		t.Errorf("a directory: %v, argv %q", err, read(t, log))
 	}
 	fakes(t, map[string]string{"docker": "exec /bin/sleep 5\n"})
 	h.upBound = 100 * time.Millisecond
-	if _, err := h.Restore(context.Background(), func(string) {}, c); err == nil || err.Error() != "docker compose run was not done within 20 minutes" {
+	if _, _, err := h.Restore(context.Background(), func(string) {}, c); err == nil || err.Error() != "docker compose run was not done within 20 minutes" {
 		t.Errorf("bound: %v", err)
+	}
+}
+
+// TestRestoreJSON: restore's answer on standard output is decoded when it
+// exits 0, never said; only standard error is said, line by line (B8).
+func TestRestoreJSON(t *testing.T) {
+	fakes(t, map[string]string{"docker": "/bin/cat >/dev/null\necho 'Container x Creating' >&2\n" +
+		`echo '{"path":"-","bytes":131072,"data_dir":"/data","replaced":["stargaite.db"]}'` + "\n"})
+	h := New(t.TempDir())
+	write(t, filepath.Join(h.Dir, "backups", "a.db"), "SQLite format 3\x00 the copy")
+	c, err := h.CopyAt("backups/a.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var said []string
+	code, r, err := h.Restore(context.Background(), func(l string) { said = append(said, l) }, c)
+	if code != 0 || err != nil || r.Bytes != 131072 || !slices.Equal(r.Replaced, []string{"stargaite.db"}) || !r.Decoded ||
+		!slices.Equal(said, []string{"Container x Creating"}) {
+		t.Fatalf("code %d, %+v, err %v, said %q", code, r, err, said)
+	}
+	fakes(t, map[string]string{"docker": "/bin/cat >/dev/null\necho 'not json'\n"})
+	said = nil
+	if code, r, err := h.Restore(context.Background(), func(l string) { said = append(said, l) }, c); code != 0 || err != nil || r.Decoded ||
+		len(said) != 0 {
+		t.Errorf("not JSON: code %d, %+v, err %v, said %q", code, r, err, said)
+	}
+	fakes(t, map[string]string{"docker": "/bin/cat >/dev/null\n" + `echo '{"path":"-","bytes":3,"replaced":[]}'` + "\nexit 1\n"})
+	if code, r, err := h.Restore(context.Background(), func(string) {}, c); code != 1 || err != nil || r.Decoded {
+		t.Errorf("exit 1: code %d, %+v, err %v", code, r, err)
 	}
 }

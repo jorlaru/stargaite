@@ -1,9 +1,10 @@
-// Command shim stands in for every external command setup.sh runs in the
-// tests of tests/setup (see setup_test.go), which link it under each name:
-// it appends a record of the call to $SETUP_LOG, then answers as a fake
-// (docker, curl, id, stat -c %u ., sleep, chown, hostname, getent) or runs
-// the real command; FAKE_TIMEOUT replaces the 1200 s bound given to the real
-// timeout. Run as stargaite-plane, it is the fake container's data plane.
+// Command shim stands in for every external command setup.sh and the
+// console run in the tests of tests/setup (see setup_test.go), which link it
+// under each name: it appends a record of the call to $SETUP_LOG, then
+// answers as a fake (docker, id, stat -c %u ., sleep, chown, hostname,
+// getent), refuses (curl, which nothing runs since C64b) or runs the real
+// command; FAKE_TIMEOUT replaces the 1200 s bound given to the real timeout.
+// Run as stargaite-plane, it is the fake container's data plane.
 // A separate binary, built once without the race detector, so each call
 // starts fast.
 package main
@@ -11,9 +12,8 @@ package main
 import (
 	"bufio"
 	"cmp"
-	"crypto/x509"
+	"crypto/tls"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -32,19 +32,17 @@ import (
 	"github.com/jorlaru/stargaite/internal/presets"
 )
 
-// record is one shim call: its argv, its working directory and, for a curl
-// given -K -, the config it read from standard input.
+// record is one shim call: its argv and its working directory.
 type record struct {
-	Argv  []string `json:"argv"`
-	Dir   string   `json:"dir"`
-	Stdin string   `json:"stdin,omitempty"`
+	Argv []string `json:"argv"`
+	Dir  string   `json:"dir"`
 }
 
 // state is what the fake docker knows between calls: whether the container
 // runs, or exists stopped, the variable names of .env it was last created
 // with, whether its override gave serve a certificate, so both listeners
-// speak TLS, the override it was last started with and the certificate it
-// serves, read from tls/ only when it starts anew, as serve does, the
+// speak TLS, the override it was last started with and the certificate and
+// key it serves, read from tls/ only when it starts anew, as serve does, the
 // version the image was last built with and the one the container runs, and
 // the configuration the fake CLI holds: budgets by scope (instance,
 // alias:<name> or key:<name>) and the telemetry flags given since the last
@@ -59,6 +57,7 @@ type state struct {
 	TLS       bool                         `json:"tls"`
 	Override  string                       `json:"override"`
 	Cert      string                       `json:"cert"`
+	Key       string                       `json:"key"`
 	Env       []string                     `json:"env"`
 	Providers map[string]map[string]string `json:"providers"`
 	Targets   map[string]map[string]any    `json:"targets"`
@@ -70,7 +69,7 @@ type state struct {
 
 func main() {
 	if filepath.Base(os.Args[0]) == "stargaite-plane" {
-		os.Exit(plane(os.Args[1]))
+		os.Exit(plane(os.Args[1], strings.Fields(os.Args[2])))
 	}
 	os.Exit(shim(filepath.Base(os.Args[0]), os.Args[1:]))
 }
@@ -97,10 +96,6 @@ func appendLine(path string, line []byte) error {
 func shim(name string, args []string) int {
 	rec := record{Argv: append([]string{name}, args...)}
 	rec.Dir, _ = os.Getwd()
-	if name == "curl" && slices.Contains(args, "-K") {
-		in, _ := io.ReadAll(os.Stdin)
-		rec.Stdin = string(in)
-	}
 	line, _ := json.Marshal(rec)
 	if err := appendLine(os.Getenv("SETUP_LOG"), line); err != nil {
 		fmt.Fprintln(os.Stderr, "shim:", err)
@@ -110,7 +105,8 @@ func shim(name string, args []string) int {
 	case name == "docker":
 		return fakeDocker(args)
 	case name == "curl":
-		return fakeCurl(args)
+		fmt.Fprintln(os.Stderr, "shim: setup.sh runs no curl since C64b")
+		return 1
 	case name == "id" && slices.Equal(args, []string{"-u"}):
 		fmt.Println(env("FAKE_UID", "1000"))
 		return 0
@@ -121,7 +117,7 @@ func shim(name string, args []string) int {
 		fmt.Println(env("FAKE_OWNER", "1000"))
 		return 0
 	case name == "hostname" && slices.Equal(args, []string{"-I"}):
-		fmt.Println(env("FAKE_ADDRESSES", "192.0.2.10 198.51.100.7 "))
+		fmt.Println(env("FAKE_ADDRESSES", "127.0.0.2 127.0.0.3 "))
 		return 0
 	case name == "getent" && len(args) > 0:
 		// FAKE_GETENT_PASSWD lists the users; FAKE_GETENT_GROUP is the line
@@ -208,17 +204,33 @@ func envPort() string {
 	return "4000"
 }
 
+// published is the addresses the override's "# setup: addresses=" line
+// publishes on, 127.0.0.1 without it.
+func published(override string) string {
+	for _, line := range strings.Split(override, "\n") {
+		if v, ok := strings.CutPrefix(line, "# setup: addresses="); ok {
+			return v
+		}
+	}
+	return "127.0.0.1"
+}
+
 // startPlane starts the container's data plane, after stopping the one it
 // replaces: this binary as stargaite-plane, in its own session, so a console
 // that kills its command's process group leaves it running, as a container
-// outlives the docker command that started it.
+// outlives the docker command that started it. It listens on the addresses
+// the override publishes, at .env's port, serving the certificate and key
+// the container started with when it speaks TLS.
 func (st *state) startPlane() {
 	st.stopPlane()
 	exe, err := os.Executable()
 	if err != nil {
 		return
 	}
-	cmd := &exec.Cmd{Path: exe, Args: []string{"stargaite-plane", envPort()}, SysProcAttr: &syscall.SysProcAttr{Setsid: true}}
+	cmd := &exec.Cmd{Path: exe, Args: []string{"stargaite-plane", envPort(), published(st.Override)}, SysProcAttr: &syscall.SysProcAttr{Setsid: true}}
+	if st.TLS {
+		cmd.Env = append(os.Environ(), "PLANE_CERT="+st.Cert, "PLANE_KEY="+st.Key)
+	}
 	if cmd.Start() == nil {
 		st.Plane = cmd.Process.Pid
 		_ = cmd.Process.Release()
@@ -232,25 +244,39 @@ func (st *state) stopPlane() {
 	st.Plane = 0
 }
 
-// plane serves the data plane on 127.0.0.1:port, as a running container
-// does: /health/ready, and a chat completion, each appended to
-// $SETUP_STATE.chat as its Authorization and body. It waits up to 2 s for
-// the port, which the plane it replaces may still hold, and exits once
-// $SETUP_STATE is gone, or after 10 minutes: a test killed by its timeout
-// runs no cleanup.
-func plane(port string) int {
-	var ln net.Listener
-	var err error
-	for end := time.Now().Add(2 * time.Second); ; time.Sleep(50 * time.Millisecond) {
-		if ln, err = net.Listen("tcp", "127.0.0.1:"+port); err == nil || time.Now().After(end) {
-			break
-		}
-	}
-	if err != nil {
-		return 1
-	}
+// plane serves the data plane on each of addrs at port, as a running
+// container does: /health/ready, and a chat completion, each appended to
+// $SETUP_STATE.chat as its Authorization and body; over TLS with the pair of
+// $PLANE_CERT and $PLANE_KEY when given. Every request is appended to
+// $SETUP_STATE.plane as its local address, server name and path. It waits
+// up to 2 s for each address, which the plane it replaces may still hold,
+// and exits once $SETUP_STATE is gone, or after 10 minutes: a test killed by
+// its timeout runs no cleanup.
+func plane(port string, addrs []string) int {
 	srv := &http.Server{Handler: http.HandlerFunc(planeAnswer), ReadHeaderTimeout: 10 * time.Second}
-	go func() { _ = srv.Serve(ln) }()
+	if cert := os.Getenv("PLANE_CERT"); cert != "" {
+		pair, err := tls.X509KeyPair([]byte(cert), []byte(os.Getenv("PLANE_KEY")))
+		if err != nil {
+			return 1
+		}
+		srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{pair}}
+	}
+	for _, a := range addrs {
+		var ln net.Listener
+		var err error
+		for end := time.Now().Add(2 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+			if ln, err = net.Listen("tcp", net.JoinHostPort(a, port)); err == nil || time.Now().After(end) {
+				break
+			}
+		}
+		if err != nil {
+			return 1
+		}
+		if srv.TLSConfig != nil {
+			ln = tls.NewListener(ln, srv.TLSConfig)
+		}
+		go func() { _ = srv.Serve(ln) }()
+	}
 	for end := time.Now().Add(10 * time.Minute); time.Now().Before(end); time.Sleep(time.Second) {
 		if _, err := os.Stat(os.Getenv("SETUP_STATE")); err != nil {
 			break
@@ -262,6 +288,12 @@ func plane(port string) int {
 // planeAnswer is the data plane's handler. FAKE_CHAT=fail fails the chat
 // completion with a 502, and FAKE_CHAT=timeout never answers it.
 func planeAnswer(w http.ResponseWriter, r *http.Request) {
+	sni := ""
+	if r.TLS != nil {
+		sni = r.TLS.ServerName
+	}
+	hit, _ := json.Marshal(map[string]string{"addr": r.Context().Value(http.LocalAddrContextKey).(net.Addr).String(), "sni": sni, "path": r.URL.Path})
+	_ = appendLine(os.Getenv("SETUP_STATE")+".plane", hit)
 	switch {
 	case r.URL.Path == "/health/ready":
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions":
@@ -376,7 +408,8 @@ func fakeDocker(args []string) int {
 		override, _ := os.ReadFile("compose.override.yaml")
 		if !st.Up || string(override) != st.Override || slices.Contains(args, "--force-recreate") {
 			cert, _ := os.ReadFile("tls/cert.pem")
-			st.Cert = string(cert)
+			key, _ := os.ReadFile("tls/key.pem")
+			st.Cert, st.Key = string(cert), string(key)
 		}
 		st.Up, st.Stopped, st.Env, st.Override = true, false, envNames(), string(override)
 		if st.Built != "" {
@@ -699,42 +732,6 @@ func fakeCLI(st *state, args []string) (string, int) {
 		return encode(v), 0
 	}
 	return failure(fmt.Sprintf("fake CLI: not handled: %q", args))
-}
-
-// fakeCurl answers the readiness check, the only curl setup.sh runs. The
-// proxy answers only in the scheme the container speaks, as the fake docker
-// last started it, and over HTTPS not once the certificate it serves has
-// expired.
-func fakeCurl(args []string) int {
-	url := ""
-	for i := 0; i < len(args); i++ {
-		switch {
-		case slices.Contains([]string{"-o", "--max-time", "--resolve", "--cacert"}, args[i]):
-			i++
-		case !strings.HasPrefix(args[i], "-"):
-			url = args[i]
-		}
-	}
-	if !strings.HasSuffix(url, "/health/ready") {
-		fmt.Fprintln(os.Stderr, "fake curl: not handled:", url)
-		return 6
-	}
-	st := loadState()
-	if strings.HasPrefix(url, "https://") != st.TLS {
-		fmt.Fprintln(os.Stderr, "curl: (35) the proxy speaks", map[bool]string{false: "HTTP", true: "HTTPS"}[st.TLS], "only")
-		return 35
-	}
-	if block, _ := pem.Decode([]byte(st.Cert)); st.TLS && block != nil {
-		if cert, err := x509.ParseCertificate(block.Bytes); err == nil && time.Now().After(cert.NotAfter) {
-			fmt.Fprintln(os.Stderr, "curl: (60) SSL certificate problem: certificate has expired")
-			return 60
-		}
-	}
-	if os.Getenv("FAKE_READY") == "never" {
-		fmt.Fprintln(os.Stderr, "curl: (7) Failed to connect")
-		return 7
-	}
-	return 0
 }
 
 // budget is the budget set on scope, as the API shows it, or nil.

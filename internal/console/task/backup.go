@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"path/filepath"
 	"slices"
 
@@ -19,6 +18,15 @@ const startIt = "; docker compose up -d --no-build in this clone starts it"
 // ErrRanOn marks the error of a restore whose put-back and start ran to
 // their end after the session was ended; main prints it.
 var ErrRanOn = errors.New("the restore ran to its end")
+
+// ErrUnfinished marks the error of an upgrade stopped by the end of the
+// session, which carries how to return; main prints it.
+var ErrUnfinished = errors.New("the upgrade did not finish")
+
+// PrintAfter reports whether err carries how a task ended after the session
+// was ended (ErrRanOn, ErrUnfinished), for main to print once the terminal
+// is restored.
+func PrintAfter(err error) bool { return errors.Is(err, ErrRanOn) || errors.Is(err, ErrUnfinished) }
 
 func backupSteps() []ui.Step {
 	return []ui.Step{{ID: "what", Title: "back up or restore"}, {ID: "copy", Title: "which copy"}, {ID: "put", Title: "put back"}}
@@ -50,12 +58,7 @@ func backUp(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host) (strin
 	if err := px.Call(ctx, &v, "version", nil); err != nil {
 		return "", err
 	}
-	var c host.Copy
-	err := u.Work(ctx, ui.Question{ID: "backup", Step: "what", Prompt: "backing up the store"}, func(ctx context.Context) error {
-		var err error
-		c, err = h.Backup(ctx, sayer(ctx, u), v.Version, func(w io.Writer) (int64, error) { return px.Backup(ctx, w) })
-		return err
-	})
+	c, err := backupStore(ctx, u, px, h, "what", v.Version)
 	switch {
 	case errors.Is(err, ui.ErrLeave) || errors.Is(err, ui.ErrQuit):
 		return "", err
@@ -98,16 +101,17 @@ func restoreCopy(ctx context.Context, u *ui.UI, h *host.Host) (string, error) {
 		return "", err
 	}
 	var code int
+	var put host.Restored
 	var putErr, upErr error
 	err = u.Work(ctx, ui.Question{ID: "put", Step: "put", Prompt: "putting the copy back and starting the container; this runs to its end"},
 		func(wctx context.Context) error {
 			// Only the two commands outlive the work piece: its lines are
 			// dropped once it ends, never waiting on a front that has quit.
-			code, putErr = h.Restore(context.WithoutCancel(wctx), sayer(wctx, u), c)
+			code, put, putErr = h.Restore(context.WithoutCancel(wctx), sayer(wctx, u), c)
 			upErr = h.Up(context.WithoutCancel(wctx), sayer(wctx, u), "--no-build")
 			return nil
 		})
-	res, failed := restored(c.Path, taken, code, putErr, upErr)
+	res, failed := restored(c.Path, taken, code, put, putErr, upErr)
 	// Ctrl-C, or a signal at a terminal: the front has quit, so the error
 	// carries how it ended, for main to print once the terminal is restored.
 	if errors.Is(err, ui.ErrQuit) || ctx.Err() != nil && u.Asks() {
@@ -150,11 +154,11 @@ func pickCopy(ctx context.Context, u *ui.UI, h *host.Host) (c host.Copy, found b
 	return copies[slices.IndexFunc(copies, func(c host.Copy) bool { return c.Path == path })], true, nil
 }
 
-// restored is how a restore ended, from the put-back (its exit code, or an
-// error when it did not start or end) and the start after it, which always
-// runs. It never says the store is as it was: restore can fail after moving
-// it.
-func restored(path, taken string, code int, putErr, upErr error) (string, error) {
+// restored is how a restore ended, from the put-back (its exit code and
+// answer, or an error when it did not start or end) and the start after
+// it, which always runs. It never says the store is as it was: restore can
+// fail after moving it.
+func restored(path, taken string, code int, r host.Restored, putErr, upErr error) (string, error) {
 	var put string
 	switch {
 	case putErr != nil:
@@ -163,8 +167,13 @@ func restored(path, taken string, code int, putErr, upErr error) (string, error)
 		put = fmt.Sprintf("the copy was not put back (restore exits %d): its words above say whether anything moved", code)
 	case upErr != nil:
 		return "", fmt.Errorf("the store is the copy %s, but the container did not start: %w%s", path, upErr, startIt)
-	default:
+	case !r.Decoded:
 		return fmt.Sprintf("Done: the store is the copy %s, taken %s.", path, taken), nil
+	case len(r.Replaced) > 0:
+		return fmt.Sprintf("Done: the store is the copy %s, taken %s: %d bytes; the store it replaced is kept in the volume "+
+			"under replaced/ until the next restore.", path, taken, r.Bytes), nil
+	default:
+		return fmt.Sprintf("Done: the store is the copy %s, taken %s: %d bytes; the volume held no store.", path, taken, r.Bytes), nil
 	}
 	if upErr != nil {
 		return "", fmt.Errorf("%s, and the container did not start: %w%s", put, upErr, startIt)

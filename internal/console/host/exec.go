@@ -94,35 +94,109 @@ func (h *Host) Build(ctx context.Context, say func(string), version string) erro
 }
 
 // up is Up with env added to Compose's environment; when quiet, Compose's
-// output is said only on failure, its last buildTail lines. Display hands
-// the lines over from one goroutine, which has ended when it returns.
+// output is said only on failure, its last buildTail lines.
 func (h *Host) up(ctx context.Context, say func(string), quiet bool, env []string, args ...string) error {
-	bounded, cancel := context.WithTimeout(ctx, h.upBound)
-	defer cancel()
-	var tail []string
+	var tail kept
 	show := say
 	if quiet {
-		show = func(l string) { tail = append(tail[max(0, len(tail)+1-buildTail):], l) }
+		show = tail.add
 	}
-	failed := func(msg string) error {
-		if len(tail) > 0 {
-			say("the build's last lines:")
-		}
-		for _, l := range tail {
-			say(l)
-		}
-		return errors.New(msg)
-	}
-	code, err := h.display(bounded, env, nil, show, "docker", append([]string{"compose", "up", "-d"}, args...)...)
+	over, failed, err := h.long(ctx, h.upBound, env, show, "docker", append([]string{"compose", "up", "-d"}, args...)...)
 	switch {
-	case ctx.Err() != nil:
-		return fmt.Errorf("docker compose up: %w", ctx.Err())
-	case bounded.Err() != nil:
-		return failed("docker compose up was not done within 20 minutes; its output is above")
-	case err != nil || code != 0:
-		return failed("docker compose up failed or was interrupted; its output is above")
+	case err != nil:
+		return fmt.Errorf("docker compose up: %w", err)
+	case over:
+		tail.say(say, "the build's last lines:")
+		return errors.New("docker compose up was not done within 20 minutes; its output is above")
+	case failed:
+		tail.say(say, "the build's last lines:")
+		return errors.New("docker compose up failed or was interrupted; its output is above")
 	}
 	return h.WaitReady(ctx, say)
+}
+
+// ComposeBuild builds the image of version with docker compose build,
+// within upBound, its lines kept back: its last buildTail are said when it
+// fails or runs out of time.
+func (h *Host) ComposeBuild(ctx context.Context, say func(string), version string) error {
+	return h.quietBuild(ctx, say, []string{"STARGAITE_VERSION=" + version}, "docker compose build", "compose", "build")
+}
+
+// ExportConsole builds the console of version into bin/, as setup.sh does,
+// within upBound and quiet as ComposeBuild.
+func (h *Host) ExportConsole(ctx context.Context, say func(string), version string) error {
+	return h.quietBuild(ctx, say, []string{"VERSION=" + version, "DOCKER_BUILDKIT=1"}, "docker build of the console",
+		"build", "--quiet", "--build-arg", "VERSION", "--target", "console", "--output", "type=local,dest=bin", ".")
+}
+
+// quietBuild runs docker with env added and args within upBound, its lines
+// kept back and said when it fails; what names it in the error.
+func (h *Host) quietBuild(ctx context.Context, say func(string), env []string, what string, args ...string) error {
+	var tail kept
+	over, failed, err := h.long(ctx, h.upBound, env, tail.add, "docker", args...)
+	switch {
+	case err != nil:
+		return fmt.Errorf("%s: %w", what, err)
+	case over:
+		tail.say(say, "the build's last lines:")
+		return errors.New(what + " was not done within 20 minutes")
+	case failed:
+		tail.say(say, "the build's last lines:")
+		return errors.New(what + " failed or was interrupted")
+	}
+	return nil
+}
+
+// KeepImage tags the image the container runs as <image>-previous, each
+// docker call within h.bound, and returns the image's name.
+func (h *Host) KeepImage(ctx context.Context) (string, error) {
+	bounded, cancel := context.WithTimeout(ctx, h.bound)
+	defer cancel()
+	notKept := errors.New("the running image was not kept; nothing was changed")
+	id, code, err := h.Capture(bounded, "docker", "compose", "ps", "-q", "stargaite")
+	if err != nil || code != 0 || strings.TrimSpace(string(id)) == "" {
+		return "", notKept
+	}
+	out, code, err := h.Capture(bounded, "docker", "inspect", "--format", "{{.Image}} {{.Config.Image}}", strings.TrimSpace(string(id)))
+	image, name, _ := strings.Cut(strings.TrimSpace(string(out)), " ")
+	if err != nil || code != 0 || image == "" || name == "" || strings.HasPrefix(name, "-") {
+		return "", notKept
+	}
+	if _, code, err := h.Capture(bounded, "docker", "tag", image, name+"-previous"); err != nil || code != 0 {
+		return "", notKept
+	}
+	return name, nil
+}
+
+// long runs name with env added and args, bounded by bound, its lines handed
+// to show from the goroutine Display copies them on, which has ended when it
+// returns. It returns ctx's error when ctx ended; otherwise over is whether
+// the bound passed, and failed whether it did not exit 0, the bound included.
+func (h *Host) long(ctx context.Context, bound time.Duration, env []string, show func(string), name string, args ...string) (over, failed bool, err error) {
+	bounded, cancel := context.WithTimeout(ctx, bound)
+	defer cancel()
+	code, err := h.display(bounded, env, nil, show, name, args...)
+	if ctx.Err() != nil {
+		return false, false, ctx.Err()
+	}
+	over = bounded.Err() != nil
+	return over, over || err != nil || code != 0, nil
+}
+
+// kept holds back a command's lines, its last buildTail, to say when it
+// fails.
+type kept struct{ lines []string }
+
+func (k *kept) add(l string) { k.lines = append(k.lines[max(0, len(k.lines)+1-buildTail):], l) }
+
+// say says head, then the lines kept, when there are any.
+func (k *kept) say(say func(string), head string) {
+	if len(k.lines) > 0 {
+		say(head)
+	}
+	for _, l := range k.lines {
+		say(l)
+	}
 }
 
 // Compose runs docker compose with args (stop, restart, down), its lines
@@ -317,20 +391,6 @@ func (h *Host) ps(ctx context.Context, args ...string) (bool, error) {
 		return false, fmt.Errorf("docker compose ps failed with exit %d", code)
 	}
 	return strings.TrimSpace(string(out)) != "", nil
-}
-
-// CloneVersion is the clone's git describe, as setup.sh's clone_version
-// takes it, or dev when git is missing or fails.
-func (h *Host) CloneVersion(ctx context.Context) string {
-	bounded, cancel := context.WithTimeout(ctx, h.bound)
-	defer cancel()
-	env := []string{"GIT_TERMINAL_PROMPT=0", "GIT_SSH_COMMAND=ssh -o BatchMode=yes"}
-	out, code, err := h.capture(bounded, env, "git", "describe", "--tags", "--always", "--dirty")
-	v := strings.TrimSpace(string(out))
-	if err != nil || code != 0 || v == "" {
-		return "dev"
-	}
-	return v
 }
 
 // AdminEnv is the variables each CLI call gets under TLS, as setup.sh's

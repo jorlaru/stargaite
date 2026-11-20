@@ -6,7 +6,8 @@
 # a self-signed certificate (then renewed), install again under TLS, status,
 # the machine tasks (logs, stop, start, restart, backup and restore) and,
 # from one commit more on a bare upstream, upgrade, whose printed way back is
-# then run, then uninstall, on that
+# then run, then status --check, then uninstall: each run by the console the
+# bootstrap starts, in its flags mode, on that
 # installation, under its own Compose project, image name and free host
 # port, so it runs beside a service on port 4000. The mock provider runs
 # from the source in the Go image, listening only on the Docker bridge's
@@ -232,8 +233,8 @@ main() {
 	# upgrade keeps the previous image, builds, backs up, starts and checks
 	# the new version; then the way back it printed is run as printed, and
 	# the previous image serves the restored store, without the key made
-	# after the backup. The commit moves every line of setup.sh, which the
-	# merge replaces while it runs (main "$@"; exit).
+	# after the backup. The console runs the merge, which moves every line
+	# of setup.sh; the next ./setup.sh runs the moved file.
 	{ git init -q --bare "$tree.remote" && git -C "$tree" remote add origin "$tree.remote" && git -C "$tree" push -q -u origin HEAD &&
 		sed -i '1a # setup-test upgrade: every line below moves' "$tree/setup.sh" &&
 		git -C "$tree" -c user.name=setup-test -c user.email=setup-test@example.invalid commit -q -a -m "setup-test upgrade" &&
@@ -262,6 +263,9 @@ main() {
 	[[ $(cd "$tree" && docker compose exec -T stargaite /stargaite version) == "$want" ]] || fail "the previous image, $want, does not run"
 	keys=$(cd "$tree" && docker compose exec -T "${adm[@]}" stargaite /stargaite keys list --json | jq -r '[.keys[].name] | sort | join(",")')
 	[[ $keys == e2e,e2e-2,e2e-3 ]] || fail "the restored store holds the keys $keys, not e2e, e2e-2 and e2e-3"
+	# The clone is at its upstream still: status --check fetches and says so.
+	again status --check
+	[[ $out == *"upgrade: none, up to date with origin/"* ]] || fail "status --check did not say the clone is up to date"
 	# Uninstall: the container, both image tags and the console go; the volume and .env stay, and the command
 	# that removes the volume names it as Compose does.
 	again uninstall --yes

@@ -13,6 +13,7 @@ import (
 	"maps"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -51,7 +52,7 @@ const sessionBound = 12 * time.Second
 // homeBound is how long the home reads what exists before each pick.
 const homeBound = 15 * time.Second
 
-const usage = `usage: stargaite-console [install | provider | alias | key | budget | telemetry | status | logs | stop | start | restart | backup | restore | uninstall | help] [flags] [--version]
+const usage = `usage: stargaite-console [install | provider | alias | key | budget | telemetry | remote | status | logs | stop | start | restart | backup | restore | uninstall | upgrade | help] [flags] [--version]
 At a terminal with no subcommand: the guided console.
   install   the first run: this machine, then a provider, an alias with its fallbacks and a key, each kept when it
             exists, ending with one test call; at a terminal it starts at the first missing step
@@ -76,6 +77,8 @@ At a terminal with no subcommand: the guided console.
   telemetry traces to Langfuse or any OTLP endpoint, replacing what was set whole, then one test span (free)
             --backend <langfuse|otlp|off>   --endpoint <url>   --langfuse-public-env <VAR>   --langfuse-secret-env <VAR>
             --header-name <name>   --key-env <VAR>   --replace   --allow-private-network   --yes
+  remote    publish the data plane beyond loopback, always with TLS: your certificate or a self-signed one; run again, it renews it
+            --address <a,b>   --tls <own|self-signed>   --tls-cert <file>   --tls-key <file>   --tls-name <name>   --tls-ca <file>   --yes
   logs      the container's last 100 log lines; at a terminal it then follows them until Esc, an hour at most
             --follow is refused without a terminal: the console follows logs only while someone watches
   stop, start, restart   the container; stop and restart interrupt traffic   --yes
@@ -84,7 +87,9 @@ At a terminal with no subcommand: the guided console.
             and started again   --from <file>   --yes
   uninstall the container, its two images and bin/stargaite-console; the volume, .env, the override, backups/
             and tls/ are kept, and the commands that remove them printed   --yes
-  status    what exists: providers, aliases, targets without an alias, keys, budgets, telemetry and both versions
+  upgrade   fast-forward this clone to its upstream and rebuild, keeping the previous image and taking a backup just before the new version starts, then checking it; it prints the way back
+            --rebuild rebuilds this clone's version, without fetching   --legacy-backup <file>   --yes
+  status    what exists: providers, aliases, targets without an alias, keys, budgets, telemetry and both versions; --check first says whether the clone's upstream has an upgrade (one git fetch)
 For what has no flag here (reorder an alias, see what it sends, change a provider or a key, see usage and cost, check everything):
 the guided console, or the stargaite command: docker compose exec -T stargaite /stargaite help
 `
@@ -174,7 +179,35 @@ func run(args, environ []string, stdin, stdout, stderr *os.File) int {
 	if s, ok := got.Load().(os.Signal); ok {
 		e.signal = s
 	}
+	switch exec, line := restartDecision(e, environ); {
+	case line != "":
+		return fail(exitOK, "%s", line)
+	case exec:
+		// The program has quit and restored the terminal: the new console
+		// takes this process, its pid and terminal, with the marker.
+		signal.Stop(sigs)
+		path := filepath.Join(h.Dir, "bin", "stargaite-console")
+		err := syscall.Exec(path, []string{path}, append(slices.Clone(environ), reexecMarker+"=1"))
+		return fail(exitFail, "the new console did not start: %s; ./setup.sh starts it", ui.OneLine(err.Error()))
+	}
 	return e.code()
+}
+
+// reexecMarker is set in the new console's environment: it restarts once.
+const reexecMarker = "STARGAITE_CONSOLE_REEXEC"
+
+// restartDecision is whether to start the new console: only when the
+// session asked for it and ended cleanly, within its bound, with no signal,
+// Ctrl-C or panic, and only once per session (the marker); with the marker,
+// line says why it does not.
+func restartDecision(e ending, environ []string) (exec bool, line string) {
+	switch {
+	case !e.restart || !e.ended || e.signal != nil || e.panicked || e.interrupted || e.session != exitOK:
+		return false, ""
+	case set(environ, reexecMarker):
+		return false, "the console was restarted once in this session; ./setup.sh starts the new one"
+	}
+	return true, ""
 }
 
 // ending is what decides the exit code.
@@ -184,6 +217,7 @@ type ending struct {
 	interrupted bool // Ctrl-C in guided mode
 	ended       bool // the session returned within sessionBound
 	session     int  // its code
+	restart     bool // the session asked to start the new console (task.ErrReexec)
 }
 
 // code is the first that applies: a signal's, a panic's, Ctrl-C's, the
@@ -241,7 +275,7 @@ func parseFlags(e task.Entry, args []string) (map[string]string, error) {
 // task says so and is a failure; a task that ends the session succeeds.
 func runOne(root context.Context, u *ui.UI, entry task.Entry, px *proxy.Proxy, h *host.Host) (int, error) {
 	res, err := u.Run(root, entry.Steps, func(ctx context.Context) (string, error) { return entry.Run(ctx, u, px, h) })
-	if errors.Is(err, task.ErrEnd) {
+	if err == task.ErrEnd || errors.Is(err, task.ErrReexec) { // a subcommand ends with its status: no restart
 		err = nil
 	}
 	var usageErr *ui.UsageError
@@ -255,7 +289,7 @@ func runOne(root context.Context, u *ui.UI, entry task.Entry, px *proxy.Proxy, h
 		return exitOK, nil
 	case errors.As(err, &usageErr):
 		return exitUsage, err
-	case errors.Is(err, task.ErrRanOn): // how a restore that ran to its end after Ctrl-C or a signal ended
+	case task.PrintAfter(err): // how a restore or an upgrade ended after Ctrl-C or a signal
 		return exitINT, err
 	case errors.Is(err, ui.ErrQuit):
 		return exitINT, nil
@@ -299,8 +333,10 @@ func guidedSession(root context.Context, cancel context.CancelFunc, px *proxy.Pr
 	var (
 		e        ending
 		panicked atomic.Bool
+		restart  atomic.Bool
 		failure  error // an error that ended the session, printed after the program
 	)
+	_ = flushInput(int(stdin.Fd())) // keys typed before the console starts open nothing (design section 3)
 	opts := append(guided.Options(root, environ), tea.WithInput(stdin), tea.WithOutput(stdout))
 	p := tea.NewProgram(guided.NewModel(version), opts...)
 	front := guided.NewFront(p)
@@ -309,7 +345,7 @@ func guidedSession(root context.Context, cancel context.CancelFunc, px *proxy.Pr
 		defer front.Done()
 		if only != nil {
 			code, err := runOne(root, u, *only, px, h)
-			if err != nil && (root.Err() == nil || errors.Is(err, task.ErrRanOn)) {
+			if err != nil && (root.Err() == nil || task.PrintAfter(err)) {
 				failure = err
 			}
 			return code
@@ -317,11 +353,14 @@ func guidedSession(root context.Context, cancel context.CancelFunc, px *proxy.Pr
 		err := task.Home(root, u, px, h, homeBound)
 		switch {
 		case errors.Is(err, ui.ErrQuit):
-			if errors.Is(err, task.ErrRanOn) {
+			if task.PrintAfter(err) {
 				failure = err
 			}
 			return exitINT
-		case errors.Is(err, task.ErrEnd):
+		case errors.Is(err, task.ErrReexec):
+			restart.Store(true)
+			return exitOK
+		case err == task.ErrEnd:
 			return exitOK
 		case root.Err() != nil:
 			return exitFail
@@ -338,6 +377,7 @@ func guidedSession(root context.Context, cancel context.CancelFunc, px *proxy.Pr
 		e.interrupted = m.Interrupted()
 	}
 	e.panicked = panicked.Load() || errors.Is(err, tea.ErrProgramPanic)
+	e.restart = restart.Load()
 	switch {
 	case err != nil && !stopped && !e.panicked: // the terminal could not be set up or read
 		_, _ = fmt.Fprintf(stderr, "stargaite-console: %s\n", ui.OneLine(err.Error()))

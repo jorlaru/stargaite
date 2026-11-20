@@ -11,8 +11,9 @@ import (
 	"github.com/jorlaru/stargaite/internal/console/host"
 )
 
-// The files bash and Go both write, .env and compose.override.yaml, are
-// written byte for byte alike while setup.sh and the console share a clone.
+// The file bash and Go both write, compose.override.yaml, is written byte for
+// byte alike while setup.sh and the console share a clone. .env's writer is
+// the console's alone (host's TestEnvSetFormats holds bash's bytes).
 
 // bashFunc is the function name of ../../setup.sh, from "name() {" to the
 // first line that is exactly "}".
@@ -76,37 +77,6 @@ func sameFile(t *testing.T, row, file, bashDir, goDir string) {
 	}
 }
 
-func ptr(s string) *string { return &s }
-
-func TestSharedEnvFormat(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("setup.sh supports Linux only")
-	}
-	script := "die() { exit 1; }; tmp_file=\n" + bashFunc(t, "env_set") + `env_set "$1" "$2"`
-	for _, tc := range []struct {
-		row         string
-		seed        *string
-		name, value string
-	}{
-		{"no .env", nil, "NAME", "v"},
-		{"empty .env", ptr(""), "NAME", "v"},
-		{"replaced", ptr("A=1\n"), "A", "2"},
-		{"appended", ptr("A=1\n"), "B", "2"},
-		{"no final newline", ptr("A=1"), "B", "2"},
-		{"no final newline, replaced", ptr("A=1"), "A", "2"},
-		{"CRLF", ptr("A=1\r\nB=2\r\n"), "B", "3"},
-		{"commented and twice", ptr("# NAME=old\nNAME=old\nNAME=old2\n"), "NAME", "new"},
-		{"a value the shell would expand", ptr("A=1\n"), "KEY", `s3cr3t $HOME #x y\z`},
-	} {
-		bashDir, goDir := seeded(t, ".env", tc.seed)
-		runBash(t, bashDir, script, tc.name, tc.value)
-		if err := host.New(goDir).EnvSet(tc.name, tc.value); err != nil {
-			t.Fatalf("%s: %v", tc.row, err)
-		}
-		sameFile(t, tc.row, ".env", bashDir, goDir)
-	}
-}
-
 func TestSharedOverrideFormat(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("setup.sh supports Linux only")
@@ -122,7 +92,7 @@ func TestSharedOverrideFormat(t *testing.T) {
 		seed *string
 	}{{"no override", nil}, {"marked, with TLS", &marked}} {
 		bashDir, goDir := seeded(t, "compose.override.yaml", tc.seed)
-		runBash(t, bashDir, script, "host.docker.internal:host-gateway", "extra_hosts", "host_gateway=1")
+		runBash(t, bashDir, script, "host_gateway=1")
 		h := host.New(goDir)
 		o, err := h.ReadOverride()
 		if err != nil {

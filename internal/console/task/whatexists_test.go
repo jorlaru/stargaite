@@ -239,21 +239,47 @@ func TestSeeWhatExistsDockerFails(t *testing.T) {
 
 func TestMenuFresh(t *testing.T) {
 	m := Menu()
-	if len(m) != 8 {
+	if len(m) != 11 {
 		t.Fatalf("Menu() = %+v", m)
 	}
-	first := m[7]
+	first := m[10]
 	if first.Group != "" || first.Label != "First run" || first.Sub != "install" ||
 		!slices.Equal(first.Flags, []string{"port", "provider", "base-url", "protocol", "api-key-env", "key-env", "model", "alias", "fallback",
 			"max-output-tokens", "effort", "input-price", "output-price", "key-name", "rpm-limit"}) ||
 		!slices.Equal(first.Bools, []string{"replace", "allow-private-network", "yes", "reverify"}) ||
 		!slices.Equal(first.Steps, firstSteps()) || first.Run == nil {
-		t.Fatalf("Menu()[7] = %+v", first)
+		t.Fatalf("Menu()[10] = %+v", first)
 	}
-	see := m[6]
+	see := m[9]
 	if see.Group != "This machine" || see.Label != "See what exists" || see.Sub != "status" ||
 		len(see.Steps) != 1 || see.Steps[0] != (ui.Step{ID: "show", Title: "what exists"}) || see.Run == nil {
-		t.Fatalf("Menu()[6] = %+v", see)
+		t.Fatalf("Menu()[9] = %+v", see)
+	}
+	spend := []Entry{
+		{Group: "Spend and traces", Label: "Cap spending", Sub: "budget", Flags: []string{"on", "limit-usd", "reset", "input-price", "output-price"},
+			Bools: []string{"yes", "reverify"}, Steps: capSteps()},
+		{Group: "Spend and traces", Label: "See usage and cost", Steps: usageSteps()},
+		{Group: "Spend and traces", Label: "Send traces", Sub: "telemetry",
+			Flags: []string{"backend", "endpoint", "langfuse-public-env", "langfuse-secret-env", "header-name", "key-env"},
+			Bools: []string{"replace", "allow-private-network", "yes"}, Steps: traceSteps()},
+	}
+	for i, e := range spend {
+		got := m[6+i]
+		if got.Group != e.Group || got.Label != e.Label || got.Sub != e.Sub || !slices.Equal(got.Flags, e.Flags) ||
+			!slices.Equal(got.Bools, e.Bools) || !slices.Equal(got.Steps, e.Steps) || got.Run == nil {
+			t.Fatalf("Menu()[%d] = %+v", 6+i, got)
+		}
+	}
+	for steps, want := range map[string][]ui.Step{
+		"cap":   {{ID: "on", Title: "on what"}, {ID: "limit", Title: "limit and reset"}, {ID: "check", Title: "check"}},
+		"usage": {{ID: "period", Title: "period"}, {ID: "by", Title: "grouped by"}, {ID: "table", Title: "table"}},
+		"trace": {{ID: "which", Title: "where"}, {ID: "add", Title: "endpoint"}, {ID: "key", Title: "keys"}, {ID: "write", Title: "write"},
+			{ID: "recreate", Title: "recreate"}, {ID: "test", Title: "test"}},
+	} {
+		got := map[string][]ui.Step{"cap": capSteps(), "usage": usageSteps(), "trace": traceSteps()}[steps]
+		if !slices.Equal(got, want) {
+			t.Fatalf("%s steps = %+v", steps, got)
+		}
 	}
 	add := m[0]
 	if add.Group != "Providers" || add.Label != "Add providers" || add.Sub != "provider" ||
@@ -309,9 +335,9 @@ func TestMenuFresh(t *testing.T) {
 	if m[4].Sub != "key" || !slices.Equal(m[4].Flags, []string{"alias", "key-name", "rpm-limit"}) || m[4].Bools != nil {
 		t.Fatalf("Menu()[4] = %+v", m[4])
 	}
-	m[6].Label = "changed"
-	m[6].Steps[0].Title = "changed"
-	if again := Menu(); again[6].Label != "See what exists" || again[6].Steps[0].Title != "what exists" {
+	m[9].Label = "changed"
+	m[9].Steps[0].Title = "changed"
+	if again := Menu(); again[9].Label != "See what exists" || again[9].Steps[0].Title != "what exists" {
 		t.Fatal("a change to Menu()'s result reached a second call")
 	}
 }

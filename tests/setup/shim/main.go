@@ -521,21 +521,9 @@ func written(resource any) string {
 	return encode(map[string]any{"revision": 1, "changed": true, "diff": []any{}, "findings": []any{}, "resource": resource})
 }
 
-// fakeCLI answers the CLI commands setup.sh runs, in the shapes of the admin
-// API's --json answers.
+// fakeCLI answers the CLI commands setup.sh and the console run, in the
+// shapes of the admin API's --json answers.
 func fakeCLI(st *state, args []string) (string, int) {
-	// telemetry test without --json prints the line the CLI renders (TEL-2).
-	if slices.Equal(args, []string{"telemetry", "test"}) {
-		switch {
-		case st.Telemetry["otlp-endpoint"] == "":
-			return "stargaite: no exporter is configured: telemetry set --otlp-endpoint <url> sets one", 1
-		case len(st.unresolved()) > 0:
-			return "credentials: unresolved · credential_unresolved: " + strings.Join(st.unresolved(), ", ") + " does not resolve", 1
-		case os.Getenv("FAKE_TELEMETRY") == "unauthorized":
-			return "credentials: resolved · reachable: yes · authorized: no (401) · bad credentials", 1
-		}
-		return "credentials: resolved · reachable: yes · authorized: yes · span: accepted (200) · trace_id=4bf92f3577b34da6a3ce929d0e0e4736", 0
-	}
 	// apply is one word: the console's dry run, apply --json --dry-run -f -,
 	// with a document on standard input.
 	if len(args) > 1 && args[0] == "apply" && args[1] == "--json" {
@@ -631,7 +619,7 @@ func fakeCLI(st *state, args []string) (string, int) {
 	case "models list":
 		list := []any{}
 		for name, targets := range st.Models {
-			list = append(list, map[string]any{"name": name, "targets": targets})
+			list = append(list, map[string]any{"name": name, "targets": targets, "budget": st.budget("alias:" + name)})
 		}
 		return encode(map[string]any{"models": list}), 0
 	case "models explain": // which effort and output cap are sent is the proxy's to say: none here
@@ -646,7 +634,7 @@ func fakeCLI(st *state, args []string) (string, int) {
 	case "keys list":
 		list := []any{}
 		for _, name := range st.Keys {
-			list = append(list, map[string]any{"name": name, "models": []string{"main"}, "secrets": []any{}})
+			list = append(list, map[string]any{"name": name, "models": []string{"main"}, "secrets": []any{}, "budget": st.budget("key:" + name)})
 		}
 		return encode(map[string]any{"keys": list}), 0
 	case "keys create":
@@ -661,6 +649,7 @@ func fakeCLI(st *state, args []string) (string, int) {
 			return failure("target does not exist")
 		}
 		t["pricing"] = flags["pricing"][0]
+		delete(t, "verified_at") // as the proxy does: a target's edit clears its verification
 		return written(t), 0
 	case "telemetry set":
 		if e := flags["otlp-endpoint"][0]; !strings.HasPrefix(e, "http://") && !strings.HasPrefix(e, "https://") {
@@ -678,6 +667,16 @@ func fakeCLI(st *state, args []string) (string, int) {
 		}
 		st.Telemetry = map[string]string{}
 		return encode(map[string]any{"revision": 1, "changed": true, "diff": []any{}, "findings": []any{}}), 0
+	case "telemetry test": // the outcome of one test span, as the CLI's --json gives it (TEL-2)
+		switch {
+		case st.Telemetry["otlp-endpoint"] == "":
+			return failure("no exporter is configured: telemetry set --otlp-endpoint <url> sets one")
+		case len(st.unresolved()) > 0:
+			return encode(map[string]any{"outcome": "credential_unresolved", "message": strings.Join(st.unresolved(), ", ") + " does not resolve"}), 1
+		case os.Getenv("FAKE_TELEMETRY") == "unauthorized":
+			return encode(map[string]any{"outcome": "unauthorized", "status": 401, "message": "bad credentials"}), 1
+		}
+		return encode(map[string]any{"outcome": "accepted", "status": 200, "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"}), 0
 	case "telemetry status":
 		v := map[string]any{"telemetry": nil, "unresolved": st.unresolved()}
 		if e := st.Telemetry["otlp-endpoint"]; e != "" {

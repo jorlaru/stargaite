@@ -273,7 +273,7 @@ func TestMakeAliasOutputCap(t *testing.T) {
 		refused("output_cap_required", "models/x"), refused("output_cap_exceeds_target", "models/x")}})
 	s := &scripted{answers: map[string][]string{"fallback-provider": {""}, "effort": {""}, "max-output-tokens": {"999999999"}}}
 	_, err = w.makeAlias(ui.New(s, map[string]string{"provider": "claude", "model": "m", "alias": "x"}))
-	if err == nil || !strings.HasPrefix(err.Error(), "the proxy would refuse this alias:\nmodels/x: output_cap_exceeds_target message") {
+	if err == nil || !strings.HasPrefix(err.Error(), "the proxy would refuse this alias:\nalias x: output_cap_exceeds_target message") {
 		t.Fatalf("err = %v\n%s", err, s.output())
 	}
 	if !slices.Contains(s.asked, "the alias's output cap in tokens, which an anthropic target needs") {
@@ -375,7 +375,7 @@ func TestMakeAliasRepricesListed(t *testing.T) {
 	w.override(map[string][]reply{"apply --json --dry-run -f -": {refused("unpriced_under_budget", "targets/acme/m"),
 		refused("unpriced_under_budget", "targets/acme/m"), refused("output_cap_exceeds_target", "models/x")}})
 	_, out, err = w.makePlain(map[string]string{"provider": "acme", "model": "m", "alias": "x", "input-price": "2", "output-price": "8"})
-	if err == nil || err.Error() != "the proxy would refuse this alias:\nmodels/x: output_cap_exceeds_target message" {
+	if err == nil || err.Error() != "the proxy would refuse this alias:\nalias x: output_cap_exceeds_target message" {
 		t.Fatalf("third refuses: err = %v\n%s", err, out)
 	}
 	if got := changing(w.cli()); len(got) != 1 || !strings.HasPrefix(got[0], "targets set ") || len(mock.Calls()) != 0 ||

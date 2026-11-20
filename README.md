@@ -152,8 +152,8 @@ flags:
 | `provider` | Add providers and their keys in one go; each key is checked for free (its model list) before it is written to `.env`, and the container is recreated once |
 | `alias` | An alias toward a provider's model, with fallbacks from any provider; its new targets are checked first, each paid call announced |
 | `key` | A client key for one or more aliases, shown once, then one test call through it, announced first |
-| `budget` | A spending limit on the instance, an alias or a key; the prices of the targets it reaches unpriced are asked first |
-| `telemetry` | Traces to Langfuse or any OTLP endpoint, then `telemetry test` |
+| `budget` | The console's Cap spending: a limit on the instance, an alias or a key; the prices of the targets it reaches unpriced are asked first, and a target they leave unverified is checked again, paid, only at a terminal or with `--reverify` |
+| `telemetry` | The console's Send traces: to Langfuse or any OTLP endpoint, replacing what was set whole, then one free test span; `--backend off` turns traces off |
 | `remote` | Publish the data plane beyond loopback, always with TLS: your certificate or a self-signed one ([Install with Docker by hand](#install-with-docker-by-hand), day two) |
 | `status` | What exists: providers and their credentials, aliases with their models in order, models in no alias, keys, budgets, telemetry, and the running and the clone's versions; `--check` first says whether an upgrade is available |
 | `upgrade` | Fast-forward the clone and rebuild, keeping the previous image and taking a backup first, then print the way back |
@@ -390,7 +390,7 @@ alias allows. Every answer carries `x-stargaite-request-id`, `x-stargaite-target
 | Create, rotate and revoke a client key | `stargaite keys create my-app --model smart` · `stargaite keys rotate my-app` · `stargaite keys revoke my-app --yes` |
 | Limit and budget a key | `stargaite keys set my-app --rpm-limit 60 --max-parallel-requests 4 --budget limit_usd=10,reset_interval=daily` |
 | Meter a subscription plan | `stargaite providers set <name> --billing subscription --quota 5h:requests=1000` · `stargaite usage quota` |
-| See usage and cost | `stargaite usage show --since 24h --by key,model` |
+| See usage and cost | `./setup.sh`, then See usage and cost, a table by key, alias or target · `stargaite usage show --since 24h --by key,model` |
 | Send traces to Langfuse | `stargaite telemetry set --preset langfuse --otlp-endpoint https://<host>/api/public/otel` · `stargaite telemetry test` |
 | Check the whole configuration | `stargaite validate` |
 | Save and apply the configuration as YAML | `stargaite export > config.yaml` · `stargaite apply -f - --dry-run < config.yaml` · `stargaite apply -f - < config.yaml` |

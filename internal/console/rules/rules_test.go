@@ -254,6 +254,18 @@ func TestPlain(t *testing.T) {
 	}
 }
 
+// TestNamed: a resource of internal/config in words, for a refusal line;
+// another form, such as settings, kept as it is.
+func TestNamed(t *testing.T) {
+	for res, want := range map[string]string{
+		"providers/x": "provider x", "targets/a": "target a", "models/x": "alias x", "keys/k": "key k", "settings": "settings",
+	} {
+		if got := Named(res); got != want {
+			t.Errorf("%s: %q, want %q", res, got, want)
+		}
+	}
+}
+
 // TestPlainNames: a resource is named by its kind in words, its name kept
 // whole; a resource of another form is kept as it is.
 func TestPlainNames(t *testing.T) {

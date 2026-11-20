@@ -996,7 +996,7 @@ func TestKeyCheckPath(t *testing.T) {
 }
 
 func TestVariableOf(t *testing.T) {
-	if got := variableOf("my-llm.v2"); got != "MY_LLM_V2_API_KEY" {
+	if got := variableOf("my-llm.v2", "_API_KEY"); got != "MY_LLM_V2_API_KEY" {
 		t.Fatal(got)
 	}
 }

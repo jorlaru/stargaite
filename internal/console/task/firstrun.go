@@ -127,7 +127,7 @@ func facts(export proxy.ExportReply, validate proxy.Change) rules.Facts {
 		aliases[n] = len(m.Targets)
 	}
 	return rules.Facts{Providers: len(export.Providers), Keys: len(export.Keys), Aliases: aliases,
-		Unresolved: unresolved(validate.Findings)}
+		Unresolved: unresolved(validate.Findings), Uncapped: export.Settings.Budget == nil}
 }
 
 // readFacts reads export and validate, concurrently, and judges them.

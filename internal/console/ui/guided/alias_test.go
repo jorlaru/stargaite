@@ -70,13 +70,14 @@ func newAliasWorld(t *testing.T) *aliasWorld {
 }
 
 // must runs the CLI before the run, unrecorded, failing the test on a
-// non-zero exit.
-func (w *aliasWorld) must(t *testing.T, args ...string) {
+// non-zero exit; it returns the CLI's standard output.
+func (w *aliasWorld) must(t *testing.T, args ...string) string {
 	t.Helper()
 	var out, errOut bytes.Buffer
 	if code := cli.Main(args, func(k string) string { return w.env[k] }, strings.NewReader(""), &out, &errOut); code != 0 {
 		t.Fatalf("%q: exit %d: %s%s", args, code, out.String(), errOut.String())
 	}
+	return out.String()
 }
 
 // proxy is the world's CLI, every argv recorded as the console sent it. The

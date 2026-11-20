@@ -280,18 +280,44 @@ type stopped struct {
 func (s stopped) Error() string { return s.msg }
 func (s stopped) Unwrap() error { return s.cause }
 
+// TelemetryTest runs telemetry test, which sends one span to the trace
+// backend (no provider is called), and returns how far it got: an answer of
+// exit 0 or 1 is the reply, whatever its outcome.
+func (p *Proxy) TelemetryTest(ctx context.Context) (*TelemetryTestReply, error) {
+	const words = "telemetry test"
+	out, code, err := p.call(ctx, words, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("stargaite %s: %w", words, err)
+	}
+	var reply TelemetryTestReply
+	if err := decodeAnswer(words, out, code, &reply); err != nil {
+		return nil, err
+	}
+	return &reply, nil
+}
+
+// decodeAnswer decodes the answer of a command that exits 1 on an outcome it
+// still reports, as targets verify and telemetry test do: an answer of exit 0
+// or 1 that decodes is reply; anything else follows Call's rule.
+func decodeAnswer(words string, out []byte, code int, reply Reply) error {
+	if code > 1 {
+		return failure(words, out, code)
+	}
+	if err := decode(words, out, reply); err != nil {
+		if code != 0 {
+			return failure(words, out, code)
+		}
+		return err
+	}
+	return nil
+}
+
 // verdict reads a check's answer. An answer of exit 0 or 1 is a VerifyReply;
 // more calls than stated, or a failed check, is an error; anything else
 // follows Call's rule.
 func verdict(words, target string, calls int, out []byte, code int) (*VerifyReply, error) {
 	var reply VerifyReply
-	if code > 1 {
-		return nil, failure(words, out, code)
-	}
-	if err := decode(words, out, &reply); err != nil {
-		if code != 0 {
-			return nil, failure(words, out, code)
-		}
+	if err := decodeAnswer(words, out, code, &reply); err != nil {
 		return nil, err
 	}
 	if len(reply.Calls) > calls {

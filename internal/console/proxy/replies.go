@@ -5,6 +5,9 @@ import (
 	"encoding/json/v2"
 	"fmt"
 	"maps"
+	"strings"
+
+	"github.com/jorlaru/stargaite/internal/console/ui"
 )
 
 // The replies hold only the members the console reads; the CLI's answers
@@ -319,4 +322,69 @@ type TelemetryBlock struct {
 	OTLPEndpoint string            `json:"otlp_endpoint"`
 	BasicAuthEnv []string          `json:"basic_auth_env"`
 	HeaderEnv    map[string]string `json:"header_env"`
+}
+
+// TelemetryTestReply is "telemetry test --json": how far the one test span
+// got, with the backend's status, its cause (redacted by the proxy) and the
+// trace id of an accepted span.
+type TelemetryTestReply struct {
+	Outcome string `json:"outcome"`
+	Status  int    `json:"status"`
+	Message string `json:"message"`
+	TraceID string `json:"trace_id"`
+}
+
+// Required names the members the answer must have.
+func (*TelemetryTestReply) Required() []string { return []string{"outcome"} }
+
+// Line says the answer in the CLI's words (internal/cli/client.go, tested):
+// each step the span passed, then the one that failed, its trace id and
+// cause; every string from the proxy cleaned.
+func (t *TelemetryTestReply) Line() string {
+	steps := []string{"credentials: resolved", "reachable: yes", "authorized: yes"}
+	switch t.Outcome {
+	case "credential_unresolved":
+		steps = []string{"credentials: unresolved"}
+	case "unreachable":
+		steps = append(steps[:1], "reachable: no")
+	case "unauthorized":
+		steps = append(steps[:2], fmt.Sprintf("authorized: no (%d)", t.Status))
+	case "not_found":
+		steps = append(steps[:2], fmt.Sprintf("span: not_found (%d)", t.Status))
+	default:
+		steps = append(steps, fmt.Sprintf("span: %s (%d)", ui.OneLine(t.Outcome), t.Status))
+	}
+	if t.TraceID != "" {
+		steps = append(steps, "trace_id="+ui.OneLine(t.TraceID))
+	}
+	if t.Message != "" {
+		steps = append(steps, ui.OneLine(t.Message))
+	}
+	return strings.Join(steps, " · ")
+}
+
+// UsageReply is "usage show --json": where the window was read from (records
+// or daily), the span read, and a group per billing mode and grouped value.
+type UsageReply struct {
+	Source string       `json:"source"`
+	Since  string       `json:"since"`
+	Until  string       `json:"until"`
+	Groups []UsageGroup `json:"groups"`
+}
+
+// Required names the members the answer must have.
+func (*UsageReply) Required() []string { return []string{"source", "since", "until", "groups"} }
+
+// UsageGroup is one row of usage show; only the grouped column is set, and
+// CostUSD is nil when no record of the group had a cost.
+type UsageGroup struct {
+	Billing  string   `json:"billing"`
+	Key      string   `json:"key"`
+	Model    string   `json:"model"`
+	Target   string   `json:"target"`
+	Requests int64    `json:"requests"`
+	Errors   int64    `json:"errors"`
+	Input    int64    `json:"input_tokens"`
+	Output   int64    `json:"output_tokens"`
+	CostUSD  *float64 `json:"cost_usd"`
 }

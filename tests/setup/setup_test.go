@@ -766,27 +766,31 @@ func TestSetupFlags(t *testing.T) {
 		}
 
 		// The alias's budget is refused for acme/m1, which has no price: its
-		// prices are set, as of today, and the budget applied once more.
-		// ollama/llama3, of a provider with billing none, is never asked about.
+		// prices are set, as of today, and the budget applied once more; the
+		// price cleared acme/m1's verification, and without --reverify it is
+		// only said, nothing paid. ollama/llama3, of a provider with billing
+		// none, is never asked about.
 		got, out = sub("budget", "--on", "alias:main", "--limit-usd", "5", "--input-price", "1.5", "--output-price", "6")
 		today := time.Now().Format(time.DateOnly)
-		want = []string{"models show -- main", "models set --budget limit_usd=5,reset_interval=monthly -- main",
+		want = []string{"models list", "models set --budget limit_usd=5,reset_interval=monthly -- main", "targets list",
 			"targets set --pricing input_per_million=1.5,output_per_million=6,as_of=" + today + " -- acme/m1",
-			"models set --budget limit_usd=5,reset_interval=monthly -- main"}
-		if !slices.Equal(got, want) || !strings.Contains(out, "error: targets/acme/m1: pay-per-use target") ||
-			!strings.Contains(out, "setting the prices of acme/m1 to 1.5 and 6 USD per million input and output tokens, as of "+today) ||
-			!strings.Contains(out, "which clears its verification: a later install or alias toward it verifies it again") {
+			"models set --budget limit_usd=5,reset_interval=monthly -- main", "providers list", "targets list"}
+		if !slices.Equal(got, want) || !strings.Contains(out, "acme/m1 has no prices and a budget reaches it: its prices are asked") ||
+			!strings.Contains(out, "setting the prices of acme/m1 to 1.5 and 6 USD per million input and output tokens, as of "+today+", which clears its verification") ||
+			!strings.Contains(out, "1 target(s) must be checked again: 1 paid call(s) (--reverify asks for it)") ||
+			!strings.Contains(out, "Done: alias main, budget 5 USD, reset monthly.") || strings.Contains(out, "ollama/llama3 has no prices") {
 			t.Errorf("budget: %q, want %q:\n%s", got, want, out)
 		}
 		// A budget that replaces one is confirmed: without --yes, exit 2 and
 		// nothing set.
 		before = len(r.cli())
 		code, out = r.exec("budget", "--on", "alias:main", "--limit-usd", "7")
-		if got := r.cli()[before:]; code != 2 || !strings.Contains(out, "missing --yes: the budget on alias:main, 5 USD, reset monthly, is replaced") ||
-			!slices.Equal(got, []string{"models show -- main"}) {
+		if got := r.cli()[before:]; code != 2 ||
+			!strings.Contains(out, "missing --yes: the budget of alias main, 5 USD, resets monthly, is replaced by 7 USD, reset monthly") ||
+			!slices.Equal(got, []string{"models list"}) {
 			t.Errorf("budget replaced without --yes: exit %d, %q:\n%s", code, got, out)
 		}
-		if got, out = sub("budget", "--on", "alias:main", "--limit-usd", "7", "--yes"); !slices.Equal(got, []string{"models show -- main",
+		if got, out = sub("budget", "--on", "alias:main", "--limit-usd", "7", "--yes"); !slices.Equal(got, []string{"models list",
 			"models set --budget limit_usd=7,reset_interval=monthly -- main"}) {
 			t.Errorf("budget replaced: %q:\n%s", got, out)
 		}
@@ -795,7 +799,7 @@ func TestSetupFlags(t *testing.T) {
 			t.Errorf("budget on the instance: %q:\n%s", got, out)
 		}
 		if got, out = sub("budget", "--on", "key:app", "--limit-usd", "0.5", "--reset", "never"); !slices.Equal(got,
-			[]string{"keys show -- app", "keys set --budget limit_usd=0.5,reset_interval=never -- app"}) {
+			[]string{"keys list", "keys set --budget limit_usd=0.5,reset_interval=never -- app"}) {
 			t.Errorf("budget on a key: %q:\n%s", got, out)
 		}
 
@@ -886,7 +890,7 @@ func TestSetupFlags(t *testing.T) {
 		up := r.count("docker", "compose up")
 		code, out := r.exec("telemetry", "--backend", "otlp", "--endpoint", "https://otlp.example", "--header-name", "X-Tok", "--yes")
 		if code != 0 || r.count("docker", "compose up") != up+1 || !strings.Contains(out, "OTLP_X_TOK is in .env; kept") ||
-			!strings.Contains(out, "the container is recreated to read OTLP_X_TOK") || !strings.Contains(out, "span: accepted (200)") {
+			!strings.Contains(out, "the container is recreated if it has not read OTLP_X_TOK yet") || !strings.Contains(out, "span: accepted (200)") {
 			t.Errorf("credential kept but unresolved: exit %d, %d compose up, want %d:\n%s", code, r.count("docker", "compose up"), up+1, out)
 		}
 	})
@@ -1117,22 +1121,24 @@ func TestSetupNoTTY(t *testing.T) {
 		cli     []string // the CLI calls after the install's, which change nothing
 	}{
 		{without(budget, "--on"), "missing --on: what the budget is on", nil},
-		{without(budget, "--limit-usd"), "missing --limit-usd", nil},
+		// The budget's scope is read before its limit and reset are asked
+		// (owner, C63-Q5): one read, nothing written.
+		{without(budget, "--limit-usd"), "missing --limit-usd", []string{"models list"}},
 		{without(budget, "--input-price"), "missing --input-price: the price of acme/m1 in USD per million input tokens",
-			[]string{"models show -- main", "models set --budget limit_usd=5,reset_interval=monthly -- main"}},
-		{append(slices.Clone(budget), "--on", "alias"), "--on takes instance, alias:<name> or key:<name>", nil},
-		{append(slices.Clone(budget), "--reset", "weekly"), "--reset takes daily, monthly or never", nil},
-		{append(slices.Clone(budget), "--limit-usd", "5,reset_interval=never"), "--limit-usd takes a number of USD", nil},
-		{append(slices.Clone(budget), "--input-price", "1,as_of=2020-01-01"), "--input-price and --output-price take a number of USD",
-			[]string{"models show -- main", "models set --budget limit_usd=5,reset_interval=monthly -- main"}},
+			[]string{"models list", "models set --budget limit_usd=5,reset_interval=monthly -- main", "targets list"}},
+		{append(slices.Clone(budget), "--on", "alias"), "--on: instance, alias:<name> or key:<name> is needed", nil},
+		{append(slices.Clone(budget), "--reset", "weekly"), "--reset: weekly is not one of monthly, daily, never", []string{"models list"}},
+		{append(slices.Clone(budget), "--limit-usd", "5,reset_interval=never"), "--limit-usd: a number of USD is needed", []string{"models list"}},
+		{append(slices.Clone(budget), "--input-price", "1,as_of=2020-01-01"), "--input-price: --input-price and --output-price take a number of USD",
+			[]string{"models list", "models set --budget limit_usd=5,reset_interval=monthly -- main", "targets list"}},
 		{without(langfuse, "--backend"), "missing --backend", nil},
-		{append(slices.Clone(langfuse), "--backend", "zipkin"), "--backend takes langfuse or otlp", nil},
+		{append(slices.Clone(langfuse), "--backend", "zipkin"), "--backend: zipkin is not one of langfuse, otlp, off", nil},
 		{without(langfuse, "--endpoint"), "missing --endpoint", nil},
 		{without(langfuse, "--langfuse-public-env"), "missing --langfuse-public-env", []string{"telemetry status"}},
 		{without(langfuse, "--langfuse-secret-env"), "missing --langfuse-secret-env", []string{"telemetry status"}},
 		{append(slices.Clone(langfuse), "--header-name", "Authorization"), "--header-name and --key-env are for --backend otlp", nil},
 		{without(otlp, "--header-name"), "--key-env holds the credential of --header-name: give both", nil},
-		{without(otlp, "--key-env"), "missing --key-env: the variable of this script's environment that holds OTLP_AUTHORIZATION", []string{"telemetry status"}},
+		{without(otlp, "--key-env"), "missing --key-env: OTLP_AUTHORIZATION", []string{"telemetry status"}},
 		{without(otlp, "--yes"), "missing --yes: writing OTLP_AUTHORIZATION to .env, and the container is then recreated", []string{"telemetry status"}},
 		{[]string{"provider", "--provider", "ollama"}, "missing --yes: writing compose.override.yaml with host_gateway=1", []string{"providers presets", "providers list",
 			"providers add --base-url http://host.docker.internal:11434/v1 --allow-private-network -- ollama"}},
@@ -1163,10 +1169,10 @@ func TestSetupNoTTY(t *testing.T) {
 }
 
 // TestSetupPrompts: at a terminal, ./setup.sh with no subcommand opens the
-// console's home on an installation; budget asks for the prices of the
-// target its budget reaches unpriced, telemetry and remote ask their
-// questions, hidden ones for credentials. The first run's prompts are the
-// console's (TestGuidedFirstRun, TestFirstRunAtTerminalResumesAtKey).
+// console's home on an installation, and remote asks its questions. The
+// prompts of the first run, budget and telemetry are the console's
+// (TestGuidedFirstRun, TestFirstRunAtTerminalResumesAtKey,
+// TestGuidedCapSpending, TestGuidedSendTraces).
 func TestSetupPrompts(t *testing.T) {
 	r := newRun(t, []string{"SRC=v"})
 	port := freePort(t)
@@ -1179,62 +1185,9 @@ func TestSetupPrompts(t *testing.T) {
 		t.Errorf("no subcommand: exit %d, want 130:\n%s", code, out)
 	}
 
-	// budget asks for the prices of the target its budget reaches unpriced.
-	before := len(r.cli())
-	code, out := r.pty([]string{"budget"},
-		step{"what the budget is on: instance, alias:<name> or key:<name>: ", "alias:main"},
-		step{"the limit in USD: ", "5"},
-		step{"when it resets: daily, monthly or never [monthly]: ", ""},
-		step{"the price of acme/m1 in USD per million input tokens: ", "2"},
-		step{"the price of acme/m1 in USD per million output tokens: ", "8"},
-	)
-	want := []string{"models show -- main", "models set --budget limit_usd=5,reset_interval=monthly -- main",
-		"targets set --pricing input_per_million=2,output_per_million=8,as_of=" + time.Now().Format(time.DateOnly) + " -- acme/m1",
-		"models set --budget limit_usd=5,reset_interval=monthly -- main"}
-	if got := r.cli()[before:]; code != 0 || !slices.Equal(got, want) {
-		t.Errorf("budget: exit %d, %q, want %q:\n%s", code, got, want, out)
-	}
-
-	// telemetry reads a header credential hidden.
-	const secret = "typed-otlp-secret"
-	code, out = r.pty([]string{"telemetry"},
-		step{"the backend: langfuse or otlp: ", "otlp"},
-		step{"spans go to <endpoint>/v1/traces: ", "https://otlp.example"},
-		step{"empty for none: ", "Authorization"},
-		step{"OTLP_AUTHORIZATION (typed hidden): ", secret},
-		step{"continue? [y/N]: ", "y"},
-	)
-	if code != 0 || !strings.Contains(out, "span: accepted") || !strings.Contains(r.file(".env"), "OTLP_AUTHORIZATION='"+secret+"'") {
-		t.Errorf("telemetry: exit %d, .env %q:\n%s", code, r.file(".env"), out)
-	}
-	if found := r.leaks(secret, out); len(found) > 0 {
-		t.Errorf("the credential is in %q", found)
-	}
-
-	// Langfuse replaces it, once confirmed, and reads its two keys hidden.
-	const public, private = "typed-lf-public", "typed-lf-secret"
-	code, out = r.pty([]string{"telemetry"},
-		step{"the backend: langfuse or otlp: ", "langfuse"},
-		step{"https://<host>/api/public/otel: ", "https://lf.example/api/public/otel"},
-		step{"continue? [y/N]: ", "y"},
-		step{"LANGFUSE_PUBLIC_KEY (typed hidden): ", public},
-		step{"LANGFUSE_SECRET_KEY (typed hidden): ", private},
-		step{"continue? [y/N]: ", "y"},
-	)
-	env := r.file(".env")
-	if code != 0 || !strings.Contains(out, "is replaced whole") || !strings.Contains(out, "span: accepted") ||
-		!strings.Contains(env, "LANGFUSE_PUBLIC_KEY='"+public+"'") || !strings.Contains(env, "LANGFUSE_SECRET_KEY='"+private+"'") {
-		t.Errorf("langfuse: exit %d, .env %q:\n%s", code, env, out)
-	}
-	for _, secret := range []string{public, private} {
-		if found := r.leaks(secret, out); len(found) > 0 {
-			t.Errorf("%s is in %q", secret, found)
-		}
-	}
-
 	// remote lists this host's addresses, asks for those to publish on and
 	// the certificate, then confirms.
-	code, out = r.pty([]string{"remote"},
+	code, out := r.pty([]string{"remote"},
 		step{"separated by commas; 127.0.0.1 alone for loopback only: ", "192.0.2.10"},
 		step{"the certificate: own (yours, with its key) or self-signed (made here with openssl): ", "self-signed"},
 		step{"continue? [y/N]: ", "y"},
@@ -1247,9 +1200,9 @@ func TestSetupPrompts(t *testing.T) {
 
 // TestSetupSecrets: a credential reaches .env (mode 0600) byte for byte and
 // nothing else: no argv, no output, no other file. Values .env cannot hold
-// are refused. Control: a copy of setup.sh whose env_set, which telemetry
-// still runs, passes the credential in an argv is caught. The hidden prompt
-// is the console's (TestProviderSecretNeverOnTerminal, TestGuidedFirstRun).
+// are refused. Control: a copy of setup.sh whose main passes the credential
+// in an argv is caught. The hidden prompt is the console's
+// (TestProviderSecretNeverOnTerminal, TestGuidedFirstRun, TestGuidedSendTraces).
 func TestSetupSecrets(t *testing.T) {
 	const value = `s3cr3t $HOME #x y\z`
 	t.Run("flags", func(t *testing.T) {
@@ -1283,9 +1236,9 @@ func TestSetupSecrets(t *testing.T) {
 			t.Errorf("--key-env %s: exit %d:\n%s", pasted, code, out)
 		}
 	}
-	// telemetry reads its credential in bash: a value .env cannot hold, a value
-	// given instead of a name and a variable not exported are refused, and
-	// --replace replaces it.
+	// telemetry reads its credential in the console: a value .env cannot hold,
+	// a value given instead of a name and a variable not exported are refused,
+	// and --replace replaces it.
 	t.Run("telemetry", func(t *testing.T) {
 		r := newRun(t, []string{"SRC=v", "Q=it's", "NL=two\nlines", `BS=ends\`, "OT=first", "OT2=second"})
 		if code, out := r.exec(acme(freePort(t))...); code != 0 {
@@ -1301,12 +1254,12 @@ func TestSetupSecrets(t *testing.T) {
 			}
 		}
 		if code, out := r.exec(otlp("--key-env", "sk-pasted-value")...); code != 2 || strings.Contains(out, "sk-pasted-value") ||
-			!strings.Contains(out, "--key-env takes the name of a variable exported to this script") || r.file(".env") != env {
+			!strings.Contains(out, "--key-env takes the name of a variable exported to the console") || r.file(".env") != env {
 			t.Errorf("a value for a name: exit %d:\n%s", code, out)
 		}
 		// from is one of setup.sh's own variables, not exported to it.
 		if code, out := r.exec(otlp("--key-env", "from")...); code != 2 ||
-			!strings.Contains(out, "--key-env takes the name of a variable exported to this script") || r.file(".env") != env {
+			!strings.Contains(out, "--key-env takes the name of a variable exported to the console") || r.file(".env") != env {
 			t.Errorf("a variable not exported: exit %d:\n%s", code, out)
 		}
 		if code, out := r.exec(otlp("--key-env", "OT")...); code != 0 || !strings.Contains(r.file(".env"), "\nOTLP_AUTHORIZATION='first'\n") {
@@ -1322,9 +1275,9 @@ func TestSetupSecrets(t *testing.T) {
 			t.Fatalf("install: exit %d:\n%s", code, out)
 		}
 		src := r.file("setup.sh")
-		leaky := strings.Replace(src, "env_set() {\n", "env_set() {\n\tsleep 0 \"$2\"\n", 1)
+		leaky := strings.Replace(src, "main() {\n", "main() {\n\tsleep 0 \"$OT\"\n", 1)
 		if leaky == src {
-			t.Fatal("env_set not found in setup.sh")
+			t.Fatal("main not found in setup.sh")
 		}
 		if err := os.WriteFile(filepath.Join(r.dir, "setup.sh"), []byte(leaky), 0o700); err != nil {
 			t.Fatal(err)
@@ -1338,8 +1291,9 @@ func TestSetupSecrets(t *testing.T) {
 
 // TestSetupOverride: an override without the marker is the reader's and is
 // left untouched, the step that needs it stopping with what to add; control:
-// one with the marker is regenerated, keeping the "# setup:" lines it holds.
-// telemetry toward an endpoint on the host needs the host-gateway line.
+// one that holds the line goes on. telemetry toward an endpoint on the host
+// needs the host-gateway line. One with the marker, regenerated keeping the
+// "# setup:" lines it holds, is TestSendTracesOverride's.
 func TestSetupOverride(t *testing.T) {
 	local := []string{"telemetry", "--backend", "otlp", "--endpoint", "http://127.0.0.1:4318", "--yes"}
 	// installed is an installation whose override is then the one given.
@@ -1375,27 +1329,6 @@ func TestSetupOverride(t *testing.T) {
 	r = installed(theirs)
 	if code, out := r.exec(local...); code != 0 || r.file("compose.override.yaml") != theirs {
 		t.Errorf("an override that holds the line: exit %d, %q:\n%s", code, r.file("compose.override.yaml"), out)
-	}
-
-	// The control: an override that holds TLS, as remote writes it, keeps it
-	// when the host-gateway line joins.
-	marker := "# Written by setup.sh from its \"# setup:\" lines below; it rewrites this file whole.\n"
-	setup := "# setup: tls=self-signed\n# setup: tls_name=localhost\n# setup: tls_ca=cert.pem\n# setup: addresses=127.0.0.1\n"
-	tls := "    command: [\"serve\", \"--listen\", \"0.0.0.0:4000\", \"--tls-cert\", \"/tls/cert.pem\", \"--tls-key\", \"/tls/key.pem\"]\n" +
-		"    ports: !override\n      - \"127.0.0.1:${STARGAITE_PORT:-4000}:4000\"\n    volumes:\n      - ./tls:/tls:ro\n"
-	marked := marker + setup + "services:\n  stargaite:\n    extra_hosts:\n      - \"localhost:127.0.0.1\"\n" + tls
-	r = installed(marked)
-	before := len(r.cli())
-	if code, out := r.exec(local...); code != 0 {
-		t.Fatalf("control: exit %d:\n%s", code, out)
-	}
-	want := marker + setup + "# setup: host_gateway=1\nservices:\n  stargaite:\n    extra_hosts:\n      - \"host.docker.internal:host-gateway\"\n" +
-		"      - \"localhost:127.0.0.1\"\n" + tls
-	if got := r.file("compose.override.yaml"); got != want {
-		t.Errorf("override:\n%s\nwant:\n%s", got, want)
-	}
-	if !slices.Contains(r.cli()[before:], "telemetry set --otlp-endpoint http://host.docker.internal:4318 --allow-private-network") {
-		t.Errorf("CLI calls: %q", r.cli()[before:])
 	}
 }
 
@@ -1553,8 +1486,11 @@ func TestSetupRemote(t *testing.T) {
 		// first answer over HTTPS is TestTryCompletionTransport's and e2e's.
 		ready(t, r, n, "localhost", port, " --cacert tls/cert.pem ")
 		n = len(r.calls())
-		if code, out := r.exec("budget", "--on", "instance", "--limit-usd", "1", "--input-price", "1", "--output-price", "2", "--yes"); code != 0 {
-			t.Errorf("budget: exit %d:\n%s", code, out)
+		// upgrade checks readiness first; the test's clone is no git clone, so
+		// it stops at its fetch.
+		if code, out := r.exec("upgrade"); code != 1 ||
+			!strings.Contains(out, "setup.sh: upgrades come from a git clone of stargaite, with git: see https://git-scm.com/downloads") {
+			t.Errorf("upgrade: exit %d:\n%s", code, out)
 		}
 		if code, out := r.exec("status"); code != 0 || !strings.Contains(out, "provider acme: credential resolved") {
 			t.Errorf("status: exit %d:\n%s", code, out)
@@ -1760,7 +1696,7 @@ func TestSetupRemote(t *testing.T) {
 			t.Errorf("0.0.0.0: exit %d, addresses on the certificate %s:\n%s", code, ipsOf(certOf(t, r)), out)
 		}
 		r.env = append(r.env, "FAKE_READY=never")
-		if code, out := r.exec("budget", "--on", "instance", "--limit-usd", "1", "--yes"); code != 1 || !strings.Contains(out, "a log line\n./setup.sh remote again repairs a remote that did not finish") {
+		if code, out := r.exec("upgrade"); code != 1 || !strings.Contains(out, "a log line\n./setup.sh remote again repairs a remote that did not finish") {
 			t.Errorf("never ready: exit %d:\n%s", code, out)
 		}
 	})
@@ -1826,7 +1762,7 @@ func TestSetupRemote(t *testing.T) {
 		if out, err := restart.CombinedOutput(); err != nil {
 			t.Fatalf("restart: %v: %s", err, out)
 		}
-		if code, out := r.exec("budget", "--on", "instance", "--limit-usd", "1", "--yes"); code != 1 || !strings.Contains(out, "not ready within 120 s") {
+		if code, out := r.exec("upgrade"); code != 1 || !strings.Contains(out, "not ready within 120 s") {
 			t.Fatalf("the shim does not refuse the expired certificate: exit %d:\n%s", code, out)
 		}
 		code, out := r.exec("remote", "--tls", "self-signed", "--yes")
@@ -1889,8 +1825,8 @@ func TestSetupRemote(t *testing.T) {
 
 // TestSetupPrereqs: everything missing is reported at once, each with where
 // to get it, before anything runs; control: Compose 2.24.4 passes. install
-// checks Docker before the console; the subcommands still in bash check curl
-// and jq too.
+// checks Docker before the console; the subcommands still in bash (upgrade
+// here) check curl and jq too.
 func TestSetupPrereqs(t *testing.T) {
 	port := freePort(t)
 	t.Run("missing tools", func(t *testing.T) {
@@ -1899,14 +1835,14 @@ func TestSetupPrereqs(t *testing.T) {
 		if code != 1 || !strings.Contains(out, "Docker: see https://docs.docker.com/engine/install/") || r.count("docker", "compose up") != 0 {
 			t.Errorf("install: exit %d:\n%s", code, out)
 		}
-		code, out = r.exec("budget", "--on", "instance", "--limit-usd", "1", "--yes")
+		code, out = r.exec("upgrade")
 		for _, s := range []string{"Docker: see https://docs.docker.com/engine/install/", "curl: see https://curl.se/download.html", "jq: see https://jqlang.org/download/"} {
 			if !strings.Contains(out, s) {
-				t.Errorf("budget: no %q in:\n%s", s, out)
+				t.Errorf("upgrade: no %q in:\n%s", s, out)
 			}
 		}
 		if code != 1 || r.count("docker", "compose up") != 0 {
-			t.Errorf("budget: exit %d, or it went on:\n%s", code, out)
+			t.Errorf("upgrade: exit %d, or it went on:\n%s", code, out)
 		}
 	})
 	for _, c := range []struct {
@@ -2057,11 +1993,12 @@ func TestSetupBounds(t *testing.T) {
 		r.env = append(r.env, env...)
 		return r
 	}
-	telemetry := []string{"telemetry", "--backend", "otlp", "--endpoint", "https://otlp.example", "--header-name", "Authorization", "--key-env", "OT", "--yes"}
+	// remote's recreate is a bash compose_up.
+	remote := []string{"remote", "--tls", "self-signed", "--address", "127.0.0.1", "--yes"}
 	r := installed()
 	ups := r.count("docker", "compose up")
-	if code, out := r.exec(telemetry...); code != 0 {
-		t.Fatalf("telemetry: exit %d:\n%s", code, out)
+	if code, out := r.exec(remote...); code != 0 {
+		t.Fatalf("remote: exit %d:\n%s", code, out)
 	}
 	for _, c := range r.calls() {
 		if c.Argv[0] == "curl" && !slices.Contains(c.Argv, "--max-time") {
@@ -2075,7 +2012,7 @@ func TestSetupBounds(t *testing.T) {
 	t.Run("never ready", func(t *testing.T) {
 		r := installed("FAKE_READY=never")
 		before := len(r.cli())
-		code, out := r.exec("budget", "--on", "instance", "--limit-usd", "1", "--yes")
+		code, out := r.exec("upgrade")
 		if code != 1 || !strings.Contains(out, "not ready within 120 s; the last 30 log lines:\na log line") || strings.Contains(out, "remote again") ||
 			r.count("curl", "/health/ready") != 120 || r.count("docker", "compose logs --tail 30 stargaite") != 1 || len(r.cli()) != before {
 			t.Errorf("exit %d, %d readiness checks:\n%s", code, r.count("curl", "/health/ready"), out)
@@ -2084,7 +2021,7 @@ func TestSetupBounds(t *testing.T) {
 	t.Run("up outlives its bound", func(t *testing.T) {
 		r := installed("FAKE_UP=hang", "FAKE_TIMEOUT=1")
 		start := time.Now()
-		code, out := r.exec(telemetry...)
+		code, out := r.exec(remote...)
 		if took := time.Since(start); code != 1 || took > 15*time.Second || !strings.Contains(out, "docker compose up failed or was interrupted") ||
 			r.afterUp("curl", "/health/ready") != 0 || r.afterUp("docker", "/stargaite") != 0 {
 			t.Errorf("exit %d after %s, %d CLI calls after the up:\n%s", code, took, r.afterUp("docker", "/stargaite"), out)
@@ -2102,8 +2039,7 @@ func TestSetupInterrupt(t *testing.T) {
 	}
 	r.env = append(r.env, "FAKE_UP=hang")
 	start := time.Now()
-	code, out := r.pty([]string{"telemetry", "--backend", "otlp", "--endpoint", "https://otlp.example", "--header-name", "Authorization", "--key-env", "OT", "--yes"},
-		step{"fake build: 30 s", "\x03"})
+	code, out := r.pty([]string{"remote", "--tls", "self-signed", "--address", "127.0.0.1", "--yes"}, step{"fake build: 30 s", "\x03"})
 	if took := time.Since(start); code != 130 || took > 10*time.Second || r.afterUp("docker", "/stargaite") != 0 {
 		t.Errorf("exit %d after %s, %d CLI calls after the up:\n%s", code, took, r.afterUp("docker", "/stargaite"), out)
 	}

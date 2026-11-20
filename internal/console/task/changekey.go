@@ -205,51 +205,9 @@ func (r *run) revoke(ctx context.Context, k proxy.Key) (string, error) {
 	return "Done: key " + k.Name + " revoked.", nil
 }
 
-// keyBudget sets, replaces or removes key k's budget. Every question is
-// asked before anything is written.
+// keyBudget sets, replaces or removes key k's budget, as Cap spending does.
 func (r *run) keyBudget(ctx context.Context, k proxy.Key) (string, error) {
-	todo := "set"
-	if k.Budget != nil {
-		var err error
-		if todo, err = r.u.Pick(ctx, ui.Question{ID: "budget", Step: "change", Prompt: "What do you want to do with its budget?",
-			Options: []ui.Option{{Value: "set", Label: "set another"}, {Value: "remove", Label: "remove it"}}}); err != nil {
-			return "", err
-		}
-	}
-	if todo == "remove" {
-		if err := confirm(ctx, r.u, "change", "the budget of key "+k.Name+", "+usd(k.Budget)+", is removed"); err != nil {
-			return "", err
-		}
-		if err := r.setKey(ctx, k.Name, "--budget="); err != nil {
-			return "", err
-		}
-		return "Done: key " + k.Name + ", no budget.", nil
-	}
-	l, err := r.u.Text(ctx, ui.Question{ID: "limit-usd", Step: "change", Prompt: "the limit in USD", Check: isLimit})
-	if err != nil {
-		return "", err
-	}
-	reset, err := r.u.Pick(ctx, ui.Question{ID: "reset", Step: "change", Prompt: "When does it reset?",
-		Options: []ui.Option{{Value: "monthly", Label: "monthly"}, {Value: "daily", Label: "daily"}, {Value: "never", Label: "never"}}})
-	if err != nil {
-		return "", err
-	}
-	v, _ := strconv.ParseFloat(l, 64)
-	l = usdText(v) // as a JSON number: the CLI refuses "05"
-	what := l + " USD, reset " + reset
-	text := "a budget of " + l + " USD is set on key " + k.Name + ", reset " + reset // it may refuse the key's apps at once
-	if k.Budget != nil {
-		text = "the budget of key " + k.Name + ", " + usd(k.Budget) + ", is replaced by " + what
-	}
-	if err := confirm(ctx, r.u, "change", text); err != nil {
-		return "", err
-	}
-	findings, err := r.priced(ctx, "change", "key "+k.Name+": budget "+what, "keys set", []string{"--budget", "limit_usd=" + l + ",reset_interval=" + reset}, k.Name)
-	if err != nil {
-		return "", err
-	}
-	r.warn(ctx, findings, false, "keys/"+k.Name)
-	return "Done: key " + k.Name + ", budget " + what + ".", nil
+	return r.setBudget(ctx, "change", scope{"key", k.Name}, k.Budget)
 }
 
 // priced makes a change that a budget may refuse for targets without prices;

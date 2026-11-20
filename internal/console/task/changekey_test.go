@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"maps"
 	"net/http"
 	"slices"
@@ -52,6 +53,13 @@ func (w *world) listedKey(n string) (proxy.Key, bool) {
 // made by the test on the data plane at port.
 func chat(t *testing.T, port, secret string) int {
 	t.Helper()
+	code, _ := chatReply(t, port, secret)
+	return code
+}
+
+// chatReply is chat's status and body.
+func chatReply(t *testing.T, port, secret string) (int, string) {
+	t.Helper()
 	req, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:"+port+"/v1/chat/completions",
 		strings.NewReader(`{"model":"a","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}`))
 	if err != nil {
@@ -63,8 +71,9 @@ func chat(t *testing.T, port, secret string) int {
 	if err != nil {
 		t.Fatal(err)
 	}
+	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	return resp.StatusCode
+	return resp.StatusCode, string(body)
 }
 
 // revealed is the value of the reveal the front was asked, "" for none.
@@ -433,7 +442,7 @@ func TestChangeKeyBudgetOtherRefusal(t *testing.T) {
 	if err == nil {
 		t.Fatalf("no error\n%s", s.output())
 	}
-	if lines := strings.Split(err.Error(), "\n"); len(lines) != 2 || lines[0] != "the proxy would refuse this change:" || lines[1] != "keys/k: unknown_alias message" {
+	if lines := strings.Split(err.Error(), "\n"); len(lines) != 2 || lines[0] != "the proxy would refuse this change:" || lines[1] != "key k: unknown_alias message" {
 		t.Errorf("err = %q", err)
 	}
 	if s.asks("input-price") || indexOf(w.cli(), "targets set ") >= 0 {

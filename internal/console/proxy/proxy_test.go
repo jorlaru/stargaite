@@ -17,6 +17,7 @@ import (
 	"github.com/jorlaru/stargaite/internal/admintest"
 	"github.com/jorlaru/stargaite/internal/cli"
 	"github.com/jorlaru/stargaite/internal/console/paid"
+	"github.com/jorlaru/stargaite/internal/usage"
 	"github.com/jorlaru/stargaite/tests/mockprovider"
 )
 
@@ -967,5 +968,95 @@ func TestDryRunStdin(t *testing.T) {
 	}
 	if decl["name"] == nil {
 		t.Error("DryRun changed the caller's declaration")
+	}
+}
+
+// TestTelemetryTest: an answer of exit 0 or 1 that decodes is the reply,
+// whatever its outcome, and Line says it in the CLI's words; an error
+// envelope and an exit 2 follow Call's rule; a message is cleaned.
+func TestTelemetryTest(t *testing.T) {
+	for _, tc := range []struct {
+		out  string
+		code int
+		line string
+	}{
+		{`{"outcome":"accepted","status":200,"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}`, 0,
+			"credentials: resolved · reachable: yes · authorized: yes · span: accepted (200) · trace_id=4bf92f3577b34da6a3ce929d0e0e4736"},
+		{`{"outcome":"unauthorized","status":401,"message":"bad credentials"}`, 1,
+			"credentials: resolved · reachable: yes · authorized: no (401) · bad credentials"},
+		{`{"outcome":"credential_unresolved","message":"X does not resolve"}`, 1, "credentials: unresolved · X does not resolve"},
+		{`{"outcome":"unreachable","message":"dial tcp 192.0.2.1:4318: connect: connection refused"}`, 1,
+			"credentials: resolved · reachable: no · dial tcp 192.0.2.1:4318: connect: connection refused"},
+		{`{"outcome":"not_found","status":404}`, 1, "credentials: resolved · reachable: yes · span: not_found (404)"},
+		{`{"outcome":"rejected","status":400,"message":"bad\u001b[2J span"}`, 1,
+			"credentials: resolved · reachable: yes · authorized: yes · span: rejected (400) · bad[2J span"},
+	} {
+		var seen [][]string
+		reply, err := New(canned(tc.out, tc.code, &seen)).TelemetryTest(context.Background())
+		if err != nil || reply.Line() != tc.line {
+			t.Errorf("%s exit %d: %v, line %q, want %q", tc.out, tc.code, err, lineOf(reply), tc.line)
+		}
+		if len(seen) != 1 || !slices.Equal(seen[0], []string{"telemetry", "test", "--json"}) {
+			t.Errorf("argv %q", seen)
+		}
+	}
+	for _, tc := range []struct {
+		out  string
+		code int
+		want string
+	}{
+		{`{"error":{"message":"no exporter is configured: telemetry set --otlp-endpoint <url> sets one"}}`, 1,
+			"stargaite telemetry test: no exporter is configured: telemetry set --otlp-endpoint <url> sets one"},
+		{"usage: sk-hand-edited-secret\n", 2, "stargaite telemetry test: failed with exit 2"},
+		{`{"outcome":"accepted"}`, 2, "stargaite telemetry test: failed with exit 2"},
+	} {
+		if reply, err := New(canned(tc.out, tc.code, nil)).TelemetryTest(context.Background()); err == nil || err.Error() != tc.want {
+			t.Errorf("%q exit %d: %+v, err = %v, want %q", tc.out, tc.code, reply, err, tc.want)
+		}
+	}
+	// The real CLI, with no exporter set.
+	_, err := New(cliRunner(admintest.Server(t))).TelemetryTest(context.Background())
+	if err == nil || !strings.HasPrefix(err.Error(), "stargaite telemetry test: no exporter is configured") {
+		t.Errorf("no exporter: err = %v", err)
+	}
+}
+
+// lineOf is reply's Line, "" for no reply.
+func lineOf(reply *TelemetryTestReply) string {
+	if reply == nil {
+		return ""
+	}
+	return reply.Line()
+}
+
+// TestUsageReplyDecodes: the answer of usage show decodes, a group without
+// a cost with a nil CostUSD; an answer without groups fails naming it; the
+// real CLI's answer decodes.
+func TestUsageReplyDecodes(t *testing.T) {
+	cost := 0.0000062
+	report := usage.Report{Source: "records", Since: time.Date(2026, 11, 20, 0, 0, 0, 0, time.UTC), Until: time.Date(2026, 11, 20, 8, 0, 0, 0, time.UTC),
+		Groups: []usage.Group{{Billing: "pay_per_use", Key: "k", Requests: 2, Errors: 1, Input: 10, Output: 20, CostUSD: &cost},
+			{Billing: "none", Key: "j", Requests: 1, Input: 3, Output: 4}}}
+	out, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reply UsageReply
+	if err := New(canned(string(out), 0, nil)).Call(context.Background(), &reply, "usage show", nil); err != nil {
+		t.Fatal(err)
+	}
+	want := UsageReply{Source: "records", Since: "2026-11-20T00:00:00Z", Until: "2026-11-20T08:00:00Z", Groups: []UsageGroup{
+		{Billing: "pay_per_use", Key: "k", Requests: 2, Errors: 1, Input: 10, Output: 20, CostUSD: &cost}, {Billing: "none", Key: "j", Requests: 1, Input: 3, Output: 4}}}
+	if !reflect.DeepEqual(reply, want) {
+		t.Errorf("reply = %+v, want %+v", reply, want)
+	}
+	err = New(canned(`{"source":"records","since":"x","until":"y"}`, 0, nil)).Call(context.Background(), &UsageReply{}, "usage show", nil)
+	if err == nil || err.Error() != `stargaite usage show: the answer has no "groups": `+stale {
+		t.Errorf("err = %v", err)
+	}
+	reply = UsageReply{}
+	if err := New(cliRunner(admintest.Server(t))).Call(context.Background(), &reply, "usage show", []string{"--since", "24h", "--by", "key"}); err != nil ||
+		reply.Source != "records" || len(reply.Groups) != 0 {
+		t.Errorf("the real CLI: %+v, %v", reply, err)
 	}
 }

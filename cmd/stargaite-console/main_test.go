@@ -138,7 +138,7 @@ func TestVersionFirst(t *testing.T) {
 func TestUsage(t *testing.T) {
 	env, log := fake(t, replies)
 	out, _, code := runConsole(t, console, env, "help")
-	if code != 0 || !strings.HasPrefix(out, "usage: stargaite-console [install | provider | alias | key | status | help] [flags] [--version]\n") {
+	if code != 0 || !strings.HasPrefix(out, "usage: stargaite-console [install | provider | alias | key | budget | telemetry | status | help] [flags] [--version]\n") {
 		t.Fatalf("help: exit %d\n%s", code, out)
 	}
 	for _, c := range []struct {
@@ -161,7 +161,7 @@ func TestUsage(t *testing.T) {
 
 func TestUsageText(t *testing.T) {
 	out, _, _ := runConsole(t, console, nil, "--help")
-	want := "usage: stargaite-console [install | provider | alias | key | status | help] [flags] [--version]\n" +
+	want := "usage: stargaite-console [install | provider | alias | key | budget | telemetry | status | help] [flags] [--version]\n" +
 		"At a terminal with no subcommand: the guided console.\n" +
 		"  install   the first run: this machine, then a provider, an alias with its fallbacks and a key, each kept when it\n" +
 		"            exists, ending with one test call; at a terminal it starts at the first missing step\n" +
@@ -180,9 +180,15 @@ func TestUsageText(t *testing.T) {
 		"  key       a client key for one or more aliases, shown once, then one test call through the first\n" +
 		"            --alias <a,b> (main)   --key-name <name> (my-app)   --rpm-limit <n> (60)\n" +
 		"            the test call is announced first: up to one paid call per target of that alias, capped at 256 output tokens, never retried\n" +
+		"  budget    a spending cap on the instance, an alias or a key; the prices the proxy says it needs are asked first\n" +
+		"            --on <instance|alias:<name>|key:<name>>   --limit-usd <usd>   --reset <daily|monthly|never> (monthly)\n" +
+		"            --input-price <usd>   --output-price <usd>   --yes replaces a cap   --reverify checks again what a price cleared\n" +
+		"  telemetry traces to Langfuse or any OTLP endpoint, replacing what was set whole, then one test span (free)\n" +
+		"            --backend <langfuse|otlp|off>   --endpoint <url>   --langfuse-public-env <VAR>   --langfuse-secret-env <VAR>\n" +
+		"            --header-name <name>   --key-env <VAR>   --replace   --allow-private-network   --yes\n" +
 		"  status    what exists: providers, aliases, targets without an alias, keys, budgets, telemetry and both versions\n" +
-		"For what has no flag here (reorder an alias, see what it sends, change a provider or a key): the guided console,\n" +
-		"or the stargaite command: docker compose exec -T stargaite /stargaite help\n"
+		"For what has no flag here (reorder an alias, see what it sends, change a provider or a key, see usage and cost):\n" +
+		"the guided console, or the stargaite command: docker compose exec -T stargaite /stargaite help\n"
 	if out != want {
 		t.Fatalf("usage:\n%q\nwant:\n%q", out, want)
 	}

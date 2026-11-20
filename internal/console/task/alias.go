@@ -546,7 +546,7 @@ func refusal(what string, findings []proxy.Finding, pass func(proxy.Finding) boo
 	var lines []string
 	for _, f := range findings {
 		if f.Severity == "error" && (pass == nil || !pass(f)) {
-			lines = append(lines, ui.OneLine(f.Resource)+": "+ui.OneLine(f.Message))
+			lines = append(lines, ui.OneLine(rules.Named(f.Resource))+": "+ui.OneLine(f.Message))
 		}
 	}
 	if len(lines) == 0 {

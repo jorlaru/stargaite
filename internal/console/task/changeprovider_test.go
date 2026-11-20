@@ -15,6 +15,7 @@ import (
 	"github.com/jorlaru/stargaite/internal/console/proxy"
 	"github.com/jorlaru/stargaite/internal/console/ui"
 	"github.com/jorlaru/stargaite/internal/console/ui/plain"
+	"github.com/jorlaru/stargaite/tests/mockprovider"
 )
 
 // changeProvider runs Change a provider with u.
@@ -81,7 +82,9 @@ func TestChangeProviderReplaceRefused(t *testing.T) {
 }
 
 func TestChangeProviderTimeoutRecheck(t *testing.T) {
-	answers := map[string]string{"provider": "mock", "change": "timeout", "total-seconds": "9"}
+	// The plain front runs in flags mode, where a re-check pays only with
+	// --reverify (TestRecheckFlagsMode).
+	answers := map[string]string{"provider": "mock", "change": "timeout", "total-seconds": "9", "reverify": "yes"}
 	checked := func(t *testing.T) (*world, int) {
 		w, _ := checkWorld(t)
 		w.target("mock/m", "--kind", "chat")
@@ -152,6 +155,57 @@ func TestChangeProviderTimeoutRecheck(t *testing.T) {
 	if _, err := w.changeProvider(ui.New(plain.New(&out), answers)); err == nil ||
 		!strings.HasSuffix(out.String(), "1 target(s) left unchecked: mock/b\nalready changed and kept: mock: timeout 9 s\n") {
 		t.Errorf("two targets: %v\n%s", err, out.String())
+	}
+}
+
+// TestRecheckFlagsMode: without a terminal, a target whose verification a
+// change cleared is checked again only with --reverify; without it the
+// count is said and nothing is paid. At a terminal the paid step is asked.
+func TestRecheckFlagsMode(t *testing.T) {
+	// priced is a world whose verified mock/m then had its prices set, which
+	// clears its verification; its verify argvs and mock calls so far.
+	priced := func(t *testing.T, flags ...string) (*world, *mockprovider.Server, int, int) {
+		w, mock := checkWorld(t)
+		w.target("mock/m", flags...)
+		if checked, err := w.checkIn(ui.New(plain.New(&bytes.Buffer{}), nil), "mock/m"); err != nil || !checked {
+			t.Fatalf("checking mock/m: %v", err)
+		}
+		w.must("targets", "set", "--pricing", "input_per_million=1,output_per_million=2,as_of="+time.Now().Format(time.DateOnly), "--", "mock/m")
+		return w, mock, len(w.verifies()), len(mock.Calls())
+	}
+	recheck := func(w *world, u *ui.UI) error {
+		_, err := w.inAlias(u, func(ctx context.Context, r *run) (string, error) { return "", r.recheck(ctx, []string{"mock/m"}) })
+		return err
+	}
+
+	w, mock, verifies, calls := priced(t, "--kind", "chat")
+	var out bytes.Buffer
+	if err := recheck(w, ui.New(plain.New(&out), map[string]string{})); err != nil || len(w.verifies()) != verifies || len(mock.Calls()) != calls ||
+		!strings.Contains(out.String(), "1 target(s) must be checked again: 1 paid call(s) (--reverify asks for it)\n") {
+		t.Errorf("no --reverify: %v, verify argvs %q, %d mock calls\n%s", err, w.verifies()[verifies:], len(mock.Calls())-calls, out.String())
+	}
+
+	w, _, verifies, _ = priced(t, "--kind", "chat")
+	out.Reset()
+	if err := recheck(w, ui.New(plain.New(&out), map[string]string{"reverify": "yes"})); err != nil ||
+		!slices.Equal(w.verifies()[verifies:], []string{"targets verify --json --max-output-tokens 256 --until-stdin-closes -- mock/m"}) ||
+		!strings.Contains(out.String(), "check mock/m: 1 paid call(s) to mock") {
+		t.Errorf("--reverify: %v, verify argvs %q\n%s", err, w.verifies()[verifies:], out.String())
+	}
+
+	w, _, verifies, _ = priced(t, "--kind", "chat")
+	s := &scripted{answers: map[string][]string{"check": {"not now"}}}
+	if err := recheck(w, ui.New(s, nil)); err != nil || len(w.verifies()) != verifies ||
+		!slices.Contains(s.asked, "1 target(s) must be checked again: 1 paid call(s)") {
+		t.Errorf("at a terminal: %v, asked %q, verify argvs %q", err, s.asked, w.verifies()[verifies:])
+	}
+
+	// A target whose check is three calls counts three.
+	w, _, _, _ = priced(t, threeLevels...)
+	out.Reset()
+	if err := recheck(w, ui.New(plain.New(&out), map[string]string{})); err != nil ||
+		!strings.Contains(out.String(), "1 target(s) must be checked again: 3 paid call(s) (--reverify asks for it)\n") {
+		t.Errorf("three levels: %v\n%s", err, out.String())
 	}
 }
 

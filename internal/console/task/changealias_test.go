@@ -135,6 +135,32 @@ func TestChangeAliasAddKeepsSettings(t *testing.T) {
 		a.MaxOutputTokens != 100 {
 		t.Errorf("a = %+v", a)
 	}
+	// The alias has an effort: what it sends to each target is said after the set.
+	got := w.cli()
+	set := slices.IndexFunc(got, func(a string) bool { return strings.HasPrefix(a, "models set ") })
+	if set < 0 || set+1 >= len(got) || got[set+1] != "models explain --json -- a" ||
+		!strings.Contains(out, "mock/m: sends effort") || !strings.Contains(out, "mock2/m: sends effort") {
+		t.Errorf("CLI calls %q\n%s", got, out)
+	}
+}
+
+// TestChangeAliasAddExplainFails: models explain failing after the set of an
+// alias with an effort: the error is returned, and the target added and the
+// alias's new targets are said kept, once.
+func TestChangeAliasAddExplainFails(t *testing.T) {
+	w, _ := checkWorld(t)
+	w.onMock("mock2", "--protocol", "openai", "--billing", "none")
+	w.target("mock/m", "--kind", "chat")
+	w.must("models", "add", "a", "--target", "mock/m", "--effort", "low", "--effort-mode", "default")
+	w.override(map[string][]reply{"models explain --json -- a": {{`{"error":{"message":"explain broke"}}`, 1}}})
+	_, out, err := w.changeAliasPlain(map[string]string{"alias": "a", "change": "add", "fallback-provider": "mock2", "fallback-model": "m"})
+	if err == nil || !strings.HasSuffix(out, "already changed and kept: target mock2/m added; alias a toward mock/m, mock2/m\n") ||
+		strings.Count(out, "already changed and kept") != 1 {
+		t.Errorf("%v\n%s", err, out)
+	}
+	if a := w.alias("a"); !slices.Equal(a.Targets, []string{"mock/m", "mock2/m"}) {
+		t.Errorf("a = %+v", a)
+	}
 }
 
 func TestChangeAliasDrop(t *testing.T) {

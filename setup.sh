@@ -30,12 +30,10 @@ usage_error() {
 
 interactive() { [[ -t 0 && -t 1 ]]; }
 
-# cleanup runs on every exit: no half-written file stays, and the terminal
-# echoes again after a hidden question.
+# cleanup runs on every exit: no half-written file stays.
 # shellcheck disable=SC2329 # run by the EXIT trap
 cleanup() {
 	[[ -n $tmp_file ]] && rm -f -- "$tmp_file"
-	[[ -t 0 ]] && stty echo 2>/dev/null
 	return 0
 }
 
@@ -104,7 +102,7 @@ confirm() {
 	die "stopped; nothing more was changed"
 }
 
-# agree TEXT: says TEXT, a change to .env or the override that the container
+# agree TEXT: says TEXT, a change to the override or tls/ that the container
 # reads only once recreated, and asks for that recreate the first time in a
 # run, before the change is made, so a refusal leaves nothing written.
 agree() {
@@ -114,53 +112,6 @@ agree() {
 	fi
 	confirm "$1, and the container is then recreated to read it: requests in flight are given time to finish, and the rate-limit windows restart"
 	agreed=1
-}
-
-# secret VAR NAME FLAG: the value for the credential variable NAME, from the
-# variable of this script's environment that --FLAG names, or typed hidden at
-# a terminal. Only builtins touch it. .env holds it single-quoted, so a value
-# with ' or a newline, or ending in \, is refused.
-secret() {
-	local -n _secret=$1
-	local from=${opt[$3]-}
-	if [[ -n $from ]]; then
-		# Not printed: a pasted value instead of a name would reach the screen.
-		# Only an exported variable counts, never one of this script's own.
-		[[ $from =~ ^[A-Za-z_][A-Za-z0-9_]*$ && $(declare -p -- "$from" 2>/dev/null) =~ ^declare\ -[a-zA-Z]*x ]] ||
-			usage_error "--$3 takes the name of a variable exported to this script"
-		_secret=${!from}
-	elif interactive; then
-		read -rs -p "$2 (typed hidden): " _secret || die "no answer to: $2"
-		printf '\n'
-	else
-		usage_error "missing --$3: the variable of this script's environment that holds $2"
-	fi
-	[[ -n $_secret ]] || die "$2 is empty"
-	[[ $_secret != *"'"* && $_secret != *$'\n'* && $_secret != *\\ ]] ||
-		die "$2 holds ' or a newline, or ends in \\: .env cannot hold it, so nothing was written"
-}
-
-# credentials NAME FLAG...: each credential NAME kept from .env unless
-# --replace (or y at a terminal) replaces it, otherwise read by secret from
-# FLAG; all are read before any is written, each through agree.
-credentials() {
-	local -a names=() values=()
-	local i key_value
-	while (($#)); do
-		key_value=""
-		if env_get key_value "$1" && ! yesno replace "$1 is in .env: replace it?"; then
-			say "$1 is in .env; kept"
-		else
-			secret key_value "$1" "$2"
-			names+=("$1")
-			values+=("$key_value")
-		fi
-		shift 2
-	done
-	for i in "${!names[@]}"; do
-		agree "writing ${names[i]} to .env"
-		env_set "${names[i]}" "${values[i]}"
-	done
 }
 
 # env_get VAR NAME: VAR is the value NAME has in .env, without its quotes;
@@ -178,47 +129,21 @@ env_get() {
 	return 1
 }
 
-# env_set NAME VALUE: NAME='VALUE' in .env, replacing its line or appended,
-# through a temporary .env.<random> (mode 0600) moved over the old file, so
-# no half-written .env is ever read.
-env_set() {
-	local line found=0
-	tmp_file=$(mktemp .env.XXXXXXXX) || die "no temporary file beside .env"
-	{
-		if [[ -f .env ]]; then
-			while IFS= read -r line || [[ -n $line ]]; do
-				if [[ $line == "$1="* ]]; then
-					found=1
-					printf "%s='%s'\n" "$1" "$2"
-				else
-					printf '%s\n' "$line"
-				fi
-			done <.env
-		fi
-		((found)) || printf "%s='%s'\n" "$1" "$2"
-	} >"$tmp_file" || die ".env was not written"
-	mv -f -- "$tmp_file" .env || die ".env was not written"
-	tmp_file=""
-}
-
-# override_set NEED FIELD KEY=VALUE...: compose.override.yaml regenerated
-# whole from its "# setup: KEY=VALUE" lines, each KEY set to VALUE (an empty
-# VALUE drops it), through agree; false when nothing changes. An override
-# without the marker on its first line is the reader's own and is never
-# touched: when it holds NEED, nothing changes; otherwise the step stops,
-# asking for NEED in FIELD of the service, or, without NEED, to move it away.
+# override_set KEY=VALUE...: compose.override.yaml regenerated whole from its
+# "# setup: KEY=VALUE" lines, each KEY set to VALUE (an empty VALUE drops it),
+# through agree; false when nothing changes. An override without the marker
+# on its first line is the reader's own and is never touched: the step stops,
+# asking to move it away.
 # TLS (remote) mounts tls/, gives serve the certificate, publishes the host
 # port on each address in place of compose.yaml's and maps the certificate's
 # name to loopback, where the admin listener is.
 override_set() {
 	local -A set=()
 	local -a keys=() hosts=() addrs=()
-	local line k p need=$1 field=$2 change=""
-	shift 2
+	local line k p change=""
 	if [[ -f compose.override.yaml ]]; then
 		if ! { IFS= read -r line && [[ $line == "$override_marker" ]]; } <compose.override.yaml; then
-			[[ -n $need && $(<compose.override.yaml) == *"$need"* ]] && return 1
-			die "compose.override.yaml was not written by setup.sh, so it is left as it is: ${need:+add \"$need\" to the $field of its stargaite service yourself, or }move it away and run this again"
+			die "compose.override.yaml was not written by setup.sh, so it is left as it is: move it away and run this again"
 		fi
 		while IFS= read -r line; do
 			[[ $line =~ ^'# setup: '([a-z_]+)=(.*)$ ]] || continue
@@ -298,21 +223,6 @@ field() {
 
 # ctl ARGS...: the CLI in the container, standard input closed.
 ctl() { docker compose exec -T "${admin[@]}" stargaite /stargaite "$@" </dev/null; }
-
-# cli WORD WORD ARGS...: one CLI command in the container, with --json; the
-# answer is in $reply. Its findings, warnings included, are printed; a failure
-# also prints the CLI's message and returns 1. The CLI bounds its own wait:
-# 90 s.
-cli() {
-	local code message
-	reply=$(ctl "$1" "$2" --json "${@:3}")
-	code=$?
-	field "$reply" '(.findings // .error.findings // [])[] | "  \(.severity): \(.resource): \(.message)"' 2>/dev/null
-	((code == 0)) && return 0
-	message=$(field "$reply" '.error.message // empty' 2>/dev/null)
-	say "stargaite $1 $2: ${message:-failed with exit $code}"
-	return 1
-}
 
 # at_least VERSION MINIMUM: true when the dotted VERSION, with or without a
 # leading v, is MINIMUM or later.
@@ -411,39 +321,11 @@ compose_up() {
 	wait_ready
 }
 
-# recreate WHY: the container recreated to read a changed .env or override,
-# confirmed unless agree was, then readiness.
-recreate() {
-	((agreed)) || confirm "the container is recreated to $1: requests in flight are given time to finish, and the rate-limit windows restart"
-	compose_up --no-build
-}
-
 # clone_version: STARGAITE_VERSION, the clone's git describe as make image
 # takes it, dev without git; exported for the build.
 clone_version() {
 	command -v git >/dev/null && STARGAITE_VERSION=$(git describe --tags --always --dirty 2>/dev/null) || STARGAITE_VERSION=dev
 	export STARGAITE_VERSION
-}
-
-# reach VAR WHAT [HINT]: a URL on the host's loopback becomes one on
-# host.docker.internal, as the container reaches the host, and
-# --allow-private-network joins the caller's args; a plain-HTTP URL is
-# offered it.
-reach() {
-	local -n _url=$1
-	if [[ $_url =~ ^(https?://)(localhost|127\.[0-9.]+|\[::1\])(:[0-9]+)?(/.*)?$ ]]; then
-		_url=${BASH_REMATCH[1]}host.docker.internal${BASH_REMATCH[3]}${BASH_REMATCH[4]}
-		say "localhost inside the container is the container: $2 is reached at $_url, the host's bridge address, so it must listen beyond the host's loopback${3:+ ($3)}"
-		args+=(--allow-private-network)
-	elif [[ $_url == http://* || -v opt[allow-private-network] ]] && yesno allow-private-network "$_url is plain HTTP or a private address: allow it?"; then
-		args+=(--allow-private-network)
-	fi
-}
-
-# gateway URL: the host-gateway line in the override when URL is on
-# host.docker.internal.
-gateway() {
-	[[ $1 == *//host.docker.internal* ]] && override_set host.docker.internal:host-gateway extra_hosts host_gateway=1
 }
 
 # machine: the host port, from .env (4000 without it), the checks of
@@ -458,101 +340,14 @@ machine() {
 	tls_state
 }
 
-# running: a container that runs, then machine and readiness, which every
-# subcommand but install, status and remote needs. Only Compose answering
-# with none means none runs; a Docker or Compose that fails is named by
-# machine.
+# running: a container that runs, then machine and readiness, which upgrade
+# needs. Only Compose answering with none means none runs; a Docker or
+# Compose that fails is named by machine.
 running() {
 	local id
 	id=$(docker compose ps -q 2>/dev/null) && [[ -z $id ]] && die "no container runs here: ./setup.sh install starts it"
 	machine
 	wait_ready
-}
-
-# budget: a budget on the instance, an alias or a key; one that replaces
-# another is confirmed. When the CLI refuses it because a target it reaches
-# has no price (USE-12), the prices of exactly the targets it names are asked
-# and set, and the budget applied once more.
-budget() {
-	local on limit reset in out today old id ids=() args=() show=(settings show) num='^[0-9]+(\.[0-9]+)?$'
-	ask on on "" "what the budget is on: instance, alias:<name> or key:<name>"
-	ask limit limit-usd "" "the limit in USD"
-	ask reset reset monthly "when it resets: daily, monthly or never"
-	[[ $limit =~ $num ]] || usage_error "--limit-usd takes a number of USD"
-	[[ $reset =~ ^(daily|monthly|never)$ ]] || usage_error "--reset takes daily, monthly or never"
-	case $on in
-	instance) args=(settings set) ;;
-	alias:?*) args=(models set) show=(models show -- "${on#*:}") ;;
-	key:?*) args=(keys set) show=(keys show -- "${on#*:}") ;;
-	*) usage_error "--on takes instance, alias:<name> or key:<name>" ;;
-	esac
-	args+=(--budget "limit_usd=$limit,reset_interval=$reset")
-	[[ $on == instance ]] || args+=(-- "${on#*:}")
-	cli "${show[@]}" || exit 1
-	old=$(field "$reply" '.budget // empty | "\(.limit_usd) USD, reset \(.reset_interval)"')
-	[[ -n $old ]] && confirm "the budget on $on, $old, is replaced"
-	say "setting a budget of $limit USD on $on, reset $reset"
-	cli "${args[@]}" && return
-	mapfile -t ids < <(field "$reply" '(.findings // .error.findings // [])[] | select(.code == "unpriced_under_budget") | .resource | ltrimstr("targets/")' 2>/dev/null)
-	((${#ids[@]})) || exit 1
-	printf -v today '%(%Y-%m-%d)T' -1
-	for id in "${ids[@]}"; do
-		ask in input-price "" "the price of $id in USD per million input tokens"
-		ask out output-price "" "the price of $id in USD per million output tokens"
-		[[ $in =~ $num && $out =~ $num ]] || usage_error "--input-price and --output-price take a number of USD"
-		say "setting the prices of $id to $in and $out USD per million input and output tokens, as of $today, which clears its verification: a later install or alias toward it verifies it again"
-		cli targets set --pricing "input_per_million=$in,output_per_million=$out,as_of=$today" -- "$id" || exit 1
-	done
-	cli "${args[@]}" || exit 1
-	say "the budget of $limit USD on $on is set"
-}
-
-# telemetry: Langfuse or any OTLP endpoint, its credentials into .env, a
-# local endpoint reached as a local provider is. A block that exists is
-# replaced whole, once confirmed: telemetry set is a merge patch, so an
-# earlier backend's credentials would otherwise go to the new endpoint. Then
-# telemetry set; the container recreated when this run changed .env or the
-# override, or when a reference does not resolve, as after a run that stopped
-# before its recreate; and telemetry test, its line printed as it comes.
-telemetry() {
-	local backend endpoint header var old creds=() args=()
-	ask backend backend "" "the backend: langfuse or otlp"
-	if [[ $backend == langfuse ]]; then
-		[[ -v opt[header-name] || -v opt[key-env] ]] && usage_error "--header-name and --key-env are for --backend otlp"
-		ask endpoint endpoint "" "the Langfuse endpoint, https://<host>/api/public/otel"
-		args+=(--preset langfuse)
-		creds=(LANGFUSE_PUBLIC_KEY langfuse-public-env LANGFUSE_SECRET_KEY langfuse-secret-env)
-	elif [[ $backend == otlp ]]; then
-		ask endpoint endpoint "" "the OTLP endpoint in full; spans go to <endpoint>/v1/traces"
-		ask header header-name "" "a header that carries a credential, such as Authorization; empty for none" optional
-		[[ -z $header && -v opt[key-env] ]] && usage_error "--key-env holds the credential of --header-name: give both"
-		if [[ -n $header ]]; then
-			var=OTLP_${header^^}
-			var=${var//[^A-Z0-9_]/_}
-			args+=(--header-env "$header=$var")
-			creds=("$var" key-env)
-		fi
-	else
-		usage_error "--backend takes langfuse or otlp"
-	fi
-	cli telemetry status || exit 1
-	old=$(field "$reply" '.telemetry.otlp_endpoint // empty')
-	[[ -n $old ]] && confirm "telemetry toward $old is replaced whole, none of its credentials or headers kept: it is unset first, so a change the CLI refuses leaves it unset"
-	((${#creds[@]})) && credentials "${creds[@]}"
-	reach endpoint telemetry
-	gateway "$endpoint"
-	if [[ -n $old ]]; then
-		cli telemetry unset --yes || exit 1
-	fi
-	say "setting telemetry to $endpoint"
-	cli telemetry set --otlp-endpoint "$endpoint" "${args[@]}" || die "telemetry is ${old:+now unset; it was toward }${old:-not set}"
-	cli telemetry status || exit 1
-	var=$(field "$reply" '.unresolved // [] | join(", ")')
-	if ((agreed)) || [[ -n $var ]]; then
-		recreate "read $var"
-	fi
-	say "telemetry test: one span to $endpoint"
-	ctl telemetry test
 }
 
 # console ARGS...: this script becomes the console, bin/stargaite-console
@@ -665,7 +460,7 @@ remote() {
 	fi
 	say "tls/ gets the certificate and its key, and from now on the data plane speaks HTTPS only: every client, local ones too, needs https:// and to trust the certificate"
 	[[ -f compose.override.yaml ]] && old=$(<compose.override.yaml)
-	override_set "" "" "tls=$choice" "tls_name=$name" "tls_ca=$cafile" "tls_group=$gid" "addresses=${addrs[*]}" ||
+	override_set "tls=$choice" "tls_name=$name" "tls_ca=$cafile" "tls_group=$gid" "addresses=${addrs[*]}" ||
 		agree "the certificate and key in tls/ are replaced"
 	if ! (
 		umask 077
@@ -866,9 +661,11 @@ budget flags, with --yes to replace a budget:
   --input-price <usd>, --output-price <usd>
                             per million tokens, for each target it reaches
                             unpriced; as of today
+  --reverify                check again the targets whose verification a
+                            price cleared, paid; otherwise only said
 
 telemetry flags, with --key-env, --replace, --allow-private-network and --yes:
-  --backend <b>             langfuse or otlp
+  --backend <b>             langfuse, otlp, or off to turn traces off
   --endpoint <url>          the OTLP endpoint in full; for Langfuse,
                             https://<host>/api/public/otel
   --langfuse-public-env <VAR>, --langfuse-secret-env <VAR>
@@ -908,7 +705,7 @@ main() {
 		cd -- "${BASH_SOURCE[0]%/*}" || exit 1
 	fi
 	[[ -f compose.yaml ]] || die "compose.yaml is not beside setup.sh: run it from the clone of stargaite"
-	local sub=${1-} bf="replace allow-private-network yes"
+	local sub=${1-}
 	shift
 	# With no subcommand at a terminal: the console's home, which opens the
 	# first run when nothing is set up yet.
@@ -921,8 +718,8 @@ main() {
 	provider) console provider "$@" ;;
 	alias) console alias "$@" ;;
 	key) console key "$@" ;;
-	budget) parse_flags "on limit-usd reset input-price output-price" "yes" "$@"; running; budget ;;
-	telemetry) parse_flags "backend endpoint langfuse-public-env langfuse-secret-env header-name key-env" "$bf" "$@"; running; telemetry ;;
+	budget) console budget "$@" ;;
+	telemetry) console telemetry "$@" ;;
 	remote) parse_flags "address tls tls-cert tls-key tls-name tls-ca" "yes" "$@"; remote ;;
 	status) parse_flags "" "check" "$@"; status ;;
 	upgrade) parse_flags "legacy-backup" "yes" "$@"; upgrade ;;

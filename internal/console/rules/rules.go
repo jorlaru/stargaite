@@ -52,16 +52,16 @@ func Lookup(code string) (Warning, bool) {
 // resource and the CLI's own message. The resource is named in words, such
 // as "target a" for targets/a.
 func Plain(code, name, message string) string {
-	name = named(name)
+	name = Named(name)
 	if w, ok := Lookup(code); ok && w.Words != "" {
 		return fmt.Sprintf(w.Words, name)
 	}
 	return name + ": " + message
 }
 
-// named turns a resource of internal/config, such as targets/a, into words;
-// a resource of another form is kept as it is.
-func named(res string) string {
+// Named turns a resource of internal/config, such as targets/a, into words;
+// a resource of another form, such as settings, is kept as it is.
+func Named(res string) string {
 	kinds := map[string]string{"providers": "provider", "targets": "target", "models": "alias", "keys": "key"}
 	if kind, name, ok := strings.Cut(res, "/"); ok && kinds[kind] != "" {
 		return kinds[kind] + " " + name

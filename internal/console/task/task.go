@@ -43,6 +43,13 @@ func Menu() []Entry {
 		{Group: "Apps and agents", Label: "Give an app or agent its key", Sub: "key",
 			Flags: []string{"alias", "key-name", "rpm-limit"}, Steps: giveSteps(), Run: GiveKey},
 		{Group: "Apps and agents", Label: "Change a key", Steps: changeKeySteps(), Run: ChangeKey},
+		{Group: "Spend and traces", Label: "Cap spending", Sub: "budget",
+			Flags: []string{"on", "limit-usd", "reset", "input-price", "output-price"}, Bools: []string{"yes", "reverify"},
+			Steps: capSteps(), Run: CapSpending},
+		{Group: "Spend and traces", Label: "See usage and cost", Steps: usageSteps(), Run: SeeUsage}, // no subcommand: design section 4.4
+		{Group: "Spend and traces", Label: "Send traces", Sub: "telemetry",
+			Flags: []string{"backend", "endpoint", "langfuse-public-env", "langfuse-secret-env", "header-name", "key-env"},
+			Bools: []string{"replace", "allow-private-network", "yes"}, Steps: traceSteps(), Run: SendTraces},
 		{Group: "This machine", Label: "See what exists", Sub: "status",
 			Steps: []ui.Step{{ID: "show", Title: "what exists"}}, Run: SeeWhatExists},
 		{Label: "First run", Sub: "install", // no group: the home opens it, its pick does not list it

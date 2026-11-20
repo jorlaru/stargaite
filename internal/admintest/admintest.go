@@ -30,11 +30,13 @@ import (
 // Key is the admin key of Server.
 const Key = "test-admin-key-of-at-least-32-characters"
 
-// AnnexBEnv sets every credential config.example.yaml references.
+// AnnexBEnv sets every credential config.example.yaml references, and
+// OTLP_AUTHORIZATION, the credential of a header the console's traces tests
+// send.
 func AnnexBEnv() map[string]string {
 	return map[string]string{
 		"OPENROUTER_API_KEY": "x", "ANTHROPIC_API_KEY": "x", "MINIMAX_PLAN_API_KEY": "x",
-		"LANGFUSE_PUBLIC_KEY": "x", "LANGFUSE_SECRET_KEY": "x",
+		"LANGFUSE_PUBLIC_KEY": "x", "LANGFUSE_SECRET_KEY": "x", "OTLP_AUTHORIZATION": "x",
 	}
 }
 

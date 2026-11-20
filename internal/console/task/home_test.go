@@ -98,7 +98,7 @@ func TestHomeRead(t *testing.T) {
 	if got := slices.Sorted(slices.Values(w.cli())); !slices.Equal(got, []string{"export --json", "validate --json", "version --json"}) {
 		t.Errorf("CLI calls %q", got)
 	}
-	if got := labels(hm.suggested); !slices.Equal(got, []string{"Give an app or agent its key: none exists yet", fallback}) {
+	if got := labels(hm.suggested); !slices.Equal(got, []string{"Give an app or agent its key: none exists yet", fallback, "Cap spending: spend is not capped"}) {
 		t.Errorf("suggested %q", got)
 	}
 
@@ -270,12 +270,15 @@ func TestHomeQuestion(t *testing.T) {
 		"Models your apps call|Change an alias|Change an alias",
 		"Apps and agents|Give an app or agent its key|Give an app or agent its key",
 		"Apps and agents|Change a key|Change a key",
+		"Spend and traces|Cap spending|Cap spending",
+		"Spend and traces|See usage and cost|See usage and cost",
+		"Spend and traces|Send traces|Send traces",
 		"This machine|See what exists|See what exists",
 	}
 	if q.ID != "home" || q.Prompt != "What do you want to do?" || !slices.Equal(got, want) {
 		t.Fatalf("%s %q: %q", q.ID, q.Prompt, got)
 	}
-	if q := homeQuestion(home{}, Menu()); len(q.Options) != 7 || q.Options[0].Group != "Providers" {
+	if q := homeQuestion(home{}, Menu()); len(q.Options) != 10 || q.Options[0].Group != "Providers" {
 		t.Fatalf("without suggestions: %+v", q.Options)
 	}
 	if slices.ContainsFunc(q.Options, func(o ui.Option) bool { return o.Value == "First run" || o.Label == "First run" }) {
@@ -305,6 +308,31 @@ func TestHomeSuggestionPresets(t *testing.T) {
 	summary := "http://127.0.0.1:" + port + "/v1: ready · proxy " + cli.Version + " · clone dev · 1 provider(s), 1 alias(es), 1 key(s) · spend not capped\n"
 	if out := s.output(); out != summary+"Left Change an alias.\n"+summary {
 		t.Errorf("output:\n%s", out)
+	}
+}
+
+// TestHomeCapSuggestion: picking "Cap spending: spend is not capped" opens
+// Cap spending on the instance, as --on gives it: what exists is not read
+// for a pick of the scope.
+func TestHomeCapSuggestion(t *testing.T) {
+	w, _ := homeWorld(t)
+	w.must("keys", "create", "--model", "a", "--", "k")
+	hm := readHome(context.Background(), w.proxy(), w.h)
+	i := slices.IndexFunc(hm.suggested, func(s rules.Suggestion) bool { return s.Label == "Cap spending: spend is not capped" })
+	if i < 0 {
+		t.Fatalf("suggested %+v", hm.suggested)
+	}
+	s := &scripted{answers: map[string][]string{"home": {"suggested:" + strconv.Itoa(i)}, "limit-usd": {"5"}, "reset": {"monthly"}, "yes": {"yes"}}}
+	if err := Home(context.Background(), ui.New(homeFront{s}, nil), w.proxy(), w.h, 15*time.Second); !errors.Is(err, ui.ErrQuit) {
+		t.Fatalf("Home: %v\n%s", err, s.output())
+	}
+	if slices.Contains(w.cli(), "models list --json") || slices.Contains(w.cli(), "keys list --json") {
+		t.Errorf("the scope pick was read: CLI %q", w.cli())
+	}
+	reads := []string{"version --json", "export --json", "validate --json"} // the home's own
+	got := slices.DeleteFunc(changing(w.cli()), func(c string) bool { return slices.Contains(reads, c) })
+	if !slices.Equal(got, []string{"settings set --json --budget limit_usd=5,reset_interval=monthly"}) {
+		t.Errorf("changes %q\n%s", got, s.output())
 	}
 }
 

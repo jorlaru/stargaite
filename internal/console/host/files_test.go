@@ -77,6 +77,45 @@ func TestEnvSetCreates(t *testing.T) {
 	}
 }
 
+// TestEnvSetFormats: .env as setup.sh's env_set wrote it, byte for byte and
+// mode 0600, in each row its shared-format test had (the golden values are
+// bash's output, recorded before env_set was removed).
+func TestEnvSetFormats(t *testing.T) {
+	for _, tc := range []struct {
+		row               string
+		seed              *string
+		name, value, want string
+	}{
+		{"no .env", nil, "NAME", "v", "NAME='v'\n"},
+		{"empty .env", ptr(""), "NAME", "v", "NAME='v'\n"},
+		{"replaced", ptr("A=1\n"), "A", "2", "A='2'\n"},
+		{"appended", ptr("A=1\n"), "B", "2", "A=1\nB='2'\n"},
+		{"no final newline", ptr("A=1"), "B", "2", "A=1\nB='2'\n"},
+		{"no final newline, replaced", ptr("A=1"), "A", "2", "A='2'\n"},
+		{"CRLF", ptr("A=1\r\nB=2\r\n"), "B", "3", "A=1\r\nB='3'\n"},
+		{"commented and twice", ptr("# NAME=old\nNAME=old\nNAME=old2\n"), "NAME", "new", "# NAME=old\nNAME='new'\nNAME='new'\n"},
+		{"a value the shell would expand", ptr("A=1\n"), "KEY", `s3cr3t $HOME #x y\z`, "A=1\nKEY='s3cr3t $HOME #x y\\z'\n"},
+	} {
+		h := New(t.TempDir())
+		env := filepath.Join(h.Dir, ".env")
+		if tc.seed != nil {
+			write(t, env, *tc.seed)
+		}
+		if err := h.EnvSet(tc.name, tc.value); err != nil {
+			t.Fatalf("%s: %v", tc.row, err)
+		}
+		info, err := os.Stat(env)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := read(t, env); got != tc.want || info.Mode().Perm() != 0o600 {
+			t.Errorf("%s: .env %q (%v), want %q (0600)", tc.row, got, info.Mode().Perm(), tc.want)
+		}
+	}
+}
+
+func ptr(s string) *string { return &s }
+
 func TestEnvGet(t *testing.T) {
 	h := New(t.TempDir())
 	if _, ok, err := h.EnvGet("A"); ok || err != nil {

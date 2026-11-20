@@ -50,7 +50,7 @@ const sessionBound = 12 * time.Second
 // homeBound is how long the home reads what exists before each pick.
 const homeBound = 15 * time.Second
 
-const usage = `usage: stargaite-console [install | provider | alias | key | status | help] [flags] [--version]
+const usage = `usage: stargaite-console [install | provider | alias | key | budget | telemetry | status | help] [flags] [--version]
 At a terminal with no subcommand: the guided console.
   install   the first run: this machine, then a provider, an alias with its fallbacks and a key, each kept when it
             exists, ending with one test call; at a terminal it starts at the first missing step
@@ -69,9 +69,15 @@ At a terminal with no subcommand: the guided console.
   key       a client key for one or more aliases, shown once, then one test call through the first
             --alias <a,b> (main)   --key-name <name> (my-app)   --rpm-limit <n> (60)
             the test call is announced first: up to one paid call per target of that alias, capped at 256 output tokens, never retried
+  budget    a spending cap on the instance, an alias or a key; the prices the proxy says it needs are asked first
+            --on <instance|alias:<name>|key:<name>>   --limit-usd <usd>   --reset <daily|monthly|never> (monthly)
+            --input-price <usd>   --output-price <usd>   --yes replaces a cap   --reverify checks again what a price cleared
+  telemetry traces to Langfuse or any OTLP endpoint, replacing what was set whole, then one test span (free)
+            --backend <langfuse|otlp|off>   --endpoint <url>   --langfuse-public-env <VAR>   --langfuse-secret-env <VAR>
+            --header-name <name>   --key-env <VAR>   --replace   --allow-private-network   --yes
   status    what exists: providers, aliases, targets without an alias, keys, budgets, telemetry and both versions
-For what has no flag here (reorder an alias, see what it sends, change a provider or a key): the guided console,
-or the stargaite command: docker compose exec -T stargaite /stargaite help
+For what has no flag here (reorder an alias, see what it sends, change a provider or a key, see usage and cost):
+the guided console, or the stargaite command: docker compose exec -T stargaite /stargaite help
 `
 
 func main() {

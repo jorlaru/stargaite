@@ -103,10 +103,11 @@ func (r *run) addFallback(ctx context.Context, m proxy.Model) (string, error) {
 }
 
 // extend appends adds to alias n, settles what the proxy needs, checks the
-// targets through the paid step, then sets the alias's targets. The alias's
-// own declaration rides whole in the dry run, so its budget, effort and cap
-// judge the new targets. Shared with MakeAlias; it reads alias n from the
-// models listed, so listModels comes first.
+// targets through the paid step, then sets the alias's targets and, when it
+// has an effort, says what it sends. The alias's own declaration rides whole
+// in the dry run, so its budget, effort and cap judge the new targets. Shared
+// with MakeAlias; it reads alias n from the models listed, so listModels
+// comes first.
 func (r *run) extend(ctx context.Context, n string, adds []string) (string, error) {
 	m, ok := r.model(n)
 	if !ok {
@@ -134,7 +135,18 @@ func (r *run) extend(ctx context.Context, n string, adds []string) (string, erro
 		r.sayKept(ctx)
 		return "Not checked: alias " + n + " was not changed.", nil
 	}
-	return r.setAlias(ctx, a, true)
+	res, err := r.setAlias(ctx, a, true)
+	if err != nil || m.Reasoning.Effort == "" && a.effort == "" {
+		return res, err
+	}
+	// The alias has an effort: what it now sends to each target is said, and
+	// its new targets are said kept should that read fail (both callers say
+	// r.made on an error).
+	r.made = append(r.made, "alias "+n+" toward "+strings.Join(a.targets, ", "))
+	if err := r.explain(ctx, n); err != nil {
+		return "", err
+	}
+	return res, nil
 }
 
 // setAlias says alias a's new targets, sets them, and the cap and effort

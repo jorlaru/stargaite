@@ -188,7 +188,9 @@ func checkAgain(k, total int) string {
 // recheck checks again those of verified, checked before a change, whose
 // verification the server cleared: it clears it only when the provider
 // actually changed. The providers are read again, so the check's bound has
-// the new timeout. A check that does not pass, for any reason, says the
+// the new timeout. In flags mode it pays only with --reverify (design
+// section 3, Step order around a check): without it, it says the count and
+// checks nothing. A check that does not pass, for any reason, says the
 // targets it left unchecked.
 func (r *run) recheck(ctx context.Context, verified []string) error {
 	if len(verified) == 0 {
@@ -207,6 +209,15 @@ func (r *run) recheck(ctx context.Context, verified []string) error {
 		}
 	}
 	if len(again) == 0 {
+		return nil
+	}
+	if !r.u.Asks() && !r.u.Given(ui.Question{ID: "reverify"}) {
+		total := 0
+		for _, id := range again {
+			t, _ := find(r.targets, func(t proxy.Target) bool { return t.ID == id })
+			total += calls(t)
+		}
+		say(ctx, r.u, checkAgain(len(again), total)+" (--reverify asks for it)")
 		return nil
 	}
 	if checked, err := r.check(ctx, "check", checkAgain, again); !checked {

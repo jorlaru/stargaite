@@ -13,6 +13,7 @@ func TestSuggest(t *testing.T) {
 		Presets: map[string]string{"provider": "acme", "change": "key"}}
 	fallback := Suggestion{Label: "Give alias a a fallback: it has one model", Task: "Change an alias",
 		Presets: map[string]string{"alias": "a", "change": "add"}}
+	uncapped := Suggestion{Label: "Cap spending: spend is not capped", Task: "Cap spending", Presets: map[string]string{"on": "instance"}}
 	for _, tc := range []struct {
 		facts Facts
 		want  []Suggestion
@@ -23,6 +24,9 @@ func TestSuggest(t *testing.T) {
 		{Facts{Providers: 1, Aliases: map[string]int{"a": 1, "b": 2}, Unresolved: map[string]string{"acme": "ACME_KEY"}},
 			[]Suggestion{key, replace, fallback}},
 		{Facts{Providers: 1, Aliases: map[string]int{"b": 2}, Keys: 1}, nil},
+		{Facts{Providers: 1, Keys: 1, Aliases: map[string]int{"a": 2}, Uncapped: true}, []Suggestion{uncapped}},
+		{Facts{Uncapped: true}, []Suggestion{provider}},
+		{Facts{Providers: 1, Aliases: map[string]int{"a": 1}, Uncapped: true}, []Suggestion{key, fallback, uncapped}},
 	} {
 		if got := Suggest(tc.facts); !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("Suggest(%+v) = %+v\nwant %+v", tc.facts, got, tc.want)

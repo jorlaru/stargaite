@@ -92,17 +92,27 @@ func AddProviders(ctx context.Context, u *ui.UI, px *proxy.Proxy, h *host.Host) 
 		}
 		chosen = append(chosen, p)
 	}
-	wrote, err := r.write(ctx, chosen, writes)
+	urls := make([]string, len(chosen))
+	for i, p := range chosen {
+		urls[i] = p.res.BaseURL
+	}
+	wrote, err := r.write(ctx, urls, writes)
 	if err != nil {
 		return "", err
 	}
-	if err := r.recreate(ctx, chosen, wrote); err != nil {
+	unread, err := r.unread(chosen)
+	if err != nil {
+		return "", err
+	}
+	if err := r.recreate(ctx, unread, wrote); err != nil {
 		return "", err
 	}
 	if err := r.resolves(ctx, chosen); err != nil {
 		return "", err
 	}
-	r.warn(ctx, chosen)
+	for _, p := range chosen {
+		r.warn(ctx, p.findings)
+	}
 	parts := make([]string, len(chosen))
 	for i, p := range chosen {
 		verb := " kept, "
@@ -205,7 +215,7 @@ func (r *adding) provider(ctx context.Context, n string) (*picked, error) {
 	if err != nil {
 		return nil, err
 	}
-	url, private, err := r.reach(ctx, n, url)
+	url, private, err := r.reach(ctx, n, url, " (Ollama binds 127.0.0.1 unless OLLAMA_HOST=0.0.0.0)")
 	if err != nil {
 		return nil, err
 	}
@@ -250,7 +260,7 @@ func (r *adding) describe(ctx context.Context, n string) (string, []string, erro
 		return "", nil, err
 	}
 	variable, err := r.u.Text(ctx, ui.Question{ID: "api-key-env", Flag: "api-key-env", Step: "add",
-		Prompt: "the variable for its credential, or none", Default: variableOf(n), HasDefault: true})
+		Prompt: "the variable for its credential, or none", Default: variableOf(n, "_API_KEY"), HasDefault: true})
 	if err != nil {
 		return "", nil, err
 	}
@@ -260,25 +270,25 @@ func (r *adding) describe(ctx context.Context, n string) (string, []string, erro
 	return url, []string{"--api-key-env", variable, "--protocol", protocol, "--billing", "pay_per_use"}, nil
 }
 
-// variableOf is the variable a new service's credential is offered in, as
-// setup.sh names it: the name upper-cased, every other rune "_", then
-// _API_KEY.
-func variableOf(n string) string {
+// variableOf is n as setup.sh names a variable after it: upper-cased, every
+// rune outside [A-Z0-9_] "_", then suffix, such as a new service's _API_KEY.
+func variableOf(n, suffix string) string {
 	return strings.Map(func(c rune) rune {
 		if (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' {
 			return c
 		}
 		return '_'
-	}, strings.ToUpper(n)) + "_API_KEY"
+	}, strings.ToUpper(n)) + suffix
 }
 
-// reach is url as the container reaches it, and whether the provider must
-// allow private networks: a URL on the host's loopback moves to the host's
-// bridge address, which is private; for plain HTTP the reader is asked.
-func (r *adding) reach(ctx context.Context, n, url string) (string, bool, error) {
+// reach is url as the container reaches it, and whether n must allow
+// private networks: a URL on the host's loopback moves to the host's bridge
+// address, which is private, said with hint; for plain HTTP the reader is
+// asked.
+func (r *adding) reach(ctx context.Context, n, url, hint string) (string, bool, error) {
 	if moved, ok := host.ToContainer(url); ok {
 		say(ctx, r.u, "localhost inside the container is the container: "+n+" is reached at "+moved+
-			", the host's bridge address, so it must listen beyond the host's loopback (Ollama binds 127.0.0.1 unless OLLAMA_HOST=0.0.0.0)")
+			", the host's bridge address, so it must listen beyond the host's loopback"+hint)
 		return moved, true, nil
 	}
 	q := ui.Question{ID: "allow-private-network", Flag: "allow-private-network", Step: "add",
@@ -303,20 +313,11 @@ func (r *adding) key(ctx context.Context, p *picked, writes []envWrite) (string,
 		say(ctx, r.u, v+" is asked once, for "+writes[i].by+": "+p.name+" uses the same key")
 		return "key kept in .env", nil, nil
 	}
-	_, inEnv, err := r.h.EnvGet(v)
-	if err != nil {
+	switch kept, err := r.keep(ctx, v); {
+	case err != nil:
 		return "", nil, err
-	}
-	if inEnv {
-		replace, err := r.u.Confirm(ctx, ui.Question{ID: "replace", Flag: "replace", Step: "key",
-			Prompt: v + " is in .env: replace it?", Default: "no", HasDefault: true})
-		if err != nil {
-			return "", nil, err
-		}
-		if !replace {
-			say(ctx, r.u, v+" is in .env; kept")
-			return "key kept in .env", nil, nil
-		}
+	case kept:
+		return "key kept in .env", nil, nil
 	}
 	key, checked, err := checkKey(ctx, r.u, r.h, "key", p.res)
 	if err != nil {
@@ -325,11 +326,27 @@ func (r *adding) key(ctx context.Context, p *picked, writes []envWrite) (string,
 	return checked, &envWrite{name: v, value: key, by: p.name}, nil
 }
 
+// keep reports whether variable v is in .env and stays: unless the reader,
+// or --replace, replaces it.
+func (r *adding) keep(ctx context.Context, v string) (bool, error) {
+	_, inEnv, err := r.h.EnvGet(v)
+	if err != nil || !inEnv {
+		return false, err
+	}
+	replace, err := r.u.Confirm(ctx, ui.Question{ID: "replace", Flag: "replace", Step: "key",
+		Prompt: v + " is in .env: replace it?", Default: "no", HasDefault: true})
+	if err != nil || replace {
+		return false, err
+	}
+	say(ctx, r.u, v+" is in .env; kept")
+	return true, nil
+}
+
 // write agrees every change, then makes them: the keys to .env, then the
-// host-gateway line to the override when a provider is on the host's bridge
-// address. It reports whether it wrote anything.
-func (r *adding) write(ctx context.Context, run []*picked, writes []envWrite) (bool, error) {
-	o, gateway, err := r.gateway(run)
+// host-gateway line to the override when one of urls is on the host's
+// bridge address. It reports whether it wrote anything.
+func (r *adding) write(ctx context.Context, urls []string, writes []envWrite) (bool, error) {
+	o, gateway, err := r.gateway(urls)
 	if err != nil {
 		return false, err
 	}
@@ -361,11 +378,11 @@ func (r *adding) write(ctx context.Context, run []*picked, writes []envWrite) (b
 	return len(writes) > 0 || gateway, nil
 }
 
-// gateway reads the override when a provider is on host.docker.internal,
+// gateway reads the override when one of urls is on host.docker.internal,
 // and says whether it needs the host-gateway line. An override the reader
 // wrote is never rewritten: adding the line is then theirs to do.
-func (r *adding) gateway(run []*picked) (*host.Override, bool, error) {
-	if !slices.ContainsFunc(run, func(p *picked) bool { return strings.Contains(p.res.BaseURL, "//host.docker.internal") }) {
+func (r *adding) gateway(urls []string) (*host.Override, bool, error) {
+	if !slices.ContainsFunc(urls, func(u string) bool { return strings.Contains(u, "//host.docker.internal") }) {
 		return nil, false, nil
 	}
 	o, err := r.h.ReadOverride()
@@ -381,9 +398,9 @@ func (r *adding) gateway(run []*picked) (*host.Override, bool, error) {
 	return o, o.Get("host_gateway") != "1", nil
 }
 
-// recreate recreates the container once, when a file was written or a
-// provider's key is in .env but not yet in the container.
-func (r *adding) recreate(ctx context.Context, run []*picked, wrote bool) error {
+// unread is the variables of the providers whose key is in .env but not yet
+// in the container.
+func (r *adding) unread(run []*picked) ([]string, error) {
 	var unread []string
 	for _, p := range run {
 		v := p.res.APIKeyEnv
@@ -392,12 +409,19 @@ func (r *adding) recreate(ctx context.Context, run []*picked, wrote bool) error 
 		}
 		_, inEnv, err := r.h.EnvGet(v)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if inEnv {
 			unread = append(unread, v)
 		}
 	}
+	return unread, nil
+}
+
+// recreate recreates the container once, when a file was written or the
+// container has yet to read the variables unread, asking first unless the
+// reader agreed.
+func (r *adding) recreate(ctx context.Context, unread []string, wrote bool) error {
 	if !wrote && len(unread) == 0 {
 		return nil
 	}
@@ -420,14 +444,12 @@ func (r *adding) resolves(ctx context.Context, run []*picked) error {
 	return nil
 }
 
-// warn says the findings of the providers added, but those held until the
-// recreate: every credential resolves by now.
-func (r *adding) warn(ctx context.Context, run []*picked) {
-	for _, p := range run {
-		for _, f := range p.findings {
-			if w, _ := rules.Lookup(f.Code); w.Held != "recreate" && w.Held != "everything" {
-				say(ctx, r.u, rules.Plain(f.Code, f.Resource, f.Message))
-			}
+// warn says findings, but those held until the recreate, by now done, or
+// for Check everything.
+func (r *adding) warn(ctx context.Context, findings []proxy.Finding) {
+	for _, f := range findings {
+		if w, _ := rules.Lookup(f.Code); w.Held != "recreate" && w.Held != "everything" {
+			say(ctx, r.u, rules.Plain(f.Code, f.Resource, f.Message))
 		}
 	}
 }

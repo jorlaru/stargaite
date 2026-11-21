@@ -355,10 +355,13 @@ func TestGuidedHome(t *testing.T) {
 	})
 	h.enter()
 	h.waitShown("A fallback for a: from which provider?")
+	n := h.frameCount()
 	h.p.Send(key(tea.KeyEscape))
 	h.waitOutput("Left Change an alias.")
 	h.waitCount(": ready · proxy ", 3)
-	h.waitShown("What do you want to do?")
+	// The home asked again, not the first home frame: a Ctrl-C between two
+	// questions quits the program, and only main then ends the session.
+	h.shownAfter(n, "What do you want to do?")
 	quitHome(t, h, done)
 	h.mu.Lock()
 	defer h.mu.Unlock()

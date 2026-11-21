@@ -211,8 +211,12 @@ func TestServeAdversarial(t *testing.T) {
 		t.Fatalf("the stalled stream: %q %v", line, err)
 	}
 	free := held("stalled reader")
-	c := mock.Calls() // the stalled stream's, then the one that found the slot free
-	if call := c[len(c)-2]; !strings.Contains(string(call.Body), `"stream":true`) || !call.Cancelled || call.Ended.IsZero() || call.Ended.After(free.Add(time.Second)) {
+	// The stalled stream's call, then the one that found the slot free. The
+	// mock records a call's end once its handler has seen the cancel, which
+	// can come after the proxy freed the slot.
+	stalled := len(mock.Calls()) - 2
+	waitFor(t, "the stalled stream's provider call to end", func() bool { return !mock.Calls()[stalled].Ended.IsZero() })
+	if call := mock.Calls()[stalled]; !strings.Contains(string(call.Body), `"stream":true`) || !call.Cancelled || call.Ended.IsZero() || call.Ended.After(free.Add(time.Second)) {
 		t.Errorf("the stalled stream's provider call: cancelled %v, ended %v after the slot was seen free", call.Cancelled, call.Ended.Sub(free))
 	}
 
@@ -229,6 +233,7 @@ func TestServeAdversarial(t *testing.T) {
 	gone := time.Now()
 	_ = conn.Close()
 	held("gone client")
+	waitFor(t, "the gone client's provider call to end", func() bool { return !mock.Calls()[calls].Ended.IsZero() })
 	if call := mock.Calls()[calls]; !call.Cancelled || call.Ended.IsZero() || call.Ended.Sub(gone) > time.Second {
 		t.Errorf("the gone client's provider call: cancelled %v, ended %v after the close", call.Cancelled, call.Ended.Sub(gone))
 	}

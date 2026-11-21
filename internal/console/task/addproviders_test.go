@@ -648,16 +648,14 @@ func TestAddProvidersRefusedKeyFront(t *testing.T) {
 
 func TestAddProvidersCheckFails(t *testing.T) {
 	w := newWorld(t)
-	closed := httptest.NewServer(http.NotFoundHandler())
-	u, _ := url.Parse(closed.URL)
-	closed.Close()
+	port := closedPort(t)
 	answers := acmeAnswers(w)
-	answers["base-url"] = "http://127.0.0.1:" + u.Port() + "/v1"
+	answers["base-url"] = "http://127.0.0.1:" + port + "/v1"
 	res, out, err := w.add(answers, "SRC=good")
 	if err != nil || res != "Done: acme added, key not checked." {
 		t.Fatalf("%q, %v\n%s", res, err, out)
 	}
-	if !strings.Contains(out, "\nacme: key not checked: the model list at http://localhost:"+u.Port()+"/v1/models was not read") {
+	if !strings.Contains(out, "\nacme: key not checked: the model list at http://localhost:"+port+"/v1/models was not read") {
 		t.Errorf("output:\n%s", out)
 	}
 	if !strings.Contains(w.file(".env"), "\nANTHROPIC_API_KEY='good'\n") {

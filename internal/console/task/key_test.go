@@ -426,14 +426,12 @@ func TestGiveKeyTryFails(t *testing.T) {
 
 	// The plane is gone once the key is made: the logs, then T8.
 	w, mock, _ = keyWorld(t, "mock/m")
-	closed := httptest.NewServer(http.NotFoundHandler())
-	u, _ := url.Parse(closed.URL)
-	closed.Close()
+	gone := closedPort(t)
 	next := w.runner
 	w.runner = func(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
 		code, err := next(ctx, args, stdin, stdout, stderr)
 		if len(args) > 1 && args[0] == "keys" && args[1] == "create" {
-			writeFile(t, filepath.Join(w.h.Dir, ".env"), "STARGAITE_PORT="+u.Port()+"\n", 0o600)
+			writeFile(t, filepath.Join(w.h.Dir, ".env"), "STARGAITE_PORT="+gone+"\n", 0o600)
 		}
 		return code, err
 	}

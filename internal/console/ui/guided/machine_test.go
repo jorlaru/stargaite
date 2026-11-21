@@ -420,7 +420,11 @@ func TestGuidedOpenToNetwork(t *testing.T) {
 		t.Errorf("the certificate pick:\n%s", f.Content)
 	}
 	h.choose("self-signed")
-	h.waitOutput("addresses=127.0.0.1 127.0.0.2, and the container is then recreated to read it")
+	h.waitOutput("writing compose.override.yaml with the lines above, and the container is then recreated to read it")
+	confirmed := h.said()
+	if at := strings.Index(confirmed, "\n  addresses=127.0.0.1 127.0.0.2\n"); at < 0 || at > strings.Index(confirmed, "writing compose.override.yaml with the lines above") {
+		t.Errorf("the changed keys are not said before the confirm:\n%s", confirmed)
+	}
 	h.yes("● files and override")
 	r := ended(t, done, 15*time.Second)
 	if r.err != nil || r.res != "Done: the data plane answers over HTTPS on 127.0.0.1 127.0.0.2." {

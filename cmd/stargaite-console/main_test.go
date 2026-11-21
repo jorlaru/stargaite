@@ -62,14 +62,11 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// closedPort is a loopback port nothing listens on: one that was free a
-// moment ago.
-func closedPort() string {
-	srv := httptest.NewServer(http.NotFoundHandler())
-	u, _ := url.Parse(srv.URL)
-	srv.Close()
-	return u.Port()
-}
+// closedPort is a loopback port nothing listens on: 1, outside the
+// ephemeral range, so no listener of a test running alongside is ever handed
+// it, as one could be a port closed a moment ago, and then gets the home's
+// readiness checks.
+func closedPort() string { return "1" }
 
 // replies are what the fake docker answers for the seven reads, in the
 // shapes the CLI prints (RR section 1).

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -443,12 +442,9 @@ func TestUsage(t *testing.T) {
 // TestFailures: a failure exits 1; under --json it is one JSON object on
 // stdout, the server's own body or the CLI's envelope.
 func TestFailures(t *testing.T) {
-	closed, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	refused := "http://" + closed.Addr().String()
-	_ = closed.Close()
+	// Nothing listens on port 1, and no test running alongside is ever handed
+	// it, as it could be a port closed a moment ago.
+	const refused = "http://127.0.0.1:1"
 	_, vars := recorder(t, http.StatusOK, "{}\n")
 	refusal := `{"error":{"message":"the change is refused","type":"invalid_request_error","code":"invalid_request","findings":[{"severity":"error","rule":"OPS-5","code":"unknown_target","resource":"models/m","field":"targets","message":"target \"x/y\" does not exist"}]}}` + "\n"
 	_, refusing := recorder(t, http.StatusBadRequest, refusal)

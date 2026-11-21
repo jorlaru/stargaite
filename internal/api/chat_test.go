@@ -449,12 +449,9 @@ func TestChatTimers(t *testing.T) {
 		panic(http.ErrAbortHandler)
 	}))
 	t.Cleanup(cut.Close)
-	closed, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	refused := closed.Addr().String()
-	_ = closed.Close()
+	// Nothing listens on port 1, and no test running alongside is ever handed
+	// it, as it could be a port closed a moment ago.
+	const refused = "127.0.0.1:1"
 
 	tokens := f.apply(t, `version: 1
 settings: { timeouts: { connect_ms: 100, total_ms: 400 } }

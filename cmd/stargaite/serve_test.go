@@ -1851,7 +1851,11 @@ func TestSecretsReload(t *testing.T) {
 		t.Fatalf("after the reload: status %d", code)
 	}
 	if calls := mock.Calls(); len(calls) != 1 || calls[0].Header.Get("Authorization") != "Bearer "+planted {
-		t.Errorf("provider calls %d; the credential sent is not the new one", len(calls))
+		var seen []string
+		for _, c := range calls {
+			seen = append(seen, fmt.Sprintf("%s %s?%s UA=%q new-credential=%t", c.Method, c.Path, c.Query, c.Header.Get("User-Agent"), c.Header.Get("Authorization") == "Bearer "+planted))
+		}
+		t.Errorf("provider calls %d; the credential sent is not the new one: %q", len(calls), seen)
 	}
 	waitFor(t, "a telemetry batch after the reload", func() bool { return len(traces()) > batches })
 	for _, c := range traces()[batches:] {

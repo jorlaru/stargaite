@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="696" height="420" viewBox="0 0 696 420" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono','Liberation Mono',monospace" font-size="14">
+<rect width="100%" height="100%" rx="6" fill="#1e1e2e"/>
+<g fill="#e6e6e6">
+<text x="12" y="44" xml:space="preserve">What do you want to do?</text>
+<text x="12" y="62" xml:space="preserve">filter: type to filter</text>
+<text x="12" y="80" xml:space="preserve">── Suggested</text>
+<text x="12" y="98" xml:space="preserve">&gt; Give alias main a fallback: it has one model</text>
+<text x="12" y="116" xml:space="preserve">  Cap spending: spend is not capped</text>
+<text x="12" y="134" xml:space="preserve">  Check alias main: no target of acme is checked yet</text>
+<text x="12" y="152" xml:space="preserve">── Providers</text>
+<text x="12" y="170" xml:space="preserve">  Add providers</text>
+<text x="12" y="188" xml:space="preserve">  Change a provider</text>
+<text x="12" y="206" xml:space="preserve">── Models your apps call</text>
+<text x="12" y="224" xml:space="preserve">  Make an alias</text>
+<text x="12" y="242" xml:space="preserve">  Change an alias</text>
+<text x="12" y="260" xml:space="preserve">── Apps and agents</text>
+<text x="12" y="278" xml:space="preserve">  Give an app or agent its key</text>
+<text x="12" y="296" xml:space="preserve">  Change a key</text>
+<text x="12" y="314" xml:space="preserve">── Spend and traces</text>
+<text x="12" y="332" xml:space="preserve">  Cap spending</text>
+<text x="12" y="350" xml:space="preserve">  See usage and cost</text>
+<text x="12" y="368" xml:space="preserve">  Send traces</text>
+<text x="12" y="386" xml:space="preserve">(8 more)</text>
+<text x="12" y="404" xml:space="preserve">↑↓ move · type to filter · enter pick · ctrl+c quit</text>
+</g>
+</svg>

@@ -284,12 +284,9 @@ func TestCutCallCost(t *testing.T) {
 		_, _ = w.Write([]byte(`{"error":{"message":"no"}}`))
 	}))
 	t.Cleanup(refusing.Close)
-	closed, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	refused := closed.Addr().String()
-	_ = closed.Close()
+	// Nothing listens on port 1, and no test running alongside is ever handed
+	// it, as it could be a port closed a moment ago.
+	const refused = "127.0.0.1:1"
 	// A peer that accepts each connection and resets it: a request of several
 	// MiB, more than the socket buffers hold, fails while it is written.
 	// A regression guard (phase-5 design C52): passes on bc85529, fails when the

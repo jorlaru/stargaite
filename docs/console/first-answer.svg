@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="696" height="168" viewBox="0 0 696 168" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono','Liberation Mono',monospace" font-size="14">
+<rect width="100%" height="100%" rx="6" fill="#1e1e2e"/>
+<g fill="#e6e6e6">
+<text x="12" y="26" xml:space="preserve">answer: mock reply</text>
+<text x="12" y="44" xml:space="preserve">finish_reason: stop, 0.912 s, from acme/openai/gpt-4.1-mini</text>
+<text x="12" y="62" xml:space="preserve">Point an OpenAI-compatible client at base URL http://127.0.0.1:4000/v1, with mod</text>
+<text x="12" y="80" xml:space="preserve">el main and this key, such as:</text>
+<text x="12" y="98" xml:space="preserve">  curl http://127.0.0.1:4000/v1/chat/completions -H &#34;Authorization: Bearer $STAR</text>
+<text x="12" y="116" xml:space="preserve">GAITE_KEY&#34; -H &#34;Content-Type: application/json&#34; -d &#39;{&#34;model&#34;:&#34;main&#34;,&#34;max_tokens&#34;:</text>
+<text x="12" y="134" xml:space="preserve">256,&#34;messages&#34;:[{&#34;role&#34;:&#34;user&#34;,&#34;content&#34;:&#34;Hello&#34;}]}&#39;</text>
+<text x="12" y="152" xml:space="preserve">Done: key my-app, which may call main.</text>
+</g>
+</svg>

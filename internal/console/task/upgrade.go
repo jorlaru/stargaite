@@ -2,6 +2,7 @@ package task
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -309,8 +310,9 @@ func (g *upgrading) start(ctx context.Context) (string, error) {
 	}
 	readyLine := "running " + g.clone
 	_, _ = h.SeeLogs(ctx, func(l string) {
-		if strings.Contains(l, `"msg":"ready"`) {
-			readyLine = l
+		var r struct{ Msg, Version string }
+		if json.Unmarshal([]byte(l), &r) == nil && r.Msg == "ready" && r.Version != "" {
+			readyLine = "version " + r.Version + " is ready"
 		}
 	}, false)
 	return done + ": " + readyLine, nil

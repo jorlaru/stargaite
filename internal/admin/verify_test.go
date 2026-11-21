@@ -33,7 +33,8 @@ import (
 
 // verifyFixture is the admin listener with targets verify wired to a data
 // plane in process (the one serve builds), the mock as every provider, on an
-// httptest.Server whose read and write timeouts are 200 ms.
+// httptest.Server with serve's timeouts whose verify requests start with read
+// and write deadlines 200 ms away.
 type verifyFixture struct {
 	url     string
 	client  *http.Client
@@ -96,9 +97,26 @@ func newVerifyFixture(t *testing.T) *verifyFixture {
 	base, halt := context.WithCancelCause(context.Background())
 	t.Cleanup(func() { halt(nil) })
 	metricsHash := sha256.Sum256([]byte(testMetricsToken))
-	srv := httptest.NewUnstartedServer(Handler(Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(testKey)), Log: logger, Usage: st.Read(),
-		Admission: limits, Spans: spans, Counters: counters, Spanned: spanned, MetricsHash: &metricsHash, Verify: api.Verify(d)}))
-	srv.Config.ReadTimeout, srv.Config.WriteTimeout = 200*time.Millisecond, 200*time.Millisecond
+	h := Handler(Deps{Config: cfg, KeyHash: sha256.Sum256([]byte(testKey)), Log: logger, Usage: st.Read(),
+		Admission: limits, Spans: spans, Counters: counters, Spanned: spanned, MetricsHash: &metricsHash, Verify: api.Verify(d)})
+	// The 200 ms deadlines go on the verify requests alone, the ones whose
+	// handler must lift them. As the server's ReadTimeout and WriteTimeout
+	// they also cut any other request (an apply, a settings change) that took
+	// 200 ms on a loaded host, and the idle timeout they implied closed a kept
+	// connection while the client reused it for a POST: both EOF. The server
+	// keeps serve's timeouts (cmd/stargaite/serve.go), which also reset the
+	// deadlines for the next request on the connection.
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/admin/v1/verify/") {
+			rc, deadline := http.NewResponseController(w), time.Now().Add(200*time.Millisecond)
+			if err := errors.Join(rc.SetReadDeadline(deadline), rc.SetWriteDeadline(deadline)); err != nil {
+				http.Error(w, "the test deadlines were not set: "+err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+		h.ServeHTTP(w, r)
+	}))
+	srv.Config.ReadTimeout, srv.Config.WriteTimeout, srv.Config.IdleTimeout = 60*time.Second, 60*time.Second, 120*time.Second
 	srv.Config.BaseContext = func(net.Listener) context.Context { return base }
 	srv.Start()
 	t.Cleanup(srv.Close)
@@ -259,8 +277,8 @@ func (f *verifyFixture) infer(token string) int {
 }
 
 // TestVerify is AC-47 (RSN-9, phase-4 design section 6): targets verify on
-// the admin listener, api in process, on a server whose write timeout is
-// 200 ms while the mock answers the first call after 300 ms.
+// the admin listener, api in process, the request's write deadline 200 ms
+// away while the mock answers the first call after 300 ms.
 func TestVerify(t *testing.T) {
 	f := newVerifyFixture(t)
 	f.setUp(t)

@@ -31,7 +31,8 @@ import (
 // compose up makes it the running one); a canned CLI that answers version,
 // --help, validate and backup -; and a data plane answering readiness.
 // docker, git and the CLI log to one file, in order. The fakes' hooks are
-// variables: PS_DO (compose ps), BUILD_DO, UP_DO, EXPORT_DO, MERGE_SLEEP.
+// variables: PS_DO (compose ps), BUILD_DO, UP_DO, EXPORT_DO, LOGS_DO (the
+// last 100 log lines after the first), MERGE_SLEEP.
 type upWorld struct {
 	t                               *testing.T
 	h                               *host.Host
@@ -68,14 +69,14 @@ func upgradeWorld(t *testing.T, ahead int) *upWorld {
 		"'compose build') echo \"STARGAITE_VERSION=$STARGAITE_VERSION\" >>'"+w.log+"'; eval \"${BUILD_DO:-:}\" || exit 1\n"+
 		"  echo \"$STARGAITE_VERSION\" >'"+w.bin+"/built' ;;\n"+
 		"'compose up -d --no-build') eval \"${UP_DO:-:}\" || exit 1; /bin/cp '"+w.bin+"/built' '"+w.bin+"/running' ;;\n"+
-		"'compose logs --no-log-prefix --tail 100 stargaite') echo 'a log line'; "+
-		"echo \"{\\\"level\\\":\\\"INFO\\\",\\\"msg\\\":\\\"ready\\\",\\\"version\\\":\\\"$(/bin/cat '"+w.bin+"/running')\\\"}\" ;;\n"+
+		"'compose logs --no-log-prefix --tail 100 stargaite') echo 'a log line'; if [ -n \"$LOGS_DO\" ]; then eval \"$LOGS_DO\"; else "+
+		"echo \"{\\\"level\\\":\\\"INFO\\\",\\\"msg\\\":\\\"ready\\\",\\\"version\\\":\\\"$(/bin/cat '"+w.bin+"/running')\\\"}\"; fi ;;\n"+
 		"'compose logs --tail 30 stargaite') echo 'a log line' ;;\n"+
 		"'build --quiet --build-arg VERSION --target console --output type=local,dest=bin .') echo \"VERSION=$VERSION\" >>'"+w.log+"'; "+
 		"eval \"${EXPORT_DO:-:}\" ;;\n*) exit 9 ;;\nesac\n", 0o755)
 	writeFile(t, filepath.Join(w.bin, "running"), "v0.6.0-fake\n", 0o644)
 	t.Setenv("PATH", w.bin+":"+gitDir)
-	for _, v := range []string{"PS_DO", "BUILD_DO", "UP_DO", "EXPORT_DO", "MERGE_SLEEP"} {
+	for _, v := range []string{"PS_DO", "BUILD_DO", "UP_DO", "EXPORT_DO", "LOGS_DO", "MERGE_SLEEP"} {
 		t.Setenv(v, "")
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
@@ -274,7 +275,7 @@ func TestUpgrade(t *testing.T) {
 	w := upgradeWorld(t, 1)
 	old, nv := w.head(), w.newVersion()
 	res, out, err := w.plain(map[string]string{"yes": "yes"})
-	if err != nil || res != `upgraded: {"level":"INFO","msg":"ready","version":"`+nv+`"}` || w.head() != w.upstreamHead() {
+	if err != nil || res != "upgraded: version "+nv+" is ready" || w.head() != w.upstreamHead() {
 		t.Fatalf("res %q, err %v\n%s", res, err, out)
 	}
 	want := []string{"cli version --json", "cli --help", "cli validate --json", "docker tag sha256:0123abcd stargaite:local-previous",
@@ -306,6 +307,33 @@ func TestUpgrade(t *testing.T) {
 	}
 	if res, _, err := w.plain(map[string]string{"yes": "yes"}); err != nil || res != "up to date with origin/main; nothing was changed" {
 		t.Fatalf("again: %q, %v", res, err)
+	}
+}
+
+// TestUpgradeReadyLine: the result says a version only from a log line that
+// decodes as JSON with msg ready and a version, the last such line;
+// otherwise the clone's version runs.
+func TestUpgradeReadyLine(t *testing.T) {
+	for _, c := range []struct{ name, logs, want string }{
+		{"no ready line", `echo 'not json: "msg":"ready"'`, ""},
+		{"prefixed JSON", `echo 'stargaite  | {"msg":"ready","version":"x"}'`, ""},
+		{"ready, no version", `echo '{"msg":"ready"}'`, ""},
+		{"two ready lines", `echo '{"msg":"ready","version":"a"}'; echo '{"msg":"ready","version":"b"}'`, "upgraded: version b is ready"},
+		{"a versionless ready line last", `echo '{"msg":"ready","version":"a"}'; echo '{"msg":"ready"}'`, "upgraded: version a is ready"},
+		{"another message", `echo '{"msg":"started","version":"a"}'`, ""},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w := upgradeWorld(t, 1)
+			t.Setenv("LOGS_DO", c.logs)
+			want := c.want
+			if want == "" {
+				want = "upgraded: running " + w.newVersion()
+			}
+			res, out, err := w.plain(map[string]string{"yes": "yes"})
+			if err != nil || res != want || w.head() != w.upstreamHead() {
+				t.Fatalf("res %q, want %q, err %v\n%s", res, want, err, out)
+			}
+		})
 	}
 }
 
@@ -746,7 +774,7 @@ func TestRebuild(t *testing.T) {
 	}
 	want := []string{"docker tag sha256:0123abcd stargaite:local-previous", "docker compose build", "cli backup - --json", "docker compose up -d --no-build",
 		"cli version --json", "cli validate --json"}
-	if got := w.changing(); err != nil || res != `rebuilt: {"level":"INFO","msg":"ready","version":"v0.6.0-fake-dirty"}` ||
+	if got := w.changing(); err != nil || res != "rebuilt: version v0.6.0-fake-dirty is ready" ||
 		!slices.Equal(got[len(got)-len(want):], want) || slices.ContainsFunc(git, func(l string) bool { return !strings.HasPrefix(l, "git describe ") }) ||
 		!strings.Contains(readFile(w.log), "STARGAITE_VERSION=v0.6.0-fake-dirty\n") {
 		t.Fatalf("res %q, err %v, git %q, log %q\n%s", res, err, git, w.changing(), out)

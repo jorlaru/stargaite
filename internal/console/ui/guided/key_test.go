@@ -26,9 +26,14 @@ import (
 // names the data plane's port, so readiness and every try reach it; the
 // docker fake answers the container as running, its recreate and its logs;
 // and a provider on 127.0.0.1, whose URL it returns with the data plane's
-// port, serves the model list (gpt-a and m) and the mock's chat.
-func planeWorld(t *testing.T) (w *aliasWorld, port, provider string) {
+// port, serves the model list (models, else gpt-a and m) and the mock's
+// chat.
+func planeWorld(t *testing.T, models ...string) (w *aliasWorld, port, provider string) {
 	t.Helper()
+	if len(models) == 0 {
+		models = []string{"gpt-a", "m"}
+	}
+	list := `{"data":[{"id":"` + strings.Join(models, `"},{"id":"`) + `"}]}`
 	env, port := admintest.Plane(t)
 	bin := t.TempDir()
 	w = &aliasWorld{h: host.New(t.TempDir()), env: env, mock: mockprovider.New()}
@@ -41,7 +46,7 @@ func planeWorld(t *testing.T) (w *aliasWorld, port, provider string) {
 	t.Setenv("PATH", bin)
 	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/models" {
-			_, _ = io.WriteString(rw, `{"data":[{"id":"gpt-a"},{"id":"m"}]}`)
+			_, _ = io.WriteString(rw, list)
 			return
 		}
 		w.mock.ServeHTTP(rw, r)
@@ -367,9 +372,9 @@ func TestGuidedHome(t *testing.T) {
 func TestGuidedHomeNotReady(t *testing.T) {
 	h := start(t)
 	w, _ := newKeyWorld(t, "mock/m")
-	srv := httptest.NewServer(nil)
-	port := strings.TrimPrefix(srv.URL, "http://127.0.0.1:")
-	srv.Close()
+	// Nothing listens on port 1, and no test running alongside is ever handed
+	// it, as it could be a port closed a moment ago.
+	const port = "1"
 	if err := os.WriteFile(filepath.Join(w.h.Dir, ".env"), []byte("STARGAITE_PORT="+port+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}

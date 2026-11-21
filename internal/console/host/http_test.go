@@ -250,9 +250,9 @@ func TestListModelsBound(t *testing.T) {
 }
 
 func TestListModelsRefused(t *testing.T) {
-	srv, _ := serve(t, models)
-	base := srv.URL
-	srv.Close()
+	// Nothing listens on port 1, and no test running alongside is ever handed
+	// it, as it could be a port closed a moment ago.
+	const base = "http://127.0.0.1:1"
 	_, _, err := New(t.TempDir()).ListModels(context.Background(), Provider{Protocol: "openai", BaseURL: base, Key: "sk-x", AllowPrivate: true})
 	noKey(t, err, "sk-x")
 	if err == nil || !strings.HasPrefix(err.Error(), "the model list at "+base+"/models was not read: ") {

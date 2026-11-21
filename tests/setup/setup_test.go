@@ -2283,7 +2283,7 @@ func TestSetupUpgrade(t *testing.T) {
 			t.Errorf("the backup: %v, error %v", info, err)
 		}
 		for _, s := range []string{"1 new commit(s) on origin/main:", "the running image is kept as stargaite:local-previous", "building version " + want,
-			"backing up the store to " + backup, `upgraded: {"level":"INFO","msg":"ready","version":"` + want + `"}`,
+			"backing up the store to " + backup, "upgraded: version " + want + " is ready",
 			"  docker compose run --rm --no-deps -T stargaite restore --yes - < " + backup, "  docker tag stargaite:local-previous stargaite:local"} {
 			if !strings.Contains(out, s) {
 				t.Errorf("no %q in:\n%s", s, out)

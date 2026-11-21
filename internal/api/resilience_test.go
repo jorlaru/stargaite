@@ -88,12 +88,9 @@ func newResilience(t *testing.T) (s *streamFixture, good *mockprovider.Server, y
 	badSrv, goodSrv := httptest.NewServer(bad), httptest.NewServer(good)
 	t.Cleanup(badSrv.Close)
 	t.Cleanup(goodSrv.Close)
-	closed, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	refused := closed.Addr().String()
-	_ = closed.Close()
+	// Nothing listens on port 1, and no test running alongside is ever handed
+	// it, as it could be a port closed a moment ago.
+	const refused = "127.0.0.1:1"
 	yaml = strings.NewReplacer("base_url: BAD,", "base_url: "+badSrv.URL+",", "base_url: GOOD,", "base_url: "+goodSrv.URL+",",
 		"base_url: REFUSED,", "base_url: http://"+refused+",",
 		"base_url: REBOUND,", "base_url: https://rebound.test:"+badSrv.URL[strings.LastIndex(badSrv.URL, ":")+1:]+",").Replace(resilienceConfig)

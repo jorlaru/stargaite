@@ -244,10 +244,7 @@ func TestPickModelLocal(t *testing.T) {
 }
 
 func TestPickModelListFails(t *testing.T) {
-	closedSrv := httptest.NewServer(http.NotFoundHandler())
-	u, _ := url.Parse(closedSrv.URL)
-	closedSrv.Close()
-	closed := &listing{port: u.Port()}
+	closed := &listing{port: closedPort(t)}
 	for name, l := range map[string]*listing{
 		"500": serveList(t, func(rw http.ResponseWriter, _ *http.Request) {
 			rw.WriteHeader(http.StatusInternalServerError)

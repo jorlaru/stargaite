@@ -242,7 +242,7 @@ main() {
 		fail "the upstream with one commit more was not made"
 	again upgrade --yes
 	built=$(docker image inspect -f '{{.Id}}' "$STARGAITE_IMAGE") || fail "no image $STARGAITE_IMAGE after the upgrade"
-	[[ $out == *'upgraded: {'*'"msg":"ready"'*"\"version\":\"$newer\""* ]] || fail "upgrade did not report version $newer ready"
+	[[ $out == *"upgraded: version $newer is ready"* ]] || fail "upgrade did not report version $newer ready"
 	[[ $(cd "$tree" && docker compose exec -T stargaite /stargaite version) == "$newer" ]] || fail "the running version is not $newer"
 	docker image inspect "$STARGAITE_IMAGE-previous" >/dev/null || fail "no previous image $STARGAITE_IMAGE-previous"
 	[[ $out =~ "backing up the store to "(backups/[^ ]+\.db) ]] || fail "no backup named"

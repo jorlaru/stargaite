@@ -245,7 +245,7 @@ func TestOpenToNetworkSelfSigned(t *testing.T) {
 		t.Fatalf("err = %v\n%s", err, out)
 	}
 	if !inOrder(out, "  tls=self-signed", "  tls_name=localhost", "  tls_ca=cert.pem", "  tls_group="+gid,
-		"  addresses=127.0.0.1 127.0.0.2 127.0.0.3", "writing compose.override.yaml with "+change+recreatedToRead) {
+		"  addresses=127.0.0.1 127.0.0.2 127.0.0.3", "writing compose.override.yaml with the lines above"+recreatedToRead) || strings.Contains(out, change) {
 		t.Fatalf("the changed keys are not said before the confirm:\n%s", out)
 	}
 	w.untouched("")
@@ -297,7 +297,7 @@ func TestOpenToNetworkSelfSigned(t *testing.T) {
 	}
 
 	// Twenty addresses: each is in the transcript whole, on its own line,
-	// though the confirm's line is cut.
+	// which the confirm names; the usage error names them all.
 	w = tlsWorld(t)
 	var many []string
 	for i := 2; i <= 21; i++ {
@@ -308,11 +308,8 @@ func TestOpenToNetworkSelfSigned(t *testing.T) {
 	if !errors.As(err, &usage) || !strings.Contains(err.Error(), "addresses=127.0.0.1 "+strings.Join(many, " ")+recreatedToRead) {
 		t.Fatalf("err = %v", err)
 	}
-	cut := false
-	for _, l := range strings.Split(out, "\n") {
-		cut = cut || strings.HasPrefix(l, "writing compose.override.yaml with ") && strings.HasSuffix(l, "…")
-	}
-	if !cut || !slices.Contains(strings.Split(out, "\n"), "  addresses=127.0.0.1 "+strings.Join(many, " ")) {
+	if !slices.Contains(strings.Split(out, "\n"), "writing compose.override.yaml with the lines above"+recreatedToRead) ||
+		!slices.Contains(strings.Split(out, "\n"), "  addresses=127.0.0.1 "+strings.Join(many, " ")) {
 		t.Fatalf("twenty addresses:\n%s", out)
 	}
 	w.untouched("")
@@ -378,6 +375,31 @@ func TestOpenToNetworkRenew(t *testing.T) {
 	_, out, err = w.open(map[string]string{"tls": "self-signed", "yes": "yes"})
 	if err != nil || !slices.Contains(strings.Split(out, "\n"), "https on 127.0.0.2:"+w.p+": ready") || w.ups() != 3 {
 		t.Fatalf("expired: err %v\n%s", err, out)
+	}
+}
+
+// TestOpenToNetworkRewrites: run again with another address, the override
+// is rewritten; without --yes the usage error names the changed key and
+// nothing is written; with it the confirm names the lines above.
+func TestOpenToNetworkRewrites(t *testing.T) {
+	w := tlsWorld(t)
+	if _, out, err := w.open(map[string]string{"address": "127.0.0.2", "tls": "self-signed", "yes": "yes"}); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	override, first := w.file("compose.override.yaml"), w.file("tls/cert.pem")
+	answers := map[string]string{"address": "127.0.0.3", "tls": "self-signed"}
+	_, out, err := w.open(answers)
+	var usage *ui.UsageError
+	if !errors.As(err, &usage) || err.Error() != `missing --yes: compose.override.yaml is rewritten with addresses=127.0.0.1 127.0.0.3, keeping its other "# setup:" lines`+recreatedToRead ||
+		w.file("compose.override.yaml") != override || w.file("tls/cert.pem") != first || w.ups() != 1 {
+		t.Fatalf("err = %v, %d up(s)\n%s", err, w.ups(), out)
+	}
+	answers["yes"] = "yes"
+	_, out, err = w.open(answers)
+	if err != nil || !inOrder(out, "  addresses=127.0.0.1 127.0.0.3",
+		`compose.override.yaml is rewritten with the lines above, keeping its other "# setup:" lines`+recreatedToRead) ||
+		!strings.Contains(w.file("compose.override.yaml"), "\n# setup: addresses=127.0.0.1 127.0.0.3\n") || w.ups() != 2 {
+		t.Fatalf("err %v, %d up(s)\n%s\n%s", err, w.ups(), out, w.file("compose.override.yaml"))
 	}
 }
 

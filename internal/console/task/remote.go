@@ -70,9 +70,12 @@ func OpenToNetwork(ctx context.Context, u *ui.UI, _ *proxy.Proxy, h *host.Host) 
 	if err := o.Ours(); err != nil {
 		return "", err
 	}
-	what := setOverride(ctx, u, o, [][2]string{{"tls", c.choice}, {"tls_name", c.name}, {"tls_ca", c.ca}, {"tls_group", gid},
+	said, what := setOverride(ctx, u, o, [][2]string{{"tls", c.choice}, {"tls_name", c.name}, {"tls_ca", c.ca}, {"tls_group", gid},
 		{"addresses", strings.Join(addrs, " ")}})
-	if err := confirm(ctx, u, "write", what+recreates); err != nil {
+	if err := confirm(ctx, u, "write", said+recreates); err != nil {
+		if usage := (*ui.UsageError)(nil); errors.As(err, &usage) {
+			return "", &ui.UsageError{Msg: "missing --yes: " + what + recreates}
+		}
 		return "", err
 	}
 	if c.files == nil {
@@ -226,8 +229,9 @@ func ownQuestions() []ui.Question {
 
 // setOverride sets the TLS keys on o and shows each that changes on its
 // own line, never cut as a said line is, so a long value is in the
-// transcript whole; it returns what the confirm names.
-func setOverride(ctx context.Context, u *ui.UI, o *host.Override, keys [][2]string) string {
+// transcript whole; it returns what the confirm says, naming those lines,
+// and what a usage error names, with each key.
+func setOverride(ctx context.Context, u *ui.UI, o *host.Override, keys [][2]string) (said, what string) {
 	var changed []string
 	for _, kv := range keys {
 		if o.Get(kv[0]) != kv[1] {
@@ -236,13 +240,16 @@ func setOverride(ctx context.Context, u *ui.UI, o *host.Override, keys [][2]stri
 		}
 		o.Set(kv[0], kv[1])
 	}
+	kept := ""
 	switch {
 	case len(changed) == 0:
-		return "the certificate and key in tls/ are replaced"
+		return "the certificate and key in tls/ are replaced", "the certificate and key in tls/ are replaced"
 	case o.Exists():
-		return "compose.override.yaml is rewritten with " + strings.Join(changed, " ") + `, keeping its other "# setup:" lines`
+		said, kept = "compose.override.yaml is rewritten with ", `, keeping its other "# setup:" lines`
+	default:
+		said = "writing compose.override.yaml with "
 	}
-	return "writing compose.override.yaml with " + strings.Join(changed, " ")
+	return said + "the lines above" + kept, said + strings.Join(changed, " ") + kept
 }
 
 // writeRemote writes the override, then tls/; when tls/ fails, its reason

@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="696" height="420" viewBox="0 0 696 420" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono','Liberation Mono',monospace" font-size="14">
+<rect width="100%" height="100%" rx="6" fill="#1e1e2e"/>
+<g fill="#e6e6e6">
+<text x="12" y="26" xml:space="preserve">Done: acme added, key checked.</text>
+<text x="12" y="44" xml:space="preserve">✓ → ✓ → ✓ → ● model → fallbacks → check → key → first answer</text>
+<text x="12" y="80" xml:space="preserve">Which model of acme?</text>
+<text x="12" y="98" xml:space="preserve">filter: type to filter</text>
+<text x="12" y="116" xml:space="preserve">── OpenAI · GPT</text>
+<text x="12" y="134" xml:space="preserve">&gt; openai/gpt-4.1</text>
+<text x="12" y="152" xml:space="preserve">  openai/gpt-4.1-mini</text>
+<text x="12" y="170" xml:space="preserve">── OpenAI · o-series</text>
+<text x="12" y="188" xml:space="preserve">  openai/o4-mini</text>
+<text x="12" y="206" xml:space="preserve">── Anthropic · Claude Sonnet</text>
+<text x="12" y="224" xml:space="preserve">  anthropic/claude-sonnet-4</text>
+<text x="12" y="242" xml:space="preserve">── Anthropic · Claude Haiku</text>
+<text x="12" y="260" xml:space="preserve">  anthropic/claude-haiku-4.5</text>
+<text x="12" y="278" xml:space="preserve">── Google · Gemini</text>
+<text x="12" y="296" xml:space="preserve">  google/gemini-2.5-flash</text>
+<text x="12" y="314" xml:space="preserve">── Mistral · Mistral</text>
+<text x="12" y="332" xml:space="preserve">  mistralai/mistral-small</text>
+<text x="12" y="350" xml:space="preserve">── Qwen · Qwen</text>
+<text x="12" y="368" xml:space="preserve">  qwen/qwen3-32b</text>
+<text x="12" y="386" xml:space="preserve">(3 more)</text>
+<text x="12" y="404" xml:space="preserve">↑↓ move · type to filter · enter pick · esc menu · ctrl+c quit</text>
+</g>
+</svg>

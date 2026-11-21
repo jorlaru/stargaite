@@ -510,7 +510,7 @@ validation package in process.
 | `stargaite secrets reload` | Resolve credential references again |
 | `stargaite backup <file\|->`, `stargaite restore <file\|-> --yes`, `stargaite version` | Copy the store, to a file or to standard output; put a copy back while `serve` is stopped; print the version |
 
-`setup.sh` (OPS-11) and the console it starts, `stargaite-console`, ask the questions and run these commands for a person; they add no command.
+The console, `stargaite-console`, which `setup.sh` starts (OPS-11), asks the questions and runs these commands for a person; it adds no command.
 
 Flags follow one convention. Every scalar field of §6 is a flag of `add` (`create` for keys) and `set`, named after
 the field with dashes (`--rpm-limit`, `--trace-sample-rate`); the alias's `reasoning.effort`, `reasoning.mode` and
@@ -549,7 +549,7 @@ at least one `--model <alias>` or an explicit `--all-models`: a key never gets a
 | Id | Rule |
 |---|---|
 | OPS-1 | All configuration lives in the embedded store and changes only through the admin API. There is no configuration file to edit and no second store. `config.example.yaml` in the repository is an input for `apply`, not something the proxy reads |
-| OPS-2 | Nothing ever prompts, except `setup.sh`, the guided assistant at the root of the repository, and the console it starts, `stargaite-console`, under OPS-11. Every `stargaite` command accepts `--json`, and every command, `setup.sh` and the console included, returns `0` on success, `1` on failure and `2` on wrong usage. A command that deletes or revokes (`remove`, `keys revoke`, `telemetry unset`, `restore`, and `apply --prune` unless it is a `--dry-run`) fails with `2` unless `--yes` is given. `apply` accepts `--dry-run`: it validates and shows the difference without publishing |
+| OPS-2 | Nothing ever prompts, except the console, `stargaite-console`, which `setup.sh` at the root of the repository starts, under OPS-11. Every `stargaite` command accepts `--json`, and every command, `setup.sh` and the console included, returns `0` on success, `1` on failure and `2` on wrong usage. A command that deletes or revokes (`remove`, `keys revoke`, `telemetry unset`, `restore`, and `apply --prune` unless it is a `--dry-run`) fails with `2` unless `--yes` is given. `apply` accepts `--dry-run`: it validates and shows the difference without publishing |
 | OPS-3 | `export` writes the whole configuration as YAML, without secrets. `apply -f` validates the file, shows the difference and publishes it in one step; it creates and updates: a resource named in the file is replaced by the file's declaration as a whole, so a field the file omits returns to its default. What is absent from the file is left untouched unless `--prune` is given: then absent providers, targets and aliases are removed, absent keys are revoked (not deleted) and absent settings return to their defaults. An invalid file leaves the active configuration untouched. A key in the file that does not exist yet is created with a new secret, which `apply` prints once; a key that exists keeps its secret. `export` omits revoked keys, and a file that names a revoked key makes `apply` fail with `409 conflict`: a revoked name is never reused. Exporting from one instance and applying to an empty one therefore reproduces the configuration with new key secrets; cloning an instance with its secrets is what `backup` is for. A resource created by `apply` takes only what the file declares: it does not inherit a provider's `target_defaults`. Where a command reads a file (`apply -f`, `validate -f`, `models explain --body`, `restore`), `-` reads standard input, never a terminal; `backup -` writes the copy to standard output, never a terminal, and its summary to standard error. A pipe cut short is still valid YAML and `apply` replaces each resource it names whole, so `export` ends its YAML with the document end marker `...` and `apply -f -` publishes only a document whose last line is that marker, or one JSON document, which a cut leaves unclosed; `apply -f - --dry-run` needs no marker, and `apply -f - --prune` needs `--dry-run` |
 | OPS-4 | Every change publishes a new immutable snapshot atomically and increments the configuration revision. Requests in flight finish with the snapshot they started with. Nothing needs a restart. A change with an empty difference, and the publication at start, keep the revision: only a real difference increments it |
 | OPS-5 | Every change, from a single command or from `apply`, is validated against the whole resulting configuration before it is published. A failed check refuses the change with exit code `1`: unknown providers and targets, aliases without targets, `requires` not met (PAR-5), missing or excessive output caps (PAR-6, PAR-7), `forward` rules, on an alias, a target or a provider, that collide with a parameter the proxy writes, a target's `forward` for a parameter it lists in `unsupported_params`, and a provider's or a target's `drop` for a parameter that carries a contractual feature (PAR-2, PAR-4), reasoning rules (RSN-3, RSN-7), unpriced targets under a budget (USE-12), outbound URLs (SEC-4). Warnings never block: chat targets never verified (RSN-9) or with undeclared reasoning fields (RSN-3), credentials that do not resolve, an effort toward a `none` dialect (RSN-5), targets without prices to fall back on (USE-12), aliases that cannot serve an endpoint, a key that names an unknown alias, a quota window longer than the usage retention (LIM-8). `validate` runs the same checks on the active configuration, or on a file with no server running, except the checks that need the store (chat targets never verified) |
@@ -779,7 +779,7 @@ Each feature is meant to be an independent change.
 | targets-verify | The live check of a target | P1 | 4 | reasoning-control, usage-accounting |
 | metrics | The metrics endpoint | P1 | 4 | usage-accounting |
 | operations | Backup to a file or standard output, `restore`, retention, `secrets reload`, tested migrations | P1 | 4 | usage-accounting |
-| setup-assistant | `setup.sh`: the machine check, `.env`, the first answer, later changes, remote access with TLS, the upgrade (OPS-11) | P1 | 6 | operations, targets-verify |
+| setup-assistant | `setup.sh`, the bootstrap, and the console it starts, `stargaite-console`: the machine check, `.env`, the first answer, later changes as guided tasks picked from a menu, most also given as flags, remote access with TLS, the upgrade (OPS-11) | P1 | 6 | operations, targets-verify |
 | hardening | The adversarial suite and the benchmark | P1 | 4 | everything else |
 | responses-api | `/v1/responses`, as an independent interface | P2 | — | — |
 | config-import | Convert the configuration of an existing gateway into a file for `apply` | P2 | — | — |
@@ -792,6 +792,7 @@ Each feature is meant to be an independent change.
 | 4 | P1 | Complete and verified operation | `embeddings`, `rerank`, `targets-verify`, `metrics`, `operations`, `hardening` |
 | 5 | P1 | Less friction between clients, the proxy and providers, within the features above (`docs/design/phase-5.md`) | — |
 | 6 | P1 | A person reaches a first answer by answering questions, and upgrades with a backup | `setup-assistant` |
+| 7 | P1 | A person sets up StargAIte and makes its everyday changes from a guided console, each choice picked from a list, without knowing a command, a name or a file (`docs/design/phase-7.md`) | `setup-assistant`, extended to the console |
 
 ## 21. Acceptance criteria and test strategy
 
@@ -1369,7 +1370,7 @@ stargaite/
 │   └── setup/               # setup.sh against shims and, end to end, the mock provider
 ├── Dockerfile               # multi-stage build to a minimal non-root image; a stage exports the console
 ├── Makefile                 # `make ci` runs every check
-├── setup.sh                 # the bootstrap of the console and the guided assistant (OPS-11)
+├── setup.sh                 # the bootstrap: checks the machine, exports and starts the console (OPS-11)
 ├── config.example.yaml
 └── go.mod
 ```

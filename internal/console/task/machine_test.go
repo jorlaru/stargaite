@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -105,10 +106,14 @@ type plane struct {
 }
 
 func listenPlane(port string) (*plane, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:"+port)
+	l, err := listenLoopback(port)
 	if err != nil {
 		return nil, err
 	}
+	return planeOn(l), nil
+}
+
+func planeOn(l net.Listener) *plane {
 	p := &plane{conns: map[net.Conn]bool{}}
 	p.srv = &http.Server{Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}),
 		ConnState: func(c net.Conn, s http.ConnState) {
@@ -119,7 +124,7 @@ func listenPlane(port string) (*plane, error) {
 			}
 		}}
 	go func() { _ = p.srv.Serve(l) }()
-	return p, nil
+	return p
 }
 
 func servePlane(t *testing.T, port string) *plane {
@@ -151,6 +156,13 @@ func (m *machineWorld) serveOnUp(port string) { m.serveOn(port, "compose up", 0)
 
 // serveOn serves readiness on port after a pause once argv is logged.
 func (m *machineWorld) serveOn(port, argv string, pause time.Duration) {
+	m.serveWith(func() (net.Listener, error) { return listenLoopback(port) }, argv, pause)
+}
+
+// serveWith serves readiness on the listener listen gives, after a pause
+// once argv is logged. A listen that fails is reported as the test's own
+// failure, not left to read as the product's readiness timeout.
+func (m *machineWorld) serveWith(listen func() (net.Listener, error), argv string, pause time.Duration) {
 	var mu sync.Mutex
 	var p *plane
 	stop := make(chan struct{})
@@ -180,9 +192,103 @@ func (m *machineWorld) serveOn(port, argv string, pause time.Duration) {
 		select {
 		case <-stop:
 		default:
-			p, _ = listenPlane(port)
+			l, err := listen()
+			if err != nil {
+				m.t.Errorf("the test's data plane: %v", err)
+				return
+			}
+			p = planeOn(l)
 		}
 	}()
+}
+
+// reserved is a loopback port bound but not listening: a connection to it
+// is refused, as to a free port, yet no other socket can take it, a
+// client's local end included, until listen listens on it.
+type reserved struct {
+	port string
+	mu   sync.Mutex
+	fd   int // -1 once listen or the test's end took it
+}
+
+// reservations is the ports reserve holds, by port, for listenLoopback.
+var reservations sync.Map
+
+// reserve binds a socket to 127.0.0.1:port, 0 for one the kernel picks,
+// without listening, until the test ends. A port that is only probed free
+// can be taken before the test listens on it: by another test's listener,
+// or by the local end of a client connection, connected or in TIME_WAIT,
+// which refuses connections like a free port.
+func reserve(t *testing.T, port int) (*reserved, error) {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		return nil, err
+	}
+	syscall.CloseOnExec(fd)
+	var sa syscall.Sockaddr
+	if err = syscall.Bind(fd, &syscall.SockaddrInet4{Port: port, Addr: [4]byte{127, 0, 0, 1}}); err == nil {
+		sa, err = syscall.Getsockname(fd)
+	}
+	if err != nil {
+		_ = syscall.Close(fd)
+		return nil, err
+	}
+	r := &reserved{port: strconv.Itoa(sa.(*syscall.SockaddrInet4).Port), fd: fd}
+	reservations.Store(r.port, r)
+	t.Cleanup(func() {
+		reservations.Delete(r.port)
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.fd >= 0 {
+			_ = syscall.Close(r.fd)
+			r.fd = -1
+		}
+	})
+	return r, nil
+}
+
+// listenLoopback listens on 127.0.0.1:port, on its reserved socket when
+// reserve holds it, so the port is never free in between.
+func listenLoopback(port string) (net.Listener, error) {
+	if r, ok := reservations.Load(port); ok {
+		return r.(*reserved).listen()
+	}
+	return net.Listen("tcp", "127.0.0.1:"+port)
+}
+
+// adjacentPorts is a loopback port held open until the test ends and the
+// port above it, reserved.
+func adjacentPorts(t *testing.T) (string, *reserved) {
+	t.Helper()
+	for range 20 {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = l.Close() })
+		n := l.Addr().(*net.TCPAddr).Port
+		if r, err := reserve(t, n+1); err == nil {
+			return strconv.Itoa(n), r
+		}
+	}
+	t.Fatal("no loopback port with the one above it free in 20 tries")
+	return "", nil
+}
+
+// listen listens on the reserved port.
+func (r *reserved) listen() (net.Listener, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.fd < 0 {
+		return nil, errors.New("127.0.0.1:" + r.port + " is no longer reserved")
+	}
+	if err := syscall.Listen(r.fd, syscall.SOMAXCONN); err != nil {
+		return nil, err
+	}
+	f := os.NewFile(uintptr(r.fd), "127.0.0.1:"+r.port)
+	r.fd = -1
+	defer func() { _ = f.Close() }()
+	return net.FileListener(f)
 }
 
 // heldPort is a loopback port held open until the test ends.
@@ -257,11 +363,12 @@ func TestMachinePort(t *testing.T) {
 	})
 	t.Run("b: asked another port at a terminal", func(t *testing.T) {
 		m := machineClone(t, psNone, psNone, upPause)
-		p, q := heldPort(t), heldPort(t)
-		n, _ := strconv.Atoi(p)
-		next := strconv.Itoa(host.NextFree(n))
+		// The first free port above p, its default, stays free for the plane
+		// that serves it once compose up is logged.
+		p, r := adjacentPorts(t)
+		q, next := heldPort(t), r.port
 		m.env("STARGAITE_PORT=" + p + "\n")
-		m.serveOnUp(next)
+		m.serveWith(r.listen, "compose up", 0)
 		s := &scripted{answers: map[string][]string{"port": {q, ""}, "yes": {"yes"}}}
 		if err := m.run(ui.New(s, nil)); err != nil {
 			t.Fatalf("err = %v\n%s", err, s.output())

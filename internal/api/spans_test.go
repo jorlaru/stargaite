@@ -615,12 +615,10 @@ func TestExporterDown(t *testing.T) {
 	baseline := run(t, f, token, measured)
 	bound := 5*baseline + 500*time.Millisecond
 
-	closed, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	down := "http://" + closed.Addr().String()
-	_ = closed.Close()
+	// Nothing listens on port 1, and no test running alongside is ever handed
+	// it: a port taken and closed here could go to another test's listener,
+	// which would then get this subtest's batches.
+	const down = "http://127.0.0.1:1"
 	for _, tc := range []struct {
 		name    string
 		step    *mockprovider.Step

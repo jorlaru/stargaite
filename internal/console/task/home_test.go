@@ -6,9 +6,7 @@ import (
 	"errors"
 	"io"
 	"maps"
-	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -43,13 +41,16 @@ func homeWorld(t *testing.T) (*world, string) {
 	return w, port
 }
 
-// closedPort is a loopback port nothing listens on.
+// closedPort is a loopback port nothing listens on, reserved until the test
+// ends: a connection to it is refused, no other test is handed it, and
+// listenLoopback listens on it.
 func closedPort(t *testing.T) string {
 	t.Helper()
-	srv := httptest.NewServer(http.NotFoundHandler())
-	u, _ := url.Parse(srv.URL)
-	srv.Close()
-	return u.Port()
+	r, err := reserve(t, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r.port
 }
 
 // serial runs next one call at a time, for a canned runner, which is not

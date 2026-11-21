@@ -136,10 +136,11 @@ above (not run again).
 
 ## Container resources
 
-The figures support kick-off section 17's indicative values, which the README now states: a request of 50m CPU and
-64 Mi, a limit of 1000m CPU and 256 Mi. At rest the proxy uses no measurable CPU and 23 to 36 MB; 1,000 synchronous
-requests per second use 0.3 of a CPU; 500 open streams 62.5 MB (60 Mi). The memory limit leaves room for large bodies,
-which these figures do not exercise: each request may hold up to `max_body_bytes` and `max_response_bytes`.
+The figures support kick-off section 17's indicative values, which
+[docs/reference.md](reference.md#listeners-tls-and-the-container) states: a request of 50m CPU and 64 Mi, a limit of
+1000m CPU and 256 Mi. At rest the proxy uses no measurable CPU and 23 to 36 MB; 1,000 synchronous requests per second
+use 0.3 of a CPU; 500 open streams 62.5 MB (60 Mi). The memory limit leaves room for large bodies, which these figures
+do not exercise: each request may hold up to `max_body_bytes` and `max_response_bytes`.
 
 ## Accepted deviations
 

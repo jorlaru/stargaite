@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -96,6 +97,28 @@ func TestChangeAliasAddFallback(t *testing.T) {
 	}
 	if got := w.cli()[before:]; !slices.Equal(got, []string{"models list --json", "providers list --json"}) {
 		t.Errorf("already: CLI calls %q", got)
+	}
+}
+
+// A fallback whose check fails is removed again; the alias and its own
+// target are unchanged (issue #4).
+func TestChangeAliasAddCheckFails(t *testing.T) {
+	w, mock, before := aliasWorld(t, "mock/m")
+	mock.Script(mockprovider.Step{Status: http.StatusNotFound, Body: []byte(`{"error":{"message":"no such model"}}`)})
+	res, out, err := w.changeAliasPlain(map[string]string{"alias": "a", "change": "add", "fallback-provider": "mock2", "fallback-model": "m"})
+	if err == nil || res != "" || !strings.Contains(err.Error(), "status 404") ||
+		!strings.Contains(err.Error(), "target mock2/m failed its check; alias a was not changed, and the targets added for it were removed: mock2/m") {
+		t.Fatalf("%q, %v\n%s", res, err, out)
+	}
+	if got := w.cli()[before:]; !slices.Contains(got, "targets remove --json --yes -- mock2/m") || indexOf(got, "models set ") >= 0 ||
+		strings.Contains(out, "already changed and kept") {
+		t.Errorf("CLI calls %q\n%s", got, out)
+	}
+	if a := w.alias("a"); !slices.Equal(a.Targets, []string{"mock/m"}) {
+		t.Errorf("a toward %q", a.Targets)
+	}
+	if l := w.targets(); len(l) != 1 || l[0].ID != "mock/m" {
+		t.Errorf("targets left: %+v", l)
 	}
 }
 

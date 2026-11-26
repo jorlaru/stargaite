@@ -87,7 +87,7 @@ func (r *run) makeAlias(ctx context.Context) (string, error) {
 	checked, err := r.check(ctx, "check", inAll, a.targets)
 	switch {
 	case err != nil:
-		return "", fmt.Errorf("%w; no alias or key was created", err)
+		return "", fmt.Errorf("%w; no alias or key was created%s", err, r.unadd(ctx, a, err))
 	case !checked:
 		r.sayKept(ctx)
 		return "Not checked: alias " + n + " was not made.", nil

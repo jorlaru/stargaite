@@ -648,6 +648,12 @@ func fakeCLI(st *state, args []string) (string, int) {
 		}
 		st.Targets[pos[0]] = map[string]any{"id": pos[0], "kind": flags["kind"][0]}
 		return written(st.Targets[pos[0]]), 0
+	case "targets remove":
+		if _, ok := st.Targets[pos[0]]; !ok || !slices.Contains(args, "--yes") {
+			return failure("targets remove takes a target that exists, and --yes")
+		}
+		delete(st.Targets, pos[0])
+		return encode(map[string]any{"revision": 1, "changed": true, "diff": []any{}, "findings": []any{}}), 0
 	case "targets verify":
 		if os.Getenv("FAKE_VERIFY") == "fail" {
 			return encode(map[string]any{"target": pos[0], "ok": false, "stored": true, "calls": []any{

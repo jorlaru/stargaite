@@ -248,6 +248,15 @@ func TestParseFlags(t *testing.T) {
 	if got, err := parseFlags(restore, []string{"--what", "backup"}); err == nil || err.Error() != "unknown flag --what" || got != nil {
 		t.Errorf("--what: got %v, %v; want unknown flag --what", got, err)
 	}
+
+	// setup.sh help lists --yes among the install flags that provider, alias
+	// and key take (issue #3).
+	for _, sub := range []string{"install", "provider", "alias", "key"} {
+		i := slices.IndexFunc(task.Menu(), func(e task.Entry) bool { return e.Sub == sub })
+		if got, err := parseFlags(task.Menu()[i], []string{"--yes"}); err != nil || got["yes"] != "yes" {
+			t.Errorf("%s --yes: got %v, %v", sub, got, err)
+		}
+	}
 }
 
 // TestRunOneEnd: a task that ends the session (task.ErrEnd) exits 0, its

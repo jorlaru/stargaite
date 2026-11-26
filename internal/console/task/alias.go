@@ -411,6 +411,39 @@ func (r *run) kept(ctx context.Context, err error) error {
 	return err
 }
 
+// unadd removes the targets plan a added, after its check failed with
+// failed: no alias lists them, and without a terminal nothing else would
+// remove them. Esc, Ctrl-C or a signal keeps them, said kept. A removal
+// refused or failed is said, and that target stays in r.made. It returns
+// the words that name the targets removed, "" for none.
+func (r *run) unadd(ctx context.Context, a aliasPlan, failed error) string {
+	if errors.Is(failed, ui.ErrLeave) || errors.Is(failed, ui.ErrQuit) || ctx.Err() != nil {
+		return ""
+	}
+	var removed []string
+	for _, t := range a.added {
+		say(ctx, r.u, "removing target "+t+", added for this alias: the check failed")
+		var change proxy.Change
+		refused, err := r.px.CallRefusable(ctx, &change, "targets remove", []string{"--yes"}, t)
+		for _, f := range refused { // a success's findings are the whole configuration's warnings
+			say(ctx, r.u, rules.Plain(f.Code, f.Resource, f.Message))
+		}
+		switch {
+		case err != nil:
+			say(ctx, r.u, "target "+t+" was not removed: "+err.Error())
+		case len(refused) > 0:
+			say(ctx, r.u, "the proxy refused to remove target "+t)
+		default:
+			removed = append(removed, t)
+			r.made = slices.DeleteFunc(r.made, func(m string) bool { return m == "target "+t+" added" })
+		}
+	}
+	if len(removed) == 0 {
+		return ""
+	}
+	return ", and the targets added for it were removed: " + strings.Join(removed, ", ")
+}
+
 // sayKept says what the run changed, if anything: it stays.
 func (r *run) sayKept(ctx context.Context) {
 	if len(r.made) > 0 {

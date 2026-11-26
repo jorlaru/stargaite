@@ -2086,8 +2086,9 @@ func TestSetupPaidCalls(t *testing.T) {
 	if code != 1 || r.count("docker", "targets verify") != 1 || r.count("docker", "models add") != 0 || r.count("docker", "keys create") != 0 || len(r.chats()) != 0 {
 		t.Errorf("failed verify: exit %d, %q:\n%s", code, r.cli(), out)
 	}
-	if !strings.Contains(out, "status 404, model not found: acme/m1") || !strings.Contains(out, "no alias or key was created") {
-		t.Errorf("failed verify: no provider message:\n%s", out)
+	if !strings.Contains(out, "status 404, model not found: acme/m1") ||
+		!strings.Contains(out, "no alias or key was created, and the targets added for it were removed: acme/m1") || r.count("docker", "targets remove") != 1 {
+		t.Errorf("failed verify: no provider message, or the target added kept:\n%s", out)
 	}
 
 	r = newRun(t, []string{"SRC=v", "FAKE_CHAT=fail"})

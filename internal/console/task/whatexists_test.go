@@ -557,7 +557,7 @@ func TestMenuFresh(t *testing.T) {
 		!slices.Equal(m[2].Bools, []string{"replace", "allow-private-network", "yes", "reverify"}) {
 		t.Fatalf("Menu()[2] = %+v", m[2])
 	}
-	if m[4].Sub != "key" || !slices.Equal(m[4].Flags, []string{"alias", "key-name", "rpm-limit"}) || m[4].Bools != nil {
+	if m[4].Sub != "key" || !slices.Equal(m[4].Flags, []string{"alias", "key-name", "rpm-limit"}) || !slices.Equal(m[4].Bools, []string{"yes"}) {
 		t.Fatalf("Menu()[4] = %+v", m[4])
 	}
 	m[9].Label = "changed"

@@ -130,7 +130,7 @@ func (r *run) extend(ctx context.Context, n string, adds []string) (string, erro
 	checked, err := r.check(ctx, "check", inAll, a.targets)
 	switch {
 	case err != nil:
-		return "", fmt.Errorf("%w; alias %s was not changed", err, n)
+		return "", fmt.Errorf("%w; alias %s was not changed%s", err, n, r.unadd(ctx, a, err))
 	case !checked:
 		r.sayKept(ctx)
 		return "Not checked: alias " + n + " was not changed.", nil

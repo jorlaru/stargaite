@@ -1,5 +1,14 @@
 # Changes
 
+## Since phase 7
+
+`./setup.sh key` takes `--yes`, as `./setup.sh help` says, so a script may pass it to each of install, provider, alias
+and key ([#3](https://github.com/jorlaru/stargaite/issues/3)). When the check of an alias's new targets fails, in
+`./setup.sh alias`, the first run or Change an alias, the targets that run added are removed again, those whose
+check passed among them, and the error says so; they no longer stay in no alias, which only the console at a terminal
+could remove. Esc or Ctrl-C during the
+check still keeps them, named as kept ([#4](https://github.com/jorlaru/stargaite/issues/4)).
+
 ## Since phase 6
 
 `./setup.sh` is now the bootstrap of a guided console, `bin/stargaite-console`, which runs on the host: it checks

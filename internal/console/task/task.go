@@ -64,7 +64,7 @@ func Menu() []Entry {
 			Steps: makeSteps(), Run: MakeAlias},
 		{Group: "Models your apps call", Label: "Change an alias", Steps: changeAliasSteps(), Run: ChangeAlias},
 		{Group: "Apps and agents", Label: "Give an app or agent its key", Sub: "key",
-			Flags: []string{"alias", "key-name", "rpm-limit"}, Steps: giveSteps(), Run: GiveKey},
+			Flags: []string{"alias", "key-name", "rpm-limit"}, Bools: []string{"yes"}, Steps: giveSteps(), Run: GiveKey},
 		{Group: "Apps and agents", Label: "Change a key", Steps: changeKeySteps(), Run: ChangeKey},
 		{Group: "Spend and traces", Label: "Cap spending", Sub: "budget",
 			Flags: []string{"on", "limit-usd", "reset", "input-price", "output-price"}, Bools: []string{"yes", "reverify"},

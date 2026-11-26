@@ -300,12 +300,55 @@ func TestMakeAliasCheckFails(t *testing.T) {
 	mock.Script(mockprovider.Step{Status: http.StatusNotFound, Body: []byte(`{"error":{"message":"no such model"}}`)})
 	_, out, err := w.makePlain(map[string]string{"provider": "mock", "model": "m", "alias": "x"})
 	if err == nil || !strings.Contains(err.Error(), "status 404") ||
-		!strings.Contains(err.Error(), "target mock/m failed its check; no alias or key was created") {
+		!strings.Contains(err.Error(), "target mock/m failed its check; no alias or key was created, and the targets added for it were removed: mock/m") {
 		t.Fatalf("err = %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "already changed and kept: target mock/m added\n") || indexOf(w.cli(), "models add ") >= 0 {
-		t.Errorf("CLI calls %q\n%s", w.cli(), out)
+	// The target added for the alias goes with it (issue #4): no alias lists
+	// it, and without a terminal nothing else would remove it.
+	if got := w.cli(); !slices.Contains(got, "targets remove --json --yes -- mock/m") || indexOf(got, "models add ") >= 0 ||
+		strings.Contains(out, "already changed and kept") || !strings.Contains(out, "removing target mock/m, added for this alias: the check failed\n") {
+		t.Errorf("CLI calls %q\n%s", got, out)
 	}
+	if l := w.targets(); len(l) != 0 {
+		t.Errorf("targets left: %+v", l)
+	}
+
+	// A removal the proxy refuses is said, and the target is said kept.
+	w, mock = checkWorld(t)
+	mock.Script(mockprovider.Step{Status: http.StatusNotFound, Body: []byte(`{"error":{"message":"no such model"}}`)})
+	w.override(map[string][]reply{"targets remove --json --yes -- mock/m": {refused("target_in_use", "targets/mock/m")}})
+	_, out, err = w.makePlain(map[string]string{"provider": "mock", "model": "m", "alias": "x"})
+	if err == nil || !strings.HasSuffix(err.Error(), "target mock/m failed its check; no alias or key was created") ||
+		!strings.Contains(out, "target_in_use message") || !strings.Contains(out, "the proxy refused to remove target mock/m\n") ||
+		!strings.Contains(out, "already changed and kept: target mock/m added\n") {
+		t.Fatalf("refused: err = %v\n%s", err, out)
+	}
+
+	// Esc during the check keeps the target added, said kept: only a failed
+	// check removes it.
+	w, mock = checkWorld(t)
+	mock.Script(mockprovider.Step{Hang: true})
+	s := &scripted{answers: map[string][]string{"check": {"check"}, "fallback-provider": {""}, "effort": {""}},
+		leaveWork: func(q ui.Question) bool { return q.ID == "checking" && len(mock.Calls()) == 1 }}
+	if _, err := w.makeAlias(ui.New(s, map[string]string{"provider": "mock", "model": "m", "alias": "x"})); !errors.Is(err, ui.ErrLeave) {
+		t.Fatalf("Esc: err = %v\n%s", err, s.output())
+	}
+	if indexOf(w.cli(), "targets remove ") >= 0 || !strings.Contains(s.output(), "already changed and kept: target mock/m added\n") {
+		t.Errorf("Esc: CLI calls %q\n%s", w.cli(), s.output())
+	}
+	if l := w.targets(); len(l) != 1 || l[0].ID != "mock/m" {
+		t.Errorf("Esc: targets %+v", l)
+	}
+}
+
+// targets is the targets the CLI lists.
+func (w *world) targets() []proxy.Target {
+	w.t.Helper()
+	var l struct {
+		Targets []proxy.Target `json:"targets"`
+	}
+	w.decoded(&l, "targets", "list")
+	return l.Targets
 }
 
 func TestMakeAliasEffort(t *testing.T) {
